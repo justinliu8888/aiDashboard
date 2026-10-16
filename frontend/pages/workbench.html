@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AI 报表生成工作台 · 机房能耗日报</title>
+<script src="https://modao.cc/agent-py/static/source/js/tailwindcss.js"></script>
+<script src="https://modao.cc/agent-py/static/source/js/iconify-icon.min.js"></script>
+<script src="https://modao.cc/agent-py/static/source/js/echarts.min.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+  .no-bar { scrollbar-width: none; -ms-overflow-style: none; }
+  .no-bar::-webkit-scrollbar { width: 0; height: 0; display: none; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .region-highlight { animation: flash 1.4s ease-out 1; }
+  @keyframes flash {
+    0% { box-shadow: 0 0 0 3px rgba(217, 70, 239, 0.4); }
+    100% { box-shadow: 0 0 0 0 rgba(217, 70, 239, 0); }
+  }
+  /* 下一阶段按钮：灰色不可点 */
+  .btn-disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-disabled:hover { background: inherit !important; }
+</style>
+</head>
+<body class="h-screen overflow-hidden flex flex-col bg-slate-100 text-slate-800">
+
+<!-- ===== 顶部导航 ===== -->
+<header class="shrink-0 h-14 bg-[#0d1f3a] flex items-center gap-6 px-6">
+  <div class="flex items-center gap-2.5">
+    <div class="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center">
+      <iconify-icon class="text-white text-lg" icon="mdi:chart-box"></iconify-icon>
+    </div>
+    <span class="text-white font-semibold tracking-wide">云枢数据平台</span>
+    <span class="text-[11px] text-slate-400 border border-slate-600 rounded px-1.5 py-0.5">报表中心</span>
+  </div>
+  <nav class="hidden lg:flex items-center gap-1 text-sm">
+    <span class="px-3 py-1.5 rounded-md bg-white/10 text-white font-medium">报表策略</span>
+  </nav>
+  <div class="ml-auto flex items-center gap-3">
+    <span id="health-badge" class="hidden xl:flex items-center gap-1.5 text-[11px] text-emerald-300 bg-emerald-500/10 border border-emerald-500/30 rounded-md px-2 py-1">
+      <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>后端服务正常
+    </span>
+    <div class="flex items-center gap-2">
+      <div class="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-white text-xs font-medium">陈</div>
+      <div class="hidden xl:block leading-tight">
+        <div class="text-xs text-white">陈工</div>
+        <div class="text-[10px] text-slate-400">数据工程师</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ===== 报表工具栏 ===== -->
+<div class="shrink-0 bg-white border-b border-slate-200 px-5 py-3">
+  <div class="flex items-center gap-4">
+    <a class="w-8 h-8 shrink-0 rounded-lg border border-slate-200 hover:bg-slate-50 flex items-center justify-center text-slate-500" href="../" title="返回 playground">
+      <iconify-icon class="text-base" icon="mdi:arrow-left"></iconify-icon>
+    </a>
+    <div class="min-w-0">
+      <div class="flex items-center gap-2 flex-wrap">
+        <h1 class="text-base font-semibold text-slate-900">机房能耗日报</h1>
+        <span id="draft-badge" class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-slate-100 text-slate-500 border-slate-200">
+          <iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>尚无草稿
+        </span>
+        <span id="state-badge" class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-slate-100 text-slate-600 border-slate-200 mono">IDLE</span>
+      </div>
+      <div class="flex items-center gap-2.5 text-xs text-slate-500 mt-1.5">
+        <span>subject: <span class="mono">machine_room / room_a</span></span><span class="text-slate-300">|</span>
+        <span>revision: <span id="meta-rev" class="mono">—</span></span><span class="text-slate-300">|</span>
+        <span>designSessionId: <span id="meta-session" class="mono">—</span></span>
+      </div>
+    </div>
+    <div class="ml-auto flex items-center gap-2 shrink-0">
+      <button id="btn-regenerate" class="inline-flex items-center gap-1.5 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200 transition">
+        <iconify-icon class="text-base text-slate-500" icon="mdi:refresh"></iconify-icon>重新生成
+      </button>
+      <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-white text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200" title="下一阶段：FakeAgent 还未实现 VALIDATING 流程">
+        <iconify-icon class="text-base text-slate-500" icon="mdi:clipboard-check-outline"></iconify-icon>校验
+      </button>
+      <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-blue-50 text-blue-700 text-sm font-medium px-3 py-2 border border-blue-200" title="下一阶段：FakeAgent 还未实现 PREVIEWING 流程">
+        <iconify-icon class="text-base" icon="mdi:play-circle-outline"></iconify-icon>试运行
+      </button>
+      <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-white text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200" title="下一阶段：保存需要调 SAVE_DEFINITION_DRAFT 工具">
+        <iconify-icon class="text-base text-slate-500" icon="mdi:content-save-outline"></iconify-icon>保存草稿
+      </button>
+      <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-blue-700 text-white text-sm font-medium px-3.5 py-2" title="下一阶段：发布需后端校验和试运行通过">
+        <iconify-icon class="text-base" icon="mdi:rocket-launch-outline"></iconify-icon>发布
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 主体 ===== -->
+<div class="flex-1 min-h-0 flex">
+
+  <!-- 左：AI 对话区 -->
+  <section class="w-[36%] min-w-[340px] max-w-[560px] shrink-0 bg-white border-r border-slate-200 flex flex-col">
+    <div class="shrink-0 px-4 py-3 border-b border-slate-200 flex items-center gap-3">
+      <div class="relative">
+        <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <iconify-icon class="text-white text-lg" icon="mdi:robot-outline"></iconify-icon>
+        </div>
+        <span class="absolute -right-0.5 -bottom-0.5 w-2.5 h-2.5 rounded-full bg-emerald-400 ring-2 ring-white"></span>
+      </div>
+      <div class="min-w-0">
+        <div class="text-sm font-semibold text-slate-900">AI 报表助理</div>
+        <div class="text-[11px] text-slate-500">FakeAgent · 助理模式</div>
+      </div>
+      <button id="btn-clear" class="ml-auto text-xs text-slate-500 hover:text-blue-700 flex items-center gap-1 px-2 py-1 rounded-md hover:bg-slate-50">
+        <iconify-icon class="text-sm" icon="mdi:history"></iconify-icon>清空
+      </button>
+    </div>
+
+    <div id="chat-scroll" class="flex-1 min-h-0 overflow-y-auto no-bar bg-slate-50 px-4 py-4 space-y-4">
+      <!-- 欢迎 -->
+      <div class="flex gap-2.5">
+        <div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">
+            你好，我是 AI 报表助理。描述你的报表需求，我会生成结构化报表草稿。本阶段只对接了 FakeAgent，不会真的查数据。
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 快捷样例 -->
+    <div class="shrink-0 border-t border-slate-200 bg-white px-4 pt-3">
+      <div class="flex items-center gap-1.5 overflow-x-auto no-bar pb-0.5">
+        <button data-quick="生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">生成能耗日报</button>
+        <button data-quick="帮我看异常设备" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">异常设备（信息不足）</button>
+        <button data-quick="帮我看所有项目的能耗排名" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">所有项目（权限）</button>
+        <button data-quick="帮我看 A 机房分钟级历史能耗" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">分钟级（能力）</button>
+        <button data-quick="把趋势图改成最近 7 天" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">改 7 天</button>
+        <button data-quick="不要趋势图，改成只要总耗电和设备排名" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">删趋势图</button>
+      </div>
+    </div>
+
+    <!-- 输入 -->
+    <div class="shrink-0 border-t border-slate-200 bg-white">
+      <div class="px-4 py-3">
+        <div class="flex items-end gap-2 rounded-xl border border-slate-300 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-100 bg-white px-3 py-2 transition">
+          <textarea id="chat-input" class="flex-1 resize-none outline-none text-sm max-h-24 no-bar leading-relaxed" rows="1" placeholder="描述报表需求，或输入修改要求…"></textarea>
+          <button id="btn-send" class="shrink-0 w-9 h-9 rounded-lg bg-blue-700 hover:bg-blue-800 text-white flex items-center justify-center transition">
+            <iconify-icon class="text-base" icon="mdi:send"></iconify-icon>
+          </button>
+        </div>
+        <div class="flex items-center justify-between mt-2">
+          <span class="text-[11px] text-slate-500">当前 state: <span id="footer-state" class="mono text-slate-700">ANALYZING</span></span>
+          <span class="text-[10px] text-slate-400">Enter 发送 · Shift+Enter 换行</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 右：报表预览区 -->
+  <section class="flex-1 min-w-0 overflow-y-auto no-bar bg-slate-100">
+    <div id="preview-root" class="p-5 space-y-5">
+      <!-- 空态 -->
+      <div id="preview-empty" class="bg-white rounded-xl border border-dashed border-slate-300 p-10 text-center text-slate-400">
+        <iconify-icon class="text-5xl text-slate-300" icon="mdi:file-document-outline"></iconify-icon>
+        <div class="mt-3 text-sm">还没有草稿，试试左侧「生成能耗日报」</div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- toast -->
+<div id="toast" class="hidden fixed left-1/2 bottom-8 -translate-x-1/2 z-50 bg-slate-900 text-white text-sm px-4 py-2.5 rounded-lg shadow-lg"></div>
+
+<script src="./workbench.js"></script>
+</body>
+</html>

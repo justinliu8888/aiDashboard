@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>AI 报表生成工作台 · 机房能耗日报</title>
+<script src="https://modao.cc/agent-py/static/source/js/tailwindcss.js"></script>
+<script src="https://modao.cc/agent-py/static/source/js/iconify-icon.min.js"></script>
+<script src="https://modao.cc/agent-py/static/source/js/echarts.min.js"></script>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;}
+  .no-bar{scrollbar-width:none;-ms-overflow-style:none;}
+  .no-bar::-webkit-scrollbar{width:0;height:0;display:none;}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+</style>
+</head>
+<body class="h-screen overflow-hidden flex flex-col bg-slate-100 text-slate-800">
+<!-- ===== 顶部导航 ===== -->
+<header class="shrink-0 h-14 bg-[#0d1f3a] flex items-center gap-6 px-6">
+<div class="flex items-center gap-2.5">
+<div class="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center">
+<iconify-icon class="text-white text-lg" icon="mdi:chart-box"></iconify-icon>
+</div>
+<span class="text-white font-semibold tracking-wide">云枢数据平台</span>
+<span class="text-[11px] text-slate-400 border border-slate-600 rounded px-1.5 py-0.5">报表中心</span>
+</div>
+<nav class="hidden lg:flex items-center gap-1 text-sm">
+<a class="px-3 py-1.5 rounded-md bg-white/10 text-white font-medium" href="home.html">报表策略</a>
+</nav>
+<div class="ml-auto flex items-center gap-3">
+<span class="hidden xl:flex items-center gap-1.5 text-[11px] text-emerald-300 bg-emerald-500/10 border border-emerald-500/30 rounded-md px-2 py-1">
+<span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>后端服务正常
+    </span>
+<div class="flex items-center gap-2">
+<div class="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-white text-xs font-medium">陈</div>
+<div class="hidden xl:block leading-tight">
+<div class="text-xs text-white">陈工</div>
+<div class="text-[10px] text-slate-400">数据工程师</div>
+</div>
+</div>
+</div>
+</header>
+<!-- ===== 报表工具栏 ===== -->
+<div class="shrink-0 bg-white border-b border-slate-200 px-5 py-3">
+<div class="flex items-center gap-4">
+<a class="w-8 h-8 shrink-0 rounded-lg border border-slate-200 hover:bg-slate-50 flex items-center justify-center text-slate-500" href="home.html" title="返回报表策略">
+<iconify-icon class="text-base" icon="mdi:arrow-left"></iconify-icon>
+</a>
+<div class="min-w-0">
+<div class="flex items-center gap-2 flex-wrap">
+<h1 class="text-base font-semibold text-slate-900">机房能耗日报</h1>
+<span class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-amber-50 text-amber-700 border-amber-200">
+<iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>AI 生成草稿
+        </span>
+<span class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-slate-100 text-slate-600 border-slate-200">待校验</span>
+</div>
+<div class="flex items-center gap-2.5 text-xs text-slate-500 mt-1.5">
+<span>策略版本 v3</span><span class="text-slate-300">|</span>
+<span>定义草稿 v6</span><span class="text-slate-300">|</span>
+<span>范围 华南数据中心 / A 机房</span><span class="text-slate-300">|</span>
+<span>自动保存于 09-29 08:01</span>
+</div>
+</div>
+<div class="ml-auto flex items-center gap-2 shrink-0">
+<button class="inline-flex items-center gap-1.5 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200 transition" onclick="appendUser('重新生成昨日机房能耗日报草稿。');appendTemplate('tpl-generate');">
+<iconify-icon class="text-base text-slate-500" icon="mdi:refresh"></iconify-icon>重新生成
+      </button>
+<a class="inline-flex items-center gap-1.5 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200 transition" href="validation.html">
+<iconify-icon class="text-base text-slate-500" icon="mdi:clipboard-check-outline"></iconify-icon>校验
+      </a>
+<a class="inline-flex items-center gap-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 text-sm font-medium px-3 py-2 border border-blue-200 transition" href="validation.html">
+<iconify-icon class="text-base" icon="mdi:play-circle-outline"></iconify-icon>试运行
+      </a>
+<button class="inline-flex items-center gap-1.5 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200 transition" onclick="toast('草稿已保存为 定义草稿 v7（保存由后端执行）')">
+<iconify-icon class="text-base text-slate-500" icon="mdi:content-save-outline"></iconify-icon>保存草稿
+      </button>
+<button class="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-sm font-medium px-3.5 py-2 transition" onclick="toast('发布需通过后端校验与试运行，AI 无权直接发布')">
+<iconify-icon class="text-base" icon="mdi:rocket-launch-outline"></iconify-icon>发布
+      </button>
+</div>
+</div>
+</div>
+<!-- ===== 主体：左对话 / 右预览 ===== -->
+<div class="flex-1 min-h-0 flex">
+<!-- 左：AI 对话区 -->
+<section class="w-[36%] min-w-[340px] max-w-[560px] shrink-0 bg-white border-r border-slate-200 flex flex-col">
+<!-- 对话头 -->
+<div class="shrink-0 px-4 py-3 border-b border-slate-200 flex items-center gap-3">
+<div class="relative">
+<div class="w-9 h-9 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white text-lg" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<span class="absolute -right-0.5 -bottom-0.5 w-2.5 h-2.5 rounded-full bg-emerald-400 ring-2 ring-white"></span>
+</div>
+<div class="min-w-0">
+<div class="text-sm font-semibold text-slate-900">AI 报表助理</div>
+<div class="text-[11px] text-slate-500">助理模式 · 非执行引擎</div>
+</div>
+<button class="ml-auto text-xs text-slate-500 hover:text-blue-700 flex items-center gap-1 px-2 py-1 rounded-md hover:bg-slate-50" onclick="clearChat()">
+<iconify-icon class="text-sm" icon="mdi:history"></iconify-icon>清空
+      </button>
+</div>
+<!-- 对话记录 -->
+<div class="flex-1 min-h-0 overflow-y-auto no-bar bg-slate-50 px-4 py-4 space-y-4" id="chat-scroll">
+<!-- 欢迎 -->
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">
+            你好，我是 AI 报表助理。描述你的报表需求，我会生成结构化报表草稿并说明使用依据。我不会直接执行 SQL、修改数据或绕过权限校验。
+          </div>
+</div>
+</div>
+<!-- 用户：生成需求 -->
+<div class="flex justify-end">
+<div class="max-w-[86%] rounded-2xl rounded-tr-sm bg-blue-600 text-white text-sm px-3.5 py-2.5 leading-relaxed">
+          生成昨日机房能耗日报，包含总耗电、趋势、排名、告警和异常设备。
+        </div>
+</div>
+<!-- AI：已生成草稿 -->
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0 space-y-2.5">
+<div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">
+            已生成一版报表草稿《机房能耗日报》（2026-09-28），右侧预览已更新。本次为草稿，尚未经过后端校验与发布。
+          </div>
+<!-- AI 使用依据卡片 -->
+<div class="rounded-xl border border-slate-200 bg-white p-3.5">
+<div class="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+<iconify-icon class="text-sm text-blue-600" icon="mdi:database-outline"></iconify-icon>AI 使用依据
+            </div>
+<div class="mt-2.5 space-y-2">
+<div class="flex gap-2">
+<span class="mt-1 w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0"></span>
+<div class="text-[12px] leading-relaxed">
+<span class="font-medium text-slate-800">设备能耗历史数据集</span>
+<span class="text-[10px] text-blue-700 bg-blue-50 border border-blue-100 rounded px-1 py-px ml-1">核心业务</span>
+<div class="text-slate-500">→ 总耗电、能耗趋势、设备能耗排名、单位运行耗电</div>
+</div>
+</div>
+<div class="flex gap-2">
+<span class="mt-1 w-1.5 h-1.5 rounded-full bg-rose-500 shrink-0"></span>
+<div class="text-[12px] leading-relaxed">
+<span class="font-medium text-slate-800">设备告警历史数据集</span>
+<span class="text-[10px] text-blue-700 bg-blue-50 border border-blue-100 rounded px-1 py-px ml-1">核心业务</span>
+<div class="text-slate-500">→ 告警数量、告警等级分布、异常设备列表、告警趋势</div>
+</div>
+</div>
+<div class="flex gap-2">
+<span class="mt-1 w-1.5 h-1.5 rounded-full bg-slate-400 shrink-0"></span>
+<div class="text-[12px] leading-relaxed">
+<span class="font-medium text-slate-800">设备目录</span>
+<span class="text-[10px] text-slate-600 bg-slate-100 border border-slate-200 rounded px-1 py-px ml-1">基础维表 / 权限范围</span>
+<div class="text-slate-500">→ 设备名称、项目、机房、设备类型、权限范围</div>
+</div>
+</div>
+</div>
+<div class="mt-3 pt-2.5 border-t border-slate-100 grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px]">
+<div class="flex justify-between"><span class="text-slate-500">时间范围</span><span class="text-slate-700">2026-09-28</span></div>
+<div class="flex justify-between"><span class="text-slate-500">粒度</span><span class="text-slate-700">小时级</span></div>
+<div class="flex justify-between"><span class="text-slate-500">范围</span><span class="text-slate-700">A 机房</span></div>
+<div class="flex justify-between"><span class="text-slate-500">设备数</span><span class="text-slate-700">26 台</span></div>
+</div>
+</div>
+<div class="flex flex-wrap gap-1.5">
+<a class="inline-flex items-center gap-1 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-medium px-2.5 py-1.5 transition" href="validation.html">
+<iconify-icon class="text-sm" icon="mdi:clipboard-check-outline"></iconify-icon>校验草稿
+            </a>
+<button class="inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 border border-slate-200 transition" onclick="appendTemplate('tpl-evidence')">
+<iconify-icon class="text-sm text-slate-500" icon="mdi:link-variant"></iconify-icon>查看使用依据
+            </button>
+</div>
+</div>
+</div>
+<!-- 用户：修改要求 -->
+<div class="flex justify-end">
+<div class="max-w-[86%] rounded-2xl rounded-tr-sm bg-blue-600 text-white text-sm px-3.5 py-2.5 leading-relaxed">
+          把异常设备表加上单位运行耗电和告警等级，按耗电量排序。
+        </div>
+</div>
+<!-- AI：变更确认卡片 -->
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl border border-blue-200 bg-white overflow-hidden">
+<div class="px-3.5 py-2.5 bg-blue-50 border-b border-blue-100 flex items-center gap-2">
+<iconify-icon class="text-blue-700" icon="mdi:file-document-edit-outline"></iconify-icon>
+<span class="text-sm font-semibold text-blue-900">AI 变更确认</span>
+<span class="text-[10px] text-blue-700 bg-white border border-blue-200 rounded px-1.5 py-px ml-auto">待你确认</span>
+</div>
+<div class="px-3.5 py-3 space-y-3">
+<div>
+<div class="text-[11px] text-slate-500">变更定位</div>
+<div class="mt-1 flex flex-wrap items-center gap-1.5 text-xs">
+<span class="mono text-[10px] text-slate-700 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5">module_abnormal_devices</span>
+<span class="text-slate-700">异常设备表</span>
+</div>
+</div>
+<div>
+<div class="text-[11px] text-slate-500">变更内容</div>
+<ul class="mt-1 space-y-1 text-xs text-slate-700">
+<li class="flex gap-1.5"><span class="text-emerald-600 font-medium">新增</span>字段 单位运行耗电（unit_energy）</li>
+<li class="flex gap-1.5"><span class="text-emerald-600 font-medium">新增</span>字段 告警等级（alarm_level）</li>
+<li class="flex gap-1.5"><span class="text-amber-600 font-medium">调整</span>排序方式改为按耗电量降序</li>
+</ul>
+</div>
+<div class="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
+<div class="text-[11px] text-slate-500">影响范围</div>
+<div class="text-xs text-slate-700 mt-0.5">仅作用于该模块，不影响总耗电口径、趋势与其他模块；需确认后应用。</div>
+</div>
+<div class="flex flex-wrap gap-1.5">
+<button class="inline-flex items-center gap-1 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-medium px-2.5 py-1.5 transition" onclick="acceptChange(this)">
+<iconify-icon class="text-sm" icon="mdi:check"></iconify-icon>接受变更
+                </button>
+<button class="inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 border border-slate-200 transition" onclick="rejectChange(this)">
+<iconify-icon class="text-sm text-slate-500" icon="mdi:close"></iconify-icon>拒绝
+                </button>
+<button class="inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 border border-slate-200 transition" onclick="toast('变更详情：module_abnormal_devices 字段 4 → 6，排序表达式已更新')">
+<iconify-icon class="text-sm text-slate-500" icon="mdi:eye-outline"></iconify-icon>查看变更详情
+                </button>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- 底部操作区 -->
+<div class="shrink-0 border-t border-slate-200 bg-white">
+<!-- 当前上下文 -->
+<div class="px-4 pt-3">
+<div class="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+<div class="flex items-center justify-between">
+<span class="text-[11px] font-semibold text-slate-600 flex items-center gap-1">
+<iconify-icon class="text-sm text-blue-600" icon="mdi:target"></iconify-icon>当前上下文
+            </span>
+<span class="text-[10px] text-slate-400">随对话自动同步</span>
+</div>
+<div class="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5 text-[11px]">
+<div class="flex justify-between"><span class="text-slate-500">报表</span><span class="text-slate-800 font-medium">机房能耗日报</span></div>
+<div class="flex justify-between"><span class="text-slate-500">数据范围</span><span class="text-slate-800">A 机房</span></div>
+<div class="flex justify-between"><span class="text-slate-500">粒度</span><span class="text-slate-800">小时级</span></div>
+<div class="flex justify-between"><span class="text-slate-500">策略版本</span><span class="text-slate-800">v3</span></div>
+</div>
+</div>
+</div>
+<!-- 快捷需求 -->
+<div class="px-4 pt-3">
+<div class="flex items-center gap-1.5 overflow-x-auto no-bar pb-0.5">
+<button class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition" onclick="quick('生成昨日机房能耗日报，包含总耗电、趋势、排名、告警和异常设备。','tpl-generate')">生成能耗日报</button>
+<button class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition" onclick="quick('生成昨日告警分析，按告警等级分布统计。','tpl-alarm')">生成告警分析</button>
+<button class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition" onclick="quick('在报表中增加异常设备表模块。','tpl-change-confirm')">加异常设备表</button>
+<button class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition" onclick="quick('解释校验错误：字段 outdoor_temperature 不存在。','tpl-correction')">解释校验错误</button>
+<button class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition" onclick="quick('查看本次报表的使用依据。','tpl-evidence')">查看使用依据</button>
+</div>
+</div>
+<!-- 边界说明面板 -->
+<div class="hidden px-4 pt-3" id="boundary-panel">
+<div class="rounded-xl border border-slate-200 bg-slate-50 p-3.5">
+<div class="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+<iconify-icon class="text-sm text-blue-600" icon="mdi:shield-check-outline"></iconify-icon>AI 能力边界说明
+          </div>
+<ul class="mt-2 space-y-1.5 text-[11px] text-slate-600 leading-relaxed">
+<li class="flex gap-1.5"><iconify-icon class="text-sm text-slate-400 shrink-0 mt-px" icon="mdi:close-circle-outline"></iconify-icon>AI 是报表生成助理，不是执行引擎。</li>
+<li class="flex gap-1.5"><iconify-icon class="text-sm text-slate-400 shrink-0 mt-px" icon="mdi:close-circle-outline"></iconify-icon>AI 不直接执行 SQL，不直接生成 React / Vue 前端代码。</li>
+<li class="flex gap-1.5"><iconify-icon class="text-sm text-slate-400 shrink-0 mt-px" icon="mdi:close-circle-outline"></iconify-icon>AI 不绕过权限与后端校验，不自行创建数据源或指标口径。</li>
+<li class="flex gap-1.5"><iconify-icon class="text-sm text-blue-500 shrink-0 mt-px" icon="mdi:check-circle-outline"></iconify-icon>AI 只生成结构化报表草稿或修改建议；修改必须绑定模块 ID。</li>
+<li class="flex gap-1.5"><iconify-icon class="text-sm text-blue-500 shrink-0 mt-px" icon="mdi:check-circle-outline"></iconify-icon>跨模块修改先说明影响范围；每次修正需用户确认后再应用。</li>
+<li class="flex gap-1.5"><iconify-icon class="text-sm text-blue-500 shrink-0 mt-px" icon="mdi:check-circle-outline"></iconify-icon>保存、校验、试运行、发布均由后端控制。</li>
+<li class="flex gap-1.5"><iconify-icon class="text-sm text-blue-500 shrink-0 mt-px" icon="mdi:check-circle-outline"></iconify-icon>AI 分析文字只能基于已计算事实与数据质量信息，不编造结果。</li>
+</ul>
+</div>
+</div>
+<!-- 输入区 -->
+<div class="px-4 py-3">
+<div class="flex items-end gap-2 rounded-xl border border-slate-300 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-100 bg-white px-3 py-2 transition">
+<textarea class="flex-1 resize-none outline-none text-sm max-h-24 no-bar leading-relaxed" id="chat-input" placeholder="描述报表需求，或输入修改要求…" rows="1"></textarea>
+<button class="shrink-0 w-9 h-9 rounded-lg bg-blue-700 hover:bg-blue-800 text-white flex items-center justify-center transition" onclick="handleSend()">
+<iconify-icon class="text-base" icon="mdi:send"></iconify-icon>
+</button>
+</div>
+<div class="flex items-center justify-between mt-2">
+<button class="text-[11px] text-slate-500 hover:text-blue-700 flex items-center gap-1" onclick="toggleBoundary()">
+<iconify-icon class="text-sm" icon="mdi:shield-check-outline"></iconify-icon>AI 能力边界说明
+          </button>
+<span class="text-[10px] text-slate-400">Enter 发送 · Shift+Enter 换行</span>
+</div>
+</div>
+</div>
+</section>
+<!-- 右：报表预览区 -->
+<section class="flex-1 min-w-0 overflow-y-auto no-bar bg-slate-100">
+<div class="p-5 space-y-5">
+<!-- 结果摘要 + 指标卡 -->
+<div class="bg-white rounded-xl border border-slate-200 p-5">
+<div class="flex items-start justify-between gap-4">
+<div>
+<div class="flex items-center gap-2 flex-wrap">
+<h2 class="text-lg font-semibold text-slate-900">机房能耗日报</h2>
+<span class="inline-flex items-center rounded-md text-xs font-medium px-2 py-1 border bg-blue-50 text-blue-700 border-blue-200">2026-09-28</span>
+<span class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-amber-50 text-amber-700 border-amber-200">
+<iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>AI 草稿 · 未发布
+              </span>
+</div>
+<div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
+<span>范围：华南数据中心 / A 机房</span>
+<span>设备：26 台</span>
+<span>数据完整度：98.6%</span>
+<span>生成时间：09-29 08:01</span>
+</div>
+</div>
+<span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 shrink-0">module_summary</span>
+</div>
+<div class="mt-4 grid grid-cols-2 xl:grid-cols-5 gap-3">
+<div class="rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-3">
+<div class="text-[11px] text-slate-500">总耗电</div>
+<div class="text-xl font-semibold text-slate-900 mt-1">32,810<span class="text-xs font-normal text-slate-400 ml-1">kWh</span></div>
+<div class="text-[11px] text-slate-400 mt-1">2026-09-28 全天</div>
+</div>
+<div class="rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-3">
+<div class="text-[11px] text-slate-500">环比</div>
+<div class="text-xl font-semibold text-rose-600 mt-1">+3.2%</div>
+<div class="text-[11px] text-slate-400 mt-1">对比 09-27（31,793）</div>
+</div>
+<div class="rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-3">
+<div class="text-[11px] text-slate-500">异常设备</div>
+<div class="text-xl font-semibold text-slate-900 mt-1">3</div>
+<div class="text-[11px] text-amber-600 mt-1">阈值口径待确认</div>
+</div>
+<div class="rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-3">
+<div class="text-[11px] text-slate-500">告警数量</div>
+<div class="text-xl font-semibold text-slate-900 mt-1">12</div>
+<div class="text-[11px] text-rose-600 mt-1">高等级 5 条</div>
+</div>
+<div class="rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-3">
+<div class="text-[11px] text-slate-500">缺失采样设备</div>
+<div class="text-xl font-semibold text-slate-900 mt-1">2</div>
+<div class="text-[11px] text-slate-400 mt-1">完整度 98.6%</div>
+</div>
+</div>
+</div>
+<!-- 能耗趋势 -->
+<div class="bg-white rounded-xl border border-slate-200 p-5">
+<div class="flex items-start justify-between gap-4">
+<div>
+<h3 class="font-semibold text-slate-900">小时级能耗趋势</h3>
+<p class="text-xs text-slate-500 mt-0.5">2026-09-28 00:00 – 23:59 · 单位 kWh · 已叠加异常点与告警标记</p>
+</div>
+<span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 shrink-0">module_trend</span>
+</div>
+<div class="mt-3 w-full h-[260px]" id="chart-trend"></div>
+<div class="mt-2 flex flex-wrap items-center gap-x-5 gap-y-2 text-[11px] text-slate-500">
+<span class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-blue-600 rounded"></span>小时能耗</span>
+<span class="flex items-center gap-1.5"><span class="w-4 border-t border-dashed border-amber-500"></span>单位运行耗电阈值 1,900 kWh/h</span>
+<span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rotate-45 bg-rose-500 rounded-sm"></span>异常设备标记</span>
+<span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rotate-45 bg-amber-500 rounded-sm"></span>告警标记</span>
+</div>
+</div>
+<!-- 设备能耗排名 -->
+<div class="bg-white rounded-xl border border-slate-200 p-5">
+<div class="flex items-start justify-between gap-4">
+<div>
+<h3 class="font-semibold text-slate-900">设备能耗排名</h3>
+<p class="text-xs text-slate-500 mt-0.5">按耗电量降序 · Top 8 / 共 26 台设备</p>
+</div>
+<span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 shrink-0">module_ranking</span>
+</div>
+<div class="mt-3 overflow-x-auto no-bar">
+<table class="w-full text-sm min-w-[720px]">
+<thead>
+<tr class="bg-slate-50 text-xs text-slate-500">
+<th class="text-left font-medium px-3 py-2 rounded-l-lg">排名</th>
+<th class="text-left font-medium px-3 py-2">设备名称</th>
+<th class="text-left font-medium px-3 py-2">设备类型</th>
+<th class="text-right font-medium px-3 py-2">耗电量 (kWh)</th>
+<th class="text-right font-medium px-3 py-2">单位运行耗电 (kWh/h)</th>
+<th class="text-right font-medium px-3 py-2">环比</th>
+<th class="text-left font-medium px-3 py-2 rounded-r-lg">状态</th>
+</tr>
+</thead>
+<tbody class="divide-y divide-slate-100">
+<tr class="hover:bg-slate-50">
+<td class="px-3 py-2.5"><span class="inline-flex items-center justify-center w-5 h-5 rounded bg-amber-100 text-amber-700 text-[11px] font-semibold">1</span></td>
+<td class="px-3 py-2.5 font-medium text-slate-800">1# 冷机</td>
+<td class="px-3 py-2.5 text-slate-500">冷水机组</td>
+<td class="px-3 py-2.5 text-right text-slate-800">6,420</td>
+<td class="px-3 py-2.5 text-right text-slate-800">8.9</td>
+<td class="px-3 py-2.5 text-right text-rose-600">+6.2%</td>
+<td class="px-3 py-2.5"><span class="inline-flex items-center rounded text-[11px] font-medium px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200">正常</span></td>
+</tr>
+<tr class="hover:bg-slate-50 bg-rose-50/40">
+<td class="px-3 py-2.5"><span class="inline-flex items-center justify-center w-5 h-5 rounded bg-slate-200 text-slate-600 text-[11px] font-semibold">2</span></td>
+<td class="px-3 py-2.5 font-medium text-slate-800">3# 冷机</td>
+<td class="px-3 py-2.5 text-slate-500">冷水机组</td>
+<td class="px-3 py-2.5 text-right text-slate-800">5,180</td>
+<td class="px-3 py-2.5 text-right font-semibold text-rose-600">11.4</td>
+<td class="px-3 py-2.5 text-right text-rose-600">+12.8%</td>
+<td class="px-3 py-2.5"><span class="inline-flex items-center rounded text-[11px] font-medium px-1.5 py-0.5 bg-rose-50 text-rose-700 border border-rose-200">异常</span></td>
+</tr>
+<tr class="hover:bg-slate-50">
+<td class="px-3 py-2.5"><span class="inline-flex items-center justify-center w-5 h-5 rounded bg-slate-200 text-slate-600 text-[11px] font-semibold">3</span></td>
+<td class="px-3 py-2.5 font-medium text-slate-800">2# 冷机</td>
+<td class="px-3 py-2.5 text-slate-500">冷水机组</td>
+<td class="px-3 py-2.5 text-right text-slate-800">4,760</td>
+<td class="px-3 py-2.5 text-right text-slate-800">9.1</td>
+<td class="px-3 py-2.5 text-right text-rose-600">+1.4%</td>
+<td class="px-3 py-2.5"><span class="inline-flex items-center rounded text-[11px] font-medium px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200">正常</span></td>
+</tr>
+<tr class="hover:bg-slate-50">
+<td class="px-3 py-2.5"><span class="inline-flex items-center justify-center w-5 h-5 rounded bg-slate-100 text-slate-500 text-[11px] font-semibold">4</span></td>
+<td class="px-3 py-2.5 font-medium text-slate-800">精密空调 A-02</td>
+<td class="px-3 py-2.5 text-slate-500">精密空调</td>
+<td class="px-3 py-2.5 text-right text-slate-800">2,940</td>
+<td class="px-3 py-2.5 text-right text-slate-800">4.2</td>
+<td class="px-3 py-2.5 text-right text-rose-600">+0.8%</td>
+<td class="px-3 py-2.5"><span class="inline-flex items-center rounded text-[11px] font-medium px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200">正常</span></td>
+</tr>
+<tr class="hover:bg-slate-50">
+<td class="px-3 py-2.5"><span class="inline-flex items-center justify-center w-5 h-5 rounded bg-slate-100 text-slate-500 text-[11px] font-semibold">5</span></td>
+<td class="px-3 py-2.5 font-medium text-slate-800">UPS-01</td>
+<td class="px-3 py-2.5 text-slate-500">UPS</td>
+<td class="px-3 py-2.5 text-right text-slate-800">1,860</td>
+<td class="px-3 py-2.5 text-right text-slate-800">1.9</td>
+<td class="px-3 py-2.5 text-right text-emerald-600">-0.6%</td>
+<td class="px-3 py-2.5"><span class="inline-flex items-center rounded text-[11px] font-medium px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200">正常</span></td>
+</tr>
+<tr class="hover:bg-slate-50 bg-amber-50/40">
+<td class="px-3 py-2.5"><span class="inline-flex items-center justify-center w-5 h-5 rounded bg-slate-100 text-slate-500 text-[11px] font-semibold">6</span></td>
+<td class="px-3 py-2.5 font-medium text-slate-800">精密空调 A-05</td>
+<td class="px-3 py-2.5 text-slate-500">精密空调</td>
+<td class="px-3 py-2.5 text-right text-slate-800">1,520</td>
+<td class="px-3 py-2.5 text-right text-slate-800">3.8</td>
+<td class="px-3 py-2.5 text-right text-rose-600">+2.1%</td>
+<td class="px-3 py-2.5"><span class="inline-flex items-center rounded text-[11px] font-medium px-1.5 py-0.5 bg-amber-50 text-amber-700 border border-amber-200">数据缺失</span></td>
+</tr>
+<tr class="hover:bg-slate-50">
+<td class="px-3 py-2.5"><span class="inline-flex items-center justify-center w-5 h-5 rounded bg-slate-100 text-slate-500 text-[11px] font-semibold">7</span></td>
+<td class="px-3 py-2.5 font-medium text-slate-800">精密空调 A-01</td>
+<td class="px-3 py-2.5 text-slate-500">精密空调</td>
+<td class="px-3 py-2.5 text-right text-slate-800">1,410</td>
+<td class="px-3 py-2.5 text-right text-slate-800">3.5</td>
+<td class="px-3 py-2.5 text-right text-rose-600">+0.4%</td>
+<td class="px-3 py-2.5"><span class="inline-flex items-center rounded text-[11px] font-medium px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200">正常</span></td>
+</tr>
+<tr class="hover:bg-slate-50">
+<td class="px-3 py-2.5"><span class="inline-flex items-center justify-center w-5 h-5 rounded bg-slate-100 text-slate-500 text-[11px] font-semibold">8</span></td>
+<td class="px-3 py-2.5 font-medium text-slate-800">配电柜 P-03</td>
+<td class="px-3 py-2.5 text-slate-500">配电</td>
+<td class="px-3 py-2.5 text-right text-slate-800">980</td>
+<td class="px-3 py-2.5 text-right text-slate-800">0.6</td>
+<td class="px-3 py-2.5 text-right text-emerald-600">-1.2%</td>
+<td class="px-3 py-2.5"><span class="inline-flex items-center rounded text-[11px] font-medium px-1.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200">正常</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<!-- 告警分布 + 异常设备 -->
+<div class="grid grid-cols-1 2xl:grid-cols-2 gap-5">
+<div class="bg-white rounded-xl border border-slate-200 p-5">
+<div class="flex items-start justify-between gap-4">
+<div>
+<h3 class="font-semibold text-slate-900">告警等级分布</h3>
+<p class="text-xs text-slate-500 mt-0.5">2026-09-28 · 共 12 条告警</p>
+</div>
+<span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 shrink-0">module_alarm</span>
+</div>
+<div class="mt-3 w-full h-[220px]" id="chart-alarm"></div>
+</div>
+<div class="bg-white rounded-xl border border-slate-200 p-5">
+<div class="flex items-start justify-between gap-4">
+<div>
+<h3 class="font-semibold text-slate-900">异常设备列表</h3>
+<p class="text-xs text-slate-500 mt-0.5">3 台设备命中异常规则 · 单位运行耗电 / 数据缺失 / 环比增长</p>
+</div>
+<span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 shrink-0">module_abnormal_devices</span>
+</div>
+<div class="mt-3 space-y-2.5">
+<div class="rounded-lg border border-rose-200 bg-rose-50/50 px-3.5 py-3">
+<div class="flex items-center gap-2">
+<iconify-icon class="text-rose-600" icon="mdi:alert-decagram-outline"></iconify-icon>
+<span class="text-sm font-medium text-slate-800">3# 冷机</span>
+<span class="text-[10px] text-rose-700 bg-white border border-rose-200 rounded px-1.5 py-0.5">严重告警</span>
+<span class="ml-auto text-xs text-slate-500">单位运行耗电 11.4 kWh/h</span>
+</div>
+<div class="text-xs text-slate-600 mt-1.5 leading-relaxed">单位运行耗电高于阈值 10 kWh/h，同时存在高等级告警，建议检查运行工况。</div>
+</div>
+<div class="rounded-lg border border-amber-200 bg-amber-50/50 px-3.5 py-3">
+<div class="flex items-center gap-2">
+<iconify-icon class="text-amber-600" icon="mdi:database-alert-outline"></iconify-icon>
+<span class="text-sm font-medium text-slate-800">精密空调 A-05</span>
+<span class="text-[10px] text-amber-700 bg-white border border-amber-200 rounded px-1.5 py-0.5">数据缺失</span>
+<span class="ml-auto text-xs text-slate-500">缺失率 12.4%</span>
+</div>
+<div class="text-xs text-slate-600 mt-1.5 leading-relaxed">全天 24 小时中缺失 3 个小时采样，缺失率超过 10% 阈值。</div>
+</div>
+<div class="rounded-lg border border-amber-200 bg-amber-50/50 px-3.5 py-3">
+<div class="flex items-center gap-2">
+<iconify-icon class="text-amber-600" icon="mdi:trending-up"></iconify-icon>
+<span class="text-sm font-medium text-slate-800">配电柜 P-07</span>
+<span class="text-[10px] text-amber-700 bg-white border border-amber-200 rounded px-1.5 py-0.5">环比增长</span>
+<span class="ml-auto text-xs text-slate-500">环比 +23.5%</span>
+</div>
+<div class="text-xs text-slate-600 mt-1.5 leading-relaxed">能耗环比增长超过 20% 阈值，建议核对负载变化记录。</div>
+</div>
+</div>
+</div>
+</div>
+<div class="text-[11px] text-slate-400 pb-1">预览区由 AI 生成的报表定义渲染（模块 ID 绑定），正式数据以发布后的后端渲染结果为准。</div>
+</div>
+</section>
+</div>
+<!-- ===== 动态消息模板 ===== -->
+<template id="tpl-generate">
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">
+        已重新生成《机房能耗日报》草稿，右侧预览已刷新。使用数据集：设备能耗历史数据集、设备告警历史数据集、设备目录；时间范围 2026-09-28，粒度小时级，范围 A 机房（26 台设备）。
+      </div>
+</div>
+</div>
+</template>
+<template id="tpl-alarm">
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl border border-slate-200 bg-white overflow-hidden">
+<div class="px-3.5 py-2.5 bg-slate-50 border-b border-slate-100 flex items-center gap-2">
+<iconify-icon class="text-rose-600" icon="mdi:bell-alert-outline"></iconify-icon>
+<span class="text-sm font-semibold text-slate-900">已生成告警分析草稿</span>
+<span class="text-[10px] text-slate-500 bg-white border border-slate-200 rounded px-1.5 py-px ml-auto">新草稿</span>
+</div>
+<div class="px-3.5 py-3 space-y-2 text-sm text-slate-700 leading-relaxed">
+<div>使用数据集：设备告警历史数据集（核心业务）、设备目录。</div>
+<div class="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px] pt-1">
+<div class="flex justify-between"><span class="text-slate-500">时间范围</span><span class="text-slate-700">2026-09-28</span></div>
+<div class="flex justify-between"><span class="text-slate-500">告警总数</span><span class="text-slate-700">47</span></div>
+<div class="flex justify-between"><span class="text-slate-500">高等级</span><span class="text-slate-700">9</span></div>
+<div class="flex justify-between"><span class="text-slate-500">涉及设备</span><span class="text-slate-700">11</span></div>
+</div>
+<div class="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-[11px] text-slate-600">
+            该草稿为独立策略，与当前《机房能耗日报》互不影响；需确认后才会写入策略。
+          </div>
+</div>
+<div class="px-3.5 pb-3 flex flex-wrap gap-1.5">
+<a class="inline-flex items-center gap-1 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-medium px-2.5 py-1.5 transition" href="workbench.html">切换到该草稿</a>
+<button class="inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 border border-slate-200 transition" onclick="toast('已记录，本次不写入策略')">暂不处理</button>
+</div>
+</div>
+</div>
+</div>
+</template>
+<template id="tpl-change-confirm">
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl border border-blue-200 bg-white overflow-hidden">
+<div class="px-3.5 py-2.5 bg-blue-50 border-b border-blue-100 flex items-center gap-2">
+<iconify-icon class="text-blue-700" icon="mdi:file-document-edit-outline"></iconify-icon>
+<span class="text-sm font-semibold text-blue-900">AI 变更确认</span>
+<span class="text-[10px] text-blue-700 bg-white border border-blue-200 rounded px-1.5 py-px ml-auto">待你确认</span>
+</div>
+<div class="px-3.5 py-3 space-y-3">
+<div>
+<div class="text-[11px] text-slate-500">变更定位</div>
+<div class="mt-1 flex flex-wrap items-center gap-1.5 text-xs">
+<span class="mono text-[10px] text-slate-700 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5">module_new_abnormal_devices</span>
+<span class="text-slate-700">新增「异常设备表」模块</span>
+</div>
+</div>
+<div>
+<div class="text-[11px] text-slate-500">变更内容</div>
+<ul class="mt-1 space-y-1 text-xs text-slate-700">
+<li class="flex gap-1.5"><span class="text-emerald-600 font-medium">新增</span>模块 异常设备表（设备名称 / 机房 / 异常类型 / 告警等级 / 单位运行耗电）</li>
+<li class="flex gap-1.5"><span class="text-amber-600 font-medium">调整</span>插入位置：设备能耗排名之后</li>
+</ul>
+</div>
+<div class="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2">
+<div class="text-[11px] text-amber-800 font-medium">跨模块影响说明</div>
+<div class="text-xs text-amber-900/90 mt-0.5 leading-relaxed">新增模块会改变报表结构顺序，但不影响总耗电口径、趋势图与告警分布的计算逻辑。</div>
+</div>
+<div class="flex flex-wrap gap-1.5">
+<button class="inline-flex items-center gap-1 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-medium px-2.5 py-1.5 transition" onclick="acceptChange(this)">
+<iconify-icon class="text-sm" icon="mdi:check"></iconify-icon>接受变更
+            </button>
+<button class="inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 border border-slate-200 transition" onclick="rejectChange(this)">
+<iconify-icon class="text-sm text-slate-500" icon="mdi:close"></iconify-icon>拒绝
+            </button>
+<button class="inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 border border-slate-200 transition" onclick="toast('变更详情：新增 module_new_abnormal_devices，字段 5 个，位置 index 4')">
+<iconify-icon class="text-sm text-slate-500" icon="mdi:eye-outline"></iconify-icon>查看变更详情
+            </button>
+</div>
+</div>
+</div>
+</div>
+</div>
+</template>
+<template id="tpl-correction">
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl border border-rose-200 bg-white overflow-hidden">
+<div class="px-3.5 py-2.5 bg-rose-50 border-b border-rose-100 flex items-center gap-2">
+<iconify-icon class="text-rose-600" icon="mdi:tool-outline"></iconify-icon>
+<span class="text-sm font-semibold text-rose-900">AI 修正建议</span>
+<span class="text-[10px] text-rose-700 bg-white border border-rose-200 rounded px-1.5 py-px ml-auto">来自校验失败</span>
+</div>
+<div class="px-3.5 py-3 space-y-3">
+<div class="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2.5 text-[11px] space-y-1">
+<div class="flex gap-2"><span class="text-slate-500 w-16 shrink-0">错误类型</span><span class="text-slate-800">字段不存在</span></div>
+<div class="flex gap-2"><span class="text-slate-500 w-16 shrink-0">错误位置</span><span class="text-slate-800">小时能耗趋势 / 数据绑定</span></div>
+<div class="flex gap-2"><span class="text-slate-500 w-16 shrink-0">错误字段</span><span class="mono text-rose-700">outdoor_temperature</span></div>
+</div>
+<div>
+<div class="text-[11px] text-slate-500">AI 分析</div>
+<p class="text-xs text-slate-700 mt-1 leading-relaxed">当前设备能耗历史数据集中没有 <span class="mono text-[11px]">outdoor_temperature</span> 字段，因此无法按室外温度进行对比分析。</p>
+</div>
+<div class="space-y-2">
+<div class="text-[11px] text-slate-500">修正方案</div>
+<div class="rounded-lg border border-slate-200 px-3 py-2.5">
+<div class="flex items-center gap-2">
+<span class="text-[10px] font-semibold text-blue-700 bg-blue-50 border border-blue-200 rounded px-1.5 py-0.5">方案 1</span>
+<span class="text-xs font-medium text-slate-800">替换为 room_temp</span>
+<span class="text-[10px] text-emerald-600 ml-auto">推荐</span>
+</div>
+<div class="text-[11px] text-slate-500 mt-1.5 leading-relaxed">优点：不需要新增数据源。风险：室内温度不能完全代表室外温度。</div>
+<button class="mt-2 inline-flex items-center gap-1 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-[11px] font-medium px-2.5 py-1.5 transition" onclick="applyFix(this,'方案 1：outdoor_temperature → room_temp')">应用方案 1</button>
+</div>
+<div class="rounded-lg border border-slate-200 px-3 py-2.5">
+<div class="flex items-center gap-2">
+<span class="text-[10px] font-semibold text-slate-600 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5">方案 2</span>
+<span class="text-xs font-medium text-slate-800">移除室外温度对比</span>
+</div>
+<div class="text-[11px] text-slate-500 mt-1.5 leading-relaxed">优点：最快通过校验。风险：报表少一个环境影响分析维度。</div>
+<button class="mt-2 inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-[11px] font-medium px-2.5 py-1.5 border border-slate-200 transition" onclick="applyFix(this,'方案 2：移除室外温度对比')">应用方案 2</button>
+</div>
+<div class="rounded-lg border border-slate-200 px-3 py-2.5">
+<div class="flex items-center gap-2">
+<span class="text-[10px] font-semibold text-slate-600 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5">方案 3</span>
+<span class="text-xs font-medium text-slate-800">切换到支持室外温度的数据源</span>
+</div>
+<div class="text-[11px] text-slate-500 mt-1.5 leading-relaxed">优点：可以保留室外温度分析。风险：需要重新校验数据源权限和字段依赖。</div>
+<button class="mt-2 inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-[11px] font-medium px-2.5 py-1.5 border border-slate-200 transition" onclick="showPlan3(this)">查看方案 3 影响</button>
+</div>
+</div>
+<div class="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-[11px] text-slate-600 leading-relaxed">
+            规则：每次修正需你确认后再应用，应用后需重新校验；AI 不能直接创建新数据源或伪造字段。
+          </div>
+<div class="flex flex-wrap gap-1.5">
+<button class="inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 border border-slate-200 transition" onclick="appendUser('拒绝该修正建议，先保持原配置。');toast('已记录：拒绝修正建议，报表定义保持不变')">
+<iconify-icon class="text-sm text-slate-500" icon="mdi:close"></iconify-icon>拒绝建议
+            </button>
+<button class="inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 border border-slate-200 transition" onclick="appendUser('为什么不能直接新增一个室外温度字段？')">
+<iconify-icon class="text-sm text-slate-500" icon="mdi:comment-question-outline"></iconify-icon>继续提问
+            </button>
+</div>
+</div>
+</div>
+</div>
+</div>
+</template>
+<template id="tpl-clarify">
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl border border-amber-200 bg-white overflow-hidden">
+<div class="px-3.5 py-2.5 bg-amber-50 border-b border-amber-100 flex items-center gap-2">
+<iconify-icon class="text-amber-600" icon="mdi:help-circle-outline"></iconify-icon>
+<span class="text-sm font-semibold text-amber-900">口径不明确，请先选择判断方式</span>
+</div>
+<div class="px-3.5 py-3 space-y-2">
+<p class="text-xs text-slate-600 leading-relaxed">「异常设备」有多种口径，AI 不自行定义指标口径，请选择本次使用的异常判断方式：</p>
+<div class="space-y-1.5">
+<button class="w-full text-left rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50/50 px-3 py-2 text-xs text-slate-700 transition flex items-center gap-2" onclick="chooseOption(this,'单位运行耗电超过 10 kWh/h')">
+<span class="w-4 h-4 rounded-full border border-slate-300 shrink-0"></span>单位运行耗电超过 10 kWh/h
+            </button>
+<button class="w-full text-left rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50/50 px-3 py-2 text-xs text-slate-700 transition flex items-center gap-2" onclick="chooseOption(this,'存在高等级告警')">
+<span class="w-4 h-4 rounded-full border border-slate-300 shrink-0"></span>存在高等级告警
+            </button>
+<button class="w-full text-left rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50/50 px-3 py-2 text-xs text-slate-700 transition flex items-center gap-2" onclick="chooseOption(this,'能耗环比增长超过 20%')">
+<span class="w-4 h-4 rounded-full border border-slate-300 shrink-0"></span>能耗环比增长超过 20%
+            </button>
+<button class="w-full text-left rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50/50 px-3 py-2 text-xs text-slate-700 transition flex items-center gap-2" onclick="chooseOption(this,'数据缺失率超过 10%')">
+<span class="w-4 h-4 rounded-full border border-slate-300 shrink-0"></span>数据缺失率超过 10%
+            </button>
+<button class="w-full text-left rounded-lg border border-slate-200 hover:border-blue-300 hover:bg-blue-50/50 px-3 py-2 text-xs text-slate-700 transition flex items-center gap-2" onclick="chooseOption(this,'自定义阈值')">
+<span class="w-4 h-4 rounded-full border border-slate-300 shrink-0"></span>自定义阈值（需在指标口径中登记）
+            </button>
+</div>
+</div>
+</div>
+</div>
+</div>
+</template>
+<template id="tpl-unsupported">
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">
+<div class="flex items-center gap-2 mb-1.5">
+<iconify-icon class="text-slate-500" icon="mdi:clock-alert-outline"></iconify-icon>
+<span class="font-semibold text-slate-900">数据粒度不支持</span>
+</div>
+        当前 MVP 只接入了<span class="font-medium text-slate-900">小时级能耗数据</span>，暂不支持分钟级历史能耗。建议改用小时粒度生成趋势图（例如最近 24 小时或最近 7 天）。
+      </div>
+</div>
+</div>
+</template>
+<template id="tpl-permission">
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">
+<div class="flex items-center gap-2 mb-1.5">
+<iconify-icon class="text-amber-600" icon="mdi:lock-outline"></iconify-icon>
+<span class="font-semibold text-slate-900">超出数据权限范围</span>
+</div>
+        当前用户仅有<span class="font-medium text-slate-900">「华南数据中心 / A 机房」</span>的数据权限，无法查看所有项目能耗。请缩小到有权限的范围后继续生成，例如「华南数据中心 / A 机房的能源日报」。
+      </div>
+<div class="mt-2 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-[11px] text-slate-600">
+        可切换范围：华南数据中心 / A 机房。其他范围需向数据管理员申请授权。
+      </div>
+</div>
+</div>
+</template>
+<template id="tpl-danger">
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-rose-600 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:shield-alert-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3">
+<div class="flex items-center gap-2 mb-1.5">
+<iconify-icon class="text-rose-600" icon="mdi:alert-octagon-outline"></iconify-icon>
+<span class="text-sm font-semibold text-rose-900">危险动作已拒绝</span>
+</div>
+<p class="text-xs text-rose-900/90 leading-relaxed">
+          AI 不支持执行 SQL、删除数据或绕过平台权限。请改为查询、分析或生成报表类需求，例如「统计昨日各设备能耗排名」。
+        </p>
+<div class="mt-2 text-[11px] text-rose-700/80">本次请求未对任何数据或配置产生变更。</div>
+</div>
+</div>
+</div>
+</template>
+<template id="tpl-evidence">
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl border border-slate-200 bg-white overflow-hidden">
+<div class="px-3.5 py-2.5 bg-slate-50 border-b border-slate-100 flex items-center gap-2">
+<iconify-icon class="text-blue-600" icon="mdi:database-outline"></iconify-icon>
+<span class="text-sm font-semibold text-slate-900">AI 使用依据</span>
+</div>
+<div class="px-3.5 py-3 space-y-2 text-[12px]">
+<div class="flex gap-2 items-start"><span class="mt-1 w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0"></span><div><span class="font-medium text-slate-800">设备能耗历史数据集</span><div class="text-slate-500">总耗电、能耗趋势、设备能耗排名、单位运行耗电</div></div></div>
+<div class="flex gap-2 items-start"><span class="mt-1 w-1.5 h-1.5 rounded-full bg-rose-500 shrink-0"></span><div><span class="font-medium text-slate-800">设备告警历史数据集</span><div class="text-slate-500">告警数量、告警等级分布、异常设备列表、告警趋势</div></div></div>
+<div class="flex gap-2 items-start"><span class="mt-1 w-1.5 h-1.5 rounded-full bg-slate-400 shrink-0"></span><div><span class="font-medium text-slate-800">设备目录（基础维表 / 权限范围）</span><div class="text-slate-500">设备名称、项目、机房、设备类型、权限范围</div></div></div>
+<div class="pt-2 border-t border-slate-100 grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px]">
+<div class="flex justify-between"><span class="text-slate-500">时间范围</span><span class="text-slate-700">2026-09-28</span></div>
+<div class="flex justify-between"><span class="text-slate-500">粒度</span><span class="text-slate-700">小时级</span></div>
+<div class="flex justify-between"><span class="text-slate-500">范围</span><span class="text-slate-700">华南数据中心 / A 机房</span></div>
+<div class="flex justify-between"><span class="text-slate-500">设备数</span><span class="text-slate-700">26 台</span></div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</template>
+<template id="tpl-generic">
+<div class="flex gap-2.5">
+<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+</div>
+<div class="flex-1 min-w-0">
+<div class="rounded-xl border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">
+        已记录你的需求。我可以基于当前上下文（机房能耗日报 / A 机房 / 小时级）生成草稿、提出变更建议或解释校验错误。若要改动报表结构，我会先给出绑定模块 ID 的变更确认卡片，待你确认后再应用。
+      </div>
+</div>
+</div>
+</template>
+<!-- 提示条 -->
+<div class="hidden fixed left-1/2 bottom-8 -translate-x-1/2 z-50 bg-slate-900 text-white text-sm px-4 py-2.5 rounded-lg shadow-lg" id="toast"></div>
+<script>
+  var chatScroll = document.getElementById('chat-scroll');
+
+  function scrollToBottom() {
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+  }
+
+  function appendUser(text) {
+    var wrap = document.createElement('div');
+    wrap.className = 'flex justify-end';
+    var bubble = document.createElement('div');
+    bubble.className = 'max-w-[86%] rounded-2xl rounded-tr-sm bg-blue-600 text-white text-sm px-3.5 py-2.5 leading-relaxed';
+    bubble.textContent = text;
+    wrap.appendChild(bubble);
+    chatScroll.appendChild(wrap);
+    scrollToBottom();
+  }
+
+  function appendTemplate(id) {
+    var tpl = document.getElementById(id);
+    if (!tpl) return;
+    chatScroll.appendChild(tpl.content.cloneNode(true));
+    scrollToBottom();
+  }
+
+  function quick(text, tplId) {
+    appendUser(text);
+    setTimeout(function () { appendTemplate(tplId); }, 260);
+  }
+
+  function handleSend() {
+    var input = document.getElementById('chat-input');
+    var text = input.value.trim();
+    if (!text) return;
+    appendUser(text);
+    input.value = '';
+    input.style.height = 'auto';
+    setTimeout(function () { respond(text); }, 260);
+  }
+
+  function respond(text) {
+    var compact = text.replace(/\s/g, '');
+    var upper = text.toUpperCase();
+    if (compact.indexOf('删除') !== -1 || upper.indexOf('SQL') !== -1 || compact.indexOf('drop') !== -1) {
+      appendTemplate('tpl-danger');
+    } else if (compact.indexOf('所有项目') !== -1 || compact.indexOf('全部项目') !== -1 || compact.indexOf('所有机房') !== -1) {
+      appendTemplate('tpl-permission');
+    } else if (compact.indexOf('每分钟') !== -1 || compact.indexOf('分钟级') !== -1 || compact.indexOf('秒级') !== -1) {
+      appendTemplate('tpl-unsupported');
+    } else if (compact.indexOf('异常设备') !== -1) {
+      appendTemplate('tpl-clarify');
+    } else if (compact.indexOf('校验') !== -1 || compact.indexOf('outdoor') !== -1 || compact.indexOf('修正') !== -1) {
+      appendTemplate('tpl-correction');
+    } else if (compact.indexOf('依据') !== -1 || compact.indexOf('数据源') !== -1) {
+      appendTemplate('tpl-evidence');
+    } else {
+      appendTemplate('tpl-generic');
+    }
+  }
+
+  function acceptChange(btn) {
+    var card = btn.closest('.rounded-xl');
+    if (card) {
+      var footer = card.querySelector('.flex.flex-wrap.gap-1\\.5');
+      if (footer) {
+        footer.innerHTML = '<span class="inline-flex items-center gap-1 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-medium px-2.5 py-1.5"><iconify-icon icon="mdi:check" class="text-sm"></iconify-icon>变更已应用，等待重新校验</span>';
+      }
+    }
+    appendUser('接受变更。');
+    appendTemplate('tpl-generic');
+    toast('变更已应用（绑定模块 ID），请重新校验');
+  }
+
+  function rejectChange(btn) {
+    var card = btn.closest('.rounded-xl');
+    if (card) {
+      var footer = card.querySelector('.flex.flex-wrap.gap-1\\.5');
+      if (footer) {
+        footer.innerHTML = '<span class="inline-flex items-center gap-1 rounded-lg bg-slate-100 text-slate-600 border border-slate-200 text-xs font-medium px-2.5 py-1.5"><iconify-icon icon="mdi:close" class="text-sm"></iconify-icon>已拒绝，报表定义保持不变</span>';
+      }
+    }
+    toast('已拒绝该变更，未产生任何修改');
+  }
+
+  function applyFix(btn, name) {
+    appendUser('应用修正方案：' + name);
+    appendTemplate('tpl-generic');
+    toast('已应用：' + name + '，请重新校验');
+  }
+
+  function showPlan3(btn) {
+    appendUser('查看方案 3 影响。');
+    appendTemplate('tpl-generic');
+    toast('方案 3 影响：需新增数据源授权、字段依赖重新校验，可能影响 2 个模块');
+  }
+
+  function chooseOption(btn, label) {
+    appendUser('异常判断口径选择：' + label);
+    setTimeout(function () {
+      var wrap = document.createElement('div');
+      wrap.className = 'flex gap-2.5';
+      wrap.innerHTML = '<div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center"><iconify-icon icon="mdi:robot-outline" class="text-white"></iconify-icon></div><div class="flex-1 min-w-0"><div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">已按「' + label + '」口径生成异常设备判断规则，并在模块 <span class="mono text-[11px]">module_abnormal_devices</span> 中生效。该口径会写入定义草稿，需你确认后再保存。</div></div>';
+      chatScroll.appendChild(wrap);
+      scrollToBottom();
+    }, 260);
+  }
+
+  var boundaryOpen = false;
+  function toggleBoundary() {
+    boundaryOpen = !boundaryOpen;
+    document.getElementById('boundary-panel').classList.toggle('hidden', !boundaryOpen);
+    scrollToBottom();
+  }
+
+  function clearChat() {
+    chatScroll.innerHTML = '';
+    appendTemplate('tpl-generic');
+    toast('已清空当前对话记录');
+  }
+
+  var toastTimer = null;
+  function toast(msg) {
+    var el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.remove('hidden');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.classList.add('hidden'); }, 2600);
+  }
+
+  // 输入框自适应高度 + Enter 发送
+  var inputEl = document.getElementById('chat-input');
+  inputEl.addEventListener('input', function () {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 96) + 'px';
+  });
+  inputEl.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  });
+
+  // ===== 图表 =====
+  var hours = ['00:00','01:00','02:00','03:00','04:00','05:00','06:00','07:00','08:00','09:00','10:00','11:00',
+               '12:00','13:00','14:00','15:00','16:00','17:00','18:00','19:00','20:00','21:00','22:00','23:00'];
+  var energy = [1120,1060,1015,995,1010,1085,1200,1340,1445,1490,1560,1650,1700,1730,1700,1640,1685,1580,1475,1415,1350,1285,1195,1085];
+
+  var trendChart = echarts.init(document.getElementById('chart-trend'));
+  trendChart.setOption({
+    grid: { left: 10, right: 18, top: 40, bottom: 10, containLabel: true },
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: '#0f172a',
+      borderWidth: 0,
+      textStyle: { color: '#fff', fontSize: 12 },
+      formatter: function (params) {
+        var p = params[0];
+        return p.axisValue + '<br/>能耗：<b>' + p.value + '</b> kWh';
+      }
+    },
+    xAxis: {
+      type: 'category',
+      data: hours,
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: '#e2e8f0' } },
+      axisTick: { show: false },
+      axisLabel: { color: '#94a3b8', fontSize: 10, interval: 3 }
+    },
+    yAxis: {
+      type: 'value',
+      name: 'kWh',
+      nameTextStyle: { color: '#94a3b8', fontSize: 10 },
+      min: 800,
+      splitLine: { lineStyle: { color: '#f1f5f9' } },
+      axisLabel: { color: '#94a3b8', fontSize: 10 }
+    },
+    series: [{
+      name: '小时能耗',
+      type: 'line',
+      smooth: true,
+      symbol: 'circle',
+      symbolSize: 5,
+      data: energy,
+      itemStyle: { color: '#2563eb' },
+      lineStyle: { width: 2.5, color: '#2563eb' },
+      areaStyle: {
+        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          { offset: 0, color: 'rgba(37,99,235,0.30)' },
+          { offset: 1, color: 'rgba(37,99,235,0.02)' }
+        ])
+      },
+      markLine: {
+        silent: true,
+        symbol: 'none',
+        data: [{
+          yAxis: 1900,
+          lineStyle: { color: '#f59e0b', type: 'dashed', width: 1.5 },
+          label: { formatter: '阈值 1,900', color: '#b45309', fontSize: 10, position: 'insideEndTop' }
+        }]
+      },
+      markPoint: {
+        symbol: 'pin',
+        symbolSize: 34,
+        label: { color: '#fff', fontSize: 9 },
+        data: [
+          { coord: ['08:00', 1445], value: '告警', itemStyle: { color: '#f59e0b' } },
+          { coord: ['14:00', 1700], value: '异常', itemStyle: { color: '#ef4444' } }
+        ]
+      }
+    }]
+  });
+
+  var alarmChart = echarts.init(document.getElementById('chart-alarm'));
+  alarmChart.setOption({
+    grid: { left: 10, right: 40, top: 16, bottom: 10, containLabel: true },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, backgroundColor: '#0f172a', borderWidth: 0, textStyle: { color: '#fff', fontSize: 12 } },
+    xAxis: {
+      type: 'value',
+      splitLine: { lineStyle: { color: '#f1f5f9' } },
+      axisLabel: { color: '#94a3b8', fontSize: 10 }
+    },
+    yAxis: {
+      type: 'category',
+      data: ['提示', '一般', '严重', '紧急'],
+      axisLine: { lineStyle: { color: '#e2e8f0' } },
+      axisTick: { show: false },
+      axisLabel: { color: '#64748b', fontSize: 11 }
+    },
+    series: [{
+      type: 'bar',
+      barWidth: 14,
+      data: [
+        { value: 2, itemStyle: { color: '#94a3b8' } },
+        { value: 5, itemStyle: { color: '#f59e0b' } },
+        { value: 3, itemStyle: { color: '#fb923c' } },
+        { value: 2, itemStyle: { color: '#ef4444' } }
+      ],
+      itemStyle: { borderRadius: [0, 4, 4, 0] },
+      label: { show: true, position: 'right', color: '#475569', fontSize: 11 }
+    }]
+  });
+
+  window.addEventListener('resize', function () {
+    trendChart.resize();
+    alarmChart.resize();
+  });
+
+  // 从校验面板跳转回来时展示修正建议卡片
+  if (window.location.hash === '#correction') {
+    chatScroll.innerHTML = '';
+    appendUser('校验失败：小时能耗趋势绑定字段 outdoor_temperature 不存在，请给出修正建议。');
+    appendTemplate('tpl-correction');
+  }
+
+  scrollToBottom();
+</script>
+</body>
+</html>
