@@ -18,6 +18,7 @@ class AgentState(str, Enum):
     ANALYZING = "ANALYZING"
     NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
     BLOCKED_OR_UNSUPPORTED = "BLOCKED_OR_UNSUPPORTED"
+    INTERRUPT_CONFIRMING = "INTERRUPT_CONFIRMING"
     DEFINITION_DRAFT_READY = "DEFINITION_DRAFT_READY"
     WAITING_USER_CONFIRM = "WAITING_USER_CONFIRM"
     SAVE_DEFINITION_DRAFT = "SAVE_DEFINITION_DRAFT"
@@ -37,19 +38,38 @@ ALLOWED_TRANSITIONS: dict[AgentState, set[AgentState]] = {
         AgentState.WAITING_USER_CONFIRM,
         AgentState.NEEDS_CLARIFICATION,
         AgentState.BLOCKED_OR_UNSUPPORTED,
+        AgentState.INTERRUPT_CONFIRMING,
     },
     AgentState.NEEDS_CLARIFICATION: {AgentState.ANALYZING},
+    AgentState.INTERRUPT_CONFIRMING: {
+        AgentState.ANALYZING,
+        AgentState.WAITING_USER_CONFIRM,
+        AgentState.VALIDATING,
+        AgentState.PREVIEWING,
+        AgentState.READY,
+    },
     AgentState.DEFINITION_DRAFT_READY: {AgentState.WAITING_USER_CONFIRM},
     AgentState.WAITING_USER_CONFIRM: {
         AgentState.SAVE_DEFINITION_DRAFT,
         AgentState.ANALYZING,
         # 允许用户在确认阶段触发局部修改，进入新的草稿就绪状态
         AgentState.DEFINITION_DRAFT_READY,
+        # 允许在等待确认时追问 / 提问 / 闲聊，由 ContextEngine 前置判定
+        AgentState.NEEDS_CLARIFICATION,
+        AgentState.BLOCKED_OR_UNSUPPORTED,
+        AgentState.INTERRUPT_CONFIRMING,
     },
-    AgentState.SAVE_DEFINITION_DRAFT: {AgentState.VALIDATING},
-    AgentState.VALIDATING: {AgentState.PREVIEWING, AgentState.VALIDATION_FAILED},
+    AgentState.SAVE_DEFINITION_DRAFT: {
+        AgentState.VALIDATING,
+        AgentState.INTERRUPT_CONFIRMING,
+    },
+    AgentState.VALIDATING: {
+        AgentState.PREVIEWING,
+        AgentState.VALIDATION_FAILED,
+        AgentState.INTERRUPT_CONFIRMING,
+    },
     AgentState.VALIDATION_FAILED: {AgentState.ANALYZING},
-    AgentState.PREVIEWING: {AgentState.PREVIEW_READY},
+    AgentState.PREVIEWING: {AgentState.PREVIEW_READY, AgentState.INTERRUPT_CONFIRMING},
     AgentState.PREVIEW_READY: {AgentState.RENDERING},
     AgentState.RENDERING: {AgentState.READY},
     AgentState.READY: {AgentState.ANALYZING},
@@ -167,3 +187,4 @@ class AgentResponse(BaseModel):
     toolRequests: list[ToolRequest] = Field(default_factory=list)
     uiActions: list[str] = Field(default_factory=list)
     error: AgentError | None = None
+    debug: dict[str, Any] = Field(default_factory=dict)

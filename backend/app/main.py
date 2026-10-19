@@ -1,6 +1,7 @@
 """FastAPI 应用入口。"""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -11,6 +12,11 @@ from fastapi.staticfiles import StaticFiles
 from app.routers import agent as agent_router
 from app.routers import mock_capability
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
 app = FastAPI(title="智能报表 AI 后端", version="1.0.0")
 

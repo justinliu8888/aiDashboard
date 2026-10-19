@@ -151,6 +151,18 @@ class FakeReportAgent:
                 reportPolicyDraft=policy,
                 reportDefinitionDraft=definition,
             ),
+            questions=[
+                AgentQuestion(
+                    id="confirm_draft",
+                    prompt="请对当前草稿做出选择：",
+                    expects="SINGLE_CHOICE",
+                    options=[
+                        QuestionOption(value="同意", label="同意"),
+                        QuestionOption(value="修改", label="修改"),
+                        QuestionOption(value="重新开始", label="重新开始"),
+                    ],
+                )
+            ],
             toolRequests=[
                 ToolRequest(
                     id="req_save_1",
@@ -161,7 +173,8 @@ class FakeReportAgent:
             uiActions=[
                 "preview_framework",
                 "confirm_framework",
-                "regenerate_framework",
+                "reject_framework",
+                "request_modification",
             ],
         )
 

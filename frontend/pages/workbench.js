@@ -13,7 +13,8 @@ const session = {
   designSessionId: null,
   reportDefinitionId: null,
   baseDefinitionRevision: null,
-  definition: null, // 当前草稿（用于应用 changeSet）
+  definition: null, // 当前草稿（用于应用 changeSet 和用户编辑）
+  policy: null,     // 当前报表策略草稿
 };
 
 const DEFAULT_CONTEXT = {
@@ -99,6 +100,48 @@ function aiBubble(innerHTML) {
 
 function appendAiText(text) {
   aiBubble(`<div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">${esc(text)}</div>`);
+}
+
+// 对话气泡下方贴 3 个按钮：同意 / 修改 / 重新开始
+function appendConfirmActions() {
+  const wrap = aiBubble(`
+    <div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3">
+      <div class="text-sm text-slate-700 leading-relaxed mb-2.5">请对右侧草稿做出选择，或直接在预览区编辑：</div>
+      <div class="flex flex-wrap gap-2">
+        <button class="btn-confirm inline-flex items-center gap-1 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-medium px-3 py-1.5 transition">
+          <iconify-icon class="text-sm" icon="mdi:check"></iconify-icon>同意
+        </button>
+        <button class="btn-modify inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-3 py-1.5 border border-slate-200 transition">
+          <iconify-icon class="text-sm text-slate-500" icon="mdi:pencil-outline"></iconify-icon>修改
+        </button>
+        <button class="btn-restart inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-3 py-1.5 border border-slate-200 transition">
+          <iconify-icon class="text-sm text-slate-500" icon="mdi:refresh"></iconify-icon>重新开始
+        </button>
+      </div>
+    </div>
+  `);
+  wrap.querySelector(".btn-confirm").addEventListener("click", () => sendMessage("同意"));
+  wrap.querySelector(".btn-modify").addEventListener("click", () => {
+    const input = $("chat-input");
+    input.value = "";
+    input.focus();
+    input.setAttribute("placeholder", "请写下你想怎么改，例如：把趋势图改成最近 7 天");
+    toast("请在输入框写下修改意见");
+  });
+  wrap.querySelector(".btn-restart").addEventListener("click", () => sendMessage("重新开始"));
+}
+
+function appendAiThinking() {
+  return aiBubble(`
+    <div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed inline-flex items-center gap-2">
+      <iconify-icon class="text-base animate-spin text-blue-600" icon="mdi:loading"></iconify-icon>
+      <span>AI 思考中...</span>
+    </div>`);
+}
+
+function removeBubble(bubble) {
+  bubble?.remove();
+  scrollChatBottom();
 }
 
 function appendAiQuestions(questions) {
@@ -227,22 +270,32 @@ async function sendMessage(text) {
   if (!text) return;
   appendUser(text);
 
+  const context = { ...DEFAULT_CONTEXT };
+  if (session.designSessionId) context.designSessionId = session.designSessionId;
+  if (session.reportDefinitionId) context.reportDefinitionId = session.reportDefinitionId;
+  if (session.baseDefinitionRevision != null) context.baseDefinitionRevision = session.baseDefinitionRevision;
+
   const body = {
     agentProtocolVersion: "1.0",
     conversationId: session.conversationId,
     state: session.state,
     message: text,
-    context: DEFAULT_CONTEXT,
+    context,
   };
-  if (session.designSessionId) body.designSessionId = session.designSessionId;
-  if (session.reportDefinitionId) body.reportDefinitionId = session.reportDefinitionId;
-  if (session.baseDefinitionRevision != null) body.baseDefinitionRevision = session.baseDefinitionRevision;
+
+  // 把当前草稿作为 snapshots 带回后端，确认时需要用于保存
+  if (session.definition || session.policy) {
+    body.snapshots = {};
+    if (session.policy) body.snapshots.reportPolicy = session.policy;
+    if (session.definition) body.snapshots.reportDefinition = session.definition;
+  }
 
   // 修改语义：命中某个区域时提示 Agent
   if (session.state === "WAITING_USER_CONFIRM" && /趋势/.test(text)) {
-    body.selectedRegionId = "region_hourly_trend";
+    context.selectedRegionId = "region_hourly_trend";
   }
 
+  const thinking = appendAiThinking();
   let data;
   try {
     const res = await fetch(API_BASE + "/api/agent/chat", {
@@ -252,9 +305,12 @@ async function sendMessage(text) {
     });
     data = await res.json();
   } catch (err) {
+    removeBubble(thinking);
     appendAiText("请求失败：" + err.message);
     return;
   }
+
+  removeBubble(thinking);
 
   if (data.error) {
     appendAiText(`[${data.error.code}] ${data.error.message}`);
@@ -276,10 +332,18 @@ async function sendMessage(text) {
       break;
     case "WAITING_USER_CONFIRM":
       session.definition = data.domainObjects?.reportDefinitionDraft || session.definition;
+      session.policy = data.domainObjects?.reportPolicyDraft || session.policy;
       session.reportDefinitionId = session.definition?.metadata?.id || session.reportDefinitionId;
       session.baseDefinitionRevision = session.definition?.metadata?.revision ?? session.baseDefinitionRevision;
-      appendAiText("已生成报表草稿，请在右侧预览区确认结构是否符合预期。");
+      appendAiText(data.reply || '已生成报表草稿，右侧可以直接编辑；满意后点"同意"。');
       renderPreview(session.definition);
+      appendConfirmActions();
+      break;
+    case "SAVE_DEFINITION_DRAFT":
+      appendAiText(data.reply || "草稿已保存，接下来进入校验。");
+      break;
+    case "VALIDATING":
+      appendAiText(data.reply || "正在校验报表定义…");
       break;
     case "DEFINITION_DRAFT_READY":
       if (data.domainObjects?.changeSet) {
@@ -346,18 +410,19 @@ function renderPreview(definition, highlightRegionIds = []) {
   }
   previewRoot.innerHTML = "";
 
-  // 顶部摘要
+  // 顶部摘要（报表名可编辑）
   const summary = document.createElement("div");
   summary.className = "bg-white rounded-xl border border-slate-200 p-5";
   summary.innerHTML = `
     <div class="flex items-start justify-between gap-4">
-      <div>
+      <div class="flex-1 min-w-0">
         <div class="flex items-center gap-2 flex-wrap">
-          <h2 class="text-lg font-semibold text-slate-900">${esc(definition.name || "报表草稿")}</h2>
+          <h2 class="report-name text-lg font-semibold text-slate-900 outline-none px-1 -mx-1 rounded hover:bg-slate-50 focus:bg-amber-50 focus:ring-2 focus:ring-amber-200" contenteditable="true" spellcheck="false">${esc(definition.name || "报表草稿")}</h2>
           <span class="inline-flex items-center rounded-md text-xs font-medium px-2 py-1 border bg-blue-50 text-blue-700 border-blue-200">${esc(definition.schemaVersion || "1.0")}</span>
           <span class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-amber-50 text-amber-700 border-amber-200">
             <iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>${esc(definition.metadata?.status || "DRAFT")}
           </span>
+          <span class="text-[11px] text-slate-400 inline-flex items-center gap-1"><iconify-icon icon="mdi:pencil-outline"></iconify-icon>点击名称可直接编辑</span>
         </div>
         <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
           <span>revision: <span class="mono">${definition.metadata?.revision ?? "—"}</span></span>
@@ -367,11 +432,29 @@ function renderPreview(definition, highlightRegionIds = []) {
       </div>
     </div>
   `;
+  const nameEl = summary.querySelector(".report-name");
+  nameEl.addEventListener("blur", () => {
+    const newName = nameEl.textContent.trim();
+    if (newName && newName !== definition.name) {
+      definition.name = newName;
+      bumpRevision(definition);
+      toast("已更新报表名 → revision " + definition.metadata.revision);
+      updateMeta();
+    } else {
+      nameEl.textContent = definition.name || "报表草稿";
+    }
+  });
+  nameEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      nameEl.blur();
+    }
+  });
   previewRoot.appendChild(summary);
 
   // 各区域
   for (const region of definition.regions) {
-    const card = renderRegion(region);
+    const card = renderRegion(region, definition);
     if (highlightRegionIds.includes(region.id)) {
       card.classList.add("region-highlight");
     }
@@ -379,23 +462,69 @@ function renderPreview(definition, highlightRegionIds = []) {
   }
 }
 
-function renderRegion(region) {
+function bumpRevision(definition) {
+  if (!definition.metadata) definition.metadata = {};
+  definition.metadata.revision = (definition.metadata.revision ?? 0) + 1;
+  session.baseDefinitionRevision = definition.metadata.revision;
+}
+
+function renderRegion(region, definition) {
   const card = document.createElement("div");
-  card.className = "bg-white rounded-xl border border-slate-200 p-5";
+  card.className = "bg-white rounded-xl border border-slate-200 p-5 group";
   card.dataset.regionId = region.id;
 
   const header = `
     <div class="flex items-start justify-between gap-4">
-      <div>
-        <h3 class="font-semibold text-slate-900">${esc(region.name || region.component?.title || region.role)}</h3>
+      <div class="flex-1 min-w-0">
+        <h3 class="region-name font-semibold text-slate-900 outline-none px-1 -mx-1 rounded hover:bg-slate-50 focus:bg-amber-50 focus:ring-2 focus:ring-amber-200 inline-block" contenteditable="true" spellcheck="false">${esc(region.name || region.component?.title || region.role)}</h3>
         <p class="text-xs text-slate-500 mt-0.5">role: <span class="mono">${esc(region.role)}</span> · component: <span class="mono">${esc(region.component?.type)}</span>${region.component?.chartKind ? ' / <span class="mono">' + esc(region.component.chartKind) + "</span>" : ""}</p>
       </div>
-      <span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 shrink-0">${esc(region.id)}</span>
+      <div class="flex items-center gap-1 shrink-0">
+        <button class="btn-del-region w-7 h-7 rounded border border-slate-200 hover:bg-rose-50 hover:border-rose-200 hover:text-rose-600 text-slate-400 flex items-center justify-center transition" title="删除此区域">
+          <iconify-icon class="text-base" icon="mdi:trash-can-outline"></iconify-icon>
+        </button>
+        <span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 shrink-0">${esc(region.id)}</span>
+      </div>
     </div>`;
 
   const body = renderRegionBody(region);
 
   card.innerHTML = header + '<div class="mt-3">' + body + "</div>";
+
+  // 区域名编辑
+  const nameEl = card.querySelector(".region-name");
+  const originalName = region.name || region.component?.title || region.role;
+  nameEl.addEventListener("blur", () => {
+    const newName = nameEl.textContent.trim();
+    if (newName && newName !== originalName) {
+      region.name = newName;
+      bumpRevision(definition);
+      toast("已更新区域名 → revision " + definition.metadata.revision);
+      updateMeta();
+    } else {
+      nameEl.textContent = originalName;
+    }
+  });
+  nameEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      nameEl.blur();
+    }
+  });
+
+  // 区域删除
+  card.querySelector(".btn-del-region").addEventListener("click", () => {
+    if (!confirm(`确定删除「${region.name || region.id}」吗？`)) return;
+    const idx = definition.regions.findIndex((r) => r.id === region.id);
+    if (idx >= 0) {
+      definition.regions.splice(idx, 1);
+      bumpRevision(definition);
+      renderPreview(definition);
+      updateMeta();
+      toast("已删除区域 → revision " + definition.metadata.revision);
+    }
+  });
+
   return card;
 }
 
@@ -513,6 +642,7 @@ $("btn-clear").addEventListener("click", () => {
   session.reportDefinitionId = null;
   session.baseDefinitionRevision = null;
   session.definition = null;
+  session.policy = null;
   chatScroll.innerHTML = "";
   previewRoot.innerHTML = "";
   previewRoot.appendChild(previewEmpty);
