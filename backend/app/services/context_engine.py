@@ -24,6 +24,8 @@ from pydantic import BaseModel, Field
 
 from app.config import get_settings
 from app.schemas.agent import AgentRequest, AgentState
+from app.schemas.edit_plan import EditIntent, EditPlan
+from app.schemas.report_definition import ReportDefinitionDraft
 from app.services.request_timeline import log_timeline_step
 
 
@@ -93,6 +95,43 @@ class RouteDecision(BaseModel):
     nextQuestion: str = ""
     reason: str = ""
     engineStage: str = ""
+    # 节点 5.5：当前消息是否属于模板编辑意图（供 AgentService / 下游观测使用）
+    isTemplateEdit: bool = False
+
+
+# 节点 5.5 TemplateEditEngine 粗判用的关键词，与 agent_service.TEMPLATE_EDIT_HINT_WORDS 保持一致
+_TEMPLATE_EDIT_HINTS = (
+    "删", "删除", "去掉", "不要", "移除",
+    "改成", "改为", "重命名", "叫做", "标题", "名字",
+    "加一个", "新增", "增加", "补充",
+    "数据源",
+    "柱状图", "折线图", "饼图", "面积图", "表格", "明细表",
+    "粒度", "分钟", "小时", "按天",
+    "最近 7 天", "最近 30 天", "本周", "本月",
+    "指标", "能耗成本", "pue",
+    "降序", "升序", "排序",
+    "怎么展示", "展示方式", "展示形式",
+)
+
+_TEMPLATE_EDIT_SEMANTIC_PROMPT = """
+你只负责理解当前报表草稿的编辑话术，不负责修改草稿。
+把用户原话改写成当前规则引擎可识别的标准编辑句，返回严格 JSON：
+{"intent":"EditIntent 枚举值","confidence":0.0,"normalizedMessage":"标准编辑句"}
+标准编辑句须保留用户原话中的新名称、目标和数值，不得编造目标 section、
+数据源、指标、时间范围或修改内容。信息不足时 intent=UNKNOWN，
+normalizedMessage=""。例如“当前报表 改名成我要吃龙虾”可以规范成
+“报表名称改成我要吃龙虾”。不要回答用户，不要输出其他内容。
+"""
+
+
+def _detect_template_edit(message: str, state: AgentState) -> bool:
+    """粗判用户消息是不是模板编辑意图。"""
+    if state not in {AgentState.WAITING_USER_CONFIRM, AgentState.USER_EDITING_TEMPLATE}:
+        return False
+    text = (message or "").lower()
+    if not text:
+        return False
+    return any(hint.lower() in text for hint in _TEMPLATE_EDIT_HINTS)
 
 
 _CONCIERGE_PROMPT = """
@@ -188,6 +227,17 @@ WAITING_USER_CONFIRM 下三个固定按钮的识别规则（必须严格命中�
 - 不要 markdown；
 - targetState 必须是状态机枚举之一或 null；
 - confidence 是 0 到 1 的数字。
+
+你还必须维护一张"已收集信息表"，字段名固定如下：
+- requiredInfo：当前节点推进还需要的槽位名列表，例如 ["subjectId","timeRange","metricRefs"]；
+- collectedInfo：已经拿到的槽位，key 与 requiredInfo 对应，value 是从对话里原样提取到的值。
+  必须包含输入里 alreadyCollected 已经有的内容（历史轮次已问过、用户已答过），
+  再补上本轮用户新提供的信息。不要凭空编造没提到过的值。
+- missingInfo：requiredInfo 里还没拿到的槽位；
+- isReadyForNextStep：requiredInfo 全部拿到就是 true，否则 false；
+- nextQuestion：缺信息时的一句具体追问（不追问就留空字符串）。
+
+槽位命名只用这几个：subjectId、subjectRef、timeRange、metricRefs、grainUnit、reportName、sourceRef。
 """.strip()
 
 
@@ -204,6 +254,143 @@ class ContextEngine:
                 timeout=self._settings.volc_timeout,
                 max_retries=0,
             )
+
+    async def build_template_edit_plan(
+        self,
+        *,
+        message: str,
+        definition: ReportDefinitionDraft | None,
+        selected_region_id: str | None,
+        emit: EmitEvent | None = None,
+    ) -> tuple[EditPlan, str]:
+        """规则优先；语义仅规范化话术，再由规则引擎复核候选计划。"""
+        from app.services.template_edit_engine import template_edit_engine
+
+        rule_plan = template_edit_engine.parse(
+            message=message,
+            definition=definition,
+            selected_region_id=selected_region_id,
+        )
+        if (definition is None or
+                (rule_plan.intent != EditIntent.UNKNOWN
+                 and not rule_plan.needsClarification
+                 and rule_plan.confidence >= 0.7)):
+            return rule_plan, "rule"
+        if self._client is None:
+            return rule_plan, "rule_no_model"
+
+        await _emit(emit, "stage", {
+            "stage": "template_edit_semantic_start",
+            "model": self._settings.volc_context_router_model,
+            "ruleIntent": rule_plan.intent.value,
+        })
+        try:
+            payload = {
+                "state": AgentState.USER_EDITING_TEMPLATE.value,
+                "message": message,
+                "currentDraft": self._summarize_definition(definition),
+                "selectedRegionId": selected_region_id,
+                "ruleIntent": rule_plan.intent.value,
+                "validIntents": [intent.value for intent in EditIntent],
+            }
+            raw = await self._chat_json_stream(
+                model=self._settings.volc_context_router_model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": _TEMPLATE_EDIT_SEMANTIC_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                response_format={"type": "json_object"},
+                timeout=self._settings.volc_context_router_timeout,
+                emit=emit,
+                chunk_stage="template_edit_semantic_chunk",
+            )
+            data = json.loads(raw)
+            if not isinstance(data, dict) or float(data.get("confidence", 0)) < 0.8:
+                raise ValueError("semantic confidence too low")
+            normalized = data.get("normalizedMessage")
+            if not isinstance(normalized, str) or not normalized.strip() or len(normalized) > 500:
+                raise ValueError("invalid normalized edit message")
+            candidate = template_edit_engine.parse(
+                message=normalized,
+                definition=definition,
+                selected_region_id=selected_region_id,
+            )
+            if candidate.intent.value != data.get("intent") or candidate.intent == EditIntent.UNKNOWN:
+                raise ValueError("semantic intent disagrees with rule verification")
+            if not self._is_grounded_edit(message, candidate, definition, selected_region_id):
+                raise ValueError("semantic edit contains ungrounded target or value")
+            await _emit(emit, "stage", {
+                "stage": "template_edit_semantic_done",
+                "intent": candidate.intent.value,
+                "needsClarification": candidate.needsClarification,
+            })
+            return candidate, "semantic"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("编辑语义兜底未通过，保留规则追问：%s", exc)
+            await _emit(emit, "stage", {
+                "stage": "template_edit_semantic_fallback",
+                "reason": type(exc).__name__,
+            })
+            return rule_plan, "rule_fallback"
+
+    @staticmethod
+    def _is_grounded_edit(
+        message: str,
+        plan: EditPlan,
+        definition: ReportDefinitionDraft,
+        selected_region_id: str | None,
+    ) -> bool:
+        """模型只能改写用户表达，不能凭空指定目标、名称或登记能力。"""
+        from app.services.catalog_mock_service import match_source_by_alias
+        from app.services.metric_mock_service import match_metric_by_alias
+        from app.services.template_edit_engine import template_edit_engine
+
+        op = plan.operation
+        if plan.intent == EditIntent.RENAME_REPORT:
+            report_name = str((definition.metadata or {}).get("name") or "")
+            if not (
+                (report_name and report_name in message)
+                or any(word in message for word in ("报表名称", "报表名", "报告名称", "整个报表"))
+            ):
+                return False
+        if plan.intent != EditIntent.RENAME_REPORT:
+            original_target = template_edit_engine._find_region(
+                definition.regions or [], message, selected_region_id,
+            )
+            if not original_target or plan.target.regionId != original_target.get("id"):
+                return False
+        if plan.intent in {EditIntent.RENAME_REPORT, EditIntent.RENAME_SECTION}:
+            return bool(op.newTitle and len(op.newTitle) <= 100 and op.newTitle in message)
+        if plan.intent == EditIntent.ADD_SECTION:
+            return bool(
+                op.sectionTitle and op.sectionTitle in message
+                and op.sourceRef == match_source_by_alias(message)
+                and op.metricRef == match_metric_by_alias(message)
+            )
+        if plan.intent == EditIntent.CHANGE_DATA_SOURCE:
+            return bool(op.sourceRef and op.sourceRef == match_source_by_alias(message))
+        if plan.intent == EditIntent.CHANGE_METRIC:
+            return bool(op.metricRef and op.metricRef == match_metric_by_alias(message))
+        if plan.intent == EditIntent.CHANGE_VISUALIZATION:
+            return any(word in message for word in ("柱状图", "条形图", "折线图", "面积图", "饼图", "环图", "表格"))
+        if plan.intent == EditIntent.CHANGE_TIME_RANGE:
+            return bool(op.timeWindowLabel and op.timeWindowLabel in message)
+        if plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN:
+            unit = (op.grain or {}).get("unit")
+            return bool(unit and any(
+                word in message for word in {
+                    "MINUTE": ("分钟",), "HOUR": ("小时",), "DAY": ("天", "日")
+                }.get(unit, ())
+            ))
+        if plan.intent == EditIntent.CHANGE_TOP_N:
+            return bool(op.topN and op.topN > 0 and str(op.topN) in message)
+        if plan.intent == EditIntent.CHANGE_SORT:
+            return bool(op.sortDirection and (
+                ("升序" in message and op.sortDirection == "ASC")
+                or ("降序" in message and op.sortDirection == "DESC")
+            ))
+        return plan.intent == EditIntent.DELETE_SECTION
 
     async def route(
         self, request: AgentRequest, emit: EmitEvent | None = None
@@ -236,9 +423,23 @@ class ContextEngine:
             )
             decision = self._fallback_route(request, "VOLC_API_KEY 未配置")
             decision.engineStage = "fallback_no_client"
+            decision.isTemplateEdit = _detect_template_edit(request.message, request.state)
+            decision.collectedInfo = dict(request.collectedInfo or {})
             return decision
 
         concierge = await self._run_concierge(request, emit=emit)
+        await _emit(
+            emit,
+            "stage",
+            {
+                "stage": "concierge_decision",
+                "state": request.state.value,
+                "action": concierge.action.value,
+                "intent": concierge.userIntent.value,
+                "confidence": concierge.confidence,
+                "reason": concierge.reason,
+            },
+        )
         logger.info(
             "[context_engine] step=concierge_decision conversationId=%s action=%s intent=%s confidence=%.2f reason=%r elapsed_total_ms=%.1f",
             request.conversationId,
@@ -272,6 +473,8 @@ class ContextEngine:
                 isReadyForNextStep=False,
                 reason=f"concierge: {concierge.reason}",
                 engineStage="concierge_direct_reply",
+                isTemplateEdit=_detect_template_edit(request.message, request.state),
+                collectedInfo=dict(request.collectedInfo or {}),
             )
 
         try:
@@ -283,6 +486,25 @@ class ContextEngine:
                 {
                     "stage": "deep_route_start",
                     "model": self._settings.volc_context_router_model,
+                    "debugParams": {
+                        "模型调用": {
+                            "model": self._settings.volc_context_router_model,
+                            "temperature": 0,
+                            "responseFormat": "json_object",
+                            "timeoutSeconds": self._settings.volc_context_router_timeout,
+                        },
+                        "路由输入": {
+                            "state": request.state.value,
+                            "message": request.message,
+                            "projectId": request.context.projectId,
+                            "subjectRef": request.context.subjectRef,
+                            "subjectId": request.context.subjectId,
+                            "selectedRegionId": request.context.selectedRegionId,
+                            "hasDefinition": request.snapshots.reportDefinition is not None,
+                            "hasPolicy": request.snapshots.reportPolicy is not None,
+                            "baseDefinitionRevision": request.context.baseDefinitionRevision,
+                        },
+                    },
                 },
             )
             logger.info(
@@ -303,12 +525,34 @@ class ContextEngine:
                 chunk_stage="deep_route_chunk",
             )
             log_timeline_step("deep_route_done")
+            decision = self._parse_decision(raw)
+            decision.collectedInfo = self._merge_collected(request, decision)
             await _emit(
                 emit,
                 "stage",
                 {
                     "stage": "deep_route_done",
-                    "elapsedMs": round((perf_counter() - router_started) * 1000),
+                    "stepElapsedMs": round((perf_counter() - router_started) * 1000),
+                    "debugParams": {
+                        "模型输出": {
+                            "rawChars": len(raw),
+                            "rawOutput": _short(raw, limit=4000),
+                        },
+                        "解析结果": {
+                            "intent": decision.userIntent.value,
+                            "action": decision.routingAction.value,
+                            "targetState": decision.targetState.value if decision.targetState else None,
+                            "confidence": decision.confidence,
+                            "ready": decision.isReadyForNextStep,
+                            "requiresUserConfirm": decision.requiresUserConfirm,
+                            "requiredInfo": decision.requiredInfo,
+                            "collectedInfoKeys": list(decision.collectedInfo),
+                            "missingInfo": decision.missingInfo,
+                            "nextQuestion": decision.nextQuestion,
+                            "reply": decision.reply,
+                            "reason": decision.reason,
+                        },
+                    },
                 },
             )
             logger.info(
@@ -317,8 +561,8 @@ class ContextEngine:
                 (perf_counter() - router_started) * 1000,
                 _short(raw),
             )
-            decision = self._parse_decision(raw)
             decision.engineStage = "deep_route_done"
+            decision.isTemplateEdit = _detect_template_edit(request.message, request.state)
             logger.info(
                 "[context_engine] step=route_return conversationId=%s elapsed_total_ms=%.1f action=%s intent=%s",
                 request.conversationId,
@@ -337,6 +581,8 @@ class ContextEngine:
             logger.exception("ContextEngine 模型路由失败，走保守兜底：%s", exc)
             decision = self._fallback_route(request, str(exc))
             decision.engineStage = "deep_route_failed_fallback"
+            decision.isTemplateEdit = _detect_template_edit(request.message, request.state)
+            decision.collectedInfo = dict(request.collectedInfo or {})
             return decision
 
     async def _run_concierge(
@@ -473,6 +719,24 @@ class ContextEngine:
                 reason="模型输出不合法",
             )
 
+    @staticmethod
+    def _merge_collected(
+        request: AgentRequest, decision: RouteDecision
+    ) -> dict[str, Any]:
+        """把历史已收集的槽位和本轮新收集的槽位合并。
+
+        历史值优先保留 —— 用户之前明确说过的信息不能被这一轮的空值覆盖。
+        本轮新拿到的值只补空缺，不改已有结论。
+        """
+        merged: dict[str, Any] = {}
+        for key, value in (request.collectedInfo or {}).items():
+            if value is not None and value != "":
+                merged[key] = value
+        for key, value in (decision.collectedInfo or {}).items():
+            if key not in merged and value is not None and value != "":
+                merged[key] = value
+        return merged
+
     def _compose_input(self, request: AgentRequest) -> str:
         ctx = request.context
         snapshots = request.snapshots
@@ -494,6 +758,9 @@ class ContextEngine:
                 "subjectRef": ctx.subjectRef,
                 "subjectId": ctx.subjectId,
             },
+            # 历史轮次已问过、用户已答过的槽位。模型要在它基础上继续补全，
+            # 不能每轮都重新问一遍同样的问题。
+            "alreadyCollected": dict(request.collectedInfo or {}),
             "snapshotsSummary": {
                 "hasPolicy": policy is not None,
                 "hasDefinition": draft is not None,
@@ -530,7 +797,7 @@ class ContextEngine:
             "regions": [
                 {
                     "regionId": r.get("regionId") or r.get("id"),
-                    "title": r.get("title") or r.get("displayName"),
+                    "title": r.get("title") or r.get("name") or r.get("displayName"),
                     "role": r.get("role"),
                     "componentType": (r.get("component") or {}).get("type"),
                 }

@@ -1,0 +1,98 @@
+{
+  "outDir": "../.selfcheck/flow-edit-plan",
+  "serve": "..",
+  "waitMs": 1500,
+  "timeout": 30000,
+  "ignore": ["modao.cc", "/health", "/api/sessions"],
+  "flows": [
+    {
+      "name": "待确认修改-摘要菜单-输入锁定-接受后改草稿-取消-过期计划拦截",
+      "path": "/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "(() => { const s = document.createElement('script'); s.src = '/flows/support/agent-e-mock.js'; document.head.appendChild(s); return true; })()"
+        },
+        { "wait": 600 },
+        { "eval": "!!window.__mockReady" },
+
+        {
+          "type": "#chat-input",
+          "text": "把第三个卡片换成小时粒度，数据源用能耗明细"
+        },
+        { "press": "Enter" },
+        { "waitFor": "[data-pending-plan]", "timeout": 15000 },
+
+        { "assertText": "待确认的修改" },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan]').innerText; return t.includes('第 3 个正文卡片') && t.includes('小时趋势'); })()"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan]').innerText; return t.includes('数据源') && t.includes('粒度') && t.includes('时间窗') && t.includes('未验证能力') && t.includes('Mock'); })()"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-pending-plan] select'); if (!sel) return false; const labels = Array.from(sel.options).map(o => o.textContent.trim()); return labels.join(',') === '请选择,接受修改,继续调整,取消'; })()"
+        },
+        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "eval": "document.getElementById('btn-send').disabled === true" },
+        {
+          "eval": "document.querySelectorAll('#preview-root [data-region-id]').length === 5"
+        },
+        {
+          "eval": "document.querySelectorAll('#preview-root [data-region-id]')[2].getAttribute('data-region-id') === 'region_hourly_trend'"
+        },
+        { "screenshot": "edit-plan-01-待确认摘要与确认菜单" },
+
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-pending-plan] select'); const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        { "wait": 1200 },
+        {
+          "eval": "(() => { const c = window.__mock.calls.filter(x => x.url.indexOf('/api/agent/chat/stream') >= 0); const last = c[c.length - 1]; return !!last && !!last.body && last.body.message === '接受修改'; })()"
+        },
+        {
+          "eval": "(() => { const c = window.__mock.calls.filter(x => x.url.indexOf('/api/agent/chat/stream') >= 0); const last = c[c.length - 1]; const ids = last.body && last.body.context && last.body.context.visibleRegionIds; return Array.isArray(ids) && ids.length === 5 && ids[0] === 'region_total_energy' && ids[2] === 'region_hourly_trend' && ids.indexOf('region_report_title') === -1; })()"
+        },
+        { "eval": "session.baseDefinitionRevision === 2" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "screenshot": "edit-plan-02-接受后由后端改草稿" },
+
+        {
+          "type": "#chat-input",
+          "text": "再把第三个卡片换成天粒度"
+        },
+        { "press": "Enter" },
+        { "waitFor": "[data-pending-plan='plan_002']", "timeout": 15000 },
+        {
+          "eval": "(() => { const c = window.__mock.calls.filter(x => x.url.indexOf('/api/agent/chat/stream') >= 0); const last = c[c.length - 1]; const ids = last.body && last.body.context && last.body.context.visibleRegionIds; return Array.isArray(ids) && ids.length === 5 && ids[2] === 'region_hourly_trend'; })()"
+        },
+        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "screenshot": "edit-plan-03-第二版计划重新锁定输入" },
+
+        {
+          "eval": "(() => { const card = document.querySelector('[data-pending-plan=\"plan_002\"]'); const sel = card.querySelector('select'); const opt = Array.from(sel.options).find(o => o.textContent.trim() === '取消'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        { "wait": 1200 },
+        {
+          "eval": "(() => { const c = window.__mock.calls.filter(x => x.url.indexOf('/api/agent/chat/stream') >= 0); const last = c[c.length - 1]; return !!last && !!last.body && last.body.message === '取消'; })()"
+        },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+
+        {
+          "type": "#chat-input",
+          "text": "把第三个卡片再改一下"
+        },
+        { "press": "Enter" },
+        { "waitFor": "[data-pending-plan='plan_003']", "timeout": 15000 },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan=\"plan_003\"]').innerText; return t.includes('已经过期'); })()"
+        },
+        {
+          "eval": "document.querySelectorAll('[data-pending-plan=\"plan_003\"] select').length === 0"
+        },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "screenshot": "edit-plan-04-过期计划不给选项" }
+      ]
+    }
+  ]
+}

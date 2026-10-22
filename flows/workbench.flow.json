@@ -1,0 +1,48 @@
+{
+  "serve": "../v3/report-ai-workspace v3",
+  "outDir": "../.selfcheck/flow",
+  "waitMs": 1500,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "工作台-主流程",
+      "path": "/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        { "assertVisible": "text=AI 报表助理" },
+        { "click": "button:has-text(\"生成能耗日报\")" },
+        { "wait": 1200 },
+        { "assertText": "机房能耗日报" },
+        { "assertVisible": "text=数据完整度" },
+        { "screenshot": "workbench-01-生成报表" },
+        { "click": "button:has-text(\"接受变更\")" },
+        { "wait": 800 },
+        { "screenshot": "workbench-02-接受变更" }
+      ]
+    },
+    {
+      "name": "工作台-输入需求",
+      "path": "/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        { "type": "#chat-input", "text": "生成一份机房告警分析报表" },
+        { "wait": 300 },
+        { "press": "Enter" },
+        { "wait": 1200 },
+        { "screenshot": "workbench-03-输入需求" }
+      ]
+    },
+    {
+      "name": "首页-进入工作台",
+      "path": "/home.html",
+      "continueOnError": true,
+      "steps": [
+        { "assertVisible": "h1" },
+        { "click": "a:has-text(\"新建策略\")" },
+        { "wait": 800 },
+        { "assertUrl": "workbench" },
+        { "screenshot": "home-01-跳转" }
+      ]
+    }
+  ]
+}

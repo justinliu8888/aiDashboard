@@ -1,0 +1,30 @@
+{
+  "outDir": "../.selfcheck/flow-dropdown-restore",
+  "waitMs": 1500,
+  "timeout": 180000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "回归-刷新恢复后下拉框可用",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "wait": 2000 },
+        { "click": "#btn-new-session" },
+        { "wait": 500 },
+        {
+          "type": "#chat-input",
+          "text": "生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析"
+        },
+        { "press": "Enter" },
+        { "waitFor": "#preview-root .region-name", "timeout": 120000 },
+        { "click": "#session-list .session-item[title^=\"生成 A 机房昨日能耗日报\"]" },
+        { "wait": 3000 },
+        { "assertVisible": ".question-select" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s=>!s.disabled).length > 0" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).some(s=>!s.disabled && s.options.length>1)" },
+        { "screenshot": "restore-01-恢复后下拉框可用" }
+      ]
+    }
+  ]
+}

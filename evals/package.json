@@ -1,0 +1,18 @@
+{
+  "name": "haewu-report-evals",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "智能报表 AI 后端的 eval 套件，用 Evalite 跑。",
+  "scripts": {
+    "eval:dev": "evalite watch",
+    "eval:run": "evalite run"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "autoevals": "^0.4.1",
+    "evalite": "^0.19.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

@@ -40,6 +40,26 @@ class Settings:
     # 可靠性
     llm_repair_retries: int = int(os.getenv("LLM_REPAIR_RETRIES", "1"))
 
+    # ReAct 预算：AgentScope 默认 max_iters=50，报表场景用不了那么多步
+    react_max_iters: int = int(os.getenv("REACT_MAX_ITERS", "6"))
+    react_max_iters_edit: int = int(os.getenv("REACT_MAX_ITERS_EDIT", "4"))
+    react_max_iters_fix: int = int(os.getenv("REACT_MAX_ITERS_FIX", "5"))
+    react_structured_output_grace_iters: int = int(
+        os.getenv("REACT_STRUCTURED_OUTPUT_GRACE_ITERS", "2")
+    )
+
+    # Observation 裁剪：单次工具返回的条目上限，防止上下文爆炸
+    observation_max_items: int = int(os.getenv("OBSERVATION_MAX_ITEMS", "20"))
+    observation_error_max_chars: int = int(os.getenv("OBSERVATION_ERROR_MAX_CHARS", "200"))
+
+    # 会话存储：SQLite 单文件，落在 backend/data/ 下
+    session_db_path: Path = Path(
+        os.getenv("AI_SESSION_DB_PATH", str(_BACKEND_DIR / "data" / "haewu.db"))
+    ).expanduser()
+
+    # 访问令牌：留空则不校验（仅限 localhost 使用）；挂公网 Tunnel 时必须设置
+    access_token: str = os.getenv("AI_ACCESS_TOKEN", "")
+
 
 @lru_cache
 def get_settings() -> Settings:

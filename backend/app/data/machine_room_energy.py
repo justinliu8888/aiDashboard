@@ -24,32 +24,107 @@ CATALOG_MACHINE_ROOM_ENERGY: dict[str, Any] = {
 }
 
 
+# 额外的明细数据源，用于演示“改数据源”和分钟级能力
+CATALOG_EAS_ENERGY_DETAIL: dict[str, Any] = {
+    "sourceRef": "eas_energy_detail",
+    "sourceVersion": "v1",
+    "subjectRef": "machine_room",
+    "description": "EAS 能耗明细：按设备、分钟级采样的区间电量",
+    "supportedGrains": ["MINUTE", "HOUR", "DAY"],
+    "fields": {
+        "deviceId": {"dataType": "STRING", "semanticType": "IDENTIFIER"},
+        "deviceName": {"dataType": "STRING"},
+        "timestamp": {"dataType": "DATETIME", "semanticType": "TIMESTAMP"},
+        "energyKwh": {
+            "dataType": "DECIMAL",
+            "unit": "kWh",
+            "semanticType": "INTERVAL_ENERGY",
+        },
+    },
+    "permissionTags": ["project_scoped"],
+}
+
+
+# 日汇总数据源，仅支持 DAY 粒度，用于演示“粒度不支持”
+CATALOG_ENERGY_DAILY_SUMMARY: dict[str, Any] = {
+    "sourceRef": "catalog.machine_room.energy_daily_summary",
+    "sourceVersion": "1.0",
+    "subjectRef": "machine_room",
+    "description": "机房能耗日汇总：仅支持天粒度",
+    "supportedGrains": ["DAY"],
+    "fields": {
+        "machineRoomId": {"dataType": "STRING", "semanticType": "IDENTIFIER"},
+        "logicalDate": {"dataType": "DATE"},
+        "energyKwh": {
+            "dataType": "DECIMAL",
+            "unit": "kWh",
+            "semanticType": "INTERVAL_ENERGY",
+        },
+    },
+    "permissionTags": ["project_scoped"],
+}
+
+
 METRIC_TOTAL_ENERGY: dict[str, Any] = {
     "metricRef": "metric.machine_room.total_energy",
     "metricVersion": "1.0",
+    "subjectRef": "machine_room",
     "label": "总耗电",
     "unit": "kWh",
     "aggregation": "SUM",
     "fieldRef": "energyKwh",
     "dimensions": ["machineRoomId"],
     "description": "机房所有设备区间电量求和",
+    "permissionTags": ["project_scoped"],
 }
 
 
 METRIC_DEVICE_ENERGY: dict[str, Any] = {
     "metricRef": "metric.machine_room.device_energy",
     "metricVersion": "1.0",
+    "subjectRef": "machine_room",
     "label": "设备耗电",
     "unit": "kWh",
     "aggregation": "SUM",
     "fieldRef": "energyKwh",
     "dimensions": ["deviceId"],
     "description": "按设备聚合的区间电量",
+    "permissionTags": ["project_scoped"],
+}
+
+
+METRIC_ENERGY_COST: dict[str, Any] = {
+    "metricRef": "metric.machine_room.energy_cost",
+    "metricVersion": "1.0",
+    "subjectRef": "machine_room",
+    "label": "能耗成本",
+    "unit": "元",
+    "aggregation": "SUM",
+    "fieldRef": "energyCost",
+    "dimensions": ["machineRoomId"],
+    "description": "按单价换算的能耗成本",
+    "permissionTags": ["project_scoped"],
+}
+
+
+METRIC_PUE: dict[str, Any] = {
+    "metricRef": "metric.machine_room.pue",
+    "metricVersion": "1.0",
+    "subjectRef": "machine_room",
+    "label": "PUE",
+    "unit": "",
+    "aggregation": "AVG",
+    "fieldRef": "pue",
+    "dimensions": ["machineRoomId"],
+    "description": "机房 PUE 平均值",
+    "permissionTags": ["project_scoped"],
 }
 
 
 # 当前用户在首功能阶段默认授权的项目/机房范围
 AUTHORIZED_SCOPE: dict[str, Any] = {
     "projectIds": ["project_001"],
-    "machineRoomIds": ["room_a"],
+    # subjectRef -> 该业务对象下被授权的实例 id。
+    # 工具层按它过滤目录 / 指标，防止模型跨对象探测。
+    "subjectIds": {"machine_room": ["room_a"]},
 }

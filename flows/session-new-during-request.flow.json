@@ -1,0 +1,27 @@
+{
+  "outDir": "../.selfcheck/flow-new-during-request",
+  "waitMs": 1500,
+  "timeout": 90000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "新建对话-请求进行中不丢历史",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 300 },
+        { "type": "#chat-input", "text": "你好" },
+        { "press": "Enter" },
+        { "wait": 800 },
+        { "click": "#btn-new-session" },
+        { "wait": 200 },
+        { "assertText": "请先停止正在生成的请求" },
+        { "waitFor": "#session-list .session-item[title=\"你好\"]", "timeout": 120000 },
+        { "assertCount": "#session-list .session-item", "count": 1, "op": ">=" },
+        { "eval": "document.querySelector('#session-list .session-item[title=\"你好\"]') !== null" },
+        { "screenshot": "new-during-request-01-历史仍在列" }
+      ]
+    }
+  ]
+}

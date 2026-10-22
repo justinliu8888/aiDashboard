@@ -1,0 +1,37 @@
+{
+  "serve": "./v3/report-ai-workspace v3",
+  "outDir": ".selfcheck",
+  "waitMs": 1800,
+  "ignore": ["modao.cc"],
+  "pages": [
+    {
+      "name": "home",
+      "path": "/home.html",
+      "title": "报表策略",
+      "selectors": ["h1", "header nav a", "main"],
+      "texts": ["报表策略", "新建策略"],
+      "counts": ["header nav a>=1"]
+    },
+    {
+      "name": "workbench",
+      "path": "/workbench.html",
+      "title": "工作台",
+      "selectors": ["h1", "textarea, input[type=text]"],
+      "texts": ["机房能耗日报", "AI 报表助理"]
+    },
+    {
+      "name": "validation",
+      "path": "/validation.html",
+      "title": "校验",
+      "selectors": ["h1"],
+      "texts": ["校验与试运行", "执行节点"]
+    },
+    {
+      "name": "result",
+      "path": "/result.html",
+      "title": "报表结果",
+      "selectors": ["h1", "main"],
+      "texts": ["机房能耗日报", "数据完整度"]
+    }
+  ]
+}

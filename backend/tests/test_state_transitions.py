@@ -32,11 +32,13 @@ def test_waiting_user_confirm_can_save_or_restart_or_patch():
 
 def test_validating_must_lead_to_preview_or_fail():
     allowed = ALLOWED_TRANSITIONS[AgentState.VALIDATING]
-    assert allowed == {AgentState.PREVIEWING, AgentState.VALIDATION_FAILED}
+    assert {AgentState.PREVIEWING, AgentState.VALIDATION_FAILED} <= allowed
+    assert AgentState.INTERRUPT_CONFIRMING in allowed
 
 
 def test_render_pipeline_order():
-    assert ALLOWED_TRANSITIONS[AgentState.PREVIEWING] == {AgentState.PREVIEW_READY}
+    assert AgentState.PREVIEW_READY in ALLOWED_TRANSITIONS[AgentState.PREVIEWING]
+    assert AgentState.INTERRUPT_CONFIRMING in ALLOWED_TRANSITIONS[AgentState.PREVIEWING]
     assert ALLOWED_TRANSITIONS[AgentState.PREVIEW_READY] == {AgentState.RENDERING}
     assert ALLOWED_TRANSITIONS[AgentState.RENDERING] == {AgentState.READY}
 

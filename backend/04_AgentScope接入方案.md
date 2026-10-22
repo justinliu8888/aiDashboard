@@ -197,19 +197,24 @@ POST /api/agent/chat
   -> 返回 AgentResponse
 ```
 
-建议新增：
+实际落地结构：
 
 ```text
 app/
   agents/
     agentscope_report_agent.py
     agent_router.py
+    fake_report_agent.py
     prompts/
       report_generation.md
-    tools/
-      catalog_tool.py
-      metric_tool.py
-      capability_tool.py
+  tools/                      ← 13 个工具，统一收在这里，一个工具一个文件
+    base.py                   ← 统一契约 + 节点白名单常量
+    registry.py               ← 注册 / Toolkit 构建 / 契约校验 / 中台清单导出
+    context.py                ← ToolContext（授权范围 + 草稿状态）
+    submission.py             ← 终结工具提交槽
+    schemas.py                ← 终结工具载荷模型
+  services/
+    scope_service.py          ← 项目 / 实例可见性规则
   config.py
 scripts/
   smoke_llm.py
@@ -227,17 +232,24 @@ FakeAgent 必须保留：
 
 AgentScope 不应该直接编造数据源、指标、单位和能力，必须通过工具拿到候选项。
 
-| 工具 | 用途 | 来源 |
-| --- | --- | --- |
-| `search_catalog` | 查可用数据源、字段、粒度、权限标签 | `catalog_mock_service`，后续换 Java Catalog |
-| `search_metric` | 查指标口径、单位、维度 | `metric_mock_service`，后续换 Java Metric |
-| `check_capability` | 判断小时级 / 日级 / 分钟级是否支持 | 数据目录能力 |
-| `build_definition` | 根据 Agent 的结构化计划组装完整定义 | `report_draft_service` |
-| `build_change_set` | 根据修改计划组装 ChangeSet | `report_draft_service` |
+所有工具统一收在 [app/tools/](file:///Users/peiliu/Desktop/海悟/20261012%20智能报表功能/ai功能/backend/app/tools) 目录，**一个工具一个文件**：
+
+| 工具 | 分类 | 用途 | 来源 |
+| --- | --- | --- | --- |
+| `search_catalog` | FACT | 查可用数据源、字段、粒度、权限标签 | `catalog_mock_service`，后续换 Java Catalog |
+| `search_metric` | FACT | 查指标口径、单位、维度 | `metric_mock_service`，后续换 Java Metric |
+| `check_capability` | FACT | 判断小时级 / 日级 / 分钟级是否支持 | 数据目录能力 |
+| `get_current_draft` | FACT | 读当前草稿概览 | 请求快照 |
+| `get_current_region` | FACT | 读单个 region（编辑语境） | 请求快照 |
+| `get_validation_result` | FACT | 读结构化校验问题 | 校验服务 |
+| `build_definition_draft` | BUILDER | 根据 Agent 的结构化计划组装完整定义 | `report_draft_service` |
+| `submit_*`（6 个） | TERMINAL | 提交本轮结论 | 各工具 + 确定性组装层 |
 
 关键选择：LLM 是直接产完整 `ReportDefinitionDraft`，还是只产“报表计划”，由后端工具组装完整定义。
 
 候选建议：**LLM 只产计划，后端组装完整定义。** 这样更稳定，也更符合“AI 负责理解，系统负责确定规则”。
+
+**工具还必须过一层数据范围授权**：能调用工具 ≠ 能看所有数据。目录 / 指标 / 能力查询都要按 `projectId` / `subjectId` 过滤，范围由后端从 `ToolContext` 取，不暴露给模型。详见 `06_ReAct改造方案.md` 的 [6.3.1](file:///Users/peiliu/Desktop/海悟/20261012%20智能报表功能/ai功能/backend/06_ReAct改造方案.md)。
 
 ---
 
@@ -361,6 +373,78 @@ Skill 化原则：
 | `CapabilitySkill` | 包装目录能力检查 | 对接统一能力校验服务 |
 | `DefinitionBuilderSkill` | 包装 `report_draft_service` | 沉淀为报表定义生成能力 |
 | `ChangeSetBuilderSkill` | 包装 `report_draft_service` | 沉淀为报表变更生成能力 |
+
+**落地状态**：上述能力已统一实现于 [app/tools/](file:///Users/peiliu/Desktop/海悟/20261012%20智能报表功能/ai功能/backend/app/tools) 目录（**一个工具一个文件**），共 13 个工具：
+
+```text
+只读事实（FACT）
+  search_catalog / search_metric / check_capability
+  get_current_draft / get_current_region / get_validation_result
+确定性组装（BUILDER）
+  build_definition_draft
+终结工具（TERMINAL）
+  submit_draft_plan / submit_clarification / submit_blocked
+  submit_change_plan / submit_edit_plan / submit_fix_plan
+```
+
+统一契约（`NAME` / `DESCRIPTION` / `PARAMETERS` / `CATEGORY` / `IS_READ_ONLY` / `APPLICABLE_STATES` / `CONCLUSION_STATES` / `run()`）见 [base.py](file:///Users/peiliu/Desktop/海悟/20261012%20智能报表功能/ai功能/backend/app/tools/base.py)，中台上架清单由 `registry.export_manifest()` 导出 —— **迁中台时只换实现不改契约**。详细方案见 `06_ReAct改造方案.md`。
+
+**契约版本 `TOOL_CONTRACT_VERSION = 1.1.0`**（`1.0.0` → `1.1.0` 的唯一变更是新增 `CONCLUSION_STATES`）。
+
+**`CONCLUSION_STATES`：终结工具声明自己可能落哪些状态**
+
+同一个终结工具可能产生不止一个结论状态：
+
+| 工具 | 结论状态 | 分叉条件 |
+| --- | --- | --- |
+| `submit_clarification` | `NEEDS_CLARIFICATION` / `ANALYZING` | 带 `missingInfo` → 追问；不带 → 停在 `ANALYZING` |
+| `submit_edit_plan` | `USER_EDITING_TEMPLATE` / `NEEDS_CLARIFICATION` | 计划清楚 → 交给确定性引擎执行；说不清 → 追问 |
+
+用元组而不是单值，才能把这层分叉显式化，也才能对**每个结论分支逐个**校验合法性。非终结工具不得声明该字段。
+
+**节点白名单与合法转移的关系（核心不变量）**
+
+> **工具在某节点可用 ⇔ 它的结论状态在该节点是合法转移。**
+
+合法转移由 `ALLOWED_TRANSITIONS` 唯一决定（[agent.py](file:///Users/peiliu/Desktop/海悟/20261012%20智能报表功能/ai功能/backend/app/schemas/agent.py)），`is_conclusion_legal()` 封装判定：保持原状态算合法，其余必须在允许集合里。
+
+这条不变量由 `registry.validate_tool_contracts()` 自动校验，有测试守着：
+
+```python
+def test_tool_contracts_are_self_consistent():
+    problems = registry.validate_tool_contracts()
+    assert problems == [], "工具契约不自洽：\n" + "\n".join(problems)
+```
+
+违反它意味着**模型能挑中一个落不下去的分支** —— 比如在 `VALIDATION_FAILED` 提交一个 `WAITING_USER_CONFIRM` 的结论。
+
+**节点级白名单已经真正接入 AgentScope Toolkit**
+
+`tools_for_state(state)` 的结果注册进 Toolkit，模型看不到当前节点不该调的工具。各节点可用终结工具：
+
+```text
+ANALYZING              → submit_draft_plan / submit_clarification / submit_blocked / submit_change_plan
+NEEDS_CLARIFICATION    → submit_draft_plan / submit_clarification
+DEFINITION_DRAFT_READY → submit_change_plan
+WAITING_USER_CONFIRM   → submit_clarification / submit_blocked / submit_change_plan / submit_edit_plan
+USER_EDITING_TEMPLATE  → submit_clarification / submit_edit_plan
+VALIDATION_FAILED      → submit_fix_plan
+其余节点               → （无终结工具，流水线节点不需要模型决策）
+```
+
+**中台清单导出**（`registry.export_manifest()` / `export_manifest_json()`）里每个工具一条：
+
+```json
+{
+  "name": "submit_edit_plan",
+  "description": "提交对当前草稿某个区块的编辑计划……",
+  "parameters": { "type": "object", "properties": { "...": {} } },
+  "category": "TERMINAL",
+  "readOnly": false,
+  "applicableStates": ["WAITING_USER_CONFIRM", "USER_EDITING_TEMPLATE"],
+  "conclusionStates": ["USER_EDITING_TEMPLATE", "NEEDS_CLARIFICATION"]
+}
+```
 
 ### 7.4 已确认：Q4 第一阶段只做样例 1
 

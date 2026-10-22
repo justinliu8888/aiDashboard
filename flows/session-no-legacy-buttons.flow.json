@@ -1,0 +1,20 @@
+{
+  "outDir": "../.selfcheck/flow-no-legacy-btns",
+  "waitMs": 1500,
+  "timeout": 60000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "会话管理-旧按钮已下线",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "eval": "document.querySelector('#btn-clear') === null" },
+        { "eval": "document.querySelector('#chk-auto-collapse') === null" },
+        { "eval": "!document.querySelector('.chat-head, section')?.innerText.includes('结束自动折叠')" },
+        { "eval": "document.querySelector('#btn-new-session') !== null" },
+        { "screenshot": "no-legacy-btns-01-旧按钮已下线" }
+      ]
+    }
+  ]
+}

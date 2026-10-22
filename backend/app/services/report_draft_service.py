@@ -15,6 +15,7 @@ from app.data.machine_room_energy import (
 from app.schemas.change_set import ChangeSet, ChangeSetEntry, ChangeSetUnchanged
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.report_policy import ReportPolicyDraft
+from app.services.mock_data_service import resolve_room_name
 
 
 REGION_IDS = {
@@ -65,10 +66,16 @@ def _calendar_window(offset: int, count: int) -> dict[str, Any]:
     }
 
 
-def _title_region() -> dict[str, Any]:
+def _title_region(room_id: str) -> dict[str, Any]:
+    """报告标题区。
+
+    title 直接给出可读的真实标题（如「A 机房 昨日能耗日报」）；
+    template 里保留同名占位，后端渲染时会用真实值覆盖，两边不会打架。
+    """
+    title = f"{resolve_room_name(room_id)} 昨日能耗日报"
     return {
         "id": REGION_IDS["title"],
-        "name": "报告标题",
+        "name": title,
         "role": "REPORT_TITLE",
         "layout": {
             "placement": {"type": "GRID", "column": 1, "columnSpan": 12}
@@ -77,7 +84,7 @@ def _title_region() -> dict[str, Any]:
             "type": "TEXT",
             "content": {
                 "format": "PLAIN",
-                "template": "{{roomName}} 昨日能耗日报",
+                "template": title,
                 "bindings": {
                     "roomName": {"type": "CONTEXT", "path": "scope.machineRoomName"}
                 },
@@ -383,7 +390,7 @@ def build_definition_draft(
     include_trend: bool = True,
 ) -> ReportDefinitionDraft:
     regions: list[dict[str, Any]] = [
-        _title_region(),
+        _title_region(room_id),
         _total_energy_region(),
         _ranking_region(),
     ]

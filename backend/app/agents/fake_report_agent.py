@@ -27,7 +27,6 @@ from app.services.report_draft_service import (
     build_policy_draft,
 )
 from app.data.machine_room_energy import (
-    AUTHORIZED_SCOPE,
     CATALOG_MACHINE_ROOM_ENERGY,
 )
 

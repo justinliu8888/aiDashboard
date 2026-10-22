@@ -20,6 +20,62 @@
   /* 下一阶段按钮：灰色不可点 */
   .btn-disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-disabled:hover { background: inherit !important; }
+  /* Debug Trace 卡片折叠：内容区高度过渡 + 箭头旋转 */
+  .debug-body {
+    display: grid;
+    grid-template-rows: 1fr;
+    transition: grid-template-rows .2s ease;
+  }
+  .debug-body > .debug-body-inner {
+    overflow: hidden;
+    min-height: 0;
+  }
+  .debug-card.is-collapsed .debug-body {
+    grid-template-rows: 0fr;
+  }
+  .debug-chevron {
+    transition: transform .2s ease;
+  }
+  .debug-card.is-collapsed .debug-chevron {
+    transform: rotate(-90deg);
+  }
+  /* 会话导航栏 */
+  .nav-item-active {
+    background: #eff6ff;
+    color: #1d4ed8;
+  }
+  .session-item:hover .session-del {
+    opacity: 1;
+  }
+  /* 区域编辑入口：只在用户选了「修改」（编辑态）后出现 */
+  #preview-root .region-tools {
+    display: none;
+  }
+  #preview-root.preview-editable .region-tools {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+  #preview-root .edit-hint {
+    display: none;
+  }
+  #preview-root.preview-editable .edit-hint {
+    display: inline-flex;
+  }
+  /* 可直接编辑的标题：编辑态才有聚焦/悬停反馈 */
+  .editable-field {
+    outline: none;
+    border-radius: 0.25rem;
+    padding: 0 0.25rem;
+    margin: 0 -0.25rem;
+  }
+  #preview-root.preview-editable .editable-field:hover {
+    background: #f8fafc;
+  }
+  #preview-root.preview-editable .editable-field:focus {
+    background: #fffbeb;
+    box-shadow: 0 0 0 2px #fde68a;
+  }
 </style>
 </head>
 <body class="h-screen overflow-hidden flex flex-col bg-slate-100 text-slate-800">
@@ -74,13 +130,13 @@
       <button id="btn-regenerate" class="inline-flex items-center gap-1.5 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200 transition">
         <iconify-icon class="text-base text-slate-500" icon="mdi:refresh"></iconify-icon>重新生成
       </button>
-      <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-white text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200" title="下一阶段：FakeAgent 还未实现 VALIDATING 流程">
+      <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-white text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200" title="当前链路会在确认草稿后自动校验">
         <iconify-icon class="text-base text-slate-500" icon="mdi:clipboard-check-outline"></iconify-icon>校验
       </button>
-      <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-blue-50 text-blue-700 text-sm font-medium px-3 py-2 border border-blue-200" title="下一阶段：FakeAgent 还未实现 PREVIEWING 流程">
+      <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-blue-50 text-blue-700 text-sm font-medium px-3 py-2 border border-blue-200" title="当前链路会在校验通过后自动试运行">
         <iconify-icon class="text-base" icon="mdi:play-circle-outline"></iconify-icon>试运行
       </button>
-      <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-white text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200" title="下一阶段：保存需要调 SAVE_DEFINITION_DRAFT 工具">
+      <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-white text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200" title="确认草稿后会自动保存草稿">
         <iconify-icon class="text-base text-slate-500" icon="mdi:content-save-outline"></iconify-icon>保存草稿
       </button>
       <button class="btn-disabled inline-flex items-center gap-1.5 rounded-lg bg-blue-700 text-white text-sm font-medium px-3.5 py-2" title="下一阶段：发布需后端校验和试运行通过">
@@ -93,6 +149,22 @@
 <!-- ===== 主体 ===== -->
 <div class="flex-1 min-h-0 flex">
 
+  <!-- 左：历史会话导航栏 -->
+  <nav id="session-nav" class="w-[220px] shrink-0 bg-white border-r border-slate-200 flex flex-col">
+    <div class="shrink-0 p-3 space-y-2 border-b border-slate-200">
+      <button id="btn-new-session" class="w-full flex items-center justify-center gap-1.5 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-medium px-3 py-2 transition">
+        <iconify-icon class="text-sm" icon="mdi:plus"></iconify-icon>新建对话
+      </button>
+      <div class="relative">
+        <iconify-icon class="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 text-sm pointer-events-none" icon="mdi:magnify"></iconify-icon>
+        <input id="session-search" type="text" placeholder="搜索历史对话" class="w-full rounded-lg border border-slate-200 pl-7 pr-2 py-1.5 text-xs outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-100" />
+      </div>
+    </div>
+    <div id="session-list" class="flex-1 min-h-0 overflow-y-auto no-bar p-2 space-y-3">
+      <div class="text-[11px] text-slate-400 px-2 py-2">加载中…</div>
+    </div>
+  </nav>
+
   <!-- 左：AI 对话区 -->
   <section class="w-[36%] min-w-[340px] max-w-[560px] shrink-0 bg-white border-r border-slate-200 flex flex-col">
     <div class="shrink-0 px-4 py-3 border-b border-slate-200 flex items-center gap-3">
@@ -104,37 +176,34 @@
       </div>
       <div class="min-w-0">
         <div class="text-sm font-semibold text-slate-900">AI 报表助理</div>
-        <div class="text-[11px] text-slate-500">FakeAgent · 助理模式</div>
+        <div class="text-[11px] text-slate-500">AgentScope · 火山方舟 · Mock 数据链路</div>
       </div>
-      <button id="btn-clear" class="ml-auto text-xs text-slate-500 hover:text-blue-700 flex items-center gap-1 px-2 py-1 rounded-md hover:bg-slate-50">
-        <iconify-icon class="text-sm" icon="mdi:history"></iconify-icon>清空
-      </button>
     </div>
 
-    <div id="chat-scroll" class="flex-1 min-h-0 overflow-y-auto no-bar bg-slate-50 px-4 py-4 space-y-4">
-      <!-- 欢迎 -->
-      <div class="flex gap-2.5">
-        <div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
-          <iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
-        </div>
-        <div class="flex-1 min-w-0">
-          <div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">
-            你好，我是 AI 报表助理。描述你的报表需求，我会生成结构化报表草稿。本阶段只对接了 FakeAgent，不会真的查数据。
+    <div class="relative flex-1 min-h-0 flex">
+      <div id="chat-scroll" class="flex-1 min-h-0 overflow-y-auto no-bar bg-slate-50 px-4 py-4 space-y-4">
+        <!-- 欢迎 -->
+        <div class="flex gap-2.5">
+          <div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+            <iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">
+              你好，我是 AI 报表助理。描述你的报表需求，我会通过 AgentScope 生成结构化报表草稿；确认后会自动保存、校验、试运行，并用 Mock 机房数据渲染完整报表。
+            </div>
           </div>
         </div>
       </div>
+
+      <!-- 脱离底部时的回到底部提示 -->
+      <button id="btn-jump-bottom" class="hidden absolute bottom-3 right-4 z-10 flex items-center gap-1 rounded-full border border-slate-200 bg-white/95 shadow-md px-2.5 py-1.5 text-[11px] text-slate-600 hover:text-blue-700 hover:border-blue-300 transition">
+        <iconify-icon class="text-sm" icon="mdi:chevron-double-down"></iconify-icon>回到底部
+      </button>
     </div>
 
-    <!-- 快捷样例 -->
+    <!-- 快捷入口 -->
     <div class="shrink-0 border-t border-slate-200 bg-white px-4 pt-3">
-      <div class="flex items-center gap-1.5 overflow-x-auto no-bar pb-0.5">
-        <button data-quick="生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">生成能耗日报</button>
-        <button data-quick="帮我看异常设备" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">异常设备（信息不足）</button>
-        <button data-quick="帮我看所有项目的能耗排名" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">所有项目（权限）</button>
-        <button data-quick="帮我看 A 机房分钟级历史能耗" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">分钟级（能力）</button>
-        <button data-quick="把趋势图改成最近 7 天" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">改 7 天</button>
-        <button data-quick="不要趋势图，改成只要总耗电和设备排名" class="shrink-0 rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">删趋势图</button>
-      </div>
+      <button data-quick="生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析" class="rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">生成能耗日报</button>
     </div>
 
     <!-- 输入 -->
@@ -142,6 +211,7 @@
       <div class="px-4 py-3">
         <div class="flex items-end gap-2 rounded-xl border border-slate-300 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-100 bg-white px-3 py-2 transition">
           <textarea id="chat-input" class="flex-1 resize-none outline-none text-sm max-h-24 no-bar leading-relaxed" rows="1" placeholder="描述报表需求，或输入修改要求…"></textarea>
+          <button id="btn-stop" class="hidden shrink-0 h-9 px-2.5 rounded-lg border border-rose-200 bg-rose-50 text-rose-700 text-xs font-medium" type="button">停止生成</button>
           <button id="btn-send" class="shrink-0 w-9 h-9 rounded-lg bg-blue-700 hover:bg-blue-800 text-white flex items-center justify-center transition">
             <iconify-icon class="text-base" icon="mdi:send"></iconify-icon>
           </button>
@@ -169,6 +239,6 @@
 <!-- toast -->
 <div id="toast" class="hidden fixed left-1/2 bottom-8 -translate-x-1/2 z-50 bg-slate-900 text-white text-sm px-4 py-2.5 rounded-lg shadow-lg"></div>
 
-<script src="./workbench.js?v=20261019-edit"></script>
+<script src="./workbench.js?v=20261022-edit-plan-confirm"></script>
 </body>
 </html>

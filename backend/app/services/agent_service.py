@@ -13,32 +13,90 @@
 from __future__ import annotations
 
 import logging
+import re
+import uuid
+from datetime import datetime
 from time import perf_counter
 from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 from app.agents.fake_report_agent import FakeReportAgent
 from app.config import get_settings
 from app.schemas.agent import (
+    ADVANCE_MESSAGE,
     ALLOWED_TRANSITIONS,
     AGENT_PROTOCOL_VERSION,
     AgentError,
     AgentQuestion,
     AgentRequest,
     AgentResponse,
+    AgentResponseDomainObjects,
     AgentState,
     QuestionOption,
     ToolRequest,
 )
+from app.schemas.edit_plan import EditIntent, EditPlan
+from app.schemas.report_definition import ReportDefinitionDraft
+from app.schemas.session import PendingEditPlan
 from app.services.context_engine import RouteDecision, RoutingAction, context_engine
 from app.services.definition_save_service import definition_save_service
+from app.services.preview_service import preview_service
 from app.services.request_timeline import log_timeline_step
+from app.services.session_context import bind_session_key, current_session_key
+from app.services.session_service import session_service
+from app.services.edit_reference_resolver import resolve_visible_reference
+from app.services.edit_time_resolver import resolve_time_expression
+from app.services.template_edit_engine import EditResult, template_edit_engine
+from app.tools.context import ToolScope
+from app.services.template_preview_flow import template_preview_flow
+from app.services.validation_service import summarize_issues_for_user, validate_definition
 
 
 # 等待用户确认阶段的三个按钮：同意 / 修改 / 重新开始
 CONFIRM_BUTTON_VALUE = "同意"
 MODIFY_BUTTON_VALUE = "修改"
 RESTART_BUTTON_VALUE = "重新开始"
+EDIT_ACCEPT = "接受修改"
+EDIT_ADJUST = "继续调整"
+EDIT_CANCEL = "取消"
+EDIT_CHOICE_ID = "pending_edit_plan_confirm"
 
+# 可能触发模板编辑意图识别的粗关键词；仅用于判断“是否进入 TemplateEditEngine”，
+# 真正的意图拆解由 TemplateEditEngine.parse() 负责。
+TEMPLATE_EDIT_HINT_WORDS = (
+    "删", "删除", "去掉", "不要", "移除",
+    "改成", "改为", "重命名", "叫做", "标题", "名字",
+    "加一个", "新增", "增加", "补充",
+    "数据源", "数据能力",
+    "柱状图", "折线图", "饼图", "面积图", "表格", "明细表",
+    "粒度", "分钟", "小时", "按天",
+    "最近 7 天", "最近 30 天", "昨日", "本周", "本月",
+    "指标", "能耗成本", "pue",
+    "前 ", "降序", "升序", "排序",
+    "怎么展示", "展示方式", "展示形式", "可以展示",
+    "section", "区域", "面板", "卡片", "模块",
+)
+
+# 只读能力查询的疑问词。命中之后才尝试用确定性证据直接回答，
+# 避免把「把趋势图改成折线图」这类修改请求误判成查询。
+READONLY_QUESTION_WORDS = (
+    "哪些", "什么", "怎么", "能不能", "可不可以", "能否", "是否",
+    "有没有", "支持", "吗", "？", "?",
+)
+
+# 明确的改动动词：出现这些词就是在下指令，不是在提问。
+# 「这个能按分钟看吗」是提问，「改成按分钟粒度」是指令；
+# 即使指令后面带问号（「改成按分钟粒度，可以吗」），也仍然是指令。
+EDIT_COMMAND_WORDS = (
+    "改成", "改为", "换成", "换为", "调成", "设为", "设定为",
+)
+
+# 目标定位依赖「用户实际看到的可见顺序」的解析方式。
+# 序数和指代词必须靠可见顺序定位；精确名称和选中卡片本身就是可靠锚点，
+# 不要求前端回传 visibleRegionIds。
+ORDER_DEPENDENT_REASONS = frozenset({
+    "ordinal", "relative_previous", "demonstrative_without_selection",
+})
 
 logger = logging.getLogger(__name__)
 EmitEvent = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -72,6 +130,26 @@ def _build_agent():
 class AgentService:
     def __init__(self) -> None:
         self._agent = _build_agent()
+
+    def _remember_choice(self, response: AgentResponse) -> AgentResponse:
+        if response.state == AgentState.WAITING_USER_CONFIRM:
+            # 所有生成路径共用同一确认协议；旧 Agent 的 confirm_draft 不能绕过选项锁。
+            response.questions = self._editing_confirm_questions()
+        choice = next(
+            (q for q in response.questions if q.selectionOnly and q.options), None
+        )
+        session_key = current_session_key() or response.conversationId
+        if choice:
+            # 选择锁存库（不是进程内存）：后端重启后恢复历史会话仍能拿到锁，
+            # 不会出现「前端放行自由输入、后端拒收」的前后端不一致。
+            session_service.save_pending_choice(
+                session_key,
+                {
+                    "state": response.state.value,
+                    "question": choice.model_dump(mode="json"),
+                },
+            )
+        return response
 
     async def chat(
         self, request: AgentRequest, emit: EmitEvent | None = None
@@ -107,6 +185,202 @@ class AgentService:
                 ),
             )
 
+        session_key = bind_session_key(request)
+        # 恢复上一轮路由层收集到的槽位：本轮路由在它基础上继续补全，
+        # 不会重新问用户已经答过的问题。
+        request.collectedInfo = session_service.load_collected_info(session_key)
+        pending_raw = session_service.load_pending_choice(session_key)
+        pending = None
+        if pending_raw:
+            try:
+                pending_state = AgentState(pending_raw["state"])
+                pending = (pending_state, AgentQuestion(**pending_raw["question"]))
+            except (KeyError, ValueError):
+                logger.warning(
+                    "[agent.chat] step=pending_choice_invalid conversationId=%s raw=%s",
+                    request.conversationId,
+                    pending_raw,
+                )
+                session_service.save_pending_choice(session_key, None)
+        if session_service.load_pending_plan(session_key):
+            # 待决计划比旧的其他选择锁更权威；确认不能被迟到的题目覆盖。
+            pending = (AgentState.USER_EDITING_TEMPLATE, self._pending_edit_question())
+        if pending:
+            pending_state, question = pending
+            if request.state != pending_state or request.message not in {
+                option.value for option in question.options
+            } | ({"重新开始"} if question.allowRestart else set()):
+                return AgentResponse(
+                    conversationId=request.conversationId,
+                    state=pending_state,
+                    reply="请先从下拉框选择一项，不能直接输入或跳转。",
+                    designSessionId=request.context.designSessionId,
+                    questions=[question],
+                    uiActions=["selection_required"],
+                )
+            session_service.save_pending_choice(session_key, None)
+            if question.id == EDIT_CHOICE_ID:
+                return self._handle_pending_edit_choice(request, session_key)
+            if question.id.startswith("template_preview_"):
+                result = template_preview_flow.answer(request, question.id)
+                await _emit(emit, "stage", {
+                    "stage": "template_preview_choice",
+                    "choice": question.id,
+                    "responseState": result.state.value,
+                })
+                return self._remember_choice(result)
+            if question.id == "template_edit_confirm":
+                if request.message == CONFIRM_BUTTON_VALUE:
+                    return self._save_placeholder(request, RouteDecision())
+                if request.message == RESTART_BUTTON_VALUE:
+                    return AgentResponse(
+                        conversationId=request.conversationId,
+                        state=AgentState.ANALYZING,
+                        reply="好的，我们重新开始。请描述你想生成的新报表。",
+                        uiActions=["restart_from_template_editing"],
+                    )
+                return self._editing_prompt_response(
+                    request,
+                    reply="好的，请描述你想怎样修改当前草稿。",
+                )
+            if question.id == "ready_action":
+                if request.message == "继续修改":
+                    if request.snapshots.reportDefinition is None:
+                        return self._remember_choice(AgentResponse(
+                            conversationId=request.conversationId,
+                            state=AgentState.READY,
+                            reply="当前报表草稿未随请求带回，无法继续修改。请恢复草稿后重试。",
+                            designSessionId=request.context.designSessionId,
+                            questions=self._ready_questions(),
+                            uiActions=["show_ready_actions"],
+                        ))
+                    return self._editing_prompt_response(
+                        request,
+                        reply="好的，请描述你想怎样修改当前报表。",
+                    )
+                action = "发布" if request.message == "发布" else "导出 PDF"
+                return self._remember_choice(AgentResponse(
+                    conversationId=request.conversationId,
+                    state=AgentState.READY,
+                    reply=f"{action}流程尚未接入（Mock），请继续从下拉框选择。",
+                    designSessionId=request.context.designSessionId,
+                    questions=self._ready_questions(),
+                    uiActions=["show_ready_actions"],
+                ))
+
+        if request.message.strip() in {EDIT_ACCEPT, EDIT_ADJUST, EDIT_CANCEL}:
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.USER_EDITING_TEMPLATE,
+                reply="当前没有待确认的修改计划，请重新说明要修改什么。",
+                designSessionId=request.context.designSessionId,
+                domainObjects=AgentResponseDomainObjects(
+                    reportDefinitionDraft=request.snapshots.reportDefinition,
+                    reportPolicyDraft=request.snapshots.reportPolicy,
+                ),
+            )
+
+        if request.state == AgentState.READY:
+            # 单进程重启后待选项可能丢失；仍先恢复必选题，不允许直接路由自由文本。
+            return self._remember_choice(AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.READY,
+                reply="报表已就绪，请先从下拉框选择下一步操作。",
+                designSessionId=request.context.designSessionId,
+                questions=self._ready_questions(),
+                uiActions=["show_ready_actions"],
+            ))
+
+        if request.message.strip() in {"继续工作", "继续上一条", "继续刚才"}:
+            logger.info(
+                "[agent.chat] step=resume_unavailable conversationId=%s state=%s",
+                request.conversationId,
+                request.state.value,
+            )
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.ANALYZING,
+                reply="当前没有可恢复的上一条请求，请重新描述要处理的内容。",
+                uiActions=["resume_unavailable"],
+            )
+
+        if template_preview_flow.is_request(request):
+            result = template_preview_flow.start(request)
+            await _emit(emit, "stage", {
+                "stage": "template_preview_start",
+                "responseState": result.state.value,
+                "questionIds": [question.id for question in result.questions],
+            })
+            return self._remember_choice(result)
+
+        # 节点 6-11 的自动推进：前端收到上一个状态后再发一次 __advance__
+        # 跳过 ContextEngine，直接按 state 走对应 handler。
+        if request.message == ADVANCE_MESSAGE:
+            auto_started = perf_counter()
+            start_stage_by_state = {
+                AgentState.SAVE_DEFINITION_DRAFT: "auto_advance_start",
+                AgentState.VALIDATING: "validation_start",
+                AgentState.PREVIEWING: "preview_start",
+                AgentState.PREVIEW_READY: "render_prepare_start",
+                AgentState.RENDERING: "render_done",
+            }
+            done_stage_by_state = {
+                AgentState.SAVE_DEFINITION_DRAFT: "auto_advance_done",
+                AgentState.VALIDATING: "validation_done",
+                AgentState.PREVIEWING: "preview_done",
+                AgentState.PREVIEW_READY: "render_prepare_done",
+                AgentState.RENDERING: "render_done",
+            }
+            await _emit(
+                emit,
+                "stage",
+                {
+                    "stage": start_stage_by_state.get(request.state, "auto_advance_start"),
+                    "state": request.state.value,
+                    "message": request.message,
+                },
+            )
+            auto = self._auto_advance(request)
+            if auto is not None:
+                log_timeline_step("auto_advance")
+                await _emit(
+                    emit,
+                    "stage",
+                    {
+                        "stage": "auto_advance",
+                        "fromState": request.state.value,
+                        "toState": auto.state.value,
+                    },
+                )
+                await _emit(
+                    emit,
+                    "stage",
+                    {
+                        "stage": done_stage_by_state.get(request.state, "auto_advance_done"),
+                        "state": request.state.value,
+                        "responseState": auto.state.value,
+                        "stepElapsedMs": round((perf_counter() - auto_started) * 1000),
+                    },
+                )
+                return self._remember_choice(auto)
+
+        template_edit = await self._try_handle_template_edit(request)
+        if template_edit is not None:
+            await _emit(
+                emit,
+                "stage",
+                {
+                    "stage": "template_edit_done",
+                    "state": request.state.value,
+                    "responseState": template_edit.state.value,
+                    "editingTargetRegionId": template_edit.debug.get("editingTargetRegionId"),
+                    "editingIntent": template_edit.debug.get("editingIntent"),
+                },
+            )
+            return self._remember_choice(
+                self._finalize_template_edit(request, template_edit)
+            )
+
         route_started = perf_counter()
         log_timeline_step("context_route_start")
         await _emit(
@@ -119,7 +393,20 @@ class AgentService:
             request.conversationId,
             request.state.value,
         )
-        route = await context_engine.route(request, emit=emit)
+        # 模糊编辑已经由规则分流确认；通用路由可能把它误判为闲聊或重新生成。
+        if request.state == AgentState.USER_EDITING_TEMPLATE and request.snapshots.reportDefinition:
+            route = RouteDecision(
+                routingAction=RoutingAction.CONTINUE_CURRENT,
+                isTemplateEdit=True,
+                engineStage="template_edit_react",
+                reason="规则无法确定编辑计划，交给受约束 ReAct 查证",
+                collectedInfo=dict(request.collectedInfo),
+            )
+        else:
+            route = await context_engine.route(request, emit=emit)
+        # 路由层已经把「历史已收集」和「本轮新收集」合并好了。
+        # 写回请求对象：业务 Agent 要用它，落库也要靠它跨轮保留。
+        request.collectedInfo = dict(route.collectedInfo or {})
         log_timeline_step("context_route_done")
         await _emit(
             emit,
@@ -130,6 +417,9 @@ class AgentService:
                 "action": route.routingAction.value,
                 "targetState": route.targetState.value if route.targetState else None,
                 "engineStage": route.engineStage,
+                "isReadyForNextStep": route.isReadyForNextStep,
+                "missingInfo": route.missingInfo,
+                "reason": route.reason,
             },
         )
         logger.info(
@@ -145,9 +435,41 @@ class AgentService:
             route.reason,
         )
 
+        state_before_apply = request.state.value
         intercepted = self._apply_context_route(request, route)
+        await _emit(
+            emit,
+            "stage",
+            {
+                "stage": "apply_context_route",
+                "state": state_before_apply,
+                "action": route.routingAction.value,
+                "targetState": route.targetState.value if route.targetState else None,
+                "debugParams": {
+                    "路由判定": {
+                        "intent": route.userIntent.value,
+                        "action": route.routingAction.value,
+                        "targetState": route.targetState.value if route.targetState else None,
+                        "confidence": route.confidence,
+                        "ready": route.isReadyForNextStep,
+                        "requiresUserConfirm": route.requiresUserConfirm,
+                        "requiredInfo": route.requiredInfo,
+                        "collectedInfoKeys": list(route.collectedInfo),
+                        "missingInfo": route.missingInfo,
+                        "nextQuestion": route.nextQuestion,
+                        "reason": route.reason,
+                    },
+                    "执行结果": {
+                        "fromState": state_before_apply,
+                        "effectiveState": request.state.value,
+                        "outcome": "INTERCEPTED" if intercepted else "CONTINUE_TO_BUSINESS_AGENT",
+                        "responseState": intercepted.state.value if intercepted else None,
+                    },
+                },
+            },
+        )
         if intercepted is not None:
-            intercepted.debug = self._build_debug(route)
+            intercepted.debug = {**self._build_debug(route), **(intercepted.debug or {})}
             log_timeline_step("context_route_intercepted")
             await _emit(
                 emit,
@@ -164,7 +486,16 @@ class AgentService:
                 intercepted.state.value,
                 intercepted.uiActions,
             )
-            return intercepted
+            return self._remember_choice(intercepted)
+
+        if request.state == AgentState.USER_EDITING_TEMPLATE and isinstance(
+            self._agent, FakeReportAgent
+        ):
+            return self._edit_notice(
+                request,
+                "当前模型不可用，无法查证这项编辑问题；草稿没有变化，请稍后重试。",
+                code="EDIT_VERIFICATION_UNAVAILABLE",
+            )
 
         handle = getattr(self._agent, "ahandle", None)
         agent_started = perf_counter()
@@ -176,6 +507,29 @@ class AgentService:
                 "stage": "business_agent_start",
                 "impl": self._agent.__class__.__name__,
                 "state": request.state.value,
+                "debugParams": {
+                    "Agent 配置": {
+                        "impl": self._agent.__class__.__name__,
+                        "execution": "async" if handle is not None else "sync",
+                        "configuredModel": (
+                            get_settings().volc_model if self._agent.__class__.__name__ == "AgentScopeReportAgent"
+                            else "local_rules"
+                        ),
+                    },
+                    "输入上下文": {
+                        "state": request.state.value,
+                        "message": request.message,
+                        "projectId": request.context.projectId,
+                        "subjectRef": request.context.subjectRef,
+                        "subjectId": request.context.subjectId,
+                        "designSessionId": request.context.designSessionId,
+                        "selectedRegionId": request.context.selectedRegionId,
+                        "baseDefinitionRevision": request.context.baseDefinitionRevision,
+                        "hasPolicy": request.snapshots.reportPolicy is not None,
+                        "hasDefinition": request.snapshots.reportDefinition is not None,
+                        "hasPreview": request.snapshots.lastReportRun is not None,
+                    },
+                },
             },
         )
         logger.info(
@@ -196,6 +550,45 @@ class AgentService:
             {
                 "stage": "business_agent_done",
                 "responseState": response.state.value,
+                "toolRequests": [tool.type for tool in response.toolRequests],
+                "uiActions": response.uiActions,
+                "stepElapsedMs": round((perf_counter() - agent_started) * 1000),
+                "debugParams": {
+                    "响应": {
+                        "fromState": request.state.value,
+                        "responseState": response.state.value,
+                        "reply": response.reply,
+                        "errorCode": response.error.code if response.error else None,
+                    },
+                    "草稿与变更": {
+                        "policyName": (
+                            response.domainObjects.reportPolicyDraft.name
+                            if response.domainObjects.reportPolicyDraft else None
+                        ),
+                        "regionIds": (
+                            [region.get("id") for region in response.domainObjects.reportDefinitionDraft.regions]
+                            if response.domainObjects.reportDefinitionDraft else []
+                        ),
+                        "hasChangeSet": response.domainObjects.changeSet is not None,
+                        "changePaths": (
+                            [entry.path for entry in response.domainObjects.changeSet.changed]
+                            if response.domainObjects.changeSet else []
+                        ),
+                        "hasPreview": response.domainObjects.reportRunPreview is not None,
+                    },
+                    "交互": {
+                        "toolRequests": [
+                            {"type": tool.type, "target": tool.target}
+                            for tool in response.toolRequests
+                        ],
+                        "uiActions": response.uiActions,
+                        "questions": [
+                            {"id": question.id, "expects": question.expects}
+                            for question in response.questions
+                        ],
+                        "blocks": [block.code for block in response.blocks],
+                    },
+                },
             },
         )
         logger.info(
@@ -227,7 +620,7 @@ class AgentService:
                 ),
             )
 
-        response.debug = self._build_debug(route)
+        response.debug = {**self._build_debug(route), **(response.debug or {})}
         log_timeline_step("service_return")
         await _emit(
             emit,
@@ -240,7 +633,7 @@ class AgentService:
             (perf_counter() - total_started) * 1000,
             response.state.value,
         )
-        return response
+        return self._remember_choice(self._finalize_template_edit(request, response))
 
     @staticmethod
     def _build_debug(route: RouteDecision) -> dict[str, Any]:
@@ -249,7 +642,873 @@ class AgentService:
             "contextEngineIntent": route.userIntent.value,
             "contextEngineAction": route.routingAction.value,
             "contextEngineReason": route.reason,
+            "contextEngineIsTemplateEdit": route.isTemplateEdit,
         }
+
+    @staticmethod
+    def _pending_edit_question() -> AgentQuestion:
+        return AgentQuestion(
+            id=EDIT_CHOICE_ID,
+            prompt="确认这次修改：",
+            expects="SINGLE_CHOICE",
+            selectionOnly=True,
+            options=[
+                QuestionOption(value=value, label=value)
+                for value in (EDIT_ACCEPT, EDIT_ADJUST, EDIT_CANCEL)
+            ],
+        )
+
+    @staticmethod
+    def _draft_revision(definition: ReportDefinitionDraft) -> int:
+        return int((definition.metadata or {}).get("revision") or 0)
+
+    @staticmethod
+    def _reference_is_reliable(reference, context) -> bool:
+        """这次解析出来的目标是否可信到可以直接执行修改。
+
+        * 序数 / 指代词：必须依赖「用户实际看到的可见顺序」，
+          所以要求前端回传了 visibleRegionIds，且里面没有失效 ID
+          （草稿变过，顺序对不上，得重新核对）。
+        * 精确名称 / 选中卡片：名字和选中项本身就是可靠锚点，
+          不要求前端回传可见顺序。
+        """
+        if reference.status != "RESOLVED":
+            return False
+        if reference.reason in ORDER_DEPENDENT_REASONS:
+            return bool(context.visibleRegionIds) and not reference.staleRegionIds
+        return True
+
+    def _finalize_template_edit(
+        self, request: AgentRequest, response: AgentResponse
+    ) -> AgentResponse:
+        """把业务 Agent 的候选落到服务端，并限制同一项修改的追问次数。"""
+        if response.state != AgentState.USER_EDITING_TEMPLATE:
+            return response
+        session_key = current_session_key() or request.conversationId
+        raw = (response.debug or {}).get("pendingEditPlan")
+        if raw is not None:
+            try:
+                candidate = PendingEditPlan.model_validate({
+                    **raw,
+                    "projectId": request.context.projectId,
+                    "subjectRef": request.context.subjectRef,
+                    "subjectId": request.context.subjectId,
+                })
+                draft = request.snapshots.reportDefinition
+                plan = EditPlan.model_validate(raw["editPlan"])
+                record = session_service.repository.get_session(session_key)
+                stored = (record.snapshot or {}).get("definition") if record else None
+                if (
+                    draft is None
+                    or candidate.draftRevision != self._draft_revision(draft)
+                    or (
+                        isinstance(stored, dict)
+                        and candidate.draftRevision != self._draft_revision(
+                            ReportDefinitionDraft.model_validate(stored)
+                        )
+                    )
+                    or candidate.targetRegionId != plan.target.regionId
+                    or plan.needsClarification
+                    or plan.intent == EditIntent.UNKNOWN
+                ):
+                    raise ValueError("候选计划与当前草稿不一致")
+                reference_text = request.collectedInfo.get("pendingEditRequest") or request.message
+                reference = resolve_visible_reference(
+                    reference_text, draft.regions,
+                    visible_region_ids=request.context.visibleRegionIds,
+                    selected_region_id=request.context.selectedRegionId,
+                )
+                if reference.status != "NOT_FOUND" and (
+                    reference.regionId != candidate.targetRegionId
+                    or not self._reference_is_reliable(reference, request.context)
+                ):
+                    raise ValueError("可见卡片顺序或目标尚未确认")
+            except (KeyError, TypeError, ValueError) as exc:
+                reason = str(exc) if isinstance(exc, ValueError) else "计划字段不完整"
+                return self._edit_notice(
+                    request, f"{reason}，草稿没有变化；请重新说明可执行的修改。"
+                )
+            active = session_service.save_pending_plan_if_absent(
+                session_key, candidate
+            )
+            if active.planId != candidate.planId:
+                response.reply = "上一份修改计划仍待确认，请先处理该计划。"
+                response.debug["editingTargetRegionId"] = active.targetRegionId or None
+            session_service.reset_clarification(session_key)
+            request.collectedInfo.pop("pendingEditRequest", None)
+            request.collectedInfo.pop("pendingEditTimeAnchor", None)
+            response.domainObjects.pendingEditPlan = PendingEditPlan(
+                planId=active.planId,
+                draftRevision=active.draftRevision,
+                targetRegionId=active.targetRegionId,
+                operations=active.operations,
+                summary=active.summary,
+                createdAt=active.createdAt,
+            )
+            response.questions = [self._pending_edit_question()]
+            response.debug.pop("pendingEditPlan", None)
+            return response
+
+        if (response.debug or {}).get("editOutcome") == "answer":
+            session_service.reset_clarification(session_key)
+            request.collectedInfo.pop("pendingEditRequest", None)
+            request.collectedInfo.pop("pendingEditTimeAnchor", None)
+            return response
+
+        if response.error is not None:
+            return response
+        is_clarification = (
+            (response.debug or {}).get("editOutcome") == "clarification"
+            or bool(((response.debug or {}).get("editPlan") or {}).get("needsClarification"))
+            or any(
+                question.id in {"template_edit_clarification",
+                                "compilation_grain", "edit_time_clarification",
+                                "edit_reference_clarification"}
+                for question in response.questions
+            )
+        )
+        if not is_clarification:
+            return response
+        prior = request.collectedInfo.get("pendingEditRequest")
+        intent = (response.debug or {}).get("editingIntent") or "UNKNOWN"
+        target = (response.debug or {}).get("editingTargetRegionId") or ""
+        current = session_service.load_clarification(session_key)
+        key = (
+            current.key if prior and current
+            else f"{intent}:{target}" if intent != "UNKNOWN" or target
+            else "edit:unresolved"
+        )
+        if not session_service.can_ask_clarification(session_key, key=key):
+            response.reply = (
+                f"这项修改已追问三轮，目前仍无法确定：{response.reply}"
+                "草稿没有修改。可以重新说明完整的目标和修改内容。"
+            )
+            response.questions = []
+            response.uiActions = ["template_edit_clarification_limit"]
+            return response
+        session_service.record_clarification(
+            session_key, key=key, question=response.reply
+        )
+        if not prior:
+            request.collectedInfo["pendingEditRequest"] = request.message
+        return response
+
+    def _edit_notice(
+        self, request: AgentRequest, message: str, *, code: str | None = None
+    ) -> AgentResponse:
+        record = session_service.repository.get_session(
+            current_session_key() or request.conversationId
+        )
+        snapshot = record.snapshot or {} if record else {}
+        stored_draft = snapshot.get("definition")
+        stored_policy = snapshot.get("policy")
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=message,
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportDefinitionDraft=(
+                    ReportDefinitionDraft.model_validate(stored_draft)
+                    if isinstance(stored_draft, dict)
+                    else request.snapshots.reportDefinition
+                ),
+                reportPolicyDraft=(
+                    stored_policy
+                    if isinstance(stored_policy, dict)
+                    else request.snapshots.reportPolicy
+                ),
+            ),
+            error=AgentError(code=code, message=message) if code else None,
+        )
+
+    def _handle_pending_edit_choice(
+        self, request: AgentRequest, session_key: str
+    ) -> AgentResponse:
+        pending = session_service.load_pending_plan(session_key)
+        if pending is None:
+            return self._edit_notice(
+                request, "这份修改计划已失效，草稿没有变化；请重新提出修改。"
+            )
+        if request.message in {EDIT_CANCEL, EDIT_ADJUST}:
+            session_service.clear_pending_plan(session_key)
+            session_service.reset_clarification(session_key)
+            message = (
+                "已取消这次修改，草稿没有变化。"
+                if request.message == EDIT_CANCEL
+                else "草稿没有变化。请告诉我这份修改计划需要怎样调整。"
+            )
+            return self._edit_notice(request, message)
+
+        record = session_service.repository.get_session(session_key)
+        stored = (record.snapshot or {}).get("definition") if record else None
+        try:
+            if not isinstance(stored, dict):
+                raise ValueError("服务端没有保存原草稿")
+            definition = ReportDefinitionDraft.model_validate(stored)
+            scope_matches = all(
+                (pending.model_extra or {}).get(key) == getattr(request.context, attr)
+                for key, attr in (
+                    ("projectId", "projectId"),
+                    ("subjectRef", "subjectRef"),
+                    ("subjectId", "subjectId"),
+                )
+            )
+            if not scope_matches:
+                raise ValueError("修改范围与生成计划时不一致")
+            incoming = request.snapshots.reportDefinition
+            if (
+                incoming is None
+                or self._draft_revision(incoming) != self._draft_revision(definition)
+                or session_service.is_pending_plan_stale(
+                    session_key, self._draft_revision(definition)
+                )
+            ):
+                raise ValueError("草稿已变化，需要重新核对修改目标")
+            plan = EditPlan.model_validate((pending.model_extra or {})["editPlan"])
+            if plan.target.regionId != pending.targetRegionId:
+                raise ValueError("修改目标与待确认计划不一致")
+        except (KeyError, TypeError, ValueError) as exc:
+            session_service.clear_pending_plan(session_key)
+            return self._edit_notice(
+                request, f"{exc}，本次没有修改草稿。请重新核对目标。",
+                code="STALE_EDIT_PLAN",
+            )
+
+        scope = ToolScope(
+            project_id=request.context.projectId,
+            subject_ref=request.context.subjectRef,
+            subject_id=request.context.subjectId,
+        )
+        if session_service.take_pending_plan(session_key, pending.planId) is None:
+            return self._edit_notice(
+                request, "这份修改计划已经被处理，草稿没有重复修改。",
+                code="EDIT_PLAN_ALREADY_HANDLED",
+            )
+        try:
+            result = template_edit_engine.apply(
+                plan=plan, definition=definition, scope=scope
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("待确认编辑计划执行失败 planId=%s", pending.planId)
+            return self._edit_notice(
+                request, "本轮修改执行遇到技术问题，草稿没有变化；请重新发起修改。",
+                code="EDIT_EXECUTION_FAILED",
+            )
+        session_service.reset_clarification(session_key)
+        if result.needsClarification:
+            return self._edit_notice(
+                request,
+                result.clarificationQuestion
+                or "修改校验未通过，草稿没有变化；请重新核对目标或数据能力。",
+                code="EDIT_VALIDATION_FAILED",
+            )
+        return self._remember_choice(self._build_template_edit_response(request, result))
+
+    def _try_answer_readonly_query(
+        self, request: AgentRequest, definition: ReportDefinitionDraft
+    ) -> AgentResponse | None:
+        """能用确定性证据回答的能力查询，直接回答。
+
+        只读查询的三条硬约束（20261022 template-editing react 架构改进方案）：
+
+        1. 不改草稿；
+        2. 不产生待确认计划；
+        3. 不占「同一项修改最多三轮」的澄清轮次。
+
+        这里只覆盖两类有登记证据的问题：可展示方式、已登记的编译粒度。
+        其余能力问题无法用确定性证据回答，交给受约束的 ReAct 查证。
+        """
+        message = request.message.strip()
+        if not message or not self._is_readonly_question(message):
+            return None
+
+        scope = ToolScope(
+            project_id=request.context.projectId,
+            subject_ref=request.context.subjectRef,
+            subject_id=request.context.subjectId,
+        )
+        plan = template_edit_engine.parse(
+            message=message,
+            definition=definition,
+            selected_region_id=self._readonly_target_region(request, definition),
+            scope=scope,
+        )
+        if plan.intent == EditIntent.SUGGEST_VISUALIZATION and not plan.needsClarification:
+            options = "、".join(
+                str(item["label"])
+                for item in plan.operation.displayOptions
+                if item.get("label")
+            )
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.USER_EDITING_TEMPLATE,
+                reply=f"当前可用的展示方式：{options or '未登记'}。草稿没有变化。",
+                designSessionId=request.context.designSessionId,
+                domainObjects=AgentResponseDomainObjects(
+                    reportPolicyDraft=request.snapshots.reportPolicy,
+                    reportDefinitionDraft=definition,
+                ),
+                debug={
+                    "editOutcome": "readonly_answer",
+                    "editPlanSource": "rule_readonly",
+                    "editingTargetRegionId": plan.target.regionId or None,
+                },
+            )
+        if plan.intent in {
+            EditIntent.SUGGEST_VISUALIZATION,
+            EditIntent.CHANGE_COMPILATION_GRAIN,
+        } and not plan.target.regionId:
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.USER_EDITING_TEMPLATE,
+                reply="请指出要查询的正文卡片或数据源，我才能核对其能力；草稿没有变化。",
+                designSessionId=request.context.designSessionId,
+                domainObjects=AgentResponseDomainObjects(
+                    reportPolicyDraft=request.snapshots.reportPolicy,
+                    reportDefinitionDraft=definition,
+                ),
+                debug={"editOutcome": "readonly_answer"},
+            )
+        if (
+            plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN
+            and plan.operation.supportedGrains
+        ):
+            # 「能按哪些粒度编译」是问能力，不是要求改粒度；
+            # 「这个能按分钟看吗」也是问能力：即使点名了粒度，
+            # 用户也只是在问行不行，不是让改。
+            return self._build_readonly_grain_answer(request, plan)
+        return None
+
+    @staticmethod
+    def _is_readonly_question(message: str) -> bool:
+        """这句是在问，还是在下指令。
+
+        疑问词只是必要条件：「改成按分钟粒度，可以吗」带着问号，
+        但用户是在下指令。有明确改动动词的，一律按指令处理。
+        """
+        if any(word in message for word in EDIT_COMMAND_WORDS):
+            return False
+        return any(word in message for word in READONLY_QUESTION_WORDS)
+
+    def _readonly_target_region(
+        self, request: AgentRequest, definition: ReportDefinitionDraft
+    ) -> str | None:
+        """只读查询要回答哪张卡：精确名称 / 选中卡片优先，序数其次。"""
+        selected_region_id = request.context.selectedRegionId
+        reference = resolve_visible_reference(
+            request.message,
+            definition.regions,
+            visible_region_ids=request.context.visibleRegionIds,
+            selected_region_id=selected_region_id,
+        )
+        if reference.status == "RESOLVED" and self._reference_is_reliable(
+            reference, request.context
+        ):
+            return reference.regionId
+        return selected_region_id
+
+    @staticmethod
+    def _build_readonly_grain_answer(
+        request: AgentRequest, plan: EditPlan
+    ) -> AgentResponse:
+        """回答「这个数据能按哪些粒度编译」：给登记事实，不改草稿。"""
+        labels = {"MINUTE": "分钟", "HOUR": "小时", "DAY": "天"}
+        grains = list(plan.operation.supportedGrains or [])
+        source_ref = plan.operation.sourceRef or "当前数据源"
+        requested = (plan.operation.grain or {}).get("unit")
+        verdict = (
+            f"当前数据源{'支持' if requested in grains else '不支持'}"
+            f"{labels.get(requested, requested)}粒度。"
+            if requested else ""
+        )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=(
+                f"{verdict}当前数据源「{source_ref}」登记支持的编译粒度："
+                f"{'、'.join(labels.get(grain, grain) for grain in grains) or '未登记'}。"
+                "这是能力登记里的事实，草稿没有变化；"
+                "要改成哪个粒度，直接告诉我即可。"
+            ),
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportPolicyDraft=request.snapshots.reportPolicy,
+                reportDefinitionDraft=request.snapshots.reportDefinition,
+            ),
+            debug={
+                "editOutcome": "readonly_answer",
+                "editPlanSource": "rule_readonly",
+                "editingIntent": plan.intent.value,
+                "editingTargetRegionId": plan.target.regionId or None,
+                "supportedGrains": grains,
+            },
+        )
+
+    async def _try_handle_template_edit(
+        self, request: AgentRequest
+    ) -> AgentResponse | None:
+        """明确规则走确定性快路径；不明确的编辑交给业务 Agent 查证。"""
+        if request.state not in {
+            AgentState.WAITING_USER_CONFIRM,
+            AgentState.USER_EDITING_TEMPLATE,
+        }:
+            return None
+
+        message = request.message.strip()
+        if not message:
+            return None
+
+        # USER_EDITING_TEMPLATE 下的三按钮：同意 / 重新开始 / 继续修改
+        if request.state == AgentState.USER_EDITING_TEMPLATE:
+            if message == CONFIRM_BUTTON_VALUE:
+                return self._save_placeholder(request, RouteDecision())
+            if message == RESTART_BUTTON_VALUE:
+                return AgentResponse(
+                    conversationId=request.conversationId,
+                    state=AgentState.ANALYZING,
+                    reply="好的，我们重新开始。请描述你想生成的新报表。",
+                    designSessionId=request.context.designSessionId,
+                    uiActions=["restart_from_template_editing"],
+                )
+            if message == MODIFY_BUTTON_VALUE:
+                # 用户选"继续修改"：回到追问
+                return self._editing_prompt_response(
+                    request,
+                    reply="好的，请告诉我接下来想怎么改：删除、改标题、改指标、改数据源、改展示方式、改时间范围或 compilation 粒度？",
+                )
+
+        definition = request.snapshots.reportDefinition
+        if definition is None:
+            return None
+
+        # 入口判断：WAITING_USER_CONFIRM 下只有命中编辑关键词才进入；USER_EDITING_TEMPLATE 下所有非按钮都进入
+        in_editing = request.state == AgentState.USER_EDITING_TEMPLATE
+        hinted = any(word in message.lower() for word in TEMPLATE_EDIT_HINT_WORDS) or message == MODIFY_BUTTON_VALUE
+        if not in_editing and not hinted:
+            return None
+
+        # 只读能力查询：能用确定性证据答的就直接答。
+        # 不改草稿、不产生待确认计划，也不占修改澄清轮次。
+        readonly = self._try_answer_readonly_query(request, definition)
+        if readonly is not None:
+            return readonly
+
+        prior = request.collectedInfo.get("pendingEditRequest")
+        continuing = bool(prior) and not any(
+            word in message for word in ("删除", "删掉", "改成", "改为", "换成", "新增", "取消")
+        )
+        effective_message = f"{prior} {message}" if continuing else message
+        reference = resolve_visible_reference(
+            effective_message,
+            definition.regions,
+            visible_region_ids=request.context.visibleRegionIds,
+            selected_region_id=request.context.selectedRegionId,
+        )
+        selected_region_id = request.context.selectedRegionId
+        if reference.status != "NOT_FOUND":
+            if reference.status != "RESOLVED":
+                # 指代词没选中对象、序数越界：先问清楚是哪一张。
+                return self._edit_clarification_response(
+                    request, reference.question or "请指出要改的正文卡片名称。",
+                    intent="UNKNOWN",
+                )
+            if not self._reference_is_reliable(reference, request.context):
+                return self._edit_clarification_response(
+                    request, "当前页面卡片顺序无法核对，请指出要改的卡片名称。",
+                    intent="UNKNOWN",
+                )
+            selected_region_id = reference.regionId
+
+        anchor = request.collectedInfo.get("pendingEditTimeAnchor")
+        logical_now = (
+            datetime.fromisoformat(anchor)
+            if isinstance(anchor, str)
+            else datetime.now(ZoneInfo("Asia/Shanghai"))
+        )
+        resolved_time = resolve_time_expression(
+            effective_message, logical_now=logical_now
+        )
+        if resolved_time.status == "NEEDS_CLARIFICATION":
+            request.collectedInfo["pendingEditTimeAnchor"] = logical_now.isoformat()
+            choices = [
+                QuestionOption(
+                    value=effective_message.replace(
+                        resolved_time.matchedText,
+                        f"{resolved_time.matchedText} {option.label.split()[-1]}",
+                        1,
+                    ),
+                    label=option.label,
+                )
+                for option in resolved_time.options
+            ]
+            return self._edit_clarification_response(
+                request, resolved_time.question, choices=choices,
+                intent=EditIntent.CHANGE_TIME_RANGE.value,
+                region_id=selected_region_id or "",
+            )
+
+        scope = ToolScope(
+            project_id=request.context.projectId,
+            subject_ref=request.context.subjectRef,
+            subject_id=request.context.subjectId,
+        )
+        plan = template_edit_engine.parse(
+            message=effective_message,
+            definition=definition,
+            selected_region_id=selected_region_id,
+            scope=scope,
+        )
+        if (
+            plan.intent == EditIntent.CHANGE_DATA_SOURCE
+            and re.search(r"按(?:分钟|小时|天)|(?:分钟|小时|天|日)级", effective_message)
+        ):
+            grain_unit = template_edit_engine._parse_grain(effective_message)
+            composite = (
+                template_edit_engine.plan_source_and_grain_change(
+                    definition=definition,
+                    region_id=plan.target.regionId,
+                    grain_unit=grain_unit,
+                    source_ref=plan.operation.sourceRef,
+                    scope=scope,
+                )
+                if grain_unit and plan.target.regionId and plan.operation.sourceRef
+                else None
+            )
+            if composite is None:
+                return self._edit_clarification_response(
+                    request,
+                    "指定的数据源无法同时满足该卡片的指标字段和目标粒度；"
+                    "本次没有修改草稿，请重新指定数据源或粒度。",
+                    intent=EditIntent.CHANGE_COMPILATION_GRAIN.value,
+                    region_id=plan.target.regionId,
+                )
+            composite.confidence = plan.confidence
+            plan = composite
+        if (
+            resolved_time.status == "RESOLVED"
+            and plan.intent == EditIntent.CHANGE_TIME_RANGE
+            and not plan.needsClarification
+        ):
+            plan.operation.timeWindow = resolved_time.timeWindow
+            plan.operation.timeWindowLabel = resolved_time.label
+        elif (
+            resolved_time.status == "RESOLVED"
+            and (resolved_time.timeWindow or {}).get("value", {}).get("type")
+            == "FIXED_INTERVAL"
+        ):
+            # 明确钟点区间比「天」这类粒度误判更可信：
+            # 用户给了起止时间，改的就是时间窗，走 FIXED_INTERVAL 协议。
+            plan.intent = EditIntent.CHANGE_TIME_RANGE
+            plan.needsClarification = not plan.target.regionId
+            plan.clarificationQuestion = (
+                "" if not plan.needsClarification
+                else "你想把哪个 section 的时间范围改成这个具体时间段？"
+            )
+            if not plan.needsClarification:
+                plan.operation.timeWindow = resolved_time.timeWindow
+                plan.operation.timeWindowLabel = resolved_time.label
+        if (
+            plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN
+            and plan.needsClarification
+            and plan.target.regionId
+            and (plan.operation.grain or {}).get("unit")
+        ):
+            composite = template_edit_engine.plan_source_and_grain_change(
+                definition=definition,
+                region_id=plan.target.regionId,
+                grain_unit=plan.operation.grain["unit"],
+                scope=scope,
+            )
+            if composite is not None:
+                composite.confidence = plan.confidence
+                plan = composite
+        if plan.intent == EditIntent.SUGGEST_VISUALIZATION:
+            return self._build_template_edit_response(
+                request, template_edit_engine.apply(
+                    plan=plan, definition=definition, scope=scope
+                )
+            )
+        if plan.intent == EditIntent.UNKNOWN or plan.needsClarification or plan.confidence < 0.7:
+            if isinstance(self._agent, FakeReportAgent):
+                if plan.needsClarification or plan.intent == EditIntent.UNKNOWN:
+                    result = template_edit_engine.apply(
+                        plan=plan, definition=definition, scope=scope
+                    )
+                    response = self._build_template_edit_response(request, result)
+                    response.debug["editPlanSource"] = "rule_no_model"
+                    return response
+                return self._edit_clarification_response(
+                    request, plan.clarificationQuestion or "请再明确目标和修改内容。",
+                    intent=plan.intent.value,
+                    region_id=plan.target.regionId,
+                )
+            request.state = AgentState.USER_EDITING_TEMPLATE
+            return None
+        operation_steps = (
+            [step.model_dump(mode="json") for step in plan.operations]
+            if plan.operations else [{
+                "intent": plan.intent.value,
+                "operation": plan.operation.model_dump(mode="json", exclude_none=True),
+                "summary": self._describe_rule_edit(plan, definition),
+            }]
+        )
+        summary = plan.summary or self._describe_rule_edit(plan, definition)
+        candidate = {
+            "planId": f"plan_{uuid.uuid4().hex}",
+            "draftRevision": self._draft_revision(definition),
+            "targetRegionId": plan.target.regionId,
+            "operations": operation_steps,
+            "summary": summary,
+            "editPlan": plan.model_dump(mode="json"),
+        }
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=f"待确认的修改：{summary}\n接受后才会校验并修改草稿。",
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportDefinitionDraft=definition,
+                reportPolicyDraft=request.snapshots.reportPolicy,
+            ),
+            questions=[self._pending_edit_question()],
+            uiActions=["pending_edit_plan"],
+            debug={
+                "editOutcome": "candidate",
+                "editPlanSource": "rule",
+                "editingTargetRegionId": plan.target.regionId or None,
+                "editingIntent": plan.intent.value,
+                "pendingEditPlan": candidate,
+            },
+        )
+
+    @staticmethod
+    def _describe_rule_edit(
+        plan: EditPlan, definition: ReportDefinitionDraft
+    ) -> str:
+        label = plan.target.matchedText or (definition.metadata or {}).get("name") or "当前报表"
+        operation = plan.operation
+        action = {
+            EditIntent.RENAME_REPORT: "修改报表名称",
+            EditIntent.DELETE_SECTION: "删除卡片",
+            EditIntent.RENAME_SECTION: "修改卡片标题",
+            EditIntent.ADD_SECTION: "新增卡片",
+            EditIntent.CHANGE_DATA_SOURCE: "更换数据源",
+            EditIntent.CHANGE_COMPILATION_GRAIN: "修改编译粒度",
+            EditIntent.CHANGE_TIME_RANGE: "修改时间窗",
+            EditIntent.CHANGE_METRIC: "更换指标",
+            EditIntent.CHANGE_VISUALIZATION: "更换展示形式",
+            EditIntent.CHANGE_TOP_N: "修改排名数量",
+            EditIntent.CHANGE_SORT: "修改排序",
+        }.get(plan.intent, "修改")
+        details = [
+            f"{name}：{value}"
+            for name, value in (
+                ("新标题", operation.newTitle),
+                ("数据源", operation.sourceRef),
+                ("指标", operation.metricRef),
+                ("粒度", (operation.grain or {}).get("unit")),
+                ("时间窗", operation.timeWindowLabel),
+                ("排名数量", operation.topN),
+                ("展示形式", operation.chartKind or operation.componentType),
+            )
+            if value is not None and value != ""
+        ]
+        suffix = "；".join(details)
+        return (
+            f"对「{label}」{action}" + (f"（{suffix}）" if suffix else "") + "。"
+            "当前预览仍为 Mock 数据，尚未真实编译。"
+        )
+
+    @staticmethod
+    def _edit_clarification_response(
+        request: AgentRequest, question: str, *,
+        choices: list[QuestionOption] | None = None,
+        intent: str = "UNKNOWN",
+        region_id: str = "",
+    ) -> AgentResponse:
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=question,
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportDefinitionDraft=request.snapshots.reportDefinition,
+                reportPolicyDraft=request.snapshots.reportPolicy,
+            ),
+            questions=[AgentQuestion(
+                id="edit_time_clarification" if choices else "edit_reference_clarification",
+                prompt=question,
+                expects="SINGLE_CHOICE" if choices else "TEXT",
+                options=choices or [],
+                selectionOnly=bool(choices),
+            )],
+            uiActions=["ask_template_edit_detail"],
+            debug={
+                "editOutcome": "clarification",
+                "editingIntent": intent,
+                "editingTargetRegionId": region_id or None,
+            },
+        )
+
+    def _build_template_edit_response(
+        self, request: AgentRequest, result: EditResult
+    ) -> AgentResponse:
+        """把 TemplateEditEngine 的 EditResult 包成 AgentResponse。"""
+        intent_value = result.plan.intent.value
+        debug: dict[str, Any] = {
+            "editingTargetRegionId": result.editingTargetRegionId,
+            "editingIntent": intent_value,
+            "editPlan": result.plan.model_dump(mode="json"),
+        }
+        if result.markdownPreview:
+            debug["markdownPreview"] = result.markdownPreview
+        debug.update(result.debug or {})
+
+        # 需要追问：保留当前草稿，不写 ChangeSet
+        if result.needsClarification:
+            questions = self._editing_prompt_questions()
+            if (
+                result.plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN
+                and result.plan.operation.supportedGrains
+            ):
+                grain_labels = {
+                    "MINUTE": "分钟",
+                    "HOUR": "小时",
+                    "DAY": "天",
+                }
+                questions = [
+                    AgentQuestion(
+                        id="compilation_grain",
+                        prompt="请选择当前数据源支持的粒度：",
+                        expects="SINGLE_CHOICE",
+                        options=[
+                            QuestionOption(
+                                value=f"按{grain_labels.get(grain, grain)}粒度",
+                                label=grain_labels.get(grain, grain),
+                            )
+                            for grain in result.plan.operation.supportedGrains
+                        ],
+                        selectionOnly=True,
+                    )
+                ]
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.USER_EDITING_TEMPLATE,
+                reply=result.clarificationQuestion
+                or result.reply
+                or "请再明确一下你想怎么修改。",
+                designSessionId=request.context.designSessionId,
+                domainObjects=AgentResponseDomainObjects(
+                    reportPolicyDraft=request.snapshots.reportPolicy,
+                    reportDefinitionDraft=result.draftBeforeEdit
+                    or request.snapshots.reportDefinition,
+                ),
+                questions=questions,
+                uiActions=["template_editing", "ask_template_edit_detail"],
+                debug=debug,
+            )
+
+        # SUGGEST_VISUALIZATION：只给候选，不改草稿
+        if result.plan.intent == EditIntent.SUGGEST_VISUALIZATION:
+            option_values = [
+                str(opt.get("label"))
+                for opt in result.plan.operation.displayOptions
+                if opt.get("label")
+            ]
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.USER_EDITING_TEMPLATE,
+                reply=result.reply or "以下是可选的展示方式：",
+                designSessionId=request.context.designSessionId,
+                domainObjects=AgentResponseDomainObjects(
+                    reportPolicyDraft=request.snapshots.reportPolicy,
+                    reportDefinitionDraft=result.draftBeforeEdit
+                    or request.snapshots.reportDefinition,
+                ),
+                questions=[
+                    AgentQuestion(
+                        id="suggest_visualization",
+                        prompt="请选择展示方式：",
+                        expects="SINGLE_CHOICE",
+                        options=[
+                            QuestionOption(value=val, label=val) for val in option_values
+                        ]
+                        or [QuestionOption(value="取消", label="取消")],
+                        selectionOnly=True,
+                    )
+                ],
+                uiActions=["template_editing", "suggest_visualization"],
+                debug=debug,
+            )
+
+        # 正常应用成功：返回新草稿 + ChangeSet + 三按钮
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=result.reply or "已更新草稿，请确认。",
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportPolicyDraft=request.snapshots.reportPolicy,
+                reportDefinitionDraft=result.draftAfterEdit,
+                changeSet=result.changeSet,
+            ),
+            questions=self._editing_confirm_questions(),
+            uiActions=["template_edit_applied", "confirm_template_edit"],
+            debug=debug,
+        )
+
+    def _editing_prompt_response(
+        self, request: AgentRequest, *, reply: str
+    ) -> AgentResponse:
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportPolicyDraft=request.snapshots.reportPolicy,
+                reportDefinitionDraft=request.snapshots.reportDefinition,
+            ),
+            questions=self._editing_prompt_questions(),
+            uiActions=["template_editing", "ask_template_edit_detail"],
+            debug={"editingIntent": "UNKNOWN"},
+        )
+
+    @staticmethod
+    def _editing_prompt_questions() -> list[AgentQuestion]:
+        return [
+            AgentQuestion(
+                id="template_edit_action",
+                prompt="请选择或直接输入修改要求：",
+                expects="SINGLE_CHOICE",
+                options=[
+                    QuestionOption(value="删除这个 section", label="删除这个 section"),
+                    QuestionOption(value="改标题", label="改标题"),
+                    QuestionOption(value="改指标", label="改指标"),
+                    QuestionOption(value="改数据源", label="改数据源"),
+                    QuestionOption(value="改展示方式", label="改展示方式"),
+                    QuestionOption(value="改时间范围", label="改时间范围"),
+                    QuestionOption(value="改 compilation 粒度", label="改 compilation 粒度"),
+                ],
+            )
+        ]
+
+    @staticmethod
+    def _editing_confirm_questions() -> list[AgentQuestion]:
+        return [
+            AgentQuestion(
+                id="template_edit_confirm",
+                prompt="请确认当前编辑后的草稿：",
+                expects="SINGLE_CHOICE",
+                options=[
+                    QuestionOption(value=CONFIRM_BUTTON_VALUE, label="同意"),
+                    QuestionOption(value=MODIFY_BUTTON_VALUE, label="修改"),
+                    QuestionOption(value=RESTART_BUTTON_VALUE, label="重新开始"),
+                ],
+                selectionOnly=True,
+            )
+        ]
 
     @staticmethod
     def _protocol_error(
@@ -318,7 +1577,7 @@ class AgentService:
                 state=request.state,
                 reply=route.reply or "我在。你可以继续告诉我是要确认、修改、重做还是提问。",
                 designSessionId=request.context.designSessionId,
-                questions=self._suggestion_questions(request.state),
+                questions=self._suggestion_questions(request),
                 uiActions=["suggest_prompt"],
             )
 
@@ -393,6 +1652,10 @@ class AgentService:
             state=AgentState.SAVE_DEFINITION_DRAFT,
             reply=reply,
             designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportPolicyDraft=policy,
+                reportDefinitionDraft=definition,
+            ),
             toolRequests=[
                 ToolRequest(
                     id="req_save_confirmed",
@@ -413,22 +1676,189 @@ class AgentService:
                     },
                 ),
             ],
-            uiActions=["save_definition_draft", "start_validating"],
+            uiActions=["save_definition_draft", "advance_to_validating"],
+        )
+
+    # ---------- 节点 6-11 自动推进 ----------
+
+    def _auto_advance(self, request: AgentRequest) -> AgentResponse | None:
+        """前端发来 __advance__ 时，根据当前 state 走对应 handler。"""
+        state = request.state
+        if state == AgentState.SAVE_DEFINITION_DRAFT:
+            return self._handle_save_to_validating(request)
+        if state == AgentState.VALIDATING:
+            return self._handle_validating(request)
+        if state == AgentState.PREVIEWING:
+            return self._handle_previewing(request)
+        if state == AgentState.PREVIEW_READY:
+            return self._handle_preview_ready(request)
+        if state == AgentState.RENDERING:
+            return self._handle_rendering(request)
+        return None
+
+    def _handle_save_to_validating(self, request: AgentRequest) -> AgentResponse:
+        """节点 6 → 7：SAVE_DEFINITION_DRAFT → VALIDATING（展示 loading）。"""
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.VALIDATING,
+            reply="正在校验报表定义（结构 / 字段 / 指标 / 权限 / 能力）…",
+            designSessionId=request.context.designSessionId,
+            uiActions=["start_validating", "advance_to_validating"],
+        )
+
+    def _handle_validating(self, request: AgentRequest) -> AgentResponse:
+        """节点 7：VALIDATING → PREVIEWING 或 VALIDATION_FAILED。"""
+        definition = request.snapshots.reportDefinition
+        definition_dict = (
+            definition.model_dump(mode="json") if definition is not None else None
+        )
+        # 若 snapshot 没带，从内存版 saved 取
+        if definition_dict is None and request.context.reportDefinitionId:
+            saved = definition_save_service.get(request.context.reportDefinitionId)
+            if saved is not None:
+                definition_dict = saved.definitionDraft
+
+        result = validate_definition(definition_dict)
+
+        if result.passed:
+            reply = "校验通过（结构 / 字段 / 指标 / 权限 / 能力），开始跑预览…"
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.PREVIEWING,
+                reply=reply,
+                designSessionId=request.context.designSessionId,
+                toolRequests=[
+                    ToolRequest(
+                        id="req_run_preview",
+                        type="RUN_PREVIEW",
+                        target="JavaPreviewEngine",
+                        arguments={
+                            "definitionId": request.context.reportDefinitionId,
+                            "revision": request.context.baseDefinitionRevision,
+                        },
+                    )
+                ],
+                uiActions=["validation_passed", "advance_to_previewing"],
+                debug={"validation": result.model_dump(mode="json")},
+            )
+
+        # 校验失败
+        reply = "校验未通过，有以下问题：\n" + summarize_issues_for_user(result)
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.VALIDATION_FAILED,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            uiActions=["validation_failed", "offer_fix"],
+            debug={"validation": result.model_dump(mode="json")},
+        )
+
+    def _handle_previewing(self, request: AgentRequest) -> AgentResponse:
+        """节点 9：PREVIEWING → PREVIEW_READY。"""
+        definition = request.snapshots.reportDefinition
+        definition_dict = (
+            definition.model_dump(mode="json") if definition is not None else None
+        )
+        definition_id = request.context.reportDefinitionId or "def_unknown"
+        if definition_dict is None and request.context.reportDefinitionId:
+            saved = definition_save_service.get(request.context.reportDefinitionId)
+            if saved is not None:
+                definition_dict = saved.definitionDraft
+
+        if definition_dict is None:
+            return self._protocol_error(
+                request,
+                code="PREVIEW_MISSING_DEFINITION",
+                message="没有可预览的报表定义，请先保存并校验草稿。",
+            )
+
+        preview, record = preview_service.run_preview(
+            definitionId=definition_id,
+            definitionDraft=definition_dict,
+        )
+
+        reply = (
+            f"预览已生成（{preview.reportRunId}）。"
+            f"{record.snapshot.roomName} {record.snapshot.logicalDate} 总耗电 "
+            f"{record.snapshot.totalEnergyKwh} kWh。"
+        )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.PREVIEW_READY,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(reportRunPreview=preview),
+            uiActions=["preview_ready", "advance_to_rendering"],
+        )
+
+    def _handle_preview_ready(self, request: AgentRequest) -> AgentResponse:
+        """节点 10：PREVIEW_READY → RENDERING。附带一句 AI 解读。"""
+        last_run = request.snapshots.lastReportRun
+        run_id = last_run.reportRunId if last_run is not None else None
+        analysis = ""
+        if run_id:
+            payload = preview_service.get_result_payload(run_id)
+            if payload is not None:
+                for region in payload["regions"]:
+                    if region["componentType"] == "ANALYSIS":
+                        analysis = region["payload"].get("analysis", "")
+                        break
+
+        reply = analysis or "预览结果已就绪，开始渲染报表界面…"
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.RENDERING,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            uiActions=["start_rendering", "advance_to_ready"],
+        )
+
+    def _handle_rendering(self, request: AgentRequest) -> AgentResponse:
+        """节点 11：RENDERING → READY。渲染在前端做，这里只记一下完成。"""
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.READY,
+            reply="报表已就绪。你可以继续调整、保存、发布或导出。",
+            designSessionId=request.context.designSessionId,
+            questions=self._ready_questions(),
+            uiActions=["render_done", "show_ready_actions"],
         )
 
     @staticmethod
-    def _suggestion_questions(state: AgentState) -> list[AgentQuestion]:
-        if state == AgentState.WAITING_USER_CONFIRM:
+    def _ready_questions() -> list[AgentQuestion]:
+        return [AgentQuestion(
+            id="ready_action",
+            prompt="请选择下一步操作：",
+            expects="SINGLE_CHOICE",
+            options=[
+                QuestionOption(value="继续修改", label="继续修改"),
+                QuestionOption(value="发布", label="发布"),
+                QuestionOption(value="导出 PDF", label="导出 PDF"),
+            ],
+            selectionOnly=True,
+        )]
+
+    @staticmethod
+    def _suggestion_questions(request: AgentRequest) -> list[AgentQuestion]:
+        state = request.state
+        has_draft = request.snapshots.reportDefinition is not None
+        if state == AgentState.WAITING_USER_CONFIRM and has_draft:
             options = [
                 QuestionOption(value=CONFIRM_BUTTON_VALUE, label="同意"),
                 QuestionOption(value=MODIFY_BUTTON_VALUE, label="修改"),
                 QuestionOption(value=RESTART_BUTTON_VALUE, label="重新开始"),
             ]
             prompt = "请对当前草稿做出选择："
+        elif has_draft:
+            options = [
+                QuestionOption(value="继续修改当前报表", label="继续修改当前报表"),
+                QuestionOption(value="重新生成一版报表", label="重新生成一版报表"),
+            ]
+            prompt = "你可以继续调整当前草稿："
         else:
             options = [
                 QuestionOption(value="生成 A 机房昨日能耗日报", label="生成能耗日报"),
-                QuestionOption(value="修改当前报表", label="修改当前报表"),
+                QuestionOption(value="生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析", label="生成完整能耗日报"),
             ]
             prompt = "你可以试试这些："
         return [

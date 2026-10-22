@@ -5,8 +5,463 @@
 """
 from __future__ import annotations
 
+import json
 
-# ---------- 样例 1：正常生成 ----------
+from app.agents.agentscope_report_agent import AgentScopeReportAgent
+from app.agents.fake_report_agent import FakeReportAgent
+from app.services.agent_service import agent_service
+from app.services.context_engine import (
+    ConciergeAction, ConciergeDecision, RouteDecision, RoutingAction, UserIntent,
+    context_engine,
+)
+from app.services.report_draft_service import build_definition_draft
+
+
+def test_bare_continue_does_not_start_a_report(client, base_context, monkeypatch):
+    def unexpected_agent(request):
+        raise AssertionError("无待恢复任务时不应进入业务 Agent")
+
+    monkeypatch.setattr(agent_service._agent, "handle", unexpected_agent)
+    response = client.post("/api/agent/chat", json={
+        "conversationId": "conv_resume_missing",
+        "state": "ANALYZING",
+        "message": "继续工作",
+        "context": base_context,
+    }).json()
+    assert response["state"] == "ANALYZING"
+    assert response["uiActions"] == ["resume_unavailable"]
+    assert response["domainObjects"]["reportDefinitionDraft"] is None
+
+
+def test_resume_replays_original_message_not_continue(client, base_context):
+    response = client.post("/api/agent/chat", json={
+        "conversationId": "conv_resumed",
+        "resumeOfConversationId": "conv_cancelled",
+        "state": "ANALYZING",
+        "message": "我想吃龙虾",
+        "context": base_context,
+    }).json()
+    assert response["state"] != "WAITING_USER_CONFIRM"
+    assert response["domainObjects"]["reportDefinitionDraft"] is None
+
+
+def test_template_preview_zero_info_direct_draft(client, base_context):
+    body = {"conversationId": "conv_template_zero", "context": base_context}
+    start = client.post("/api/agent/chat", json={
+        **body, "state": "ANALYZING", "message": "给我一个模版看看",
+    }).json()
+    assert start["state"] == "NEEDS_CLARIFICATION"
+    question = start["questions"][0]
+    assert question["id"] == "template_preview_mode"
+    assert question["selectionOnly"] is True
+    assert question["allowRestart"] is True
+    assert {option["value"] for option in question["options"]} == {"补齐信息", "直接生成模版"}
+
+    for message, state in (("随便生成", "NEEDS_CLARIFICATION"), ("__advance__", "ANALYZING")):
+        rejected = client.post("/api/agent/chat", json={
+            **body, "state": state, "message": message,
+        }).json()
+        assert rejected["uiActions"] == ["selection_required"]
+        assert rejected["questions"][0]["id"] == question["id"]
+
+    generated = client.post("/api/agent/chat", json={
+        **body, "state": "NEEDS_CLARIFICATION", "message": "直接生成模版",
+    }).json()
+    assert generated["state"] == "WAITING_USER_CONFIRM"
+    assert "Mock" in generated["reply"]
+    assert "SAVE_DEFINITION_DRAFT" in {tool["type"] for tool in generated["toolRequests"]}
+    draft = generated["domainObjects"]["reportDefinitionDraft"]
+    assert draft["defaults"]["scope"]["selectors"]["machineRoomId"] == ["room_a"]
+    assert {item["source"] for item in draft["metadata"]["generationInputs"].values()} == {"系统暂选"}
+    assert generated["domainObjects"]["reportPolicyDraft"] is not None
+
+
+def test_generated_draft_requires_confirmation_dropdown(client, base_context):
+    body = {"conversationId": "conv_confirm_dropdown", "context": base_context}
+    client.post("/api/agent/chat", json={
+        **body, "state": "ANALYZING", "message": "给我一个模版看看",
+    })
+    generated = client.post("/api/agent/chat", json={
+        **body, "state": "NEEDS_CLARIFICATION", "message": "直接生成模版",
+    }).json()
+    question = generated["questions"][0]
+    assert question["id"] == "template_edit_confirm"
+    assert question["selectionOnly"] is True
+    assert {option["value"] for option in question["options"]} == {"同意", "修改", "重新开始"}
+    snapshots = {
+        "reportDefinition": generated["domainObjects"]["reportDefinitionDraft"],
+        "reportPolicy": generated["domainObjects"]["reportPolicyDraft"],
+    }
+    for message in ("把趋势图改成最近 7 天", "__advance__"):
+        rejected = client.post("/api/agent/chat", json={
+            **body, "state": "WAITING_USER_CONFIRM",
+            "message": message, "snapshots": snapshots,
+        }).json()
+        assert rejected["state"] == "WAITING_USER_CONFIRM"
+        assert rejected["uiActions"] == ["selection_required"]
+        assert rejected["questions"][0]["id"] == question["id"]
+
+    editing = client.post("/api/agent/chat", json={
+        **body, "state": "WAITING_USER_CONFIRM",
+        "message": "修改", "snapshots": snapshots,
+    }).json()
+    assert editing["state"] == "USER_EDITING_TEMPLATE"
+    assert editing["questions"][0]["selectionOnly"] is False
+    edited = client.post("/api/agent/chat", json={
+        **body, "state": "USER_EDITING_TEMPLATE",
+        "message": "把趋势图改成最近 7 天", "snapshots": snapshots,
+    }).json()
+    assert edited["uiActions"] != ["selection_required"]
+
+
+def test_agentscope_generation_uses_locked_confirmation_contract(
+    client, base_context, monkeypatch
+):
+    """真实 AgentScope 组装响应，但用确定性计划代替外部模型调用。"""
+    agent = AgentScopeReportAgent.__new__(AgentScopeReportAgent)
+    agent._model = object()
+    agent._fallback = FakeReportAgent()
+
+    async def fake_plan(request):
+        return {
+            "mode": "GENERATE",
+            "reportName": "A 机房能耗日报",
+            "roomId": "room_a",
+            "includeTrend": True,
+            "reply": "已生成草稿，请确认。",
+        }
+
+    async def continue_current(request, emit=None):
+        return RouteDecision(
+            userIntent=UserIntent.NEW_TASK,
+            routingAction=RoutingAction.CONTINUE_CURRENT,
+        )
+
+    monkeypatch.setattr(agent, "_run_agent", fake_plan)
+    monkeypatch.setattr(agent_service, "_agent", agent)
+    monkeypatch.setattr(context_engine, "route", continue_current)
+
+    for choice, expected_state in (
+        ("同意", "SAVE_DEFINITION_DRAFT"),
+        ("修改", "USER_EDITING_TEMPLATE"),
+        ("重新开始", "ANALYZING"),
+    ):
+        body = {
+            "conversationId": f"conv_agentscope_confirm_{choice}",
+            "context": base_context,
+        }
+        generated = client.post("/api/agent/chat", json={
+            **body, "state": "ANALYZING", "message": "生成昨日能耗日报",
+        }).json()
+        assert generated["state"] == "WAITING_USER_CONFIRM"
+        assert generated["reply"] == "已生成草稿，请确认。"
+        assert len(generated["questions"]) == 1
+        question = generated["questions"][0]
+        assert question["id"] == "template_edit_confirm"
+        assert question["selectionOnly"] is True
+        assert {option["value"] for option in question["options"]} == {
+            "同意", "修改", "重新开始",
+        }
+        snapshots = {
+            "reportDefinition": generated["domainObjects"]["reportDefinitionDraft"],
+            "reportPolicy": generated["domainObjects"]["reportPolicyDraft"],
+        }
+        rejected = client.post("/api/agent/chat", json={
+            **body, "state": "WAITING_USER_CONFIRM",
+            "message": "直接修改标题", "snapshots": snapshots,
+        }).json()
+        assert rejected["uiActions"] == ["selection_required"]
+        assert rejected["questions"][0]["id"] == "template_edit_confirm"
+
+        selected = client.post("/api/agent/chat", json={
+            **body, "state": "WAITING_USER_CONFIRM",
+            "message": choice, "snapshots": snapshots,
+        }).json()
+        assert selected["state"] == expected_state
+
+
+def test_confirm_dropdown_save_and_restart(client, base_context):
+    for choice, expected_state in (("同意", "SAVE_DEFINITION_DRAFT"), ("重新开始", "ANALYZING")):
+        body = {"conversationId": f"conv_confirm_{choice}", "context": base_context}
+        generated = client.post("/api/agent/chat", json={
+            **body, "state": "ANALYZING",
+            "message": "给我 A 机房昨日能耗模版",
+        }).json()
+        assert generated["state"] == "WAITING_USER_CONFIRM"
+        assert generated["questions"][0]["selectionOnly"] is True
+        chosen = client.post("/api/agent/chat", json={
+            **body, "state": "WAITING_USER_CONFIRM", "message": choice,
+            "snapshots": {
+                "reportDefinition": generated["domainObjects"]["reportDefinitionDraft"],
+                "reportPolicy": generated["domainObjects"]["reportPolicyDraft"],
+            },
+        }).json()
+        assert chosen["state"] == expected_state
+
+
+def test_ready_requires_dropdown_before_editing(client, base_context):
+    body = {"conversationId": "conv_ready_dropdown", "context": base_context}
+    ready = client.post("/api/agent/chat", json={
+        **body, "state": "RENDERING", "message": "__advance__",
+    }).json()
+    assert ready["state"] == "READY"
+    question = ready["questions"][0]
+    assert question["id"] == "ready_action"
+    assert question["selectionOnly"] is True
+    assert {option["value"] for option in question["options"]} == {
+        "继续修改", "发布", "导出 PDF",
+    }
+
+    for state, message in (("READY", "帮我改一下"), ("ANALYZING", "生成新报表"),
+                           ("READY", "__advance__")):
+        rejected = client.post("/api/agent/chat", json={
+            **body, "state": state, "message": message,
+        }).json()
+        assert rejected["state"] == "READY"
+        assert rejected["uiActions"] == ["selection_required"]
+        assert rejected["questions"][0]["id"] == "ready_action"
+
+    for action in ("发布", "导出 PDF"):
+        unavailable = client.post("/api/agent/chat", json={
+            **body, "state": "READY", "message": action,
+        }).json()
+        assert unavailable["state"] == "READY"
+        assert "Mock" in unavailable["reply"]
+        assert unavailable["questions"][0]["selectionOnly"] is True
+        rejected = client.post("/api/agent/chat", json={
+            **body, "state": "READY", "message": "直接改标题",
+        }).json()
+        assert rejected["uiActions"] == ["selection_required"]
+
+    missing_draft = client.post("/api/agent/chat", json={
+        **body, "state": "READY", "message": "继续修改",
+    }).json()
+    assert missing_draft["state"] == "READY"
+    assert missing_draft["questions"][0]["selectionOnly"] is True
+
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+    editing = client.post("/api/agent/chat", json={
+        **body, "state": "READY", "message": "继续修改",
+        "snapshots": {"reportDefinition": definition.model_dump(mode="json")},
+    }).json()
+    assert editing["state"] == "USER_EDITING_TEMPLATE"
+    assert editing["domainObjects"]["reportDefinitionDraft"] is not None
+    assert editing["questions"][0]["selectionOnly"] is False
+    changed = client.post("/api/agent/chat", json={
+        **body, "state": "USER_EDITING_TEMPLATE", "message": "报表名称改成新日报",
+        "snapshots": {"reportDefinition": definition.model_dump(mode="json")},
+    }).json()
+    # 先给候选计划，草稿此刻不动。
+    assert changed["uiActions"] == ["pending_edit_plan"]
+    assert changed["domainObjects"]["pendingEditPlan"] is not None
+    assert changed["domainObjects"]["reportDefinitionDraft"]["metadata"]["name"] == "A 机房能耗日报"
+
+    accepted = client.post("/api/agent/chat", json={
+        **body, "state": "USER_EDITING_TEMPLATE", "message": "接受修改",
+        "snapshots": {"reportDefinition": definition.model_dump(mode="json")},
+    }).json()
+    assert accepted["domainObjects"]["reportDefinitionDraft"]["metadata"]["name"] == "新日报"
+
+
+def test_ready_without_pending_choice_restores_dropdown(client, base_context):
+    response = client.post("/api/agent/chat", json={
+        "conversationId": "conv_ready_restored",
+        "context": base_context,
+        "state": "READY",
+        "message": "生成另一个报表",
+    }).json()
+    assert response["state"] == "READY"
+    assert response["questions"][0]["id"] == "ready_action"
+    assert response["questions"][0]["selectionOnly"] is True
+
+
+def test_template_preview_partial_info_dropdown_completion(client, base_context):
+    body = {"conversationId": "conv_template_partial", "context": base_context}
+    start = client.post("/api/agent/chat", json={
+        **body, "state": "ANALYZING", "message": "给我 A 机房的模版看看",
+    }).json()
+    assert start["questions"][0]["id"] == "template_preview_mode"
+    time = client.post("/api/agent/chat", json={
+        **body, "state": "NEEDS_CLARIFICATION", "message": "补齐信息",
+    }).json()
+    assert time["questions"][0]["id"] == "template_preview_time"
+    assert time["questions"][0]["selectionOnly"] is True
+    assert [option["value"] for option in time["questions"][0]["options"]] == ["昨日"]
+
+    rejected = client.post("/api/agent/chat", json={
+        **body, "state": "NEEDS_CLARIFICATION", "message": "今天",
+    }).json()
+    assert rejected["uiActions"] == ["selection_required"]
+    assert rejected["questions"][0]["id"] == "template_preview_time"
+    metric = client.post("/api/agent/chat", json={
+        **body, "state": "NEEDS_CLARIFICATION", "message": "昨日",
+    }).json()
+    assert metric["questions"][0]["id"] == "template_preview_metric"
+    assert metric["questions"][0]["selectionOnly"] is True
+    generated = client.post("/api/agent/chat", json={
+        **body, "state": "NEEDS_CLARIFICATION",
+        "message": metric["questions"][0]["options"][0]["value"],
+    }).json()
+    assert generated["state"] == "WAITING_USER_CONFIRM"
+    sources = generated["domainObjects"]["reportDefinitionDraft"]["metadata"]["generationInputs"]
+    assert {field: item["source"] for field, item in sources.items()} == {
+        "room": "用户指定", "time": "用户指定", "metric": "用户指定",
+    }
+
+
+def test_template_preview_zero_info_completion_starts_with_room(client, base_context):
+    body = {"conversationId": "conv_template_room", "context": base_context}
+    client.post("/api/agent/chat", json={
+        **body, "state": "ANALYZING", "message": "给我一个模版",
+    })
+    room = client.post("/api/agent/chat", json={
+        **body, "state": "NEEDS_CLARIFICATION", "message": "补齐信息",
+    }).json()
+    assert room["questions"][0]["id"] == "template_preview_room"
+    assert room["questions"][0]["selectionOnly"] is True
+    assert [option["value"] for option in room["questions"][0]["options"]] == ["A 机房"]
+    time = client.post("/api/agent/chat", json={
+        **body, "state": "NEEDS_CLARIFICATION", "message": "A 机房",
+    }).json()
+    assert time["questions"][0]["id"] == "template_preview_time"
+
+
+def test_template_preview_restart_clears_pending_choice(client, base_context):
+    body = {"conversationId": "conv_template_restart", "context": base_context}
+    client.post("/api/agent/chat", json={
+        **body, "state": "ANALYZING", "message": "给我一个模版",
+    })
+    restarted = client.post("/api/agent/chat", json={
+        **body, "state": "NEEDS_CLARIFICATION", "message": "重新开始",
+    }).json()
+    assert restarted["state"] == "ANALYZING"
+    assert not restarted["questions"]
+    next_request = client.post("/api/agent/chat", json={
+        **body, "state": "ANALYZING", "message": "给我 A 机房昨日能耗模版",
+    }).json()
+    assert next_request["state"] == "WAITING_USER_CONFIRM"
+    assert {item["source"] for item in
+            next_request["domainObjects"]["reportDefinitionDraft"]["metadata"]["generationInputs"].values()} == {"用户指定"}
+
+
+def test_template_preview_does_not_substitute_unsupported_scope(client, base_context):
+    for index, message in enumerate((
+        "给我 B 机房的模版", "给我机房 C 的模版", "给我今天的能耗模版",
+        "给我明天的模版", "给我 PUE 模版", "给我所有项目的模版",
+    )):
+        result = client.post("/api/agent/chat", json={
+            "conversationId": f"conv_template_unsupported_{index}",
+            "context": base_context, "state": "ANALYZING", "message": message,
+        }).json()
+        assert result["state"] == "BLOCKED_OR_UNSUPPORTED"
+        assert result["domainObjects"]["reportDefinitionDraft"] is None
+        assert result["blocks"]
+
+    unauthorized = client.post("/api/agent/chat", json={
+        "conversationId": "conv_template_unauthorized", "state": "ANALYZING",
+        "message": "给我一个模版",
+        "context": {**base_context, "projectId": "project_002"},
+    }).json()
+    assert unauthorized["state"] == "BLOCKED_OR_UNSUPPORTED"
+    assert unauthorized["domainObjects"]["reportDefinitionDraft"] is None
+
+
+def test_stream_debug_exposes_route_and_agent_parameters(client, base_context, monkeypatch):
+    """流式调试展示路由输入/输出和业务结果，但不泄漏模型凭据。"""
+    raw = json.dumps({
+        "userIntent": "NEW_TASK",
+        "routingAction": "CONTINUE_CURRENT",
+        "confidence": 0.92,
+        "isReadyForNextStep": True,
+        "reason": "信息足够",
+    })
+
+    async def fake_concierge(request, emit=None):
+        assert request.state.value == "ANALYZING"
+        assert emit is not None
+        return ConciergeDecision(action=ConciergeAction.DEEP_ROUTE, userIntent=UserIntent.NEW_TASK)
+
+    async def fake_stream(*, emit, chunk_stage, **kwargs):
+        assert kwargs["response_format"] == {"type": "json_object"}
+        await emit("model_chunk", {"stage": chunk_stage, "delta": raw})
+        return raw
+
+    monkeypatch.setattr(context_engine, "_client", object())
+    monkeypatch.setattr(context_engine, "_run_concierge", fake_concierge)
+    monkeypatch.setattr(context_engine, "_chat_json_stream", fake_stream)
+    result = client.post("/api/agent/chat/stream", json={
+        "conversationId": "conv_debug",
+        "state": "ANALYZING",
+        "message": "生成 A 机房昨日能耗日报",
+        "context": base_context,
+    })
+    assert result.status_code == 200
+    events = []
+    for block in result.text.split("\n\n"):
+        if block.startswith("event: "):
+            event, data = block.split("\n", 1)
+            events.append((event.removeprefix("event: "), json.loads(data.removeprefix("data: "))))
+    stages = {data["stage"]: data for event, data in events if event == "stage" and "stage" in data}
+
+    start = stages["deep_route_start"]["debugParams"]
+    assert start["路由输入"]["state"] == "ANALYZING"
+    assert start["模型调用"]["responseFormat"] == "json_object"
+    assert "api_key" not in json.dumps(start).lower()
+    assert any(
+        event == "model_chunk" and data["stage"] == "deep_route_chunk"
+        for event, data in events
+    )
+    output = stages["deep_route_done"]["debugParams"]
+    assert output["模型输出"]["rawOutput"] == raw
+    assert output["解析结果"]["confidence"] == 0.92
+    assert stages["deep_route_done"]["stepElapsedMs"] >= 0
+    applied = stages["apply_context_route"]["debugParams"]
+    assert applied["路由判定"]["action"] == "CONTINUE_CURRENT"
+    assert applied["执行结果"]["outcome"] == "CONTINUE_TO_BUSINESS_AGENT"
+    agent_start = stages["business_agent_start"]["debugParams"]
+    assert agent_start["输入上下文"]["subjectId"] == "room_a"
+    agent_done = stages["business_agent_done"]["debugParams"]
+    assert agent_done["响应"]["responseState"] == "WAITING_USER_CONFIRM"
+    assert "region_hourly_trend" in agent_done["草稿与变更"]["regionIds"]
+    assert agent_done["交互"]["toolRequests"][0]["type"] == "SAVE_DEFINITION_DRAFT"
+    assert stages["business_agent_done"]["stepElapsedMs"] >= 0
+
+
+def test_readonly_visualization_query_does_not_lock_input_but_edit_plan_does(client, base_context):
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+    body = {
+        "conversationId": "conv_required_dropdown",
+        "state": "USER_EDITING_TEMPLATE",
+        "context": {**base_context, "selectedRegionId": "region_device_ranking"},
+        "snapshots": {"reportDefinition": definition.model_dump(mode="json")},
+    }
+    result = client.post("/api/agent/chat", json={
+        **body, "message": "设备耗电排名可以怎么展示？"
+    }).json()
+    assert result["questions"] == []
+    assert "柱状图" in result["reply"] and "表格" in result["reply"]
+    assert result["domainObjects"]["pendingEditPlan"] is None
+    assert result["domainObjects"]["changeSet"] is None
+
+    chosen = client.post("/api/agent/chat", json={
+        **body, "message": "把设备耗电排名改成柱状图"
+    }).json()
+    assert chosen["state"] == "USER_EDITING_TEMPLATE"
+    assert chosen["uiActions"] != ["selection_required"]
+    # 选了展示形式后先给候选计划，等用户点「接受修改」才改草稿。
+    assert chosen["uiActions"] == ["pending_edit_plan"]
+    assert chosen["domainObjects"]["pendingEditPlan"] is not None
+    assert chosen["domainObjects"]["changeSet"] is None
+    assert chosen["domainObjects"]["reportDefinitionDraft"]["metadata"]["revision"] == 0
+
+    rejected = client.post("/api/agent/chat", json={
+        **body, "message": "重新开始"
+    }).json()
+    assert rejected["uiActions"] == ["selection_required"]
+    assert rejected["questions"][0]["selectionOnly"] is True
+
+
+
 
 def test_sample_1_generate_full_draft(post_chat):
     r = post_chat(
@@ -57,7 +512,7 @@ def test_sample_1_generate_full_draft(post_chat):
     assert set(data["uiActions"]) >= {
         "preview_framework",
         "confirm_framework",
-        "regenerate_framework",
+        "request_modification",
     }
 
 

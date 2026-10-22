@@ -9,6 +9,10 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
+后端请求与阶段日志默认写入 `~/Library/Logs/haewu-ai-report/backend.log`，
+单文件最多 10 MB，保留 5 份轮转文件。可用 `AI_BACKEND_LOG_PATH`
+指定其他路径；`conversationId` 和 `resumeOf` 可用于关联停止前后的两次请求。
+
 ## 接口
 
 | 接口 | 作用 |

@@ -97,9 +97,6 @@
 <div class="text-sm font-semibold text-slate-900">AI 报表助理</div>
 <div class="text-[11px] text-slate-500">助理模式 · 非执行引擎</div>
 </div>
-<button class="ml-auto text-xs text-slate-500 hover:text-blue-700 flex items-center gap-1 px-2 py-1 rounded-md hover:bg-slate-50" onclick="clearChat()">
-<iconify-icon class="text-sm" icon="mdi:history"></iconify-icon>清空
-      </button>
 </div>
 <!-- 对话记录 -->
 <div class="flex-1 min-h-0 overflow-y-auto no-bar bg-slate-50 px-4 py-4 space-y-4" id="chat-scroll">
@@ -915,12 +912,6 @@
     boundaryOpen = !boundaryOpen;
     document.getElementById('boundary-panel').classList.toggle('hidden', !boundaryOpen);
     scrollToBottom();
-  }
-
-  function clearChat() {
-    chatScroll.innerHTML = '';
-    appendTemplate('tpl-generic');
-    toast('已清空当前对话记录');
   }
 
   var toastTimer = null;
