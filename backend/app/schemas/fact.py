@@ -37,6 +37,46 @@ class FactStatus(str, Enum):
 FACT_STATUSES = tuple(status.value for status in FactStatus)
 
 
+#: 领域模块自有词表 -> 共用事实状态的映射。
+#:
+#: 各领域模块可以在自己的契约里保留更细的词表（进度用「已记录阶段」，
+#: 能力用「目录登记 / 链路支持」），但**对共用层暴露的状态**必须落回这四态，
+#: 否则「读不到」和「确实没有」会被混为一谈。
+#:
+#: 进度模块 ``availability``：
+#:     SUCCESS / NO_OBJECT / UNAVAILABLE / PERMISSION_DENIED
+#: 能力模块 ``outcome``：
+#:     OK / REGISTERED_NOT_SUPPORTED / NOT_REGISTERED / NOT_AUTHORIZED
+#:     / MISSING_CONTEXT
+DOMAIN_STATUS_TO_FACT_STATUS: dict[str, FactStatus] = {
+    # 进度
+    "SUCCESS": FactStatus.FOUND,
+    "NO_OBJECT": FactStatus.ABSENT,
+    "UNAVAILABLE": FactStatus.UNAVAILABLE,
+    "PERMISSION_DENIED": FactStatus.FORBIDDEN,
+    # 能力
+    "OK": FactStatus.FOUND,
+    # 目录登记了但当前链路不支持：事实本身**查到了**，限制在别处披露。
+    "REGISTERED_NOT_SUPPORTED": FactStatus.FOUND,
+    "NOT_REGISTERED": FactStatus.ABSENT,
+    "NOT_AUTHORIZED": FactStatus.FORBIDDEN,
+    # 上下文不足：事实读到了一部分，缺的那部分走澄清。
+    "MISSING_CONTEXT": FactStatus.FOUND,
+}
+
+
+def to_fact_status(domain_status: str | None) -> FactStatus:
+    """把领域模块的状态折成共用事实状态。
+
+    未登记的取值按「不可得」处理：宁可说读不到，也不要当成「没有」。
+    """
+    if not domain_status:
+        return FactStatus.UNAVAILABLE
+    return DOMAIN_STATUS_TO_FACT_STATUS.get(
+        str(domain_status).strip().upper(), FactStatus.UNAVAILABLE
+    )
+
+
 class DraftFacts(BaseModel):
     """当前对话报表草稿的可核实事实。
 
@@ -112,8 +152,10 @@ class SessionFacts(BaseModel):
 
 
 __all__ = [
+    "DOMAIN_STATUS_TO_FACT_STATUS",
     "FACT_STATUSES",
     "DraftFacts",
     "FactStatus",
     "SessionFacts",
+    "to_fact_status",
 ]

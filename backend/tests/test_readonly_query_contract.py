@@ -881,3 +881,35 @@ def test_ambiguous_input_during_pending_gets_clarification_not_operation(post_ch
     assert plan is not None and plan.planId == "plan_q1"
     record = session_service.repository.get_session("conv_test")
     assert record.snapshot["definition"]["metadata"]["revision"] == 0
+
+
+# ---------- 领域模块状态词表与共用事实状态的映射 ----------
+
+
+@pytest.mark.parametrize(
+    ("domain_status", "expected"),
+    [
+        ("SUCCESS", FactStatus.FOUND),
+        ("NO_OBJECT", FactStatus.ABSENT),
+        ("UNAVAILABLE", FactStatus.UNAVAILABLE),
+        ("PERMISSION_DENIED", FactStatus.FORBIDDEN),
+        ("OK", FactStatus.FOUND),
+        ("REGISTERED_NOT_SUPPORTED", FactStatus.FOUND),
+        ("NOT_REGISTERED", FactStatus.ABSENT),
+        ("NOT_AUTHORIZED", FactStatus.FORBIDDEN),
+        ("MISSING_CONTEXT", FactStatus.FOUND),
+    ],
+)
+def test_domain_status_maps_to_shared_fact_status(domain_status, expected):
+    """C / D 的自有词表要能折成共用事实状态。"""
+    from app.schemas.fact import to_fact_status
+
+    assert to_fact_status(domain_status) is expected
+
+
+def test_unknown_domain_status_is_treated_as_unavailable_not_absent():
+    """没登记的取值宁可说「读不到」，也不要当成「没有」。"""
+    from app.schemas.fact import to_fact_status
+
+    assert to_fact_status("SOMETHING_NEW") is FactStatus.UNAVAILABLE
+    assert to_fact_status(None) is FactStatus.UNAVAILABLE
