@@ -155,6 +155,49 @@ def _build_requirements(candidate: PlanCandidate):
     return candidate.requirements.model_copy(deep=True)
 
 
+def _normalize_title(text: str | None) -> str:
+    """标题归一：去掉所有空白，便于比较。"""
+    return re.sub(r"\s+", "", text or "")
+
+
+def _drop_unaccepted_suggestion_sections(
+    candidate_sections: list[PlanSectionCandidate],
+    suggestions: list[str],
+) -> list[PlanSectionCandidate]:
+    """剔除「同时出现在未接受建议里」的板块。
+
+    冻结契约写明「额外建议未被接受前不得直接进入板块」，工单 01 的验收
+    也写明「未接受建议不直接纳入」。提示词已经要求模型把用户没要的板块
+    放进 ``suggestions``，但那只在模型守规矩时成立 —— 这里由服务端兜一道。
+
+    判定用**完全相同**的标题，不做模糊匹配：模糊匹配会把用户明确要求
+    的板块也误删，而少一个用户要的板块比多一个板块更糟。
+
+    板块全被剔除时**不**产出空方案：那是候选本身有问题，抛校验错误让
+    这一轮按失败收尾，不伪造一份「没有板块」的方案。
+    """
+    if not suggestions:
+        return candidate_sections
+    suggestion_titles = {
+        _normalize_title(item) for item in suggestions if _normalize_title(item)
+    }
+    if not suggestion_titles:
+        return candidate_sections
+    kept = [
+        section
+        for section in candidate_sections
+        if _normalize_title(section.title) not in suggestion_titles
+    ]
+    if len(kept) == len(candidate_sections):
+        return candidate_sections
+    if not kept:
+        raise PlanValidationError(
+            "候选里的板块全部只是未接受的建议，没有真正的板块",
+            code="PLAN_ONLY_SUGGESTIONS",
+        )
+    return kept
+
+
 def apply_candidate(
     candidate: PlanCandidate | Mapping[str, Any],
     previous: ReportPlan | Mapping[str, Any] | None = None,
@@ -191,7 +234,12 @@ def apply_candidate(
                 "新建方案必须由调用方提供 plan_id",
                 code="PLAN_ID_REQUIRED",
             )
-        sections = _build_sections(candidate_plan.sections, [])
+        sections = _build_sections(
+            _drop_unaccepted_suggestion_sections(
+                list(candidate_plan.sections), list(candidate_plan.suggestions)
+            ),
+            [],
+        )
         return ReportPlan(
             id=str(plan_id).strip(),
             revision=1,
@@ -224,7 +272,12 @@ def apply_candidate(
             code="PLAN_ID_MISMATCH",
         )
 
-    sections = _build_sections(candidate_plan.sections, previous_plan.sections)
+    sections = _build_sections(
+        _drop_unaccepted_suggestion_sections(
+            list(candidate_plan.sections), list(candidate_plan.suggestions)
+        ),
+        previous_plan.sections,
+    )
     return ReportPlan(
         id=previous_plan.id,
         revision=previous_plan.revision + 1,

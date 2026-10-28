@@ -285,6 +285,74 @@ def test_unaccepted_suggestions_stay_out_of_sections(client, monkeypatch):
     assert [section["title"] for section in plan["sections"]] == ["PUE 总览"]
 
 
+def test_service_drops_a_section_that_is_also_an_unaccepted_suggestion(
+    client, monkeypatch
+):
+    """模型不守规矩时，服务端也要拦住「未接受建议直接进板块」。
+
+    冻结契约：「额外建议未被接受前不得直接进入板块」。
+    提示词已经要求模型把用户没要的板块放进 suggestions，但那只在模型
+    守规矩时成立 —— 这里由服务端兜一道。
+    """
+    install_model(
+        monkeypatch,
+        RecordingModel(
+            _candidate(
+                suggestions=["告警板块"],
+                sections=[
+                    {
+                        "id": "section_pue",
+                        "title": "PUE 总览",
+                        "metricIntents": ["PUE"],
+                        "componentType": "metric_card",
+                    },
+                    {
+                        "id": "section_alarm",
+                        "title": "告警板块",
+                        "metricIntents": ["PUE"],
+                        "componentType": "metric_card",
+                    },
+                ],
+            )
+        ),
+    )
+
+    plan = _post(client, "生成 PUE 报表").json()["domainObjects"]["reportPlan"]
+
+    assert [section["title"] for section in plan["sections"]] == ["PUE 总览"]
+    assert plan["suggestions"] == ["告警板块"]
+
+
+def test_candidate_with_only_suggestions_is_rejected_not_faked(client, monkeypatch):
+    """候选里只有「未接受的建议」时，不产出一份没有板块的假方案。
+
+    这一轮按失败收尾：保留原方案、给出重试入口、不显示假成功。
+    """
+    install_model(
+        monkeypatch,
+        RecordingModel(
+            _candidate(
+                suggestions=["告警板块"],
+                sections=[
+                    {
+                        "id": "section_alarm",
+                        "title": "告警板块",
+                        "metricIntents": ["PUE"],
+                        "componentType": "metric_card",
+                    }
+                ],
+            )
+        ),
+    )
+
+    payload = _post(client, "生成 PUE 报表").json()
+
+    assert payload.get("designPhase") != "PLAN_WAITING_CONFIRM"
+    assert payload.get("error") is not None
+    assert payload["error"]["code"] == "PLAN_ONLY_SUGGESTIONS"
+    assert payload.get("domainObjects", {}).get("reportPlan") is None
+
+
 # --------------------------------------------------------------------------
 # 2. 修改 → 新 revision，继续待确认
 # --------------------------------------------------------------------------
