@@ -583,9 +583,51 @@ async function main() {
     /* ---------------------------------------------------- 步骤 9：选择 */
     await runStep('真实点击区域触发选择', async (entry) => {
       const before = (await selections()).length;
-      const box = await rectOf('.rg-region[data-region-id="region-c"]');
-      // 区域 C 横跨整行，右侧被区域 D 覆盖，点左侧空白处
-      const target = { x: box.x + 16, y: box.cy };
+      // 布局级联后目标区域可能被推到很下面或被别的区域盖住，
+      // 这里先滚进视口，再用 elementFromPoint 验证候选点真的落在 region-c 上，
+      // 避免硬编码坐标点空后只留下一句「0 → 0」。
+      const probe = await evaluate(
+        cdp,
+        sessionId,
+        `(() => {
+          const el = document.querySelector('.rg-region[data-region-id="region-c"]');
+          if (!el) return { error: 'region-c 不存在' };
+          el.scrollIntoView({ block: 'center', inline: 'nearest' });
+          const r = el.getBoundingClientRect();
+          const candidates = [
+            { x: r.left + 16, y: r.top + r.height / 2 },
+            { x: r.left + r.width / 2, y: r.top + 16 },
+            { x: r.left + r.width / 2, y: r.top + r.height / 2 },
+          ];
+          const tried = [];
+          for (const c of candidates) {
+            const top = document.elementFromPoint(c.x, c.y);
+            const owner = top && top.closest ? top.closest('.rg-region') : null;
+            tried.push({
+              x: Math.round(c.x),
+              y: Math.round(c.y),
+              hit: top ? (top.getAttribute('data-region-id') || top.className || top.tagName) : null,
+              owner: owner ? owner.getAttribute('data-region-id') : null,
+            });
+            if (owner && owner.getAttribute('data-region-id') === 'region-c') {
+              return { x: c.x, y: c.y, tried, rect: { left: r.left, top: r.top, width: r.width, height: r.height } };
+            }
+          }
+          return {
+            error: '候选点都未命中 region-c',
+            tried,
+            rect: { left: r.left, top: r.top, width: r.width, height: r.height },
+            scrollY: window.scrollY,
+            innerHeight: window.innerHeight,
+            docHeight: document.documentElement.scrollHeight,
+          };
+        })()`,
+      );
+      entry.hitProbe = probe;
+      check('能在 region-c 上找到可点击点', !probe.error, JSON.stringify(probe));
+      if (probe.error) return;
+
+      const target = { x: probe.x, y: probe.y };
       await realClick(cdp, sessionId, target.x, target.y);
       entry.start = target;
       entry.end = target;
@@ -755,6 +797,116 @@ async function main() {
         a.column <= b.column + b.columnSpan - 1 && b.column <= a.column + a.columnSpan - 1;
       check('存在重叠区域对', overlap, JSON.stringify({ a, b }));
       entry.screenshot = await screenshot(cdp, sessionId, path.join(args.outDir, '14-collision-layout.png'));
+    });
+
+    /* ------------------------- 步骤 14：碰撞让位（合并真实布局引擎后才有意义） */
+    await runStep('真实拖拽触发碰撞让位：被压组件向下让位，无关组件不动', async (entry) => {
+      // 上一步结束时模块处于只读态，先回到编辑态（items 保持碰撞布局不变）
+      const toggleBox = await rectOf('#rg-toggle-mode');
+      await realClick(cdp, sessionId, toggleBox.cx, toggleBox.cy);
+      await new Promise((r) => setTimeout(r, 200));
+      const currentMode = await mode();
+      check('回到编辑态', currentMode === 'editable', `实际 ${currentMode}`);
+
+      const before = await placements();
+      const beforeB = before.find((p) => p.regionId === 'region-b');
+      const beforeC = before.find((p) => p.regionId === 'region-c');
+      const beforeD = before.find((p) => p.regionId === 'region-d');
+
+      // 区域 A 的右侧被 B 盖住，找一个确实落在 A 上的起点
+      const probe = await evaluate(
+        cdp,
+        sessionId,
+        `(() => {
+          const el = document.querySelector('.rg-region[data-region-id="region-a"]');
+          if (!el) return { error: 'region-a 不存在' };
+          el.scrollIntoView({ block: 'center', inline: 'nearest' });
+          const r = el.getBoundingClientRect();
+          const candidates = [
+            { x: r.left + 16, y: r.top + r.height / 2 },
+            { x: r.left + 8, y: r.top + 8 },
+            { x: r.left + r.width / 2, y: r.top + 16 },
+          ];
+          const tried = [];
+          for (const c of candidates) {
+            const top = document.elementFromPoint(c.x, c.y);
+            const owner = top && top.closest ? top.closest('.rg-region') : null;
+            tried.push({
+              x: Math.round(c.x),
+              y: Math.round(c.y),
+              owner: owner ? owner.getAttribute('data-region-id') : null,
+            });
+            if (owner && owner.getAttribute('data-region-id') === 'region-a') {
+              return { x: c.x, y: c.y, tried };
+            }
+          }
+          return { error: '找不到 region-a 的可点击点', tried };
+        })()`,
+      );
+      entry.hitProbe = probe;
+      check('能在 region-a 上找到起点', !probe.error, JSON.stringify(probe));
+      if (probe.error) return;
+
+      const beforeCount = await intentCount();
+      const from = { x: probe.x, y: probe.y };
+      const to = { x: from.x + geom.colPitch, y: from.y };
+      await realDrag(cdp, sessionId, from, to);
+      entry.start = from;
+      entry.end = to;
+      entry.callbackCount = (await intentCount()) - beforeCount;
+      const newIntents = (await intents()).slice(beforeCount);
+      entry.newIntents = newIntents;
+
+      check('碰撞手势回调 1 次', entry.callbackCount === 1, `实际 ${entry.callbackCount}`);
+      const intent = newIntents[0];
+      check('回调 kind 为 move', intent && intent.kind === 'move', JSON.stringify(intent));
+      check('回调目标为 region-a', intent && intent.regionId === 'region-a', JSON.stringify(intent));
+      check('受影响集合含被压的 region-b',
+        intent && intent.affectedRegionIds.includes('region-b'),
+        JSON.stringify(intent && intent.affectedRegionIds));
+      check('受影响集合不含无关 region-c',
+        intent && !intent.affectedRegionIds.includes('region-c'),
+        JSON.stringify(intent && intent.affectedRegionIds));
+      check('受影响集合不含无关 region-d',
+        intent && !intent.affectedRegionIds.includes('region-d'),
+        JSON.stringify(intent && intent.affectedRegionIds));
+
+      const after = await placements();
+      entry.placements = after;
+      const afterB = after.find((p) => p.regionId === 'region-b');
+      const afterC = after.find((p) => p.regionId === 'region-c');
+      const afterD = after.find((p) => p.regionId === 'region-d');
+
+      check('被压组件向下让位', afterB.row > beforeB.row, `${beforeB.row} → ${afterB.row}`);
+      check('被压组件保持横向位置 column', afterB.column === beforeB.column,
+        `${beforeB.column} → ${afterB.column}`);
+      check('被压组件保持跨列 columnSpan', afterB.columnSpan === beforeB.columnSpan,
+        `${beforeB.columnSpan} → ${afterB.columnSpan}`);
+      check('无关组件 region-c 完全不动',
+        afterC.column === beforeC.column && afterC.row === beforeC.row
+          && afterC.columnSpan === beforeC.columnSpan && afterC.rowSpan === beforeC.rowSpan,
+        JSON.stringify({ before: beforeC, after: afterC }));
+      check('无关组件 region-d 完全不动',
+        afterD.column === beforeD.column && afterD.row === beforeD.row
+          && afterD.columnSpan === beforeD.columnSpan && afterD.rowSpan === beforeD.rowSpan,
+        JSON.stringify({ before: beforeD, after: afterD }));
+
+      const overlapFree = (() => {
+        for (let i = 0; i < after.length; i += 1) {
+          for (let j = i + 1; j < after.length; j += 1) {
+            const a = after[i];
+            const b = after[j];
+            const colHit = !(a.column + a.columnSpan - 1 < b.column
+              || b.column + b.columnSpan - 1 < a.column);
+            const rowHit = !(a.row + a.rowSpan - 1 < b.row
+              || b.row + b.rowSpan - 1 < a.row);
+            if (colHit && rowHit) return false;
+          }
+        }
+        return true;
+      })();
+      check('让位后最终布局无重叠', overlapFree, JSON.stringify(after));
+      entry.screenshot = await screenshot(cdp, sessionId, path.join(args.outDir, '15-collision-yield.png'));
     });
 
     const report = {
