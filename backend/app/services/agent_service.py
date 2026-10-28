@@ -160,6 +160,18 @@ class AgentService:
             )
         return response
 
+    def _keep_choice_untouched(self, response: AgentResponse) -> AgentResponse:
+        """只读查询轮：菜单照原样带回，但**不落库**。
+
+        查询不是决定，不能替用户接受、取消或替换计划，也不能顺手
+        「恢复」出一个原本不存在的选择锁（ADR 0002 §6.1：
+        「查询回答后：原菜单、pendingChoice、待确认修改计划、澄清轮次全部不变」）。
+
+        业务轮用 ``_remember_choice`` 落库选择锁；查询轮只把菜单放进响应，
+        让前端照常渲染，剩下的事等用户真的选一项再说。
+        """
+        return response
+
     # ---------- 只读查询轮（工单 #13 / #14） ----------
 
     @staticmethod
@@ -247,7 +259,7 @@ class AgentService:
             "contextEngineIntent": route.userIntent.value,
             "contextEngineReason": route.reason,
         }
-        return self._remember_choice(
+        return self._keep_choice_untouched(
             self._normalize_query_answer(request, response, pending_guard)
         )
 

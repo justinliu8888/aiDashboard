@@ -532,3 +532,174 @@ def test_chat_query_answer_does_not_advance_business(post_chat):
     assert response["turnKind"] == TURN_KIND_QUERY_ANSWER
     assert response["uiActions"] == ["query_answer"]
     assert response["toolRequests"] == []
+
+
+# ---------- 5. 只读边界：查询前后业务对象逐项不变 ----------
+
+
+def _business_fingerprint(session_id: str = "conv_test") -> dict:
+    """业务对象的完整指纹：查询前后必须逐项相同。"""
+    record = session_service.repository.get_session(session_id)
+    snapshot = dict(record.snapshot or {})
+    definition = snapshot.get("definition") or {}
+    return {
+        "state": record.state,
+        "definition": definition.get("metadata"),
+        "definitionRegions": len(definition.get("regions") or []),
+        "savedDefinition": snapshot.get("savedDefinition"),
+        "preview": snapshot.get("previewPayload"),
+        "lastReportRun": snapshot.get("lastReportRun"),
+        "reportDefinitionId": record.reportDefinitionId,
+        "previewRunId": record.previewRunId,
+        "pendingChoice": record.pendingChoice,
+        "pendingPlan": session_service.load_pending_plan(session_id),
+        "clarification": session_service.load_clarification(session_id),
+    }
+
+
+def _seed_full_business_state(session_id: str = "conv_test", *, with_edit_plan: bool):
+    """造一个「什么都有」的会话：草稿 + 预览 + 待确认菜单（+ 待确认计划）。
+
+    ``with_edit_plan`` 决定服务端等的是哪个待确认状态：
+    有待确认修改计划时，服务端权威状态是 ``USER_EDITING_TEMPLATE``；
+    只有菜单时是 ``WAITING_USER_CONFIRM``。请求的 state 必须与之一致，
+    否则服务端按「客户端状态与待确认状态不符」处理，那不是查询轮。
+    """
+    definition = _definition().model_dump(mode="json")
+    snapshot = {
+        "definition": definition,
+        "previewPayload": {"reportRunId": "run_int_1", "regions": []},
+        "lastReportRun": {"reportRunId": "run_int_1", "status": "SUCCEEDED"},
+    }
+    state = "USER_EDITING_TEMPLATE" if with_edit_plan else "WAITING_USER_CONFIRM"
+    session_service.repository.upsert_session(
+        session_id=session_id,
+        state=state,
+        title="业务对象齐全的会话",
+        reportDefinitionId="def_int_1",
+        previewRunId="run_int_1",
+        snapshot=snapshot,
+    )
+    if not with_edit_plan:
+        session_service.repository.set_pending_choice(
+            session_id,
+            {
+                "state": "WAITING_USER_CONFIRM",
+                "question": {
+                    "id": "template_edit_confirm",
+                    "prompt": "请选择",
+                    "expects": "SINGLE_CHOICE",
+                    "options": [{"value": "accept", "label": "同意"}],
+                },
+            },
+        )
+    else:
+        session_service.repository.save_pending_edit_plan(
+            session_id,
+            {
+                "planId": "plan_int_1",
+                "draftRevision": 0,
+                "summary": "把名称改成新日报",
+                "changes": [],
+            },
+        )
+    return state
+
+
+def test_query_leaves_every_business_object_untouched(post_chat):
+    """一次只读查询前后，业务对象逐项不变。
+
+    覆盖：草稿内容与 revision、已保存定义、预览与运行标识、待确认菜单、
+    待确认修改计划、原业务状态、修改澄清计数。
+    """
+    state = _seed_full_business_state(with_edit_plan=False)
+    before = _business_fingerprint()
+
+    response = post_chat("你有未完成的草稿吗？", state=state).json()
+
+    assert response["turnKind"] == TURN_KIND_QUERY_ANSWER
+    after = _business_fingerprint()
+    for key in before:
+        assert after[key] == before[key], f"查询改变了业务对象：{key}"
+
+
+def test_progress_query_leaves_every_business_object_untouched(post_chat):
+    """问进度同样不碰任何业务对象。"""
+    state = _seed_full_business_state(with_edit_plan=False)
+    before = _business_fingerprint()
+
+    post_chat("刚才那份做到哪一步了？", state=state)
+
+    after = _business_fingerprint()
+    for key in before:
+        assert after[key] == before[key], f"查询改变了业务对象：{key}"
+
+
+def test_capability_query_leaves_every_business_object_untouched(post_chat):
+    """问能力同样不碰任何业务对象，也不建草稿。"""
+    state = _seed_full_business_state(with_edit_plan=False)
+    before = _business_fingerprint()
+
+    post_chat("你支持分钟趋势吗？", state=state)
+
+    after = _business_fingerprint()
+    for key in before:
+        assert after[key] == before[key], f"查询改变了业务对象：{key}"
+
+
+def test_query_keeps_pending_edit_plan_and_its_state(post_chat):
+    """有待确认修改计划时提问：原计划与原业务状态都保留。"""
+    state = _seed_full_business_state(with_edit_plan=True)
+    before = _business_fingerprint()
+
+    response = post_chat("你有未完成的草稿吗？", state=state).json()
+
+    assert response["turnKind"] == TURN_KIND_QUERY_ANSWER
+    assert response["state"] == state
+    after = _business_fingerprint()
+    for key in before:
+        assert after[key] == before[key], f"查询改变了业务对象：{key}"
+
+
+def test_query_only_appends_chat_messages(post_chat):
+    """查询允许追加聊天消息，这是它唯一的写入。"""
+    state = _seed_full_business_state(with_edit_plan=False)
+    before_count = len(session_service.repository.list_messages("conv_test"))
+
+    post_chat("你有未完成的草稿吗？", state=state)
+
+    after = session_service.repository.list_messages("conv_test")
+    assert len(after) == before_count + 2  # 一条用户消息 + 一条助手回答
+
+
+def test_query_does_not_create_a_pending_choice_that_did_not_exist(post_chat):
+    """查询不能「顺手恢复」出一个原本不存在的选择锁。
+
+    只读问答不是决定，也不是恢复手段：pendingChoice 查询前后必须一模一样。
+    """
+    _upsert_session("conv_test", state="WAITING_USER_CONFIRM", definition=_definition())
+    session_service.repository.set_pending_choice("conv_test", None)
+    before = session_service.repository.get_session("conv_test").pendingChoice
+    assert before is None
+
+    post_chat("你有未完成的草稿吗？", state="WAITING_USER_CONFIRM")
+
+    after = session_service.repository.get_session("conv_test").pendingChoice
+    assert after == before
+
+
+def test_query_does_not_write_back_a_stale_client_snapshot(post_chat):
+    """客户端带了过旧快照：服务端最新草稿不能被覆盖。"""
+    state = _seed_full_business_state(with_edit_plan=False)
+    stale = _definition().model_dump(mode="json")
+    stale["metadata"]["name"] = "旧名字"
+    stale["metadata"]["revision"] = 0
+
+    post_chat(
+        "你有未完成的草稿吗？",
+        state=state,
+        snapshots={"reportDefinition": stale},
+    )
+
+    stored = session_service.repository.get_session("conv_test").snapshot["definition"]
+    assert stored["metadata"]["name"] == "A 机房能耗日报"
