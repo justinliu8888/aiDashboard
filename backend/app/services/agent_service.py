@@ -50,14 +50,14 @@ from app.services.context_engine import (
 )
 from app.services.definition_save_service import definition_save_service
 from app.services.preview_service import preview_service
-from app.services.request_timeline import log_timeline_step
-from app.services.session_context import bind_session_key, current_session_key
-from app.services.session_fact_service import (
+from app.services.query_answer_service import (
     claims_live_progress,
     recorded_stage_disclosed,
     recorded_stage_fallback,
-    session_fact_service,
 )
+from app.services.request_timeline import log_timeline_step
+from app.services.session_context import bind_session_key, current_session_key
+from app.services.session_fact_service import session_fact_service
 from app.services.session_service import session_service
 from app.services.edit_reference_resolver import resolve_visible_reference
 from app.services.edit_time_resolver import resolve_time_expression
@@ -114,6 +114,14 @@ ORDER_DEPENDENT_REASONS = frozenset({
 })
 
 logger = logging.getLogger(__name__)
+
+#: 答案里编了实时进度、又没法用会话事实换掉时的安全兜底。
+#:
+#: 不给用户看假数字，也不把编造的内容留在屏幕上。
+QUERY_UNSAFE_ANSWER = (
+    "这次查询没有完成，暂时无法确认当前对话的情况。"
+    "草稿和待确认操作都没有变化，可以稍后再问一次。"
+)
 EmitEvent = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
@@ -316,7 +324,7 @@ class AgentService:
         response: AgentResponse,
         facts: SessionFacts,
     ) -> None:
-        """问进度时，用户可见答案必须说清「已记录、不是实时」这条边界。
+        """只读答案的边界校正：不说假话，也不漏掉必须说的边界。
 
         工单 #03：「回答明确是已记录状态，不冒充实时任务监控」；
         父规格 #12：「数据可能不是实时的，应以用户可理解的方式说明」。
@@ -325,22 +333,25 @@ class AgentService:
         （结构化字段，页面不渲染），也可能干脆没写。这里由服务端用
         **共用层的口径**处理：
 
-            - 只对「问进度」生效：问草稿、问能力不补（口径不能加错地方）；
-            - 澄清轮与技术失败轮不补：那不是进度回答；
-            - 答案里编了实时进度（百分比 / 正在跑）：不能靠再补一句否认来
-              抵消 —— 两句会打架，用户读到的是假数字；直接用服务端事实
-              换掉整句回答；
-            - 其余情况：答案没同时说清「已记录」与「不是实时」时，补上
-              共用层的口径句。
+            - 编了实时进度（百分比 / 正在跑）：任何查询回答都不能把假数字
+              给用户，也不能靠再补一句否认来抵消 —— 两句话会打架；
+              问进度时用服务端事实换掉整句回答，其它问题走安全兜底；
+            - 问进度时：答案没同时说清「已记录」与「不是实时」，补上共用层
+              的口径句；澄清轮与技术失败轮不补（那不是进度回答）；
+            - 问草稿、问能力不补这条边界（口径不能加错地方）。
         """
+        reply = response.reply or ""
+        if claims_live_progress(reply):
+            response.reply = (
+                recorded_stage_fallback(facts)
+                if routing_rules.is_progress_question(request.message)
+                else QUERY_UNSAFE_ANSWER
+            )
+            return
         if not routing_rules.is_progress_question(request.message):
             return
         outcome = (response.debug or {}).get("queryOutcome")
         if outcome in {"clarification", "technical_failure"}:
-            return
-        reply = response.reply or ""
-        if claims_live_progress(reply):
-            response.reply = recorded_stage_fallback(facts)
             return
         if recorded_stage_disclosed(reply):
             return
