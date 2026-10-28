@@ -151,7 +151,7 @@ class SessionService:
             title = self._derive_title(session_id, user_text, is_advance)
             self._repo.upsert_session(
                 session_id=session_id,
-                state=response.state.value,
+                state=self._state_to_store(session_id, response),
                 title=title,
             )
 
@@ -185,6 +185,24 @@ class SessionService:
             # 落库失败不能影响主链路
             logger.exception("[session_service] 落库失败 sessionId=%s", session_id)
             return None
+
+    def _state_to_store(self, session_id: str, response: AgentResponse) -> str:
+        """这一轮要落库的业务状态。
+
+        正常业务轮：落响应里的状态 —— 那是状态机推进的结果。
+
+        只读查询轮：**沿用库里那份**。查询轮的响应状态取的是客户端带来的
+        ``request.state``（为了「本轮不推进」），如果拿它落库，一次提问
+        就能把会话从「待确认」改成「分析中」—— 业务状态是服务端事实，
+        不能被客户端声称的状态改写。库里还没有行时（新会话）才用响应状态，
+        那是在建会话，不是在改状态。
+        """
+        if response.turnKind != TURN_KIND_QUERY_ANSWER:
+            return response.state.value
+        current = self._repo.get_session(session_id)
+        if current is not None and current.state:
+            return current.state
+        return response.state.value
 
     def _commit_session(
         self,

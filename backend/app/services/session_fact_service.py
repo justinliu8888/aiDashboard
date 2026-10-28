@@ -52,9 +52,18 @@ _STAGE_PENDING_STEPS: dict[str, list[str]] = {
 
 
 def _region_summary(region: dict[str, Any]) -> dict[str, Any]:
-    """区块概览：只保留模型判断需要的字段。"""
-    component = region.get("component") or {}
-    metric = component.get("metric") or {}
+    """区块概览：只保留模型判断需要的字段。
+
+    区块是自由字典（``regions: list[dict[str, Any]]``），里面每一项的
+    类型没人保证。读不懂的那部分就当没有 —— 一个坏区块不能让整条会话
+    的事实读取崩掉（崩掉的话，用户看到的是 500，而不是「无法确认」）。
+    """
+    component = region.get("component")
+    if not isinstance(component, dict):
+        component = {}
+    metric = component.get("metric")
+    if not isinstance(metric, dict):
+        metric = {}
     return {
         "regionId": region.get("id", ""),
         "name": region.get("name", ""),

@@ -762,3 +762,110 @@ def test_query_on_malformed_stored_draft_reports_unavailable_not_absent(client):
     # 事实状态：读到了会话但草稿读不懂 -> UNAVAILABLE（不是 ABSENT）。
     assert payload["debug"]["factStatus"] == FactStatus.UNAVAILABLE.value
     assert "没有报表草稿" not in payload["reply"]
+
+
+def test_query_survives_a_region_with_a_non_dict_component(client):
+    """区块结构不合法时，查询要能答出来，不能整个请求 500。
+
+    regions 是自由字典，component 的类型没人保证。事实摘要读不懂
+    那一项就跳过那一项，不能让整个会话事实读取崩掉。
+    """
+    from app.schemas.fact import FactStatus
+
+    odd = {
+        "metadata": {"id": "def_odd", "name": "A 机房能耗日报", "revision": 0},
+        "regions": [
+            {"id": "region_ok", "name": "总耗电", "role": "kpi",
+             "component": {"type": "TEXT", "content": {}}},
+            {"id": "region_odd", "name": "怪区块", "role": "chart",
+             "component": "total"},
+        ],
+    }
+    session_service.repository.upsert_session(
+        session_id="sess_odd_region",
+        state="WAITING_USER_CONFIRM",
+        title="怪区块会话",
+        snapshot={"definition": odd},
+    )
+
+    body = {
+        "agentProtocolVersion": "1.0",
+        "conversationId": "sess_odd_region",
+        "sessionId": "sess_odd_region",
+        "state": "WAITING_USER_CONFIRM",
+        "message": "你有未完成的草稿吗？",
+        "context": {
+            "projectId": "project_001",
+            "subjectRef": "machine_room",
+            "subjectId": "room_a",
+        },
+    }
+    response = client.post("/api/agent/chat", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["turnKind"] == TURN_KIND_QUERY_ANSWER
+    assert payload["debug"]["factStatus"] == FactStatus.FOUND.value
+    assert "A 机房能耗日报" in payload["reply"]
+
+
+# ---------- 7. 查询轮不得改写服务端业务状态 ----------
+
+
+def test_query_does_not_overwrite_server_state_with_the_client_claimed_state(client):
+    """客户端声称的状态与服务端不符时，查询也不能把服务端状态改掉。
+
+    业务状态是服务端事实。查询轮的响应状态取的是客户端带来的
+    request.state（为了「本轮不推进」），如果拿它去落库，
+    一次提问就能把会话从「待确认」改成「分析中」。
+    """
+    definition = _definition().model_dump(mode="json")
+    session_service.repository.upsert_session(
+        session_id="sess_state_guard",
+        state="WAITING_USER_CONFIRM",
+        title="待确认会话",
+        snapshot={"definition": definition},
+    )
+
+    body = {
+        "agentProtocolVersion": "1.0",
+        "conversationId": "sess_state_guard",
+        "sessionId": "sess_state_guard",
+        # 客户端带的是过期状态
+        "state": "ANALYZING",
+        "message": "你有未完成的草稿吗？",
+        "context": {
+            "projectId": "project_001",
+            "subjectRef": "machine_room",
+            "subjectId": "room_a",
+        },
+    }
+    response = client.post("/api/agent/chat", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["turnKind"] == TURN_KIND_QUERY_ANSWER
+    stored = session_service.repository.get_session("sess_state_guard")
+    assert stored.state == "WAITING_USER_CONFIRM"
+
+
+def test_query_on_a_fresh_session_still_records_a_state(client):
+    """新会话（库里还没有行）仍然要落下状态 —— 那是建会话，不是改状态。"""
+    body = {
+        "agentProtocolVersion": "1.0",
+        "conversationId": "sess_new_state",
+        "sessionId": "sess_new_state",
+        "state": "ANALYZING",
+        "message": "你有未完成的草稿吗？",
+        "context": {
+            "projectId": "project_001",
+            "subjectRef": "machine_room",
+            "subjectId": "room_a",
+        },
+    }
+    response = client.post("/api/agent/chat", json=body)
+
+    assert response.status_code == 200
+    stored = session_service.repository.get_session("sess_new_state")
+    assert stored is not None
+    assert stored.state == "ANALYZING"
