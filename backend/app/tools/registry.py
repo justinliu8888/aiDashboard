@@ -16,6 +16,7 @@ IS_READ_ONLY / APPLICABLE_STATES / run()；
 from __future__ import annotations
 
 import json
+import logging
 from contextvars import ContextVar
 from typing import Any, Callable
 
@@ -49,6 +50,9 @@ from app.tools.base import (
     ToolCategory,
     is_conclusion_legal,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 # 工具模块列表（每个模块需提供统一契约，见 app/tools/base.py）
@@ -263,10 +267,18 @@ def _make_function_tool(tool, FunctionTool, permission):
         """工具执行入口；返回 dict / str，交由 FunctionTool 转成 ToolChunk。"""
         try:
             result = runner(**kwargs)
-            if tool.CATEGORY == ToolCategory.FACT and isinstance(result, dict) and result.get("error"):
-                slot = _lookup_failure.get()
-                if slot is not None:
-                    slot["failed"] = True
+            if tool.CATEGORY == ToolCategory.FACT:
+                # 事实工具的调用要看得见：只读问答的可信度取决于
+                # 「模型到底查没查」，而不是它自己怎么说。
+                logger.info(
+                    "[tool] fact_called name=%s status=%s",
+                    name,
+                    _fact_status_of(result),
+                )
+                if isinstance(result, dict) and result.get("error"):
+                    slot = _lookup_failure.get()
+                    if slot is not None:
+                        slot["failed"] = True
             return result
         except Exception as exc:  # noqa: BLE001
             # 异常原文可能很长，截断后回给模型，避免占满上下文
@@ -285,6 +297,23 @@ def _make_function_tool(tool, FunctionTool, permission):
         is_read_only=tool.IS_READ_ONLY,
         permission=permission,
     )
+
+
+def _fact_status_of(result: Any) -> str:
+    """事实工具结果的一句话状态，供调用日志用。
+
+    领域模块各有自己的词表（availability / outcome），这里只取一个
+    能一眼看懂的结论：找到了、确认没有、读不到、没权限、还是出错了。
+    """
+    if not isinstance(result, dict):
+        return "OK"
+    if result.get("error"):
+        return "ERROR"
+    for key in ("status", "availability", "outcome"):
+        value = result.get(key)
+        if value:
+            return str(value)
+    return "OK"
 
 
 __all__ = [
