@@ -703,3 +703,62 @@ def test_query_does_not_write_back_a_stale_client_snapshot(post_chat):
 
     stored = session_service.repository.get_session("conv_test").snapshot["definition"]
     assert stored["metadata"]["name"] == "A 机房能耗日报"
+
+
+# ---------- 6. 读取失败时：会话读取与查询都要活下来 ----------
+
+
+def test_session_read_survives_a_malformed_stored_draft(client):
+    """服务端存的草稿结构坏掉时，会话读取接口不能 500。
+
+    这是「读取失败」在真实链路上的样子：草稿解析不了。
+    会话读取要能把这个会话读出来（草稿部分尽力还原），
+    否则前端刷新就是一片空白 —— 查询答了「无法确认」，页面却打不开。
+    """
+    broken = {"metadata": {"id": "def_broken"}, "regions": ["这不是合法区块列表"]}
+    session_service.repository.upsert_session(
+        session_id="sess_broken",
+        state="WAITING_USER_CONFIRM",
+        title="坏草稿会话",
+        snapshot={"definition": broken},
+    )
+
+    response = client.get("/api/sessions/sess_broken")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sessionId"] == "sess_broken"
+
+
+def test_query_on_malformed_stored_draft_reports_unavailable_not_absent(client):
+    """草稿解析不了时，查询必须说「无法确认」，不能说「没有草稿」。"""
+    from app.schemas.fact import FactStatus
+
+    broken = {"metadata": {"id": "def_broken"}, "regions": ["这不是合法区块列表"]}
+    session_service.repository.upsert_session(
+        session_id="sess_broken2",
+        state="WAITING_USER_CONFIRM",
+        title="坏草稿会话",
+        snapshot={"definition": broken},
+    )
+
+    body = {
+        "agentProtocolVersion": "1.0",
+        "conversationId": "sess_broken2",
+        "sessionId": "sess_broken2",
+        "state": "WAITING_USER_CONFIRM",
+        "message": "你有未完成的草稿吗？",
+        "context": {
+            "projectId": "project_001",
+            "subjectRef": "machine_room",
+            "subjectId": "room_a",
+        },
+    }
+    response = client.post("/api/agent/chat", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["turnKind"] == TURN_KIND_QUERY_ANSWER
+    # 事实状态：读到了会话但草稿读不懂 -> UNAVAILABLE（不是 ABSENT）。
+    assert payload["debug"]["factStatus"] == FactStatus.UNAVAILABLE.value
+    assert "没有报表草稿" not in payload["reply"]

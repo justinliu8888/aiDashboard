@@ -74,13 +74,25 @@ def resolve_placeholders(definition: dict[str, Any]) -> dict[str, Any]:
 
     前端不认占位符，直接显示会露出 `{{roomName}}`。存快照时统一解析一次，
     恢复会话拿到的就是成品文本；老会话重新落库时也会被顺手修好。
+
+    草稿是**服务端存下来的历史数据**，结构可能已经不对（老版本写的、
+    手工改过的、被截断的）。这里逐层做类型判断：解析不了的那部分跳过，
+    不能因为一个坏区块就让整个会话读不出来 —— 会话读取挂掉时，前端
+    刷新就是一片空白，用户连「无法确认」都看不到。
     """
     room_id = room_id_of_definition(definition)
-    for region in definition.get("regions") or []:
-        content = ((region.get("component") or {}).get("content")) or {}
-        template = content.get("template")
-        if isinstance(template, str) and "{{" in template:
-            content["template"] = render_template(template, room_id)
+    regions = definition.get("regions") or []
+    if not isinstance(regions, list):
+        return definition
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        component = region.get("component")
+        content = component.get("content") if isinstance(component, dict) else None
+        if isinstance(content, dict):
+            template = content.get("template")
+            if isinstance(template, str) and "{{" in template:
+                content["template"] = render_template(template, room_id)
         name = region.get("name")
         if isinstance(name, str) and "{{" in name:
             region["name"] = render_template(name, room_id)
