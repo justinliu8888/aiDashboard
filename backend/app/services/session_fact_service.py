@@ -19,7 +19,16 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from app.schemas.fact import DraftFacts, FactStatus, SessionFacts
+from app.schemas.fact import (
+    LIVE_PROGRESS_CLAIM_MARKERS,
+    LIVE_PROGRESS_PERCENT_PATTERN,
+    RECORDED_NOT_LIVE_MARKERS,
+    RECORDED_STAGE_DISCLOSURE,
+    RECORDED_STATE_MARKERS,
+    DraftFacts,
+    FactStatus,
+    SessionFacts,
+)
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.services.scope_service import is_subject_authorized
 from app.services.session_service import session_service
@@ -49,6 +58,55 @@ _STAGE_PENDING_STEPS: dict[str, list[str]] = {
     "RENDERING": ["渲染报表界面"],
     "READY": [],
 }
+
+
+def recorded_stage_disclosed(reply: str) -> bool:
+    """用户可见答案里是否说清了「已记录、不是实时」这条边界。
+
+    两半都要说才算数：
+
+        - 「这是已记录的状态」（工单 #03：回答明确是已记录状态）；
+        - 「不是实时任务监控」（同一条：不冒充实时任务监控）。
+
+    只说一半不行：日常说法（「你的需求已记录」）不含「不是实时」，
+    而「没有实时任务状态来源」也不等于说清了这是已记录的状态。
+    """
+    text = reply or ""
+    stated = any(marker in text for marker in RECORDED_STATE_MARKERS)
+    not_live = any(marker in text for marker in RECORDED_NOT_LIVE_MARKERS)
+    return stated and not_live
+
+
+def claims_live_progress(reply: str) -> bool:
+    """答案里是不是在冒充实时任务监控（编百分比 / 说正在跑）。
+
+    工单 #03 的红线：首版没有实时任务状态来源，也不能编百分比或剩余时间。
+
+    先剥掉否定式说法（「不是实时进度」「没有实时任务状态来源」……）：
+    那些是**守住**红线的表述，不是违反红线。
+    """
+    text = reply or ""
+    for marker in RECORDED_NOT_LIVE_MARKERS:
+        text = text.replace(marker, "")
+    if LIVE_PROGRESS_PERCENT_PATTERN.search(text):
+        return True
+    return any(marker in text for marker in LIVE_PROGRESS_CLAIM_MARKERS)
+
+
+def recorded_stage_fallback(facts: SessionFacts) -> str:
+    """编造了实时进度时，用服务端事实替换整句回答。
+
+    服务端不能靠「再补一句否认」来抵消一个编出来的进度 ——
+    两句话会互相打架，用户读到的是假数字。
+    这里直接用服务端记录换掉它：说明下一步，并说清这条边界。
+    """
+    steps = list(facts.draft.pendingSteps) if facts.draft else []
+    head = (
+        f"当前对话已记录的下一步：{'、'.join(steps)}。"
+        if steps
+        else "当前对话已记录了报表的业务阶段。"
+    )
+    return f"{head}{RECORDED_STAGE_DISCLOSURE}"
 
 
 def _region_summary(region: dict[str, Any]) -> dict[str, Any]:

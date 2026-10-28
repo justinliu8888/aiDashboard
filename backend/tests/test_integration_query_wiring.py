@@ -1330,3 +1330,93 @@ def test_recorded_boundary_is_stated_once_on_the_deterministic_path(post_chat):
 
     assert "不是实时" in response["reply"]
     assert response["reply"].count("不是实时进度") == 1
+
+
+def test_boundary_needs_both_halves_recorded_and_not_live(post_chat, monkeypatch):
+    """只说「不是实时」不算说清 —— 还得说明这是**已记录**的状态。
+
+    工单 #03 说的是两件事：「回答明确是已记录状态，不冒充实时任务监控」。
+    少了「已记录」这一半，答案仍然可能让人误以为系统在实时观察。
+    """
+    from app.services.agent_service import agent_service
+
+    _upsert_session(
+        "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
+    )
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent("没有实时任务状态来源，无法给出百分比或预计完成时间。"),
+    )
+
+    response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
+
+    assert "已记录" in response["reply"]
+    assert "不是实时" in response["reply"]
+
+
+def test_fabricated_live_progress_is_replaced_by_server_facts(post_chat, monkeypatch):
+    """模型编出「实时进度 60%」时，不能靠再补一句否认来抵消。
+
+    两句话会打架，用户读到的是假数字；服务端要用自己的事实换掉整句回答。
+    """
+    from app.services.agent_service import agent_service
+
+    _upsert_session(
+        "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
+    )
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent("实时进度到 60% 了，还在跑。"),
+    )
+
+    response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
+
+    assert "60%" not in response["reply"]
+    assert "不是实时" in response["reply"]
+    assert "确认这份报表草稿" in response["reply"]
+
+
+def test_progress_question_phrasing_without_progress_word_still_gets_boundary(
+    post_chat, monkeypatch
+):
+    """换一种问法（「现在什么状态？」）也必须说清这条边界。
+
+    规格要求「不同但同义的问法得到一致的业务处理」。
+    """
+    from app.services.agent_service import agent_service
+
+    _upsert_session(
+        "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
+    )
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent("当前对话的草稿停在等你确认这一步。"),
+    )
+
+    response = post_chat("现在什么状态？", state="WAITING_USER_CONFIRM").json()
+
+    assert "不是实时" in response["reply"]
+
+
+def test_capability_question_about_time_dimension_does_not_get_boundary(
+    post_chat, monkeypatch
+):
+    """「预计时间」在本产品里是时间范围维度，不是进度信号。
+
+    能力问题不能被补上进度边界。
+    """
+    from app.services.agent_service import agent_service
+
+    _upsert_session("conv_test", state="WAITING_USER_CONFIRM")
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent("支持按预计时间筛选，粒度可以选到小时。"),
+    )
+
+    response = post_chat("报表支持按预计时间筛选吗？", state="WAITING_USER_CONFIRM").json()
+
+    assert "不是实时任务进度" not in response["reply"]
