@@ -77,6 +77,33 @@ def to_fact_status(domain_status: str | None) -> FactStatus:
     )
 
 
+#: 回答「做到哪一步了」这类问题时，用户可见答案里必须说清的边界。
+#:
+#: 工单 #03：「回答明确是已记录状态，不冒充实时任务监控」；
+#: 父规格 #12：「数据可能不是实时的，应以用户可理解的方式说明」。
+#:
+#: 这是**共用层的口径**：进度领域模块（C）说这条边界时用同一句，
+#: 共用层在服务端补进用户可见答案时也用同一句 —— 一处口径，两处引用。
+RECORDED_STAGE_DISCLOSURE = "这是服务端已记录的业务阶段，不是实时任务进度。"
+
+#: 答案里出现其中之一，才算把「不是实时进度」这条边界说清楚了。
+#:
+#: 不能只看「已记录」：日常说法（「你的需求已记录」）也含这三个字；
+#: 「实时进度到 60% 了」这种**冒充实时**的说法更不能算数。
+RECORDED_STAGE_DISCLOSURE_MARKERS: tuple[str, ...] = (
+    "不是实时",
+    "非实时",
+    "没有实时",
+    "不是正在跑",
+)
+
+
+def recorded_stage_disclosed(reply: str) -> bool:
+    """用户可见答案里是否已经说清了「已记录、不是实时」这条边界。"""
+    text = reply or ""
+    return any(marker in text for marker in RECORDED_STAGE_DISCLOSURE_MARKERS)
+
+
 class DraftFacts(BaseModel):
     """当前对话报表草稿的可核实事实。
 

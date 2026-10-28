@@ -790,7 +790,10 @@ function appendAiQuestions(questions, { lock = true } = {}) {
 //   - 两张卡都不改草稿、不改 revision、不动右侧预览。
 function appendAiReadOnlyAnswer(text) {
   aiBubble(
-    `<div data-readonly-answer="1" class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">${esc(text)}</div>`
+    // whitespace-pre-wrap：答案里的换行要保留。
+    // 只读回答可能带多段（模型的分段、以及服务端补的「已记录 / 非实时」边界句），
+    // 不保留换行就会被压成一长段。
+    `<div data-readonly-answer="1" class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">${esc(text)}</div>`
   );
 }
 

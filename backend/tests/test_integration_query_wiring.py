@@ -1185,88 +1185,139 @@ def test_progress_tool_does_not_fabricate_region_count_for_a_malformed_draft(
     assert result["draft"]["regionCount"] in (0, None)
 
 
+
 # ---------- 12. 进度类回答必须说清「已记录 / 非实时」这条边界 ----------
 
 
-def test_recorded_boundary_must_reach_the_visible_reply(post_chat, monkeypatch):
-    """模型把边界写进 limitations（页面不渲染）时，服务端要补进 reply。
+def _stub_agent(reply: str, *, limitations=None, query_outcome: str = "answer"):
+    """造一个只回固定答案的 Agent，模拟真实模型的措辞波动。"""
+    from app.schemas.agent import AgentResponse, AgentState
+
+    class _StubAgent:
+        def handle(self, request):
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.WAITING_USER_CONFIRM,
+                reply=reply,
+                turnKind=TURN_KIND_QUERY_ANSWER,
+                debug={
+                    "queryMode": True,
+                    "queryOutcome": query_outcome,
+                    "limitations": list(limitations or []),
+                },
+            )
+
+    return _StubAgent()
+
+
+def test_progress_answer_states_the_recorded_boundary(post_chat, monkeypatch):
+    """问进度时，用户可见答案必须说清「已记录、不是实时」。
 
     工单 #03：「回答明确是已记录状态，不冒充实时任务监控」；
     父规格 #12：「数据可能不是实时的，应以用户可理解的方式说明」。
 
     页面只渲染 ``reply``，``limitations`` 是结构化字段、用户看不到。
-    真实模型验收里出现过：边界被写进 ``limitations``，``reply`` 里只字未提，
-    用户读到的回答既没说是「已记录」，也没说不是实时。
+    真实模型验收里出现过：边界被写进 ``limitations``，``reply`` 里只字未提。
     """
-    from app.schemas.agent import AgentResponse, AgentState
     from app.services.agent_service import agent_service
 
     _upsert_session(
         "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
     )
-
-    class _StubAgent:
-        """模拟真实模型：边界只写在 limitations 里，reply 里漏了。"""
-
-        def handle(self, request):
-            return AgentResponse(
-                conversationId=request.conversationId,
-                state=AgentState.WAITING_USER_CONFIRM,
-                reply=(
-                    "刚才那份报表目前停在「等你确认草稿」这一步。"
-                    "现在还差最后一步：你确认这份草稿。"
-                ),
-                turnKind=TURN_KIND_QUERY_ANSWER,
-                debug={
-                    "queryMode": True,
-                    "limitations": [
-                        "当前进度来自服务端已记录的会话状态，"
-                        "不是实时任务监控，没有百分比或剩余时间",
-                    ],
-                },
-            )
-
-    monkeypatch.setattr(agent_service, "_agent", _StubAgent())
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent(
+            "刚才那份报表目前停在「等你确认草稿」这一步。现在还差最后一步：你确认这份草稿。",
+            limitations=["当前进度来自服务端已记录的会话状态，不是实时任务监控"],
+        ),
+    )
 
     response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
 
     assert response["turnKind"] == "query_answer"
-    assert "已记录" in response["reply"]
     assert "不是实时" in response["reply"]
+    assert "已记录" in response["reply"]
 
 
-def test_recorded_boundary_is_not_appended_twice(post_chat, monkeypatch):
-    """答案里已经说清了这条边界时，不要再追加一遍。"""
-    from app.schemas.agent import AgentResponse, AgentState
+def test_progress_answer_still_states_boundary_when_model_only_hints(post_chat, monkeypatch):
+    """模型只说了「已记录」（日常说法）时，不算把边界说清楚。
+
+    「你的需求已记录」这种措辞满地都是；只有否定式说法
+    （不是实时 / 非实时 / 没有实时）才算说清了这条边界。
+    """
     from app.services.agent_service import agent_service
 
     _upsert_session(
         "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
     )
-
-    class _StubAgent:
-        def handle(self, request):
-            return AgentResponse(
-                conversationId=request.conversationId,
-                state=AgentState.WAITING_USER_CONFIRM,
-                reply=(
-                    "这是服务端已记录的业务阶段，不是实时任务进度。"
-                    "刚才那份报表停在「等你确认草稿」这一步。"
-                ),
-                turnKind=TURN_KIND_QUERY_ANSWER,
-                debug={
-                    "queryMode": True,
-                    "limitations": [
-                        "这是服务端已记录的业务阶段，不是实时任务进度",
-                    ],
-                },
-            )
-
-    monkeypatch.setattr(agent_service, "_agent", _StubAgent())
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent("你的需求已记录，当前对话里报表停在等你确认草稿这一步。"),
+    )
 
     response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
 
-    assert response["reply"].count("不是实时任务进度") == 1
+    assert "不是实时" in response["reply"]
+
+
+def test_progress_boundary_is_not_duplicated_when_model_already_said_it(post_chat, monkeypatch):
+    """答案里已经说了「不是实时」时，不要再追加一遍。"""
+    from app.services.agent_service import agent_service
+
+    _upsert_session(
+        "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
+    )
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent("这是服务端已记录的业务阶段，不是实时任务进度。刚才那份停在等你确认草稿这一步。"),
+    )
+
+    response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
+
+    assert response["reply"].count("不是实时") == 1
+
+
+def test_capability_answer_does_not_get_progress_boundary(post_chat, monkeypatch):
+    """问能力不是问进度：不能给能力回答补一句进度边界。"""
+    from app.services.agent_service import agent_service
+
+    _upsert_session("conv_test", state="WAITING_USER_CONFIRM")
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent(
+            "支持分钟趋势，不过预览数值来自模拟业务数据，尚未接通真实生产取数。",
+            limitations=["该数据源尚未接通真实生产取数，预览数值为模拟数据"],
+        ),
+    )
+
+    response = post_chat("你支持分钟趋势吗？", state="WAITING_USER_CONFIRM").json()
+
+    assert "不是实时任务进度" not in response["reply"]
+
+
+def test_clarification_does_not_get_progress_boundary(post_chat, monkeypatch):
+    """澄清轮不是进度回答：补边界会变成答非所问。"""
+    from app.services.agent_service import agent_service
+
+    _upsert_session(
+        "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
+    )
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent(
+            "你想问的是哪份报表？",
+            query_outcome="clarification",
+        ),
+    )
+
+    response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
+
+    assert "不是实时任务进度" not in response["reply"]
 
 
 def test_recorded_boundary_is_stated_once_on_the_deterministic_path(post_chat):
@@ -1277,5 +1328,5 @@ def test_recorded_boundary_is_stated_once_on_the_deterministic_path(post_chat):
 
     response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
 
-    assert "已记录" in response["reply"]
+    assert "不是实时" in response["reply"]
     assert response["reply"].count("不是实时进度") == 1
