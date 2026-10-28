@@ -38,7 +38,7 @@ from app.schemas.agent import (
     TURN_KIND_QUERY_ANSWER,
 )
 from app.schemas.edit_plan import EditIntent, EditPlan
-from app.schemas.fact import RECORDED_STAGE_DISCLOSURE, recorded_stage_disclosed
+from app.schemas.fact import RECORDED_STAGE_DISCLOSURE, SessionFacts
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.session import PendingEditPlan
 from app.services import routing_rules
@@ -52,7 +52,12 @@ from app.services.definition_save_service import definition_save_service
 from app.services.preview_service import preview_service
 from app.services.request_timeline import log_timeline_step
 from app.services.session_context import bind_session_key, current_session_key
-from app.services.session_fact_service import session_fact_service
+from app.services.session_fact_service import (
+    claims_live_progress,
+    recorded_stage_disclosed,
+    recorded_stage_fallback,
+    session_fact_service,
+)
 from app.services.session_service import session_service
 from app.services.edit_reference_resolver import resolve_visible_reference
 from app.services.edit_time_resolver import resolve_time_expression
@@ -302,12 +307,14 @@ class AgentService:
             "queryMode": True,
             "factStatus": facts.status.value,
         }
-        self._ensure_recorded_stage_disclosure(request, response)
+        self._ensure_recorded_stage_disclosure(request, response, facts)
         return response
 
     @staticmethod
     def _ensure_recorded_stage_disclosure(
-        request: AgentRequest, response: AgentResponse
+        request: AgentRequest,
+        response: AgentResponse,
+        facts: SessionFacts,
     ) -> None:
         """问进度时，用户可见答案必须说清「已记录、不是实时」这条边界。
 
@@ -316,21 +323,29 @@ class AgentService:
 
         这条要求不能只靠模型自觉：模型可能把边界写进 ``limitations``
         （结构化字段，页面不渲染），也可能干脆没写。这里由服务端用
-        **共用层的口径**补进用户可见答案：
+        **共用层的口径**处理：
 
             - 只对「问进度」生效：问草稿、问能力不补（口径不能加错地方）；
             - 澄清轮与技术失败轮不补：那不是进度回答；
-            - 答案里已经说了「不是实时」就不重复补。
+            - 答案里编了实时进度（百分比 / 正在跑）：不能靠再补一句否认来
+              抵消 —— 两句会打架，用户读到的是假数字；直接用服务端事实
+              换掉整句回答；
+            - 其余情况：答案没同时说清「已记录」与「不是实时」时，补上
+              共用层的口径句。
         """
         if not routing_rules.is_progress_question(request.message):
             return
         outcome = (response.debug or {}).get("queryOutcome")
         if outcome in {"clarification", "technical_failure"}:
             return
-        if recorded_stage_disclosed(response.reply):
+        reply = response.reply or ""
+        if claims_live_progress(reply):
+            response.reply = recorded_stage_fallback(facts)
+            return
+        if recorded_stage_disclosed(reply):
             return
         response.reply = (
-            f"{(response.reply or '').strip()}\n{RECORDED_STAGE_DISCLOSURE}"
+            f"{reply.strip()}\n{RECORDED_STAGE_DISCLOSURE}"
         ).strip()
 
     def _preserved_menu(

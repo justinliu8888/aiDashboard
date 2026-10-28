@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any
 
@@ -86,22 +87,39 @@ def to_fact_status(domain_status: str | None) -> FactStatus:
 #: 共用层在服务端补进用户可见答案时也用同一句 —— 一处口径，两处引用。
 RECORDED_STAGE_DISCLOSURE = "这是服务端已记录的业务阶段，不是实时任务进度。"
 
-#: 答案里出现其中之一，才算把「不是实时进度」这条边界说清楚了。
+#: 答案里出现其中之一，才算说清了「这是已记录的状态」。
 #:
-#: 不能只看「已记录」：日常说法（「你的需求已记录」）也含这三个字；
-#: 「实时进度到 60% 了」这种**冒充实时**的说法更不能算数。
-RECORDED_STAGE_DISCLOSURE_MARKERS: tuple[str, ...] = (
+#: 只看「已记录」不够：日常说法（「你的需求已记录」）也含这几个字。
+RECORDED_STATE_MARKERS: tuple[str, ...] = (
+    "已记录",
+    "已存档",
+    "记录的业务阶段",
+    "会话记录里",
+)
+
+#: 答案里出现其中之一，才算说清了「不是实时进度」。
+RECORDED_NOT_LIVE_MARKERS: tuple[str, ...] = (
     "不是实时",
     "非实时",
     "没有实时",
     "不是正在跑",
 )
 
+#: 答案里出现其中之一，就是**冒充实时任务监控**（工单 #03 的红线）。
+#:
+#: 注意「不是实时进度」「无法给出百分比」这类**否定**说法不在这里 ——
+#: 它们恰恰是在守红线。判定时先剥掉否定式说法再扫这些词。
+LIVE_PROGRESS_CLAIM_MARKERS: tuple[str, ...] = (
+    "正在跑",
+    "正在生成",
+    "正在执行",
+    "实时进度",
+    "实时监控",
+    "百分之",
+)
 
-def recorded_stage_disclosed(reply: str) -> bool:
-    """用户可见答案里是否已经说清了「已记录、不是实时」这条边界。"""
-    text = reply or ""
-    return any(marker in text for marker in RECORDED_STAGE_DISCLOSURE_MARKERS)
+#: 答案里出现这种写法，就是在编百分比。
+LIVE_PROGRESS_PERCENT_PATTERN = re.compile(r"\d+\s*%")
 
 
 class DraftFacts(BaseModel):
