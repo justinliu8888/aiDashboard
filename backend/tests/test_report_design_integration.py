@@ -20,7 +20,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services.agent_service import agent_service
 from app.services.report_design_service import report_design_service
 from app.services.session_service import session_service
 from app.storage.report_design_repository import (

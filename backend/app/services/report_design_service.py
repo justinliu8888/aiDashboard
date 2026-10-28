@@ -49,16 +49,14 @@ from app.schemas.agent import (
     AgentResponseDomainObjects,
     AgentState,
 )
-from app.schemas.report_plan import ReportPlanError
+from app.schemas.report_plan import ReportPlan, ReportPlanError
 from app.services import routing_rules
 from app.services.report_plan_service import apply_candidate
 from app.services.session_context import current_session_key
 from app.services.session_service import session_service
 from app.storage.report_design_repository import (
-    CLAIM_KIND_CLAIMED,
     CLAIM_KIND_CONFLICT,
     CLAIM_KIND_DUPLICATE,
-    COMMIT_KIND_COMMITTED,
     COMMIT_KIND_CONFLICT,
     DESIGN_PHASE_PLAN_NEEDED,
     DESIGN_PHASE_PLAN_WAITING_CONFIRM,
