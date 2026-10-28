@@ -185,16 +185,30 @@ def _trend_payload(definition_payload: dict) -> dict:
     return trend["payload"]
 
 
+def _expected_logical_date() -> str:
+    """预览数据对应的业务日期。
+
+    原断言把「昨日」写死成 2026-10-25，那是写测试那天的昨日。
+    数据层按上海时区取昨日，日期一变断言就过期 —— 这跟被测行为无关。
+    这里改成从数据层自己算出的业务日期取值：
+    断言的**意图**（首点=业务日 00:00、末点=业务日 23:00 / 23:59）
+    保持不变，只是不再把日历日期钉死。
+    """
+    snap = build_snapshot(room_id="room_a", room_name=resolve_room_name("room_a"))
+    return snap.logicalDate
+
+
 def test_preview_hourly_trend_is_24_points_in_report_timezone():
     definition = _default_definition()
     payload = _trend_payload(_draft_dict(definition))
     points = payload["points"]
+    logical_date = _expected_logical_date()
     assert len(points) == 24
     assert payload["grain"] == "HOUR"
     assert points[0]["timestamp"].endswith("+08:00")
     assert points[-1]["timestamp"].endswith("+08:00")
-    assert points[0]["timestamp"].startswith("2026-10-25T00:00:00")
-    assert points[-1]["timestamp"].startswith("2026-10-25T23:00:00")
+    assert points[0]["timestamp"].startswith(f"{logical_date}T00:00:00")
+    assert points[-1]["timestamp"].startswith(f"{logical_date}T23:00:00")
     # 横轴标签仍然是 00:00 ~ 23:00（图表观感不变）
     assert payload["xLabels"][0] == "00:00"
     assert payload["xLabels"][-1] == "23:00"
@@ -207,10 +221,11 @@ def test_preview_minute_trend_is_1440_points_in_report_timezone():
     )
     payload = _trend_payload(_draft_dict(definition))
     points = payload["points"]
+    logical_date = _expected_logical_date()
     assert len(points) == 1440
     assert payload["grain"] == "MINUTE"
-    assert points[0]["timestamp"].startswith("2026-10-25T00:00:00")
-    assert points[-1]["timestamp"].startswith("2026-10-25T23:59:00")
+    assert points[0]["timestamp"].startswith(f"{logical_date}T00:00:00")
+    assert points[-1]["timestamp"].startswith(f"{logical_date}T23:59:00")
     assert points[0]["timestamp"].endswith("+08:00")
 
 
