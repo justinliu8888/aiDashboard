@@ -296,6 +296,33 @@ class EditAnswerPayload(BaseModel):
         return value.strip()
 
 
+class QueryAnswerPayload(BaseModel):
+    """只读查询的答案提交（工单 #13 / #14 / #15 / #16 共用）。
+
+    与 ``EditAnswerPayload`` 的区别：它适用于**所有**业务节点，而不只是编辑态；
+    它还带一个「需要澄清」的分支，用来在只读提问上下文里做针对性澄清，
+    而不是把用户推去补生成条件。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reply: str = Field(min_length=1)
+    facts: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
+    #: 这次回答需要用户先澄清一下（例如问题指向的对象不明确）。
+    #: 澄清不改变业务状态，也不占用修改的澄清轮次。
+    needsClarification: bool = False
+    clarificationQuestion: str = ""
+
+    @field_validator("reply")
+    @classmethod
+    def non_blank_reply(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("回答不能为空")
+        return value.strip()
+
+
 class FixProposal(BaseModel):
     """针对一条校验问题的修复动作。"""
 

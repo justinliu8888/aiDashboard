@@ -9,6 +9,7 @@ import re
 import uuid
 
 from app.schemas.agent import (
+    TURN_KIND_QUERY_ANSWER,
     AgentBlock,
     AgentQuestion,
     AgentRequest,
@@ -52,6 +53,10 @@ class FakeReportAgent:
     def handle(self, request: AgentRequest) -> AgentResponse:
         state = request.state
 
+        # 0. 只读查询轮：查事实、只回答，不推进业务。
+        if getattr(request, "queryMode", False):
+            return self._handle_query(request)
+
         # 1. 处理修改类意图（只在改已有草稿时；首次生成里「不要趋势图」
         #    是「别加趋势」的意思，不能被劫持成改稿）
         if self._is_editing(request):
@@ -70,6 +75,95 @@ class FakeReportAgent:
 
         # 兜底：无法推进
         return self._fallback_clarification(request)
+
+    # ---------- 只读查询轮 ----------
+
+    def _handle_query(self, request: AgentRequest) -> AgentResponse:
+        """只读查询的 Fake 替身：按事实拼一条确定性的回答。
+
+        这是**测试替身**，不是产品路径：真实模型走 ReAct + 事实工具自己写答案。
+        这里走同一套事实工具、同一套事实口径，答案由规则拼出来，
+        所以可以用来稳定地验证「不推进业务」这些不变量。
+        """
+        from app.services.query_answer_service import compose_query_reply
+        from app.tools.base import ToolCategory
+        from app.tools.context import bind_tool_context, clear_tool_context
+        from app.tools.registry import tools_for_query
+        from app.tools.submission import (
+            bind_submission,
+            clear_submission,
+            take_submission,
+        )
+        from app.tools.submit_query_answer_tool import run as submit_query_answer
+
+        bind_tool_context(self._tool_context(request))
+        bind_submission()
+        try:
+            results: list[tuple[str, dict]] = []
+            for tool in tools_for_query():
+                if tool.CATEGORY is not ToolCategory.FACT:
+                    continue
+                if (tool.PARAMETERS or {}).get("required"):
+                    # 需要入参的事实工具由模型按需调用，这里不硬编参数。
+                    continue
+                try:
+                    results.append((tool.NAME, tool.run()))
+                except Exception as exc:  # noqa: BLE001
+                    results.append((tool.NAME, {"error": str(exc)}))
+            reply, facts, limitations = compose_query_reply(
+                message=request.message, results=results
+            )
+            submit_query_answer(
+                reply=reply, facts=facts, limitations=limitations
+            )
+            submission = take_submission() or {}
+        finally:
+            clear_tool_context()
+            clear_submission()
+
+        payload = submission.get("payload") or {}
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=request.state,
+            reply=str(payload.get("reply") or reply),
+            designSessionId=request.context.designSessionId,
+            turnKind=TURN_KIND_QUERY_ANSWER,
+            debug={
+                "queryMode": True,
+                "queryOutcome": "answer",
+                "verifiedFacts": payload.get("facts") or [],
+                "limitations": payload.get("limitations") or [],
+            },
+        )
+
+    @staticmethod
+    def _tool_context(request: AgentRequest):
+        """把请求里的快照整理成工具可见的只读上下文。"""
+        from app.tools.context import ToolContext
+
+        ctx = request.context
+        snapshots = request.snapshots
+        return ToolContext(
+            state=request.state,
+            subject_ref=ctx.subjectRef,
+            subject_id=ctx.subjectId,
+            project_id=ctx.projectId,
+            selected_region_id=ctx.selectedRegionId,
+            base_definition_revision=ctx.baseDefinitionRevision,
+            definition=snapshots.reportDefinition,
+            policy=snapshots.reportPolicy,
+            last_change_set=snapshots.lastChangeSet,
+            last_validation_result=(
+                snapshots.lastValidationResult.model_dump(mode="json")
+                if snapshots.lastValidationResult
+                else None
+            ),
+            last_report_run=(
+                snapshots.lastReportRun.model_dump(mode="json")
+                if snapshots.lastReportRun
+                else None
+            ),
+        )
 
     # ---------- ANALYZING ----------
 

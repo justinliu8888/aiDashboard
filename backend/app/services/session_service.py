@@ -29,7 +29,12 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from app.config import get_settings
-from app.schemas.agent import ADVANCE_MESSAGE, AgentRequest, AgentResponse
+from app.schemas.agent import (
+    ADVANCE_MESSAGE,
+    TURN_KIND_QUERY_ANSWER,
+    AgentRequest,
+    AgentResponse,
+)
 from app.schemas.session import (
     CLARIFICATION_COUNT_KEY,
     CLARIFICATION_KEY_KEY,
@@ -181,18 +186,37 @@ class SessionService:
 
         编辑态跨轮状态（待确认计划 / 澄清轮数）在写库前一刻才从库里读出来带回去：
         snapshot 是整块重建的，读早了会被并发的写覆盖掉。
+
+        只读查询轮（``turnKind == "query_answer"``）单独处理：
+        它允许追加聊天消息，但**不重建业务对象** —— 草稿、revision、
+        已保存定义、预览、待确认计划、澄清轮数一概不动，
+        也不能把客户端那份可能过旧的快照写回覆盖服务端最新的草稿。
         """
         with self._lock:
-            snapshot = self._build_snapshot(request, response)
             current = self._repo.get_session(session_id)
-            previous = (current.snapshot or {}).get("definition") if current else None
+            if response.turnKind == TURN_KIND_QUERY_ANSWER:
+                return self._commit_query_turn(
+                    session_id=session_id,
+                    response=response,
+                    request=request,
+                    message_count=message_count,
+                    current=current,
+                )
+            snapshot = self._build_snapshot(request, response)
+            previous_snapshot = (current.snapshot or {}) if current else {}
+            previous = previous_snapshot.get("definition")
             incoming = (snapshot or {}).get("definition")
-            if isinstance(previous, dict) and isinstance(incoming, dict):
+            if isinstance(previous, dict) and not isinstance(incoming, dict):
+                # 本轮没有带回草稿（例如待确认期间的一次提问被拒）：
+                # 保留库里那份，不能因为一次交互就把草稿丢掉。
+                snapshot["definition"] = previous
+            elif isinstance(previous, dict) and isinstance(incoming, dict):
                 previous_revision = int((previous.get("metadata") or {}).get("revision") or 0)
                 incoming_revision = int((incoming.get("metadata") or {}).get("revision") or 0)
                 if previous_revision > incoming_revision:
                     # 迟到的只读/重复确认回复不能把已应用的新草稿回滚。
                     snapshot["definition"] = previous
+            snapshot = self._carry_over_business_objects(snapshot, previous_snapshot)
             # 老会话的待确认计划还躺在 snapshot.pendingPlan 里：
             # snapshot 是整块重建的，不先搬走就会把计划弄丢。
             self._migrate_legacy_pending_plan(session_id)
@@ -208,6 +232,57 @@ class SessionService:
                 snapshot=snapshot,
                 messageCount=message_count,
             )
+
+    @staticmethod
+    def _carry_over_business_objects(
+        snapshot: dict[str, Any] | None, previous: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """本轮没带回的业务对象，沿用库里那份。
+
+        只读问答轮、待确认期间的拒绝回复，都可能不带草稿回传。
+        这时候要把库里的草稿、已保存定义和预览原样带着，
+        不能因为一次交互就让恢复出来的会话少东西。
+        """
+        if not previous:
+            return snapshot
+        result = dict(snapshot or {})
+        for key in ("definition", "policy", "lastReportRun", "previewPayload"):
+            if not isinstance(result.get(key), dict) and isinstance(previous.get(key), dict):
+                result[key] = previous[key]
+        return result
+
+    def _commit_query_turn(
+        self,
+        *,
+        session_id: str,
+        response: AgentResponse,
+        request: AgentRequest | None,
+        message_count: int,
+        current: SessionRecord | None,
+    ) -> SessionRecord:
+        """只读查询轮落库：只加消息，业务对象原样保留。
+
+        刻意**不用** ``response.domainObjects`` 重建快照：
+        查询轮的响应里带的是服务端可信对象，回退到请求快照就等于
+        用旧客户端快照重建业务状态。
+        """
+        # 老会话的待确认计划还躺在 snapshot.pendingPlan 里，先搬走再读。
+        self._migrate_legacy_pending_plan(session_id)
+        current = self._repo.get_session(session_id) or current
+        snapshot = dict(current.snapshot or {}) if current else {}
+        if request is not None:
+            collected = dict(getattr(request, "collectedInfo", None) or {})
+            if collected:
+                snapshot["collectedInfo"] = collected
+        return self._repo.upsert_session(
+            session_id=session_id,
+            state=current.state if current else response.state.value,
+            designSessionId=None,
+            reportDefinitionId=None,
+            previewRunId=None,
+            snapshot=snapshot,
+            messageCount=message_count,
+        )
 
     @staticmethod
     def _reply_msg_id(client_msg_id: str | None) -> str | None:
@@ -291,6 +366,15 @@ class SessionService:
         # 路由层已收集的槽位。下一轮恢复时带回 Deep Route，
         # 避免重新问用户已经答过的问题。
         if request is not None:
+            # 记录这条会话的授权范围。只读查询要按它核对事实来源，
+            # 范围对不上就不能把里面的草稿说出去。
+            if "scope" not in snapshot:
+                snapshot["scope"] = {
+                    "projectId": request.context.projectId,
+                    "subjectRef": request.context.subjectRef,
+                    "subjectId": request.context.subjectId,
+                }
+
             collected = dict(getattr(request, "collectedInfo", None) or {})
             if collected:
                 snapshot["collectedInfo"] = collected

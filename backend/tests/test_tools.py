@@ -7,6 +7,8 @@ import pytest
 
 from app.schemas.agent import AgentState
 from app.services.report_draft_service import build_definition_draft
+from app.services.session_context import bind_session_key
+from app.services.session_service import session_service
 from app.tools import registry
 from app.tools.base import ToolCategory, is_conclusion_legal
 from app.tools.context import (
@@ -36,6 +38,14 @@ def _clean_context():
     yield
     clear_tool_context()
     clear_submission()
+
+
+class _SessionKey:
+    """只带 sessionId 的最小请求壳：工具按会话 id 读服务端事实。"""
+
+    def __init__(self, session_id: str) -> None:
+        self.sessionId = session_id
+        self.conversationId = session_id
 
 
 def _bind_scope(
@@ -331,8 +341,15 @@ def test_get_current_draft_without_context():
     assert result["exists"] is False
 
 
-def test_get_current_draft_with_context():
+def test_get_current_draft_reads_server_session_facts():
+    """草稿事实来自服务端会话记录，不是本轮请求快照。"""
     definition = build_definition_draft("A 机房能耗日报", "room_a")
+    session_service.repository.upsert_session(
+        session_id="sess_tool_draft",
+        state="WAITING_USER_CONFIRM",
+        snapshot={"definition": definition.model_dump(mode="json")},
+    )
+    bind_session_key(_SessionKey("sess_tool_draft"))
     bind_tool_context(
         ToolContext(state=AgentState.DEFINITION_DRAFT_READY, definition=definition)
     )
@@ -341,6 +358,20 @@ def test_get_current_draft_with_context():
     assert result["reportName"] == "A 机房能耗日报"
     assert result["regions"]
     assert all("regionId" in r for r in result["regions"])
+    assert result["source"] == "server_session"
+
+
+def test_get_current_draft_does_not_treat_request_snapshot_as_verified_fact():
+    """只有请求快照、服务端查不到记录时，不能当成已核实的草稿。"""
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+    bind_session_key(_SessionKey("sess_tool_missing"))
+    bind_tool_context(
+        ToolContext(state=AgentState.DEFINITION_DRAFT_READY, definition=definition)
+    )
+    result = registry.get_runner("get_current_draft")()
+    assert result["exists"] is False
+    assert result["status"] == "UNAVAILABLE"
+    assert result["reason"]
 
 
 def test_get_current_region_found_and_missing():

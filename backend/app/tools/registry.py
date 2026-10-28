@@ -26,6 +26,7 @@ from app.tools import (
     check_capability_tool,
     get_current_draft_tool,
     get_current_region_tool,
+    get_current_session_status_tool,
     get_validation_result_tool,
     search_catalog_tool,
     search_metric_tool,
@@ -36,8 +37,12 @@ from app.tools import (
     submit_draft_plan_tool,
     submit_edit_plan_tool,
     submit_fix_plan_tool,
+    submit_query_answer_tool,
 )
 from app.tools.base import (
+    IS_QUERY_ONLY_ATTR,
+    QUERY_TERMINAL_TOOLS,
+    SAME_STATE_CONCLUSION,
     TOOL_CONTRACT_VERSION,
     ToolCategory,
     is_conclusion_legal,
@@ -52,6 +57,7 @@ _TOOLS: list[Any] = [
     check_capability_tool,
     get_current_draft_tool,
     get_current_region_tool,
+    get_current_session_status_tool,
     get_validation_result_tool,
     # 确定性组装
     build_definition_draft_tool,
@@ -63,6 +69,7 @@ _TOOLS: list[Any] = [
     submit_edit_answer_tool,
     submit_edit_plan_tool,
     submit_fix_plan_tool,
+    submit_query_answer_tool,
 ]
 
 _lookup_failure: ContextVar[dict[str, bool] | None] = ContextVar(
@@ -98,12 +105,30 @@ def tools_for_state(state: AgentState) -> list[Any]:
     """按当前节点筛选可用工具。
 
     ``APPLICABLE_STATES`` 为空表示全节点可用；非空则只有列出的节点可用。
+    只读查询专用的工具（``IS_QUERY_ONLY``）在这里**不出现** ——
+    普通业务轮不该有「提交只读答案」这个出口。
     """
     state_value = state.value
     return [
         tool
         for tool in _TOOLS
-        if not tool.APPLICABLE_STATES or state_value in tool.APPLICABLE_STATES
+        if not getattr(tool, IS_QUERY_ONLY_ATTR, False)
+        and (not tool.APPLICABLE_STATES or state_value in tool.APPLICABLE_STATES)
+    ]
+
+
+def tools_for_query() -> list[Any]:
+    """只读查询模式可用的工具：事实工具 + 查询答案终结工具。
+
+    查询链路在**结构上**就不开放执行权限：组装草稿、保存、校验、预览、
+    应用修改、接受或取消计划都不在这里注册，模型调不到。
+    不能只靠 Prompt 声称「请不要修改」。
+    """
+    terminal_names = set(QUERY_TERMINAL_TOOLS)
+    return [
+        tool
+        for tool in _TOOLS
+        if tool.CATEGORY == ToolCategory.FACT or tool.NAME in terminal_names
     ]
 
 
@@ -136,6 +161,9 @@ def validate_tool_contracts() -> list[str]:
             if state not in valid_states:
                 problems.append(f"{tool.NAME} 的 APPLICABLE_STATES 含非法状态 {state}")
             for conclusion in conclusions:
+                if conclusion == SAME_STATE_CONCLUSION:
+                    # 原地回答：状态保持不变，恒合法。
+                    continue
                 if conclusion not in valid_states:
                     problems.append(
                         f"{tool.NAME} 的 CONCLUSION_STATES 含非法状态 {conclusion}"
@@ -263,9 +291,10 @@ __all__ = [
     "export_manifest_json",
     "get_runner",
     "list_tools",
-    "to_agentscope_toolkit_async",
-    "to_openai_tools",
     "take_lookup_failure",
+    "tools_for_query",
     "tools_for_state",
     "validate_tool_contracts",
+    "to_agentscope_toolkit_async",
+    "to_openai_tools",
 ]
