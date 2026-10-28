@@ -923,6 +923,26 @@ def is_readonly_question(message: str) -> bool:
     return any(subject in text.lower() for subject in _QUESTION_SUBJECTS)
 
 
+#: 问的是「当前对话已记录的阶段 / 进度」的说法。
+_PROGRESS_QUESTION_MARKERS: tuple[str, ...] = (
+    "进度", "做到哪", "到哪一步", "哪一步了", "做到哪儿", "进行到",
+    "百分之", "跑到多少", "还要多久", "预计完成", "预计时间",
+)
+
+
+def is_progress_question(message: str) -> bool:
+    """这句是不是在问「当前对话已记录的业务阶段 / 进度」。
+
+    命中意味着：回答里必须说清「这是已记录的状态，不是实时进度」
+    （工单 #03 / 父规格 #12）。问的是别的事（查草稿、问能力）时不命中 ——
+    给能力回答补一句进度边界，是把口径加错地方。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    return any(marker in text for marker in _PROGRESS_QUESTION_MARKERS)
+
+
 # --------------------------------------------------------------------------
 # 和确定性组装层的对接
 # --------------------------------------------------------------------------

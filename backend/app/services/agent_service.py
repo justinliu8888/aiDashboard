@@ -38,6 +38,7 @@ from app.schemas.agent import (
     TURN_KIND_QUERY_ANSWER,
 )
 from app.schemas.edit_plan import EditIntent, EditPlan
+from app.schemas.fact import RECORDED_STAGE_DISCLOSURE, recorded_stage_disclosed
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.session import PendingEditPlan
 from app.services import routing_rules
@@ -49,10 +50,8 @@ from app.services.context_engine import (
 )
 from app.services.definition_save_service import definition_save_service
 from app.services.preview_service import preview_service
-from app.services.recorded_progress_service import (
-    boundary_clause,
-    boundary_stated,
-)
+# 边界口径改用共用层（app.schemas.fact），不再从 recorded_progress_service
+# 转述模型自己写的 limitations —— 那仍取决于模型有没有声明边界。
 from app.services.report_design_service import report_design_service
 from app.services.request_timeline import log_timeline_step
 from app.services.session_context import bind_session_key, current_session_key
@@ -306,27 +305,36 @@ class AgentService:
             "queryMode": True,
             "factStatus": facts.status.value,
         }
-        self._ensure_recorded_boundary(response)
+        self._ensure_recorded_stage_disclosure(request, response)
         return response
 
     @staticmethod
-    def _ensure_recorded_boundary(response: AgentResponse) -> None:
-        """回答里必须说清「这是已记录的状态，不是实时进度」。
+    def _ensure_recorded_stage_disclosure(
+        request: AgentRequest, response: AgentResponse
+    ) -> None:
+        """问进度时，用户可见答案必须说清「已记录、不是实时」这条边界。
 
         工单 #03：「回答明确是已记录状态，不冒充实时任务监控」；
         父规格 #12：「数据可能不是实时的，应以用户可理解的方式说明」。
 
-        模型常把这条边界写进 ``limitations``（结构化字段，页面不渲染），
-        却漏在 ``reply``（页面唯一展示的文本）之外。这里由服务端补上，
-        口径不依赖模型自觉 —— 与本方法所在的这层「服务端强制」是同一口径。
+        这条要求不能只靠模型自觉：模型可能把边界写进 ``limitations``
+        （结构化字段，页面不渲染），也可能干脆没写。这里由服务端用
+        **共用层的口径**补进用户可见答案：
+
+            - 只对「问进度」生效：问草稿、问能力不补（口径不能加错地方）；
+            - 澄清轮与技术失败轮不补：那不是进度回答；
+            - 答案里已经说了「不是实时」就不重复补。
         """
-        limitations = list((response.debug or {}).get("limitations") or [])
-        clause = boundary_clause(limitations)
-        if not clause:
+        if not routing_rules.is_progress_question(request.message):
             return
-        if boundary_stated(response.reply):
+        outcome = (response.debug or {}).get("queryOutcome")
+        if outcome in {"clarification", "technical_failure"}:
             return
-        response.reply = f"{response.reply}\n{clause}".strip()
+        if recorded_stage_disclosed(response.reply):
+            return
+        response.reply = (
+            f"{(response.reply or '').strip()}\n{RECORDED_STAGE_DISCLOSURE}"
+        ).strip()
 
     def _preserved_menu(
         self,
