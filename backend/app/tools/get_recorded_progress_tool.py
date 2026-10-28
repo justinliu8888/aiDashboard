@@ -49,6 +49,7 @@ def run() -> dict[str, Any]:
         current_session_key(),
         subject_ref=ctx.subject_ref if ctx is not None else None,
         subject_id=ctx.subject_id if ctx is not None else None,
+        project_id=ctx.project_id if ctx is not None else "",
     )
     # 对共用层暴露折算后的四态事实状态（ADR 0002 §7.1）：
     # 领域里的 availability 是细粒度词表，共用层只认 FOUND / ABSENT /

@@ -137,7 +137,7 @@ class SessionFactService:
                 reason="当前对话还没有服务端记录，也没有已保存的报表草稿",
             )
 
-        forbidden = self._scope_conflict(record, project_id, subject_ref, subject_id)
+        forbidden = self.scope_conflict(record, project_id, subject_ref, subject_id)
         if forbidden is not None:
             return SessionFacts(
                 status=FactStatus.FORBIDDEN,
@@ -209,10 +209,16 @@ class SessionFactService:
     # ---------- 内部 ----------
 
     @staticmethod
-    def _scope_conflict(
+    def scope_conflict(
         record: Any, project_id: str, subject_ref: str, subject_id: str
     ) -> str | None:
-        """事实来源与本轮请求范围不一致时返回公开说明，否则返回 None。"""
+        """事实来源与本轮请求范围不一致时返回公开说明，否则返回 None。
+
+        这是共用层的**唯一**范围校验口径。领域模块（进度 / 能力）也复用它，
+        避免各自另建一套判定 —— 两处判定漂移过一次：
+        进度模块原先只看会话挂没挂项目，没挂项目就放行，
+        于是同一条会话在草稿查询里是 FORBIDDEN、在进度查询里却把草稿念了出来。
+        """
         snapshot = record.snapshot or {}
         stored = snapshot.get("scope")
         if isinstance(stored, dict):

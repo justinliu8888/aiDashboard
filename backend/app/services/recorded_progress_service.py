@@ -29,6 +29,7 @@ from pydantic import ValidationError
 from app.schemas.session import PENDING_PLAN_KEY, PendingEditPlan
 from app.services.definition_save_service import definition_save_service
 from app.services.preview_service import preview_service
+from app.services.session_fact_service import session_fact_service
 from app.services.session_service import session_service
 
 
@@ -115,12 +116,13 @@ def describe_recorded_progress(
     *,
     subject_ref: str | None = None,
     subject_id: str | None = None,
+    project_id: str = "",
 ) -> dict[str, Any]:
     """回报当前对话**已记录**的业务阶段与相关对象。
 
     返回一个可直接交给模型观察或写进响应的事实字典。
 
-    ``subject_ref`` / ``subject_id`` 是当前请求的业务对象范围。
+    ``subject_ref`` / ``subject_id`` / ``project_id`` 是当前请求的业务对象范围。
     会话归属的项目属于别的业务对象时，不回报它的内容。
     """
     if not session_id:
@@ -130,7 +132,7 @@ def describe_recorded_progress(
     if record is None:
         return _unavailable_result(failure)
 
-    denied = _check_permission(record, subject_ref, subject_id)
+    denied = _check_permission(record, subject_ref, subject_id, project_id)
     if denied:
         return _permission_denied_result(denied)
 
@@ -166,13 +168,28 @@ def _read_session_record(session_id: str) -> tuple[Any | None, str]:
 
 
 def _check_permission(
-    record: Any, subject_ref: str | None, subject_id: str | None
+    record: Any,
+    subject_ref: str | None,
+    subject_id: str | None,
+    project_id: str = "",
 ) -> str | None:
-    """会话归属的业务对象不在当前范围内时拒绝。返回拒绝原因，None 表示放行。
+    """事实来源与本轮请求范围不一致时拒绝。返回拒绝原因，None 表示放行。
 
-    会话没挂项目（绝大多数对话）时无从判断，放行；
-    挂了项目就看项目绑的是哪个业务对象。
+    两道关，都复用共用层的口径，不另建一套：
+
+    1. **共用范围校验**（``session_fact_service``）：会话记录里存的范围与本轮
+       请求不一致、或请求的业务对象不在授权范围内 -> 拒绝。
+       这条不能省：会话大多没挂项目，只看 workspaceId 会让越权请求直接放行。
+    2. **会话归属项目**：会话挂在某个项目上，而项目绑的是别的业务对象 -> 拒绝。
+
+    会话没挂项目时，第 2 道无从判断，交给第 1 道。
     """
+    conflict = session_fact_service.scope_conflict(
+        record, project_id, subject_ref or "", subject_id or ""
+    )
+    if conflict:
+        return PERMISSION_DENIED_REASON
+
     workspace_id = getattr(record, "workspaceId", None)
     if not workspace_id:
         return None

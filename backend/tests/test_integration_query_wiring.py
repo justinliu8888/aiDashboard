@@ -304,6 +304,112 @@ def test_progress_unavailable_is_not_reported_as_absent(bound_context, monkeypat
     assert result["status"] != FactStatus.ABSENT.value
 
 
+# ---------- 4. 进度模块与 A 的可信会话事实：范围校验必须一致 ----------
+
+
+def _seed_session_with_scope(scope: dict | None = None):
+    """造一条会话：可选地带上存储的范围。"""
+    definition = _definition().model_dump(mode="json")
+    snapshot: dict = {"definition": definition}
+    if scope is not None:
+        snapshot["scope"] = scope
+    return session_service.repository.upsert_session(
+        session_id="conv_int",
+        state="WAITING_USER_CONFIRM",
+        title="范围校验会话",
+        snapshot=snapshot,
+    )
+
+
+def test_progress_tool_matches_trusted_facts_when_stored_scope_conflicts(bound_context):
+    """会话记录里的范围与本轮请求冲突时，两个模块必须同一个结论。
+
+    A 的可信会话事实判 FORBIDDEN；进度工具如果还把草稿念出来，
+    就是越权披露 —— 范围校验必须一致。
+    """
+    from app.services.session_fact_service import session_fact_service
+    from app.tools.get_recorded_progress_tool import run
+
+    _seed_session_with_scope(
+        {
+            "projectId": "project_001",
+            "subjectRef": "machine_room",
+            "subjectId": "room_b",
+        }
+    )
+
+    facts = session_fact_service.load(
+        session_id="conv_int",
+        project_id="project_001",
+        subject_ref="machine_room",
+        subject_id="room_a",
+    )
+    result = run()
+
+    assert facts.status is FactStatus.FORBIDDEN
+    assert result["status"] == FactStatus.FORBIDDEN.value
+    assert result["availability"] == "PERMISSION_DENIED"
+    # 不能泄露该会话里的草稿名称。
+    assert result["draft"]["name"] == ""
+    assert result["draft"]["exists"] is False
+
+
+def test_progress_tool_rejects_unauthorized_subject_without_workspace(bound_context):
+    """会话没挂项目时也不能越权读别人的会话。
+
+    请求的是未授权的业务对象（room_b）—— A 的可信事实与进度工具
+    必须给同一个结论。
+    """
+    from app.services.session_fact_service import session_fact_service
+    from app.tools.context import ToolContext, bind_tool_context, clear_tool_context
+    from app.tools.get_recorded_progress_tool import run
+
+    _seed_session_with_scope()
+
+    bind_tool_context(
+        ToolContext(
+            state=AgentState.ANALYZING,
+            subject_ref="machine_room",
+            subject_id="room_b",
+            project_id="project_001",
+            definition=None,
+        )
+    )
+    try:
+        facts = session_fact_service.load(
+            session_id="conv_int",
+            project_id="project_001",
+            subject_ref="machine_room",
+            subject_id="room_b",
+        )
+        result = run()
+    finally:
+        clear_tool_context()
+
+    assert facts.status is FactStatus.FORBIDDEN
+    assert result["status"] == FactStatus.FORBIDDEN.value
+    assert result["draft"]["name"] == ""
+
+
+def test_progress_tool_still_reads_own_authorized_session(bound_context):
+    """范围一致时，进度工具照常可读 —— 修复不能把正常查询也堵死。"""
+    from app.tools.get_recorded_progress_tool import run
+
+    _seed_session_with_scope(
+        {
+            "projectId": "project_001",
+            "subjectRef": "machine_room",
+            "subjectId": "room_a",
+        }
+    )
+
+    result = run()
+
+    assert result["status"] == FactStatus.FOUND.value
+    assert result["availability"] == "SUCCESS"
+    assert result["draft"]["name"] == "A 机房能耗日报"
+
+
 # ---------- 3. summary 能进入用户可见答案 ----------
 
 
