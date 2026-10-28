@@ -1,6 +1,8 @@
 // Agent B：工作台只读问答的前端决策行为测试。
 //
-// 运行：node --test frontend/tests/
+// 运行：node --test frontend/tests/*.test.mjs
+// （目录参数在 Node 24 上不匹配默认测试文件规则，要显式给 glob；
+//   跑单个文件 node --test frontend/tests/workbench_query.test.mjs 也可以）
 // 不依赖任何第三方包（用 Node 内置 test runner），不改动共用依赖配置。
 //
 // 这些测试只覆盖「外部可见的行为决策」：
