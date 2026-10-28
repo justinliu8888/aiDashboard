@@ -308,7 +308,16 @@ class AgentService:
         request: AgentRequest,
         pending_guard: tuple[AgentState, AgentQuestion] | None,
     ) -> list[AgentQuestion]:
-        """查询回答之后仍然要能用的原业务菜单。"""
+        """查询回答之后仍然要能用的原业务菜单。
+
+        只有**原来就有**的菜单才带回。库里没有就不给：
+        ADR 0002 §4.2「questions = 原有待确认菜单；没有菜单时为空」，
+        规格「查询前后保持…待确认选项…不变」。
+
+        凭空造一个 template_edit_confirm 出来，前端会把它渲染成可点的
+        确认按钮，但服务端并没有这把锁 —— 用户点了会落空，
+        而且 pendingChoice 也被查询轮改掉了。
+        """
         if pending_guard is not None:
             return [pending_guard[1]]
         raw = session_service.load_pending_choice(
@@ -324,8 +333,6 @@ class AgentService:
                     request.conversationId,
                     raw,
                 )
-        if request.state is AgentState.WAITING_USER_CONFIRM:
-            return self._editing_confirm_questions()
         return []
 
     @staticmethod

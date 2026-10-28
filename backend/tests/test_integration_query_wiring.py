@@ -1053,3 +1053,89 @@ def test_non_readonly_input_is_still_rejected_on_stale_client_state(client):
     # 原计划没被动过
     plan = session_service.load_pending_plan("sess_stale_state2")
     assert plan is not None and plan.planId == "plan_stale2"
+
+
+# ---------- 10. 没有菜单时不要凭空造一个 ----------
+
+
+def test_query_does_not_fabricate_a_menu_when_the_session_has_none(client):
+    """库里没有待确认菜单时，查询回答不能凭空造一个菜单。
+
+    ADR 0002 §4.2：「questions = 原有待确认菜单；没有菜单时为空」。
+    规格：「查询前后保持…待确认选项…不变」—— 造一个出来就是变了。
+    造出来的菜单前端会渲染成可点的确认按钮，但服务端并没有这把锁，
+    用户点了会落空。
+    """
+    session_service.repository.upsert_session(
+        session_id="sess_no_menu",
+        state="WAITING_USER_CONFIRM",
+        title="无菜单会话",
+        snapshot={"definition": _definition().model_dump(mode="json")},
+    )
+    session_service.repository.set_pending_choice("sess_no_menu", None)
+
+    body = {
+        "agentProtocolVersion": "1.0",
+        "conversationId": "sess_no_menu",
+        "sessionId": "sess_no_menu",
+        "state": "WAITING_USER_CONFIRM",
+        "message": "你有未完成的草稿吗？",
+        "context": {
+            "projectId": "project_001",
+            "subjectRef": "machine_room",
+            "subjectId": "room_a",
+        },
+    }
+    response = client.post("/api/agent/chat", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["turnKind"] == TURN_KIND_QUERY_ANSWER
+    assert payload["questions"] == []
+    assert session_service.repository.get_session("sess_no_menu").pendingChoice is None
+
+
+def test_query_keeps_the_stored_menu_unchanged(client):
+    """库里有的菜单，查询回答要原样带回，且库里那份一字不改。"""
+    from app.services.agent_service import agent_service
+
+    stored = {
+        "state": "WAITING_USER_CONFIRM",
+        "question": {
+            "id": "template_edit_confirm",
+            "prompt": "请选择",
+            "expects": "SINGLE_CHOICE",
+            "selectionOnly": True,
+            "options": [
+                {"value": "同意", "label": "同意"},
+                {"value": "修改", "label": "修改"},
+            ],
+        },
+    }
+    session_service.repository.upsert_session(
+        session_id="sess_has_menu",
+        state="WAITING_USER_CONFIRM",
+        title="有菜单会话",
+        snapshot={"definition": _definition().model_dump(mode="json")},
+    )
+    session_service.repository.set_pending_choice("sess_has_menu", stored)
+
+    body = {
+        "agentProtocolVersion": "1.0",
+        "conversationId": "sess_has_menu",
+        "sessionId": "sess_has_menu",
+        "state": "WAITING_USER_CONFIRM",
+        "message": "你有未完成的草稿吗？",
+        "context": {
+            "projectId": "project_001",
+            "subjectRef": "machine_room",
+            "subjectId": "room_a",
+        },
+    }
+    response = client.post("/api/agent/chat", json=body)
+
+    payload = response.json()
+    assert payload["turnKind"] == TURN_KIND_QUERY_ANSWER
+    assert [q["id"] for q in payload["questions"]] == ["template_edit_confirm"]
+    after = session_service.repository.get_session("sess_has_menu").pendingChoice
+    assert after["question"]["options"] == stored["question"]["options"]
