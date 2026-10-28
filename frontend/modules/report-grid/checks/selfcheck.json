@@ -1,0 +1,41 @@
+{
+  "baseDir": "../../../..",
+  "outDir": "../../../../.agent-runtime/grid-prep-g/page/selfcheck",
+  "serveCmd": "node frontend/modules/report-grid/checks/static-server.mjs --port 8930",
+  "port": 8930,
+  "waitMs": 1200,
+  "ignore": ["favicon.ico"],
+  "pages": [
+    {
+      "name": "report-grid-harness",
+      "path": "/frontend/modules/report-grid/harness/index.html",
+      "title": "网格模块测试页",
+      "waitMs": 1200,
+      "selectors": [
+        ".rg-harness-banner strong",
+        ".rg-root[data-rg-root]",
+        ".rg-grid[data-rg-grid]",
+        ".rg-region[data-rg-region]",
+        ".rg-region[data-region-id=\"region-a\"]",
+        ".rg-region",
+        ".rg-harness-controls button",
+        "#rg-intent-log",
+        "#rg-toggle-mode",
+        "#rg-destroy",
+        "#rg-rebuild",
+        "#rg-collision"
+      ],
+      "texts": [
+        "网格模块测试页，未接自动保存与 AI",
+        "区域 A · 能耗趋势",
+        "区域 C · 运行日志",
+        "本地演示：意图回调记录"
+      ],
+      "counts": [
+        ".rg-region>=4",
+        ".rg-harness-controls button>=5",
+        "#rg-intent-log>=1"
+      ]
+    }
+  ]
+}
