@@ -71,10 +71,11 @@
   function readOnlyAnswerKind(response) {
     if (!response || typeof response !== "object") return null;
 
-    const isQueryTurn =
-      response.turnKind === QUERY_TURN_KIND ||
-      (Array.isArray(response.uiActions) && response.uiActions.includes(QUERY_TURN_KIND));
-    if (!isQueryTurn) return null;
+    // **turnKind 是唯一依据**（ADR 0002 §7.2）。
+    // 不看 uiActions：那是服务端强制归一化出来的同义标记，
+    // 拿它当第二判据，等于承认「有没有 turnKind 都能算只读」，
+    // 前后端契约就出现了两个入口。
+    if (response.turnKind !== QUERY_TURN_KIND) return null;
 
     return isQueryClarification(response) ? READ_ONLY_CLARIFICATION : READ_ONLY_ANSWER;
   }
@@ -98,11 +99,6 @@
   /** 只读问答不覆盖原业务状态（会话业务状态必须保持不变）。 */
   function shouldPreserveBusinessState(response) {
     return isReadOnlyResponse(response);
-  }
-
-  /** 只读问答不重画业务确认菜单（原 pendingChoice / 修改计划保持不变）。 */
-  function shouldRenderBusinessMenu(response) {
-    return !isReadOnlyResponse(response);
   }
 
   /** 只读问答不重画右侧预览（预览结果保持不变）。 */
@@ -189,7 +185,6 @@
     isReadOnlyClarification,
     shouldAutoAdvance,
     shouldPreserveBusinessState,
-    shouldRenderBusinessMenu,
     shouldRefreshPreview,
     isQuestionLike,
     shouldHintTrendRegion,

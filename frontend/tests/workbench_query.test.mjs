@@ -29,14 +29,18 @@ test("普通业务响应不被识别成只读问答", () => {
   assert.equal(Q.readOnlyAnswerKind("not-an-object"), null);
 });
 
-test("uiActions 标记的只读回答与只读澄清能被识别", () => {
-  assert.equal(Q.readOnlyAnswerKind({ uiActions: ["query_answer"] }), "ANSWER");
+test("turnKind 是唯一依据-只有 uiActions 不算只读", () => {
+  // ADR 0002 §7.2：前端判断「本轮不推进业务」只看 turnKind。
+  // uiActions 是服务端强制归一化出来的同义标记，不是第二判据。
+  assert.equal(Q.readOnlyAnswerKind({ uiActions: ["query_answer"] }), null);
+  assert.equal(Q.readOnlyAnswerKind({ turnKind: "action", uiActions: ["query_answer"] }), null);
+  // turnKind 在，澄清与回答都认得出来。
   assert.equal(
-    Q.readOnlyAnswerKind({ uiActions: ["query_answer"], debug: { queryOutcome: "clarification" } }),
+    Q.readOnlyAnswerKind({ turnKind: "query_answer", debug: { queryOutcome: "clarification" } }),
     "CLARIFICATION"
   );
   assert.equal(
-    Q.readOnlyAnswerKind({ uiActions: ["query_answer"], debug: { needsClarification: true } }),
+    Q.readOnlyAnswerKind({ turnKind: "query_answer", debug: { needsClarification: true } }),
     "CLARIFICATION"
   );
 });
@@ -105,9 +109,7 @@ test("只读问答保持原业务状态，不被查询结果的临时状态覆�
   assert.equal(Q.shouldPreserveBusinessState({ state: "NEEDS_CLARIFICATION" }), false);
 });
 
-test("只读问答不重画业务确认菜单，也不重画右侧预览", () => {
-  assert.equal(Q.shouldRenderBusinessMenu({ turnKind: "query_answer", uiActions: ["query_answer"] }), false);
-  assert.equal(Q.shouldRenderBusinessMenu({ state: "WAITING_USER_CONFIRM" }), true);
+test("只读问答不重画右侧预览", () => {
   assert.equal(Q.shouldRefreshPreview({ turnKind: "query_answer", uiActions: ["query_answer"] }), false);
   assert.equal(Q.shouldRefreshPreview({ state: "WAITING_USER_CONFIRM" }), true);
 });
