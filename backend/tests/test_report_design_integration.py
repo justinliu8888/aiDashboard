@@ -663,6 +663,23 @@ def test_readonly_question_is_not_hijacked_by_template_flow(client, monkeypatch)
     assert not payload.get("blocks")
 
 
+def test_advance_message_in_design_session_does_not_generate_draft(
+    client, monkeypatch
+):
+    """设计会话里的 __advance__ 不能生成草稿。
+
+    __advance__ 是旧状态机的内部控制消息。在新建流程里它没有下一步，
+    掉进业务 Agent 会平白生成一份草稿，绕开「先确认，再生成」。
+    """
+    install_model(monkeypatch, RecordingModel(_candidate()))
+
+    _post(client, "生成 PUE 报表", message_id="a_1")
+    payload = _post(client, "__advance__", message_id="a_2").json()
+
+    assert payload["domainObjects"].get("reportDefinitionDraft") is None
+    assert payload.get("designPhase") == "PLAN_WAITING_CONFIRM"
+
+
 # --------------------------------------------------------------------------
 # 9. SSE 入口
 # --------------------------------------------------------------------------

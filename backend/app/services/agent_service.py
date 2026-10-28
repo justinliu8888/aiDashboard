@@ -744,6 +744,14 @@ class AgentService:
         #     同一套判定，避免一句元问题平白多出一版方案；
         #   - 其余 → 设计轮（新建或修改）。
         if design_turn:
+            if request.message == ADVANCE_MESSAGE:
+                # 设计流程不走旧的自动推进。
+                # __advance__ 是旧状态机的内部控制消息，在设计流程里必须
+                # 原样返回 —— 掉下去会被业务 Agent 当成一次生成请求，
+                # 平白生成一份草稿，绕开了「先确认，再生成」。
+                return report_design_service.keep_state_response(
+                    request, design_state
+                )
             is_question = readonly_rule
             if not is_question and design_state is not None:
                 is_question = self._is_readonly_query_turn(

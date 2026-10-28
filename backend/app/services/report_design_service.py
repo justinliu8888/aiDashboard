@@ -223,6 +223,29 @@ class ReportDesignService:
 
     # ---------- 查询轮挂回设计状态 ----------
 
+    def keep_state_response(
+        self, request: AgentRequest, state: dict[str, Any] | None
+    ) -> AgentResponse:
+        """原样带回当前设计状态，不推进任何东西。
+
+        用于设计流程里的内部控制消息（``__advance__``）：它是旧状态机的
+        内部指令，在新建流程里没有对应的下一步，原样返回即可 ——
+        掉进业务 Agent 会平白生成一份草稿。
+        """
+        current_plan = (state or {}).get("reportPlan")
+        phase = (state or {}).get("designPhase") or DESIGN_PHASE_PLAN_NEEDED
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.ANALYZING,
+            reply="",
+            designSessionId=request.context.designSessionId,
+            designPhase=phase,
+            domainObjects=AgentResponseDomainObjects(
+                reportPlan=current_plan if isinstance(current_plan, dict) else None
+            ),
+            debug={"designPhase": phase, "designOutcome": "noop"},
+        )
+
     @staticmethod
     def attach_design_state(
         response: AgentResponse, state: dict[str, Any] | None
