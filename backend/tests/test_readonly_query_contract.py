@@ -856,3 +856,28 @@ def test_new_fact_tool_summary_reaches_the_query_answer(monkeypatch, post_chat):
 
     assert response["turnKind"] == "query_answer"
     assert "分钟趋势要走 EAS 明细源" in response["reply"]
+
+
+def test_query_in_pipeline_state_does_not_advance_business(post_chat):
+    """保留推进阶段的查询回答：状态不变，前端靠 turnKind 判断不推进。"""
+    _upsert_session("conv_test", state="VALIDATING", definition=_definition())
+
+    response = post_chat("这个草稿校验到哪一步了？", state="VALIDATING").json()
+
+    assert response["state"] == "VALIDATING"
+    assert response["turnKind"] == "query_answer"
+    assert response["uiActions"] == ["query_answer"]
+
+
+def test_ambiguous_input_during_pending_gets_clarification_not_operation(post_chat):
+    """含糊输入先得到针对性澄清，原计划不变，也不擅自选操作。"""
+    _seed_pending_edit_plan()
+
+    response = post_chat("继续弄一下", state="USER_EDITING_TEMPLATE").json()
+
+    assert response["uiActions"] == ["selection_required"]
+    assert "没太明白" in response["reply"]
+    plan = session_service.load_pending_plan("conv_test")
+    assert plan is not None and plan.planId == "plan_q1"
+    record = session_service.repository.get_session("conv_test")
+    assert record.snapshot["definition"]["metadata"]["revision"] == 0

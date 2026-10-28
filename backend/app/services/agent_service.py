@@ -171,14 +171,23 @@ class AgentService:
         """待确认期间收到非只读提问的输入：仍然必须从原菜单里选。
 
         菜单原样带回，草稿和待确认计划都不动。
+        说不清是提问还是操作时，给一句针对性的澄清，而不是让用户重述。
         """
+        if routing_rules.has_operation_command(request.message):
+            reply = (
+                "请先从下拉框选择一项再继续操作。"
+                "如果只是想问当前对话的情况（草稿、进度、能力），直接问就行。"
+            )
+        else:
+            reply = (
+                "这句我没太明白：你是想修改这份报表（说清楚改哪一处），"
+                "还是想先问当前对话的情况？"
+                "原来的选择我给你留着，也可以直接从下拉框选。"
+            )
         return AgentResponse(
             conversationId=request.conversationId,
             state=state,
-            reply=(
-                "请先从下拉框选择一项再继续操作。"
-                "如果只是想问当前对话的情况（草稿、进度、能力），直接问就行。"
-            ),
+            reply=reply,
             designSessionId=request.context.designSessionId,
             questions=[question],
             uiActions=["selection_required"],

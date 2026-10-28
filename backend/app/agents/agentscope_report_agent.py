@@ -221,28 +221,40 @@ class AgentScopeReportAgent:
 
     # ---------- 入口 ----------
 
+    def _degraded_response(self, request: AgentRequest) -> AgentResponse:
+        """降级响应。
+
+        查询轮降级到 Fake 的查询路径（同一套事实工具、同一套事实口径）；
+        编辑态降级到「查证不可用」；其余降级到 FakeAgent。
+        """
+        if getattr(request, "queryMode", False):
+            return self._fallback.handle(request)
+        if request.state == AgentState.USER_EDITING_TEMPLATE:
+            return self._unavailable_edit_response(request)
+        return self._fallback.handle(request)
+
     def handle(self, request: AgentRequest) -> AgentResponse:
         """同步入口：兼容老调用方（会新建 loop，可能遇到连接池失效问题）。"""
         if self._model is None:
             logger.info("AgentScope 未就绪（%s），降级 FakeAgent", self._init_err)
-            return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
+            return self._degraded_response(request)
         try:
             plan = asyncio.run(self._run_agent(request))
         except Exception as exc:  # noqa: BLE001
             logger.exception("AgentScope 运行异常，降级 FakeAgent：%s", exc)
-            return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
+            return self._degraded_response(request)
         return self._dispatch(request, plan)
 
     async def ahandle(self, request: AgentRequest) -> AgentResponse:
         """async 入口：复用 FastAPI 的事件循环，避免 httpx 连接池跨 loop 失效。"""
         if self._model is None:
             logger.info("AgentScope 未就绪（%s），降级 FakeAgent", self._init_err)
-            return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
+            return self._degraded_response(request)
         try:
             plan = await self._run_agent(request)
         except Exception as exc:  # noqa: BLE001
             logger.exception("AgentScope 运行异常，降级 FakeAgent：%s", exc)
-            return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
+            return self._degraded_response(request)
         return self._dispatch(request, plan)
 
     def _dispatch(
