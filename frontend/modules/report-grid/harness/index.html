@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>网格模块测试页 · 未接自动保存与 AI</title>
+  <link rel="stylesheet" href="../styles/report-grid.css">
+  <link rel="stylesheet" href="./harness.css">
+</head>
+<body class="rg-harness">
+  <header class="rg-harness-banner">
+    <strong>网格模块测试页，未接自动保存与 AI</strong>
+    <span>本页只演示网格展示、鼠标拖拽与缩放，以及「意图」回调。不保存、不连后端、不调用模型。</span>
+  </header>
+
+  <main class="rg-harness-main">
+    <section class="rg-harness-controls">
+      <button id="rg-toggle-mode" type="button">切换到编辑态</button>
+      <button id="rg-destroy" type="button">销毁模块</button>
+      <button id="rg-rebuild" type="button">重建模块</button>
+      <button id="rg-collision" type="button">载入碰撞布局</button>
+      <button id="rg-reset" type="button">重置布局</button>
+      <span id="rg-status" class="rg-harness-status">初始化中…</span>
+    </section>
+
+    <section class="rg-harness-stage">
+      <div id="rg-host" class="rg-harness-host"></div>
+    </section>
+
+    <section class="rg-harness-log">
+      <h2>本地演示：意图回调记录（内存模型，未保存）</h2>
+      <p class="rg-harness-hint">
+        演示宿主把受影响区域的 placement 应用到内存模型，再调用 update() 回灌模块；这不代表任何内容已被保存。
+      </p>
+      <ol id="rg-intent-log" class="rg-harness-log-list"></ol>
+      <p id="rg-select-log" class="rg-harness-select">尚未选择区域</p>
+    </section>
+  </main>
+
+  <script type="module" src="./harness.mjs"></script>
+</body>
+</html>

@@ -1,0 +1,47 @@
+{
+  "baseDir": "../../../..",
+  "outDir": "../../../../.agent-runtime/grid-prep-g/page/interaction",
+  "serveCmd": "node frontend/modules/report-grid/checks/static-server.mjs --port 8930",
+  "port": 8930,
+  "waitMs": 1200,
+  "flows": [
+    {
+      "name": "网格模块-选择与只读切换",
+      "path": "/frontend/modules/report-grid/harness/index.html",
+      "continueOnError": false,
+      "steps": [
+        { "assertVisible": ".rg-root[data-rg-root]" },
+        { "assertText": "网格模块测试页，未接自动保存与 AI" },
+        { "eval": "window.__rgHarness.mode === 'readonly'" },
+        { "assertHidden": ".rg-handle" },
+        { "click": ".rg-region[data-region-id=\"region-a\"]" },
+        { "eval": "window.__rgHarness.selections.length === 1" },
+        { "eval": "window.__rgHarness.selections[0] === 'region-a'" },
+        { "assertVisible": ".rg-region[data-region-id=\"region-a\"][data-rg-selected=\"true\"]" },
+        { "click": ".rg-region[data-region-id=\"region-a\"]" },
+        { "eval": "window.__rgHarness.selections.length === 1" },
+        { "screenshot": "01-readonly-selected" },
+        { "click": "#rg-toggle-mode" },
+        { "eval": "window.__rgHarness.mode === 'editable'" },
+        { "assertVisible": ".rg-handle[data-rg-handle=\"se\"]" },
+        { "assertVisible": ".rg-gridlines" },
+        { "screenshot": "02-editable-mode" },
+        { "click": "#rg-toggle-mode" },
+        { "eval": "window.__rgHarness.mode === 'readonly'" },
+        { "assertHidden": ".rg-handle" },
+        { "click": "#rg-destroy" },
+        { "eval": "window.__rgHarness.alive === false" },
+        { "assertCount": ".rg-region", "count": 0, "op": "===" },
+        { "assertCount": ".rg-grid", "count": 0, "op": "===" },
+        { "screenshot": "03-destroyed" },
+        { "click": "#rg-rebuild" },
+        { "eval": "window.__rgHarness.alive === true" },
+        { "assertCount": ".rg-region", "count": 4, "op": "===" },
+        { "eval": "window.__rgHarness.selections.length === 1" },
+        { "click": "#rg-collision" },
+        { "assertCount": ".rg-region", "count": 4, "op": "===" },
+        { "screenshot": "04-collision-layout" }
+      ]
+    }
+  ]
+}
