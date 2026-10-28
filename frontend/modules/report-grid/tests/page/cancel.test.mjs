@@ -1,3 +1,8 @@
+//
+// 运行：node --test frontend/modules/report-grid/tests/page/*.test.mjs
+// （目录参数在 Node 24 上不匹配默认测试文件规则，要显式给 glob；
+//   跑单个文件 node --test frontend/modules/report-grid/tests/page/cancel.test.mjs 也可以）
+// 不依赖任何第三方包（用 Node 内置 test runner），不改动共用依赖配置。
 /**
  * G 网格页面模块 · 取消、只读加锁、销毁与视图更新
  *
@@ -45,36 +50,36 @@ function startDrag(dom, id, { x = 100, y = 100 } = {}) {
   return region;
 }
 
-test('pointercancel 取消手势，不回调且丢弃预览', () => {
+test('pointercancel 取消手势，不回调且丢弃落位示意', () => {
   const dom = setup();
   const region = startDrag(dom, 'region-a');
-  assert.ok(dom.root.querySelectorAll('.rg-preview').length >= 1);
+  assert.ok(dom.root.querySelectorAll('.rg-drop-ghost').length >= 1);
 
   region.dispatchEvent(makePointerEvent('pointercancel', { x: 300, y: 220 }));
 
   assert.equal(dom.intents.length, 0);
-  assert.equal(dom.root.querySelectorAll('.rg-preview').length, 0);
+  assert.equal(dom.root.querySelectorAll('.rg-drop-ghost').length, 0);
   assert.equal(region.getAttribute('data-rg-dragging'), null);
 });
 
-test('Escape 取消手势，不回调且丢弃预览', () => {
+test('Escape 取消手势，不回调且丢弃落位示意', () => {
   const dom = setup();
   startDrag(dom, 'region-a');
 
   dom.document.dispatchEvent(makeEvent('keydown', { key: 'Escape' }));
 
   assert.equal(dom.intents.length, 0);
-  assert.equal(dom.root.querySelectorAll('.rg-preview').length, 0);
+  assert.equal(dom.root.querySelectorAll('.rg-drop-ghost').length, 0);
 });
 
-test('手势中途 update({readonly:true}) 立即加锁，不回调且丢弃预览', () => {
+test('手势中途 update({readonly:true}) 立即加锁，不回调且丢弃落位示意', () => {
   const dom = setup();
   const region = startDrag(dom, 'region-a');
 
   dom.grid.update({ readonly: true });
 
   assert.equal(dom.intents.length, 0);
-  assert.equal(dom.root.querySelectorAll('.rg-preview').length, 0);
+  assert.equal(dom.root.querySelectorAll('.rg-drop-ghost').length, 0);
   assert.equal(region.getAttribute('data-rg-dragging'), null);
   assert.equal(dom.root.getAttribute('data-rg-readonly'), 'true');
   assert.equal(dom.root.querySelectorAll('.rg-handle').length, 0);
@@ -87,7 +92,7 @@ test('手势中途 update 换视图同样取消手势，不回调', () => {
   dom.grid.update({ items: items() });
 
   assert.equal(dom.intents.length, 0);
-  assert.equal(dom.root.querySelectorAll('.rg-preview').length, 0);
+  assert.equal(dom.root.querySelectorAll('.rg-drop-ghost').length, 0);
 });
 
 test('destroy() 取消手势，不回调', () => {
@@ -97,7 +102,7 @@ test('destroy() 取消手势，不回调', () => {
   dom.grid.destroy();
 
   assert.equal(dom.intents.length, 0);
-  assert.equal(dom.root.querySelectorAll('.rg-preview').length, 0);
+  assert.equal(dom.root.querySelectorAll('.rg-drop-ghost').length, 0);
 });
 
 test('destroy() 只清理自有 DOM', () => {

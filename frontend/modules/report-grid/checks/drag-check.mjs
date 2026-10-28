@@ -14,6 +14,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import { mkdir, writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -35,7 +36,9 @@ const CHROME_CANDIDATES = [
 /* ----------------------------------------------------------------- 参数 */
 
 function parseArgs(argv) {
-  const out = { outDir: path.join(repoRoot, '.agent-runtime', 'grid-prep-g', 'page', 'drag'), port: 8930 };
+  // 默认落到仓库根 .selfcheck/（已被 .gitignore 忽略），不污染 worktree；
+  // 任务期产物请用 --out-dir 指向临时资源目录。
+  const out = { outDir: path.join(repoRoot, '.selfcheck', 'report-grid', 'drag'), port: 8930 };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--out-dir') out.outDir = path.resolve(argv[++i]);
     else if (argv[i] === '--port') out.port = Number(argv[++i]);
@@ -180,6 +183,21 @@ async function launchChrome() {
 
 /* ------------------------------------------------------------ 静态服务器 */
 
+/** 端口上是否已有监听（不区分是谁的）。 */
+function tcpPortBusy(port) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: '127.0.0.1', port }, () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.on('error', () => resolve(false));
+    socket.setTimeout(1500, () => {
+      socket.destroy();
+      resolve(false);
+    });
+  });
+}
+
 async function waitForPort(port, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -195,6 +213,13 @@ async function waitForPort(port, timeoutMs = 15000) {
 }
 
 async function ensureServer(port) {
+  // 启动前复查端口：被占用就报告，不停止任何他人进程，也不驱动别人的服务
+  if (await tcpPortBusy(port)) {
+    throw new Error(
+      `端口 ${port} 已被占用。按约定不停止他人进程，请换一个端口重试（--port <其它端口>）。`,
+    );
+  }
+
   const script = path.join(repoRoot, 'frontend/modules/report-grid/checks/static-server.mjs');
   const child = spawn(process.execPath, [script, '--port', String(port), '--root', repoRoot], {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -203,10 +228,22 @@ async function ensureServer(port) {
   child.stderr.on('data', (d) => {
     stderr += String(d);
   });
-  const exited = new Promise((resolve) => child.on('exit', (code) => resolve(code)));
+  let exitCode = null;
+  const exited = new Promise((resolve) => child.on('exit', (code) => {
+    exitCode = code;
+    resolve(code);
+  }));
+
   const ok = await waitForPort(port, 8000);
-  if (!ok) {
-    const code = await Promise.race([exited, Promise.resolve(null)]);
+  // 端口有响应还不够：必须确认起服务的子进程仍然活着，
+  // 否则可能响应的其实是别人的服务。
+  if (!ok || exitCode !== null) {
+    const code = exitCode !== null ? exitCode : await Promise.race([exited, Promise.resolve(null)]);
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* ignore */
+    }
     throw new Error(
       `静态服务未在 ${port} 端口就绪${code !== null ? `（退出码 ${code}）` : ''}。${stderr.trim()}\n` +
         '端口被占用时不要停止他人进程，请换端口重试。',
@@ -526,7 +563,7 @@ async function main() {
         })()`,
       );
       await realDrag(cdp, sessionId, from, to);
-      entry.previewCountAfter = await evaluate(cdp, sessionId, 'document.querySelectorAll(".rg-preview").length');
+      entry.ghostCountAfter = await evaluate(cdp, sessionId, 'document.querySelectorAll(".rg-drop-ghost").length');
       entry.draggingAfter = await evaluate(
         cdp,
         sessionId,
@@ -668,9 +705,9 @@ async function main() {
         });
         await new Promise((r) => setTimeout(r, 40));
       }
-      const previewDuring = await evaluate(cdp, sessionId, 'document.querySelectorAll(".rg-preview").length');
-      entry.previewCountDuringGesture = previewDuring;
-      check('手势中有落位预览', previewDuring >= 1, `实际 ${previewDuring}`);
+      const ghostDuring = await evaluate(cdp, sessionId, 'document.querySelectorAll(".rg-drop-ghost").length');
+      entry.ghostCountDuringGesture = ghostDuring;
+      check('手势中有落位示意', ghostDuring >= 1, `实际 ${ghostDuring}`);
 
       // 鼠标仍按着时，用键盘触发宿主自己的「切换到只读态」按钮
       await evaluate(cdp, sessionId, `document.getElementById('rg-toggle-mode').focus()`);
@@ -693,10 +730,10 @@ async function main() {
       entry.end = to;
       entry.callbackCount = (await intentCount()) - before;
       entry.mode = await mode();
-      const previewAfter = await evaluate(cdp, sessionId, 'document.querySelectorAll(".rg-preview").length');
-      entry.previewCountAfter = previewAfter;
+      const ghostAfter = await evaluate(cdp, sessionId, 'document.querySelectorAll(".rg-drop-ghost").length');
+      entry.ghostCountAfter = ghostAfter;
       check('加锁后无回调', entry.callbackCount === 0, `实际 ${entry.callbackCount}`);
-      check('加锁后预览被丢弃', previewAfter === 0, `实际 ${previewAfter}`);
+      check('加锁后落位示意被丢弃', ghostAfter === 0, `实际 ${ghostAfter}`);
       check('加锁后进入只读态', entry.mode === 'readonly', `实际 ${entry.mode}`);
       entry.screenshot = await screenshot(cdp, sessionId, path.join(args.outDir, '10-lock-mid-gesture.png'));
     });

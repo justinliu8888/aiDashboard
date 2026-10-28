@@ -1,3 +1,8 @@
+//
+// 运行：node --test frontend/modules/report-grid/tests/page/*.test.mjs
+// （目录参数在 Node 24 上不匹配默认测试文件规则，要显式给 glob；
+//   跑单个文件 node --test frontend/modules/report-grid/tests/page/report-grid.test.mjs 也可以）
+// 不依赖任何第三方包（用 Node 内置 test runner），不改动共用依赖配置。
 /**
  * G 网格页面模块 · 挂载与只读态
  *

@@ -27,11 +27,6 @@ function isNodeLike(value) {
   return Boolean(value) && typeof value === 'object' && typeof value.nodeType === 'number';
 }
 
-function placementKey(placement) {
-  if (!placement) return '';
-  return `${placement.column},${placement.row},${placement.columnSpan},${placement.rowSpan}`;
-}
-
 function clamp(value, min, max) {
   if (max < min) return min;
   return Math.min(Math.max(value, min), max);
@@ -78,7 +73,7 @@ export function mountReportGrid(root, options = {}) {
   // 契约 §1.1/§1.4：列数固定 12，不随 config 变化，避免渲染与几何校验口径不一致
   const columns = GRID_COLUMNS;
   const regionEntries = new Map();
-  const previewEls = new Map();
+  const dropGhostEls = new Map();
   let currentPlacements = new Map();
 
   /* ------------------------------------------------------------ DOM 骨架 */
@@ -113,7 +108,11 @@ export function mountReportGrid(root, options = {}) {
     grid.style.setProperty('--rg-row-pitch', `${state.config.rowUnitPx + state.config.gapPx}px`);
   }
 
-  /** 输入不合法时退回「只渲染自身 placement 合法的区域」，避免整页崩掉 */
+  /**
+   * 输入不合法时退回「只渲染自身 placement 合法的区域」，避免整页崩掉。
+   * 合法性口径与布局层一致：GRID、1 基正整数、横向不越界（固定 12 列）。
+   * 重复 regionId 保留第一个，不静默覆盖成另一个。
+   */
   function computeDisplayPlacements() {
     const map = new Map();
     const resolved = resolveGridLayout({ items: state.items, intent: null, config: state.config });
@@ -122,16 +121,16 @@ export function mountReportGrid(root, options = {}) {
       return map;
     }
     for (const item of state.items) {
-      const p = item && item.placement;
-      if (
-        p && p.type === 'GRID' &&
-        positiveInt(p.column) && positiveInt(p.row) &&
-        positiveInt(p.columnSpan) && positiveInt(p.rowSpan)
-      ) {
-        map.set(item.regionId, {
-          type: 'GRID', column: p.column, row: p.row, columnSpan: p.columnSpan, rowSpan: p.rowSpan,
-        });
-      }
+      if (!item || typeof item.regionId !== 'string' || item.regionId === '') continue;
+      const p = item.placement;
+      if (!p || p.type !== 'GRID') continue;
+      if (!positiveInt(p.column) || !positiveInt(p.row)) continue;
+      if (!positiveInt(p.columnSpan) || !positiveInt(p.rowSpan)) continue;
+      if (p.column + p.columnSpan - 1 > columns) continue;
+      if (map.has(item.regionId)) continue;
+      map.set(item.regionId, {
+        type: 'GRID', column: p.column, row: p.row, columnSpan: p.columnSpan, rowSpan: p.rowSpan,
+      });
     }
     return map;
   }
@@ -362,53 +361,30 @@ export function mountReportGrid(root, options = {}) {
     };
   }
 
-  /** 结果里真正发生变化的区域（对比输入布局） */
-  function changedIds(result) {
-    const ids = [];
-    for (const entry of result.placements) {
-      const item = itemOf(entry.regionId);
-      if (!item) continue;
-      if (placementKey(entry.placement) !== placementKey(item.placement)) ids.push(entry.regionId);
-    }
-    return ids;
+  /* ------------------------------------------------------------ 落位示意 */
+
+  function clearDropGhosts() {
+    for (const el of dropGhostEls.values()) el.remove();
+    dropGhostEls.clear();
   }
 
-  /** 目标优先，其后是实际被让位的区域 */
-  function orderAffected(ids, targetId, result) {
-    const out = [];
-    const push = (id) => {
-      if (id && ids.includes(id) && !out.includes(id)) out.push(id);
-    };
-    push(targetId);
-    for (const id of (result && result.affectedRegionIds) || []) push(id);
-    for (const id of ids) push(id);
-    return out;
-  }
-
-  /* ------------------------------------------------------------ 预览 */
-
-  function clearPreviews() {
-    for (const el of previewEls.values()) el.remove();
-    previewEls.clear();
-  }
-
-  function renderPreviews(result, ids) {
-    for (const [id, el] of [...previewEls]) {
+  function renderDropGhosts(result, ids) {
+    for (const [id, el] of [...dropGhostEls]) {
       if (!ids.includes(id)) {
         el.remove();
-        previewEls.delete(id);
+        dropGhostEls.delete(id);
       }
     }
     for (const id of ids) {
       const entry = result.placements.find((p) => p.regionId === id);
       if (!entry) continue;
-      let el = previewEls.get(id);
+      let el = dropGhostEls.get(id);
       if (!el) {
         el = doc.createElement('div');
-        el.className = 'rg-preview';
-        el.setAttribute('data-rg-preview', id);
+        el.className = 'rg-drop-ghost';
+        el.setAttribute('data-rg-drop-ghost', id);
         grid.appendChild(el);
-        previewEls.set(id, el);
+        dropGhostEls.set(id, el);
       }
       applyPlacement(el, entry.placement);
       const item = itemOf(id);
@@ -416,25 +392,24 @@ export function mountReportGrid(root, options = {}) {
     }
   }
 
-  function updatePreview(dx, dy) {
+  function updateDropGhosts(dx, dy) {
     const intent = computeIntent(dx, dy);
     if (!intent) {
-      clearPreviews();
+      clearDropGhosts();
       return;
     }
     const result = resolveGridLayout({ items: state.items, intent, config: state.config });
     if (result.kind !== 'success') {
-      clearPreviews();
+      clearDropGhosts();
       return;
     }
-    const ids = changedIds(result);
-    renderPreviews(result, orderAffected(ids, intent.regionId, result));
+    renderDropGhosts(result, result.affectedRegionIds);
   }
 
   /* ------------------------------------------------------------ 手势收尾 */
 
   function endGestureVisuals() {
-    clearPreviews();
+    clearDropGhosts();
     if (gesture.el) {
       gesture.el.removeAttribute('data-rg-dragging');
       if (gesture.pointerId != null && typeof gesture.el.releasePointerCapture === 'function') {
@@ -458,7 +433,7 @@ export function mountReportGrid(root, options = {}) {
     gesture.pointerId = null;
   }
 
-  /** 取消手势：丢弃预览、回到输入布局、不发回调 */
+  /** 取消手势：丢弃落位示意、回到输入布局、不发回调 */
   function cancelGesture() {
     const wasActive = gesture.active;
     endGestureVisuals();
@@ -498,13 +473,12 @@ export function mountReportGrid(root, options = {}) {
       return;
     }
 
-    const ids = changedIds(result);
-    if (!ids.length) {
+    // 受影响集合直接用布局层的结果，不再在页面层另算一套规则
+    const affected = result.affectedRegionIds;
+    if (!affected.length) {
       render();
       return;
     }
-
-    const affected = orderAffected(ids, regionId, result);
     const payload = {
       kind: kind === 'move' ? 'move' : 'resize',
       regionId,
@@ -570,7 +544,7 @@ export function mountReportGrid(root, options = {}) {
   function onPointerMove(ev) {
     if (state.destroyed) return;
     if (gesture.active) {
-      updatePreview(clientX(ev) - gesture.startX, clientY(ev) - gesture.startY);
+      updateDropGhosts(clientX(ev) - gesture.startX, clientY(ev) - gesture.startY);
       return;
     }
     if (!pointer.active) return;
@@ -623,7 +597,7 @@ export function mountReportGrid(root, options = {}) {
 
   function update(view = {}) {
     if (state.destroyed) return;
-    cancelGesture(); // 取消进行中的手势：丢弃预览、不发回调
+    cancelGesture(); // 取消进行中的手势：丢弃落位示意、不发回调
     if (view && Array.isArray(view.items)) state.items = view.items;
     if (view && view.readonly !== undefined) state.readonly = view.readonly === false ? false : true;
     if (view && view.config) state.config = { ...DEFAULT_GRID_CONFIG, ...view.config };

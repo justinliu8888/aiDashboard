@@ -130,9 +130,9 @@
   cursor: nwse-resize;
 }
 
-/* ------------------------------------------------------------- 预览 */
+/* ------------------------------------------------------------- 落位示意 */
 
-.rg-root .rg-preview {
+.rg-root .rg-drop-ghost {
   grid-column: var(--rg-column) / span var(--rg-column-span);
   grid-row: var(--rg-row) / span var(--rg-row-span);
   pointer-events: none;

@@ -2,7 +2,7 @@
  * G 网格模块测试页 · 演示宿主
  *
  * 本页是**演示宿主**，不是生产工作台：
- *   - 用内存模型接受模块的 onIntent 回调：把受影响区域的 placement 应用到内存模型，
+ *   - 用本地视图接受模块的 onIntent 回调：把受影响区域的 placement 应用到本地视图，
  *     再调用 update() 回灌模块，用来回显「新的视图」。
  *   - 不发 HTTP、不落库、不调用模型、不代表任何内容已被保存。
  *   - 区域内容是测试占位文字，不含真实客户数据。
@@ -125,10 +125,10 @@ function renderSelectLog() {
 function updateStatus() {
   const mode = readonly ? '只读' : '编辑';
   const alive = instance ? '已挂载' : '已销毁';
-  statusEl.textContent = `模块：${alive} · 当前模式：${mode} · 内存模型区域数：${items.length} · 未保存`;
+  statusEl.textContent = `模块：${alive} · 当前模式：${mode} · 本地视图区域数：${items.length} · 未保存`;
 }
 
-/** 演示宿主：用内存模型接受意图，再把新视图写回模块 */
+/** 演示宿主：用本地视图接受意图，再把新视图写回模块 */
 function handleIntent(payload) {
   const byId = new Map(items.map((item) => [item.regionId, item]));
   for (const placement of payload.placements) {

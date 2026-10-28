@@ -176,14 +176,14 @@ function normalizeItems(items, config) {
  *   - 连锁碰撞按「原 row → 原 column → regionId」确定性顺序处理；
  *   - 与落位不冲突的组件完全不动，也不向上填空。
  */
-function yieldToTarget(items, state, targetId) {
-  const targetRect = state.get(targetId);
+function yieldToTarget(items, placementsById, targetId) {
+  const targetRect = placementsById.get(targetId);
   const movers = [];
   const others = [];
 
   for (const item of items) {
     if (item.regionId === targetId) continue;
-    const rect = state.get(item.regionId);
+    const rect = placementsById.get(item.regionId);
     if (overlaps(rect, targetRect)) movers.push({ regionId: item.regionId, rect });
     else others.push(rect);
   }
@@ -209,7 +209,7 @@ function yieldToTarget(items, state, targetId) {
     }
     const next = { type: 'GRID', column, row, columnSpan, rowSpan };
     mover.rect = next;
-    state.set(mover.regionId, next);
+    placementsById.set(mover.regionId, next);
     settled.push(next);
   }
 }
@@ -298,12 +298,12 @@ export function resolveGridLayout(input) {
 
   // 3) 归一化：合法项原样保留，非法项按 items 顺序补齐
   const normalized = normalizeItems(items, cfg);
-  const state = normalized.placements;
-  const before = new Map(state);
+  const placementsById = normalized.placements;
+  const before = new Map(placementsById);
 
   // 4) 应用意图（尺寸与越界是最后一组校验）
   if (hasIntent) {
-    const target = state.get(intent.regionId);
+    const target = placementsById.get(intent.regionId);
     const { minColumnSpan, minRowSpan } = normalized.minSpans.get(intent.regionId);
     const next = { ...target };
 
@@ -353,18 +353,18 @@ export function resolveGridLayout(input) {
       );
     }
 
-    state.set(intent.regionId, clonePlacement(next));
+    placementsById.set(intent.regionId, clonePlacement(next));
 
     // 4b) 碰撞让位
-    yieldToTarget(items, state, intent.regionId);
+    yieldToTarget(items, placementsById, intent.regionId);
   }
 
   // 5) 组装结果
-  const affected = collectAffected(items, state, before, hasIntent ? intent.regionId : null);
+  const affected = collectAffected(items, placementsById, before, hasIntent ? intent.regionId : null);
 
   const placements = items.map((item) => ({
     regionId: item.regionId,
-    placement: clonePlacement(state.get(item.regionId)),
+    placement: clonePlacement(placementsById.get(item.regionId)),
   }));
 
   return { kind: 'success', placements, affectedRegionIds: affected };

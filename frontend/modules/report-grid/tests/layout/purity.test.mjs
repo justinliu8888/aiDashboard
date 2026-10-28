@@ -1,15 +1,13 @@
+//
+// 运行：node --test frontend/modules/report-grid/tests/layout/*.test.mjs
+// （目录参数在 Node 24 上不匹配默认测试文件规则，要显式给 glob；
+//   跑单个文件 node --test frontend/modules/report-grid/tests/layout/purity.test.mjs 也可以）
+// 不依赖任何第三方包（用 Node 内置 test runner），不改动共用依赖配置。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { DEFAULT_GRID_CONFIG, resolveGridLayout } from '../../layout/grid-layout.mjs';
-
-function grid(column, row, columnSpan = 1, rowSpan = 1) {
-  return { type: 'GRID', column, row, columnSpan, rowSpan };
-}
-
-function item(regionId, placement = grid(1, 1), extra = {}) {
-  return { regionId, placement, ...extra };
-}
+import { grid, item } from '../helpers/fixtures.mjs';
 
 test('初始化不会就地修改输入 items', () => {
   const items = [item('a', grid(1, 1)), item('b', { type: 'GRID' }), item('c', grid(4, 2, 2, 2))];

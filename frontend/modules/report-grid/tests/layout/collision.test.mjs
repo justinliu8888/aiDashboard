@@ -1,21 +1,13 @@
+//
+// 运行：node --test frontend/modules/report-grid/tests/layout/*.test.mjs
+// （目录参数在 Node 24 上不匹配默认测试文件规则，要显式给 glob；
+//   跑单个文件 node --test frontend/modules/report-grid/tests/layout/collision.test.mjs 也可以）
+// 不依赖任何第三方包（用 Node 内置 test runner），不改动共用依赖配置。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { resolveGridLayout } from '../../layout/grid-layout.mjs';
-
-function grid(column, row, columnSpan = 1, rowSpan = 1) {
-  return { type: 'GRID', column, row, columnSpan, rowSpan };
-}
-
-function item(regionId, placement = grid(1, 1), extra = {}) {
-  return { regionId, placement, ...extra };
-}
-
-function placementOf(result, regionId) {
-  const found = result.placements.find((p) => p.regionId === regionId);
-  assert.ok(found, `结果里没有 ${regionId}`);
-  return found.placement;
-}
+import { grid, item, placementOf } from '../helpers/fixtures.mjs';
 
 /** 断言结果里没有任何两个区域占用同一网格单元。 */
 function assertNoOverlap(result) {

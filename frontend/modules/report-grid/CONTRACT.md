@@ -76,8 +76,9 @@ null | undefined                   // 初始化
 
 受影响集合 = **目标 + 实际被让位的区域 + 因输入非法而被补齐的区域**。
 
-- 目标永远排第一。
-- 其余按「原 row → 原 column → regionId」确定性排序。
+- 目标**确实发生变化时**排在第一；目标落位与输入相同则不在集合内（它没有变化）。
+- 手势路径下，其余按「原 row → 原 column → regionId」确定性排序。
+- 初始化路径（`intent` 为空）下按 `items` 顺序，与 §2.2「按 items 顺序补齐」一致。
 - **合法且未被让位的区域不在集合内**（无关组件不动）。
 - 初始化补齐项计入集合的原因：父规格要求「保存前的初始化…按现有组件顺序补齐」，
   补齐结果必须能随意图回到宿主并被保存，否则非法 placement 会一直留在宿主模型里。
@@ -146,9 +147,9 @@ null | undefined                   // 初始化
    不含合法且未被让位的无关组件。`resolveGridLayout` 返回的 `placements` 才是全量集合。
 5. **零变更不回调**：若 `affectedRegionIds` 为空（结果与输入一致），**不调用** `onIntent`，视图回到输入布局。
 6. **输入不被冒充为设计**：`onIntent` 是布局**提案**，不含 `operationId` / `revision`，不发 HTTP，不表示已保存。回调后视图以**宿主输入**为准。
-7. **预览仅是临时状态**：手势过程中展示落位预览（目标新落位 + 让位者新位置），视觉上可区分。松手后模块回到输入布局，由宿主 `update(view)` 写入新视图。宿主未调用 `update` 时不保留内部位置。
-8. **只读中途加锁**：`update({ readonly: true })` 发生在手势中途 → 立即取消手势、丢弃预览、**不发**完成回调。
-9. **取消**：`pointercancel`、Escape 键、`destroy()` → 取消手势、丢弃预览、不发回调。
+7. **落位示意仅是临时状态**：手势过程中展示落位示意（目标新落位 + 让位者新位置），视觉上可区分。松手后模块回到输入布局，由宿主 `update(view)` 写入新视图。宿主未调用 `update` 时不保留内部位置。
+8. **只读中途加锁**：`update({ readonly: true })` 发生在手势中途 → 立即取消手势、丢弃落位示意、**不发**完成回调。
+9. **取消**：`pointercancel`、Escape 键、`destroy()` → 取消手势、丢弃落位示意、不发回调。
 10. **`update(view)`**：`view = { items, readonly?, config? }`；替换输入视图并重绘；取消进行中的手势；`readonly` 缺省沿用当前值。若当前选中区域在新 items 中消失，调用 `onSelect(null)`；否则不调用 `onSelect`。
 11. **`destroy()`**：释放本模块的事件监听、观察器与指针状态，只清理自有 DOM；之后不再响应任何指针事件，**不再触发任何回调**（无重复回调、无旧事件）。
 12. **选择**：`onSelect(regionId)` / 取消选择时 `onSelect(null)`；重复点击同一区域不重复触发。
@@ -166,8 +167,12 @@ null | undefined                   // 初始化
 | `.rg-region` | 区域元素，带 `data-region-id="<id>"` 与 `data-rg-region="<id>"` |
 | `.rg-region[data-rg-selected="true"]` | 选中态 |
 | `.rg-region[data-rg-dragging="true"]` | 拖拽/缩放中的目标区域 |
-| `.rg-preview` | 落位预览层，带 `data-rg-preview="<id>"` |
+| `.rg-drop-ghost` | 落位示意层，带 `data-rg-drop-ghost="<id>"` |
 | `.rg-handle[data-rg-handle="e\|s\|se"]` | 缩放手柄（右侧 / 底部 / 右下角） |
+
+**术语**：本模块把拖拽过程中显示的落位提示称为「**落位示意**」（DOM 类名 `.rg-drop-ghost`），
+与 `GLOSSARY.md` 里的「报表预览」不是同一概念，不要混用；
+harness 里的「本地视图」指前端内存中的 items 缓存，与「真实模型」无关。
 
 区域用 CSS Grid 定位：`grid-column: var(--rg-column) / span var(--rg-column-span)`，
 `grid-row: var(--rg-row) / span var(--rg-row-span)`。
@@ -206,6 +211,9 @@ null | undefined                   // 初始化
 `/Users/peiliu/Desktop/海悟/20261012 智能报表功能/.agent-runtime/grid-prep-g/`。
 
 ```bash
+# 单元测试（Node 内置 test runner，无第三方依赖）
+node --test frontend/modules/report-grid/tests/layout/*.test.mjs frontend/modules/report-grid/tests/page/*.test.mjs
+
 # 静态自检
 node /Users/peiliu/Desktop/海悟/.trae/skills/frontend-self-check/scripts/selfcheck.mjs \
   --config frontend/modules/report-grid/checks/selfcheck.json \
@@ -222,6 +230,14 @@ node frontend/modules/report-grid/checks/drag-check.mjs \
 ```
 
 拖拽验证**不得**用直接调用布局方法、改 DOM 或注入最终快照冒充。断言通过 ≠ 拖拽通过。
+
+`checks/drag-check.mjs` 自带一份精简 CDP 客户端，**不复用** `.trae/skills/_shared/cdp.mjs`：
+后者在仓库之外，引用它需要把本机绝对路径写进仓库文件。保持自包含是有意的取舍，
+后续若共享库迁入仓库，可改为 import 复用。
+
+端口占用约定：三个检查脚本启动静态服务前都会复查端口；
+**端口被占用时报错退出，不停止任何他人进程**（`drag-check` 还会确认自己起的子进程仍存活，
+避免把别人的服务当成本次服务去驱动）。换端口请用 `--port`。
 
 ## 8. 不在本次范围
 

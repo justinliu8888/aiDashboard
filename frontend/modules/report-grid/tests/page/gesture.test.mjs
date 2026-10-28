@@ -1,8 +1,13 @@
+//
+// 运行：node --test frontend/modules/report-grid/tests/page/*.test.mjs
+// （目录参数在 Node 24 上不匹配默认测试文件规则，要显式给 glob；
+//   跑单个文件 node --test frontend/modules/report-grid/tests/page/gesture.test.mjs 也可以）
+// 不依赖任何第三方包（用 Node 内置 test runner），不改动共用依赖配置。
 /**
  * G 网格页面模块 · 拖拽与缩放手势
  *
  * 契约来源：CONTRACT.md 3.3（一次手势一次回调）、3.4（回调载荷）、3.5（零变更不回调）、
- * 3.6（回调只是提案）、3.7（预览仅是临时状态）。
+ * 3.6（回调只是提案）、3.7（落位示意仅是临时状态）。
  *
  * 几何约定（契约第 3 节 + 网格几何）：
  *   列宽 = (网格容器宽 - gap * (columns - 1)) / columns
@@ -190,20 +195,20 @@ test('缩到最小尺寸时不会小于生效最小跨列', () => {
   assert.equal(resized.placement.columnSpan, 2);
 });
 
-test('手势过程中显示落位预览，松手后预览消失并回到输入布局', () => {
+test('手势过程中显示落位示意，松手后示意消失并回到输入布局', () => {
   const dom = setup();
   const region = regionEl(dom.root, 'region-c');
   region.dispatchEvent(makePointerEvent('pointerdown', { x: 100, y: 400 }));
   region.dispatchEvent(makePointerEvent('pointermove', { x: 100, y: 400 + ROW_PITCH }));
 
-  const previews = dom.root.querySelectorAll('.rg-preview');
+  const previews = dom.root.querySelectorAll('.rg-drop-ghost');
   assert.ok(previews.length >= 1);
-  assert.ok(previews.some((el) => el.getAttribute('data-rg-preview') === 'region-c'));
+  assert.ok(previews.some((el) => el.getAttribute('data-rg-drop-ghost') === 'region-c'));
   assert.equal(region.getAttribute('data-rg-dragging'), 'true');
 
   region.dispatchEvent(makePointerEvent('pointerup', { x: 100, y: 400 + ROW_PITCH }));
 
-  assert.equal(dom.root.querySelectorAll('.rg-preview').length, 0);
+  assert.equal(dom.root.querySelectorAll('.rg-drop-ghost').length, 0);
   assert.equal(region.getAttribute('data-rg-dragging'), null);
   assert.equal(region.style.getPropertyValue('--rg-row'), '3');
 });

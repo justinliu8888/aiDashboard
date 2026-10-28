@@ -1,7 +1,13 @@
+//
+// 运行：node --test frontend/modules/report-grid/tests/layout/*.test.mjs
+// （目录参数在 Node 24 上不匹配默认测试文件规则，要显式给 glob；
+//   跑单个文件 node --test frontend/modules/report-grid/tests/layout/affected-set.test.mjs 也可以）
+// 不依赖任何第三方包（用 Node 内置 test runner），不改动共用依赖配置。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { resolveGridLayout, DEFAULT_GRID_CONFIG, GRID_COLUMNS } from '../../layout/grid-layout.mjs';
+import { grid, placementOf } from '../helpers/fixtures.mjs';
 
 /**
  * 受影响集合语义（契约「受影响集合」小节）与固定列数口径的回归测试。
@@ -11,16 +17,6 @@ import { resolveGridLayout, DEFAULT_GRID_CONFIG, GRID_COLUMNS } from '../../layo
  *      合法且未被让位的无关区域不在集合内。
  *   2. 列数固定 12，config.columns 不能改口径，布局层与页面层必须一致。
  */
-
-function grid(column, row, columnSpan = 1, rowSpan = 1) {
-  return { type: 'GRID', column, row, columnSpan, rowSpan };
-}
-
-function placementOf(result, regionId) {
-  const found = result.placements.find((p) => p.regionId === regionId);
-  assert.ok(found, `结果里没有 ${regionId}`);
-  return found.placement;
-}
 
 test('受影响集合：合法且未被让位的无关区域不计入', () => {
   const result = resolveGridLayout({
@@ -105,4 +101,31 @@ test('列数固定 12：config.columns 不改变布局口径', () => {
 test('列数固定 12：GRID_COLUMNS 与 DEFAULT_GRID_CONFIG.columns 都是 12', () => {
   assert.equal(GRID_COLUMNS, 12);
   assert.equal(DEFAULT_GRID_CONFIG.columns, 12);
+});
+
+test('受影响集合：初始化路径按 items 顺序，与「按 items 顺序补齐」一致', () => {
+  const result = resolveGridLayout({
+    items: [
+      { regionId: 'z', placement: { type: 'GRID', column: 1 } },
+      { regionId: 'y', placement: { type: 'GRID', column: 1 } },
+    ],
+    intent: null,
+  });
+
+  assert.equal(result.kind, 'success');
+  assert.deepEqual(result.affectedRegionIds, ['z', 'y']);
+});
+
+test('受影响集合：目标未变化时不在集合内（它没有变化）', () => {
+  const result = resolveGridLayout({
+    items: [
+      { regionId: 'a', placement: grid(1, 1) },
+      { regionId: 'c', placement: { type: 'GRID', column: 1 } },
+    ],
+    intent: { kind: 'move', regionId: 'a', column: 1, row: 1 },
+  });
+
+  assert.equal(result.kind, 'success');
+  // a 原地落位没有变化，因此不在受影响集合内；c 因输入非法被补齐，需要回传
+  assert.deepEqual(result.affectedRegionIds, ['c']);
 });

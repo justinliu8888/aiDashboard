@@ -1,3 +1,8 @@
+//
+// 运行：node --test frontend/modules/report-grid/tests/layout/*.test.mjs
+// （目录参数在 Node 24 上不匹配默认测试文件规则，要显式给 glob；
+//   跑单个文件 node --test frontend/modules/report-grid/tests/layout/validation.test.mjs 也可以）
+// 不依赖任何第三方包（用 Node 内置 test runner），不改动共用依赖配置。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -6,16 +11,7 @@ import {
   DEFAULT_GRID_CONFIG,
   resolveGridLayout,
 } from '../../layout/grid-layout.mjs';
-
-/** 构造一个合法的 GRID placement。 */
-function grid(column, row, columnSpan = 1, rowSpan = 1) {
-  return { type: 'GRID', column, row, columnSpan, rowSpan };
-}
-
-/** 构造一个最小合法 item。 */
-function item(regionId, placement = grid(1, 1), extra = {}) {
-  return { regionId, placement, ...extra };
-}
+import { grid, item } from '../helpers/fixtures.mjs';
 
 /** 断言结果是某个错误码的失败返回。 */
 function assertInvalid(result, code) {
