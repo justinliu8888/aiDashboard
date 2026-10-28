@@ -899,6 +899,26 @@ class ContextEngine:
                     ),
                 }
             )
+        if routing_rules.is_readonly_question(request.message):
+            # 模型可能把「你支持做报表吗」判成 CHITCHAT，但这类问题
+            # 同样要事实：答一句「当然支持呀～」不是事实，是猜。
+            # 判定口径用规则层的 ``is_readonly_question`` ——
+            # 它要求「有疑问标记 + 指向报表业务对象 + 没有明确改动动词」
+            # 三条同时成立，普通问候和明确生成请求都排除在外。
+            logger.info(
+                "[context_engine] step=direct_reply_downgraded conversationId=%s intent=%s reason=readonly_question_needs_facts",
+                request.conversationId,
+                concierge.userIntent.value,
+            )
+            return concierge.model_copy(
+                update={
+                    "action": ConciergeAction.DEEP_ROUTE,
+                    "reply": "",
+                    "reason": (
+                        "只读提问需要事实查证，强制深路由"
+                    ),
+                }
+            )
         if concierge.userIntent not in STATE_CHANGING_INTENTS:
             return concierge
         logger.info(

@@ -707,7 +707,6 @@ def test_query_does_not_write_back_a_stale_client_snapshot(post_chat):
 
 # ---------- 6. 读取失败时：会话读取与查询都要活下来 ----------
 
-
 def test_session_read_survives_a_malformed_stored_draft(client):
     """服务端存的草稿结构坏掉时，会话读取接口不能 500。
 
@@ -811,7 +810,6 @@ def test_query_survives_a_region_with_a_non_dict_component(client):
 
 # ---------- 7. 查询轮不得改写服务端业务状态 ----------
 
-
 def test_query_does_not_overwrite_server_state_with_the_client_claimed_state(client):
     """客户端声称的状态与服务端不符时，查询也不能把服务端状态改掉。
 
@@ -869,3 +867,98 @@ def test_query_on_a_fresh_session_still_records_a_state(client):
     stored = session_service.repository.get_session("sess_new_state")
     assert stored is not None
     assert stored.state == "ANALYZING"
+
+
+# ---------- 8. 路由器不得对能力问题提前作答 ----------
+
+
+def _route_request(message: str):
+    from app.schemas.agent import AgentRequest, AgentRequestContext
+
+    return AgentRequest(
+        conversationId="conv_route",
+        state=AgentState.ANALYZING,
+        message=message,
+        context=AgentRequestContext(
+            projectId="project_001",
+            subjectRef="machine_room",
+            subjectId="room_a",
+        ),
+    )
+
+
+def test_direct_reply_is_downgraded_when_model_calls_a_capability_question_chitchat():
+    """模型把能力问题判成 CHITCHAT 时，也不能直接作答。
+
+    路由器手里没有能力事实。答一句「当然支持呀～」不是事实，
+    而是猜 —— 规格明确要求「问能力…缺上下文时针对性澄清」，
+    也要「区分目录登记、链路支持、模拟数据与生产接通」。
+    """
+    from app.services.context_engine import (
+        ConciergeAction,
+        ConciergeDecision,
+        UserIntent,
+        context_engine,
+    )
+
+    concierge = ConciergeDecision(
+        action=ConciergeAction.DIRECT_REPLY,
+        userIntent=UserIntent.CHITCHAT,
+        reply="当然支持呀～我可以帮你生成各类机房能耗相关的报表。",
+    )
+
+    guarded = context_engine._guard_direct_reply(
+        concierge, _route_request("你支持做报表吗？")
+    )
+
+    assert guarded.action is ConciergeAction.DEEP_ROUTE
+    assert guarded.reply == ""
+
+
+def test_direct_reply_is_still_allowed_for_ordinary_greetings():
+    """普通问候仍然可以直接答 —— 规格允许「无需事实查询的直接回答」。"""
+    from app.services.context_engine import (
+        ConciergeAction,
+        ConciergeDecision,
+        UserIntent,
+        context_engine,
+    )
+
+    concierge = ConciergeDecision(
+        action=ConciergeAction.DIRECT_REPLY,
+        userIntent=UserIntent.CHITCHAT,
+        reply="我在。",
+    )
+
+    guarded = context_engine._guard_direct_reply(concierge, _route_request("你好"))
+    assert guarded.action is ConciergeAction.DIRECT_REPLY
+
+    guarded = context_engine._guard_direct_reply(
+        concierge, _route_request("你是谁？")
+    )
+    assert guarded.action is ConciergeAction.DIRECT_REPLY
+
+
+def test_direct_reply_is_still_allowed_for_explicit_generation_requests():
+    """明确生成请求要走原来的深路由，不能被当成只读提问。"""
+    from app.services.context_engine import (
+        ConciergeAction,
+        ConciergeDecision,
+        UserIntent,
+        context_engine,
+    )
+
+    concierge = ConciergeDecision(
+        action=ConciergeAction.DIRECT_REPLY,
+        userIntent=UserIntent.CHITCHAT,
+        reply="好的。",
+    )
+
+    for message in (
+        "生成 A 机房昨日能耗日报",
+        "把趋势改成折线图",
+        "接受修改",
+        "确认报表",
+    ):
+        guarded = context_engine._guard_direct_reply(concierge, _route_request(message))
+        assert guarded.action is not ConciergeAction.DEEP_ROUTE, message
