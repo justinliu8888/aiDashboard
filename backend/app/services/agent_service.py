@@ -571,28 +571,26 @@ class AgentService:
 
         # 设计流（#19）：新建流程先给文字方案。
         #
-        # 位置很讲究：
-        #   - 在旧流程的待确认菜单锁之后：老流程的选择锁不能被绕过；
-        #   - 在「先看模板」提前分流**之前**：规格写明「先看模板」这类
-        #     提前分流也必须进入新建流程，不能被旧的模板流劫持。
+        # 这里只做两件事：认出「这一轮归设计流程管」，
+        # 以及把「先看模板」提前分流挡在设计流程外面。
         #
-        # 提问（只读）不改设计版本：交给旧查询链路回答，
-        # 答完再把设计状态挂回响应（见下方 _handle_design_question）。
-        design_query = False
-        design_query_state: dict[str, Any] | None = None
+        #   - 模板流在旧流程里跑在路由之前，所以它会先抢走「先看模板」。
+        #     规格写明这类提前分流必须进入新建流程，所以设计轮不走模板流。
+        #   - 只读提问不能被模板流抢走：模板流遇到表达不了的条件会直接
+        #     BLOCKED_OR_UNSUPPORTED —— 那是用一句提问触发一条执行分支
+        #     （ADR 0002 §6.1 / 规格 #12）。
         design_state = report_design_service.load_state(request)
-        if design_state is not None or report_design_service.is_new_build(request):
-            if report_design_service.is_readonly_question(request.message):
-                design_query = True
-                design_query_state = design_state
-            else:
-                design_response = await report_design_service.handle(
-                    request, emit=emit
-                )
-                if design_response is not None:
-                    return design_response
+        design_turn = (
+            design_state is not None or report_design_service.is_new_build(request)
+        )
+        readonly_rule = routing_rules.is_readonly_question(request.message)
 
-        if pending_guard is None and template_preview_flow.is_request(request):
+        if (
+            pending_guard is None
+            and not design_turn
+            and not readonly_rule
+            and template_preview_flow.is_request(request)
+        ):
             result = template_preview_flow.start(request)
             await _emit(emit, "stage", {
                 "stage": "template_preview_start",
@@ -736,17 +734,38 @@ class AgentService:
         )
 
         state_before_apply = request.state.value
+        # 设计流（#19）：这一轮归设计流程管。
+        #
+        # 「提问不改设计版本」是硬要求，所以这里要把**提问**和**修改**分开：
+        #
+        #   - 规则层判定为只读提问 → 直接走旧查询链路；
+        #   - 已经有方案在等确认，而规则层没认出来（规则层只覆盖
+        #     「问当前对话 / 当前产品的事」）→ 问路由层，用与旧流程
+        #     同一套判定，避免一句元问题平白多出一版方案；
+        #   - 其余 → 设计轮（新建或修改）。
+        if design_turn:
+            is_question = readonly_rule
+            if not is_question and design_state is not None:
+                is_question = self._is_readonly_query_turn(
+                    request, route, pending_guard
+                )
+            if is_question:
+                response = await self._handle_readonly_query(
+                    request, route, pending_guard
+                )
+                # 查询轮不改设计对象，但要把设计阶段与方案带回响应：
+                # 前端要据此继续显示那份待确认的方案。
+                report_design_service.attach_design_state(response, design_state)
+                return response
+            design_response = await report_design_service.handle(
+                request, emit=emit, state=design_state
+            )
+            if design_response is not None:
+                return design_response
+
         # 只读查询轮：查事实、回答，不推进业务。
         # 必须在 _apply_context_route 之前判定 —— 那里的 JUMP_STATE 会真的
         # 保存草稿，等于绕过待确认菜单。
-        if design_query:
-            # 设计流程里的提问：走旧查询链路回答，但**不改设计版本**，
-            # 并且把设计阶段、方案版本和旧菜单原样带回。
-            # 路由层可能把这句话判成别的意图（模型不可用时尤其如此），
-            # 这里以「设计流程内的提问」为准，不让它变成一次生成。
-            response = await self._handle_readonly_query(request, route, pending_guard)
-            report_design_service.attach_design_state(response, design_query_state)
-            return response
         if self._is_readonly_query_turn(request, route, pending_guard):
             return await self._handle_readonly_query(request, route, pending_guard)
         if pending_guard is not None:

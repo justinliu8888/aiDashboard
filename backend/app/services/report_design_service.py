@@ -7,7 +7,7 @@
 
 边界：
 
-    - 不建模型、不复制凭证（模型客户端在 ``report_design_model``）；
+    - 不建模型、不复制凭证（模型客户端在 ``report_design_model_client``）；
     - 不确认、不取数、不调用旧报表 builder（那是 #20 / #05 的范围）；
     - 只允许追加消息；查询轮不改设计对象；
     - 模型工作在事务之外，提交时核对基础版本。
@@ -16,18 +16,20 @@
 
     1. 会话已经有设计记录 → 本轮在设计流程里；
     2. 或者：请求带了显式 ``sessionId`` + ``messageId``，
-       且这个会话还没有落过库行 → 这是**新建**会话的第一轮，
-       进入设计流程。
+       且这个会话**还没有旧流程的业务状态**（草稿 / 待确认菜单 /
+       待确认修改计划）→ 这是**新建**会话的需求，进入设计流程。
 
 第 2 条不是随手挑的：
 
     - ``messageId`` 是操作认领的幂等键。C 的 ``claim_operation`` 明确要求
       消息 id，规格也写明「新建请求使用显式 sessionId、messageId 关联
       会话和操作」；没有它就没有可认领的操作。
-    - 「会话还没有落过库行」= 这条对话还没成功完成过任何一轮，
-      也就是**新建**。已有会话（落过库行、但没进过设计阶段）保持旧协议
-      语义，老草稿编辑与恢复不受影响（规格：「对未进入新建阶段的已有会话
-      保持原协议语义」）。
+    - 「没有旧流程的业务状态」= 这条对话还没开始做任何业务动作，
+      也就是**新建**。用户可以先问一句再提需求，那轮只留下只读问答的
+      记录，不该把后面的新建请求挡在设计流程外面。
+      已有会话（已经有草稿、菜单锁或待确认计划、但没进过设计阶段）
+      保持旧协议语义，老草稿编辑与恢复不受影响
+      （规格：「对未进入新建阶段的已有会话保持原协议语义」）。
 """
 from __future__ import annotations
 
@@ -50,7 +52,11 @@ from app.schemas.agent import (
     AgentState,
 )
 from app.schemas.report_plan import ReportPlan, ReportPlanError
-from app.services import routing_rules
+from app.schemas.session import (
+    CLARIFICATION_COUNT_KEY,
+    CLARIFICATION_KEY_KEY,
+    CLARIFICATION_QUESTION_KEY,
+)
 from app.services.report_plan_service import apply_candidate
 from app.services.session_context import current_session_key
 from app.services.session_service import session_service
@@ -121,7 +127,7 @@ class ReportDesignService:
     @property
     def model_call(self) -> Any:
         if self._model_call is None:
-            from app.services.report_design_model import ReportDesignModelClient
+            from app.services.report_design_model_client import ReportDesignModelClient
 
             self._model_call = ReportDesignModelClient()
         return self._model_call
@@ -158,10 +164,20 @@ class ReportDesignService:
             return None
 
     def is_new_build(self, request: AgentRequest) -> bool:
-        """这是不是一条**新建**会话的第一轮。
+        """这是不是一条**新建**会话的需求。
 
-        需要显式 ``sessionId`` + ``messageId``（操作认领的幂等键），
-        且这个会话还没有落过库行（= 还没成功完成过任何一轮）。
+        两个条件：
+
+            1. 请求带了显式 ``sessionId`` + ``messageId``。
+               ``messageId`` 是操作认领的幂等键 —— C 的 ``claim_operation``
+               明确要求消息 id，规格也写明「新建请求使用显式 sessionId、
+               messageId 关联会话和操作」；没有它就没有可认领的操作。
+            2. 这个会话**还没有旧流程的业务状态**。
+
+        第 2 条不是「库里没有行」：用户可以先问一句「你能做什么」，
+        那轮会留下会话行，但只留下**只读问答**的记录 —— 草稿、待确认菜单、
+        待确认修改计划一个都没有。这样的会话仍然是**新建**：
+        下一句「做一份 PUE 报表」就该得到方案，而不是掉回旧流程。
         """
         if not request.sessionId or not request.messageId:
             return False
@@ -173,21 +189,37 @@ class ReportDesignService:
         except Exception:  # noqa: BLE001
             logger.exception("[report_design] 读会话失败")
             return False
-        return existing is None
-
-    def in_design_flow(self, request: AgentRequest) -> bool:
-        """本轮是否在设计流程里。"""
-        return self.load_state(request) is not None
+        if existing is None:
+            return True
+        return not self._has_old_flow_business_state(existing)
 
     @staticmethod
-    def is_readonly_question(message: str) -> bool:
-        """这句话是不是只读提问。
+    def _has_old_flow_business_state(existing: Any) -> bool:
+        """这个会话是不是已经在**旧流程**里跑起来了。
 
-        设计流程里的提问**不改设计版本**，要走旧查询链路。
-        这里用规则层判定，与旧流程降级路径同一口径：
-        模型不可用时也能把「问当前对话的事」和「下指令」分开。
+        旧流程的业务状态有四样：有草稿、有待确认菜单锁、有待确认修改计划、
+        追问到一半（有澄清轮次或已经推进到业务节点）。
+        只要有一样，这个会话就不是「新建」，保持旧协议语义。
         """
-        return routing_rules.is_readonly_question(message)
+        snapshot = existing.snapshot or {}
+        if isinstance(snapshot.get("definition"), dict):
+            return True
+        if existing.pendingChoice:
+            return True
+        if existing.pendingEditPlan:
+            return True
+        if any(
+            key in snapshot
+            for key in (
+                CLARIFICATION_COUNT_KEY,
+                CLARIFICATION_KEY_KEY,
+                CLARIFICATION_QUESTION_KEY,
+            )
+        ):
+            return True
+        if existing.state not in ("ANALYZING", "NEEDS_CLARIFICATION"):
+            return True
+        return False
 
     # ---------- 查询轮挂回设计状态 ----------
 
@@ -225,20 +257,21 @@ class ReportDesignService:
         request: AgentRequest,
         *,
         emit: Any | None = None,
+        state: dict[str, Any] | None = None,
     ) -> AgentResponse | None:
         """处理一轮设计请求。
 
         返回 None 表示「这一轮不归设计流程管」，调用方继续走旧流程。
+
+        **提问与修改的区分由调用方决定**（见 agent_service）：
+        提问要走旧查询链路，不能在这里变成一次方案生成。
         """
-        state = self.load_state(request)
+        if state is None:
+            state = self.load_state(request)
         if state is None and not self.is_new_build(request):
             return None
         if request.message.strip() == "__advance__":
             # 内部控制消息不是用户需求。设计流程不走旧的自动推进。
-            return None
-        if self.is_readonly_question(request.message):
-            # 提问不改设计版本：由调用方交给旧查询链路，
-            # 回答完再把设计状态挂回响应。
             return None
 
         action = (request.context.designAction or "").strip().upper()
@@ -278,8 +311,18 @@ class ReportDesignService:
             )
 
         current_revision = current_plan.get("revision")
+        current_plan_id = current_plan.get("id")
         base_revision = request.context.basePlanRevision
-        if base_revision is not None and base_revision != current_revision:
+        base_plan_id = request.context.planId
+
+        # 版本与方案 id 都要核对：按钮明确传递了「我确认的是哪一份、哪一版」，
+        # 对不上就说明用户看到的是旧的一份（ADR 0002 / 规格 #18「过期生成不能覆盖新版本」）。
+        stale = (
+            base_revision is not None and base_revision != current_revision
+        ) or (
+            base_plan_id is not None and base_plan_id != current_plan_id
+        )
+        if stale:
             message = (
                 f"这份方案已经更新到第 {current_revision} 版，"
                 f"你确认的是第 {base_revision} 版。请看过当前版本再确认。"

@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 #:
 #: 这里用**独立的**时限，不复用 ``VOLC_TIMEOUT``（30 秒）：
 #: 那个时限是给短问答用的，套在完整方案生成上会稳定超时。
+#: 实际取值见 ``Settings.volc_design_timeout``（环境变量 VOLC_DESIGN_TIMEOUT）。
 DEFAULT_DESIGN_TIMEOUT_SECONDS = 120
 
 
@@ -39,15 +40,12 @@ class ReportDesignModelClient:
     不外泄、不复制到别的模块。
     """
 
-    def __init__(
-        self,
-        *,
-        timeout: int | None = None,
-        model: str | None = None,
-    ) -> None:
+    def __init__(self) -> None:
         self._settings = get_settings()
-        self._model = model or self._settings.volc_model
-        self._timeout = timeout or DEFAULT_DESIGN_TIMEOUT_SECONDS
+        self._model = self._settings.volc_model
+        self._timeout = getattr(
+            self._settings, "volc_design_timeout", DEFAULT_DESIGN_TIMEOUT_SECONDS
+        )
         self._client = None
         if self._settings.volc_api_key:
             from openai import AsyncOpenAI

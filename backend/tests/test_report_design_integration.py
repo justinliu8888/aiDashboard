@@ -487,15 +487,17 @@ def test_confirm_plan_does_not_trigger_save_or_data(client, monkeypatch):
     """确认方案不接旧的保存 / 出数链路，也不伪造完成状态。"""
     install_model(monkeypatch, RecordingModel(_candidate()))
 
-    _post(client, "生成 PUE 报表", message_id="msg_1")
+    built = _post(client, "生成 PUE 报表", message_id="msg_1").json()
+    plan = built["domainObjects"]["reportPlan"]
+
     payload = _post(
         client,
         "确认",
         message_id="msg_2",
         context={
             "designAction": "CONFIRM_PLAN",
-            "planId": "ignored",
-            "basePlanRevision": 1,
+            "planId": plan["id"],
+            "basePlanRevision": plan["revision"],
         },
     ).json()
 
@@ -511,7 +513,8 @@ def test_confirm_plan_with_stale_revision_is_rejected(client, monkeypatch):
     """基于过期版本的确认要可辨识地拒绝，不静默覆盖。"""
     install_model(monkeypatch, RecordingModel(_candidate(), _candidate()))
 
-    _post(client, "生成 PUE 报表", message_id="msg_1")
+    built = _post(client, "生成 PUE 报表", message_id="msg_1").json()
+    plan = built["domainObjects"]["reportPlan"]
     _post(client, "再加一个板块", message_id="msg_2")
 
     payload = _post(
@@ -520,13 +523,35 @@ def test_confirm_plan_with_stale_revision_is_rejected(client, monkeypatch):
         message_id="msg_3",
         context={
             "designAction": "CONFIRM_PLAN",
-            "planId": "ignored",
-            "basePlanRevision": 1,
+            "planId": plan["id"],
+            "basePlanRevision": plan["revision"],
         },
     ).json()
 
     assert payload["error"]["code"] == "PLAN_REVISION_CONFLICT"
     assert payload["domainObjects"]["reportPlan"]["revision"] == 2
+
+
+def test_confirm_plan_for_another_plan_is_rejected(client, monkeypatch):
+    """确认的是另一份方案：同样要可辨识地拒绝。"""
+    install_model(monkeypatch, RecordingModel(_candidate()))
+
+    built = _post(client, "生成 PUE 报表", message_id="msg_1").json()
+    plan = built["domainObjects"]["reportPlan"]
+
+    payload = _post(
+        client,
+        "确认",
+        message_id="msg_2",
+        context={
+            "designAction": "CONFIRM_PLAN",
+            "planId": "rplan_someone_else",
+            "basePlanRevision": plan["revision"],
+        },
+    ).json()
+
+    assert payload["error"]["code"] == "PLAN_REVISION_CONFLICT"
+    assert payload["domainObjects"]["reportPlan"]["revision"] == 1
 
 
 # --------------------------------------------------------------------------
@@ -537,17 +562,27 @@ def test_confirm_plan_with_stale_revision_is_rejected(client, monkeypatch):
 def test_existing_session_keeps_old_semantics(client, monkeypatch):
     """已有会话（落过库行、没进过设计阶段）保持旧协议语义。
 
-    这一条模拟的是**旧需求**留下来的会话：它已经有会话行，
-    但从来没有进过新建的设计阶段。规格写明这类会话保持原协议语义，
-    不能被新流程重新解释。
+    这一条模拟的是**旧需求**留下来的会话：它已经有会话行、
+    已经有草稿，但从来没有进过新建的设计阶段。规格写明这类会话
+    保持原协议语义，不能被新流程重新解释。
     """
     install_model(monkeypatch, RecordingModel(_candidate()))
 
-    # 先落一个旧会话行（库里已有历史）
+    # 先落一个旧会话行（库里已有草稿与待确认菜单）
     session_service.repository.upsert_session(
         session_id="sess_old",
         state="WAITING_USER_CONFIRM",
         title="旧的能耗日报",
+        snapshot={
+            "definition": {
+                "metadata": {"id": "def_old", "revision": 1},
+                "regions": [],
+            }
+        },
+    )
+    session_service.repository.set_pending_choice(
+        "sess_old",
+        {"state": "WAITING_USER_CONFIRM", "question": {"id": "template_edit_confirm"}},
     )
 
     payload = client.post(
@@ -592,6 +627,40 @@ def test_request_without_message_id_keeps_old_semantics(client, monkeypatch):
     ).json()
 
     assert payload.get("designPhase") is None
+
+
+def test_question_first_session_can_still_start_a_new_build(client, monkeypatch):
+    """先问一句再提需求：后一句仍然进入新建流程。
+
+    只读问答那一轮会留下会话行，但没留下任何业务对象 ——
+    草稿、待确认菜单、待确认修改计划一个都没有。
+    这样的会话仍然是「新建」，不能被挡在设计流程外面。
+    """
+    install_model(monkeypatch, RecordingModel(_candidate()))
+
+    asked = _post(client, "这个报表支持分钟趋势吗？", message_id="q_1").json()
+    assert asked["turnKind"] == "query_answer"
+    assert asked.get("designPhase") is None
+
+    built = _post(client, "生成一份 PUE 报表", message_id="q_2").json()
+    assert built["designPhase"] == "PLAN_WAITING_CONFIRM"
+    assert built["domainObjects"]["reportPlan"]["revision"] == 1
+
+
+def test_readonly_question_is_not_hijacked_by_template_flow(client, monkeypatch):
+    """只读提问不能被「先看模板」提前分流劫持。
+
+    「当前预览的模板给我看看吗」既像提问又带模板关键词。
+    模板流遇到表达不了的条件会直接 BLOCKED_OR_UNSUPPORTED ——
+    那是用一句提问触发了一条执行分支（ADR 0002 §6.1 / 规格 #12）。
+    """
+    install_model(monkeypatch, RecordingModel(_candidate()))
+
+    payload = _post(client, "当前预览的模板给我看看吗？", message_id="t_1").json()
+
+    assert payload["turnKind"] == "query_answer"
+    assert payload["state"] != "BLOCKED_OR_UNSUPPORTED"
+    assert not payload.get("blocks")
 
 
 # --------------------------------------------------------------------------

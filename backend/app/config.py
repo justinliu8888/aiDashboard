@@ -37,6 +37,10 @@ class Settings:
     volc_context_concierge_timeout: int = int(os.getenv("VOLC_CONTEXT_CONCIERGE_TIMEOUT", "30"))
     volc_context_router_timeout: int = int(os.getenv("VOLC_CONTEXT_ROUTER_TIMEOUT", "30"))
 
+    # 方案设计（#19）的专用时限。完整方案 JSON 比短问答慢得多
+    # （实测真实模型约 45 秒），复用 volc_timeout（30 秒）会稳定超时。
+    volc_design_timeout: int = int(os.getenv("VOLC_DESIGN_TIMEOUT", "120"))
+
     # 可靠性
     llm_repair_retries: int = int(os.getenv("LLM_REPAIR_RETRIES", "1"))
 
