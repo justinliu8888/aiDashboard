@@ -52,7 +52,11 @@ from app.services.definition_save_service import definition_save_service
 from app.services.preview_service import preview_service
 # 边界口径改用共用层（app.schemas.fact），不再从 recorded_progress_service
 # 转述模型自己写的 limitations —— 那仍取决于模型有没有声明边界。
-from app.services.report_design_service import report_design_service
+from app.services.report_design_service import (
+    is_pure_confirmation,
+    is_vague_approval,
+    report_design_service,
+)
 # 判定与兜底策略放在 query_answer_service（回答文本策略的家）。
 from app.services.query_answer_service import (
     claims_live_progress,
@@ -611,6 +615,11 @@ class AgentService:
             design_state is not None or report_design_service.is_new_build(request)
         )
         readonly_rule = routing_rules.is_readonly_question(request.message)
+        # 「纯确认」与「模糊认可」这两类消息：都不是提问，也不走查询链路。
+        # 服务端自己能认出来（规格 #18），不需要再问一次路由层。
+        design_acknowledgement = is_pure_confirmation(
+            request.message
+        ) or is_vague_approval(request.message)
 
         if (
             pending_guard is None
@@ -718,15 +727,17 @@ class AgentService:
                 reason="规则无法确定编辑计划，交给受约束 ReAct 查证",
                 collectedInfo=dict(request.collectedInfo),
             )
-        elif design_turn and design_state is None and not readonly_rule:
-            # 新建设计轮**不跑**旧路由。
+        elif design_turn and (
+            # 新建轮：结果没有人消费。
+            (design_state is None and not readonly_rule)
+            # 纯确认 / 模糊认可：都不是提问，不走查询链路。
+            or design_acknowledgement
+        ):
+            # 这些设计轮**不跑**旧路由。
             #
-            # 这一轮一定归设计流程管（design_turn 已判定），也不是只读提问
-            # （readonly_rule 为假），所以路由结果**没有人消费** ——
-            # 设计轮只用自己的方案上下文（当前方案 + 简短历史），不读 route。
-            #
-            # 旧路由是一次真实模型往返，实测 60~150 秒；在这里等于让用户
-            # 先等一个用不上的结果，才看到自己的方案。
+            # 旧路由是一次真实模型往返，实测 60~150 秒；在这些轮次里它的
+            # 结果没有人消费 —— 等于让用户先等一个用不上的结果，才看到
+            # 自己要的答案。
             #
             # 顺带的好处：旧路由会把「昨日」「默认能耗指标」这类默认值
             # 写进 collectedInfo 落进快照 —— 设计流程没有让用户指定这些，
@@ -734,8 +745,8 @@ class AgentService:
             route = RouteDecision(
                 userIntent=UserIntent.NEW_TASK,
                 routingAction=RoutingAction.CONTINUE_CURRENT,
-                engineStage="design_new_build",
-                reason="新建流程：这一轮直接进设计流程，不跑旧路由",
+                engineStage="design_direct",
+                reason="设计流程：这一轮直接进设计流程，不跑旧路由",
                 collectedInfo=dict(request.collectedInfo),
             )
         else:
@@ -800,7 +811,12 @@ class AgentService:
                     request, design_state
                 )
             is_question = readonly_rule
-            if not is_question and design_state is not None:
+            if (
+                not is_question
+                and design_state is not None
+                # 纯确认 / 模糊认可不是提问，别再问一次路由层。
+                and not design_acknowledgement
+            ):
                 is_question = self._is_readonly_query_turn(
                     request, route, pending_guard
                 )

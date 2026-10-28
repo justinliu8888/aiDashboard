@@ -855,6 +855,29 @@ def test_readonly_question_still_runs_the_old_router(client, monkeypatch):
     assert payload["turnKind"] == "query_answer"
 
 
+def test_confirmation_turn_does_not_run_the_old_router(client, monkeypatch):
+    """纯确认轮不跑旧路由 —— 点一下确认不该白等 60~150 秒。
+
+    确认不是提问，也不走查询链路，路由层的结果没有人消费。
+    """
+    calls: list[str] = []
+
+    async def _record(request, emit=None):  # type: ignore[no-untyped-def]
+        calls.append(getattr(request, "message", ""))
+        raise AssertionError("确认轮不该跑旧路由")
+
+    monkeypatch.setattr(context_engine, "route", _record)
+    install_model(monkeypatch, RecordingModel(_candidate()))
+
+    _post(client, "生成 PUE 报表", message_id="msg_1")
+    payload = _post(client, "确认", message_id="msg_2").json()
+
+    assert calls == []
+    assert payload["designPhase"] == "PLAN_WAITING_CONFIRM"
+    assert payload["domainObjects"]["reportPlan"]["revision"] == 1
+    assert "还没有接入" in payload["reply"]
+
+
 def test_readonly_question_is_not_hijacked_by_template_flow(client, monkeypatch):
     """只读提问不能被「先看模板」提前分流劫持。
 
