@@ -33,8 +33,10 @@
         {
           "eval": "(() => { const sel = document.querySelector('[data-pending-plan] select'); if (!sel) return false; const labels = Array.from(sel.options).map(o => o.textContent.trim()); return labels.join(',') === '请选择,接受修改,继续调整,取消'; })()"
         },
-        { "eval": "document.getElementById('chat-input').disabled === true" },
-        { "eval": "document.getElementById('btn-send').disabled === true" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "document.getElementById('btn-send').disabled === false" },
+        { "eval": "document.getElementById('btn-regenerate').disabled === true" },
+        { "eval": "document.querySelector('[data-quick]').disabled === true" },
         {
           "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId).sort().join(',') === 'region_analysis,region_data_quality,region_device_ranking,region_hourly_trend,region_total_energy'"
         },
@@ -67,8 +69,8 @@
         {
           "eval": "(() => { const c = window.__mock.calls.filter(x => x.url.indexOf('/api/agent/chat/stream') >= 0); const last = c[c.length - 1]; const ids = last.body && last.body.context && last.body.context.visibleRegionIds; return Array.isArray(ids) && ids.length === 5 && ids[2] === 'region_hourly_trend'; })()"
         },
-        { "eval": "document.getElementById('chat-input').disabled === true" },
-        { "screenshot": "edit-plan-03-第二版计划重新锁定输入" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "screenshot": "edit-plan-03-第二版计划重新出菜单" },
 
         {
           "eval": "(() => { const card = document.querySelector('[data-pending-plan=\"plan_002\"]'); const sel = card.querySelector('select'); const opt = Array.from(sel.options).find(o => o.textContent.trim() === '取消'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"

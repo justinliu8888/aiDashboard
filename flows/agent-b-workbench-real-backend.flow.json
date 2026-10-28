@@ -1,0 +1,46 @@
+{
+  "outDir": "../.selfcheck/flow-agent-b-real-backend",
+  "serveCmd": "cd ../backend && AGENT_IMPL=fake AI_SESSION_DB_PATH=data/agent_b_flow.db python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8164",
+  "port": 8164,
+  "waitMs": 1500,
+  "timeout": 90000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "B-06 真后端(Fake Agent)-生成-菜单-提问入口可用-刷新恢复-原操作可继续",
+      "url": "http://127.0.0.1:8164/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析" },
+        { "press": "Enter" },
+        { "waitFor": ".question-select", "timeout": 60000 },
+
+        { "eval": "document.getElementById('state-badge').textContent === 'WAITING_USER_CONFIRM'" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).map(s => Array.from(s.options).map(o => o.textContent.trim()).join(',')).join('|') === '请选择,同意,修改,重新开始'" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "document.getElementById('btn-send').disabled === false" },
+        { "eval": "document.getElementById('btn-regenerate').disabled === true" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "screenshot": "b06-01-真后端出草稿待确认" },
+
+        { "eval": "(() => { window.location.reload(); return true; })()" },
+        { "wait": 5000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'WAITING_USER_CONFIRM'" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "screenshot": "b06-02-刷新后草稿与原菜单都还在" },
+
+        {
+          "eval": "(() => { const s = Array.from(document.querySelectorAll('.question-select')).filter(x => !x.disabled).pop(); const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        { "waitText": "报表已就绪", "timeout": 90000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'READY'" },
+        { "screenshot": "b06-03-原确认操作仍然可用" }
+      ]
+    }
+  ]
+}

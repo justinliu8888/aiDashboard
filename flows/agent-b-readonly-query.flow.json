@@ -1,0 +1,186 @@
+{
+  "outDir": "../.selfcheck/flow-agent-b-readonly-query",
+  "serveCmd": "python3 support/agent_b_mock_server.py 8155",
+  "port": 8155,
+  "waitMs": 1500,
+  "timeout": 60000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "B-01 待确认时提问-回答与菜单分开-不推进-刷新后菜单还在-原操作仍可用",
+      "url": "http://127.0.0.1:8155/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "(() => { const s = document.createElement('script'); s.src = '/flows/support/agent_b_call_recorder.js'; document.head.appendChild(s); return true; })()"
+        },
+        { "wait": 500 },
+        { "eval": "!!window.__callRecorderReady" },
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报" },
+        { "press": "Enter" },
+        { "waitFor": ".question-select", "timeout": 30000 },
+
+        { "eval": "document.getElementById('state-badge').textContent === 'DEFINITION_DRAFT_READY'" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')[0].options).map(o => o.textContent.trim()).join(',') === '请选择,同意,修改,重新开始'" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "screenshot": "b01-01-待确认菜单存在" },
+
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "document.getElementById('btn-send').disabled === false" },
+        { "eval": "document.getElementById('btn-regenerate').disabled === true" },
+        { "eval": "document.querySelector('[data-quick]').disabled === true" },
+
+        { "type": "#chat-input", "text": "你有未完成的草稿吗？" },
+        { "press": "Enter" },
+        { "waitFor": "[data-readonly-answer]", "timeout": 30000 },
+
+        { "eval": "document.querySelector('[data-readonly-answer]').innerText.includes('A 机房昨日能耗日报')" },
+        { "eval": "!document.querySelector('#chat-scroll').innerText.includes('需要你补充信息')" },
+        { "eval": "document.querySelectorAll('#chat-scroll .opt-btn').length === 0" },
+        { "eval": "!Array.from(document.querySelectorAll('#chat-scroll .question-select option')).some(o => o.textContent.trim() === '生成能耗日报')" },
+        { "eval": "document.getElementById('state-badge').textContent === 'DEFINITION_DRAFT_READY'" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')[0].options).map(o => o.textContent.trim()).join(',') === '请选择,同意,修改,重新开始'" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "window.__callRecorder.calls.filter(c => { if (c.url.indexOf('/api/agent/chat/stream') < 0) return false; try { return JSON.parse(c.body).message === '__advance__'; } catch (e) { return false; } }).length === 0" },
+        { "eval": "window.__callRecorder.calls.filter(c => { if (c.url.indexOf('/api/agent/chat/stream') < 0) return false; try { return JSON.parse(c.body).message === '你有未完成的草稿吗？'; } catch (e) { return false; } }).length === 1" },
+        { "screenshot": "b01-02-只读回答与确认菜单分开展示" },
+
+        { "eval": "(() => { window.location.reload(); return true; })()" },
+        { "wait": 4000 },
+
+        { "eval": "document.getElementById('state-badge').textContent === 'DEFINITION_DRAFT_READY'" },
+        { "eval": "!!document.querySelector('[data-readonly-answer]')" },
+        { "eval": "document.querySelector('[data-readonly-answer]').innerText.includes('A 机房昨日能耗日报')" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')[0].options).map(o => o.textContent.trim()).join(',') === '请选择,同意,修改,重新开始'" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "screenshot": "b01-03-刷新后草稿与原菜单都还在" },
+
+        {
+          "eval": "(() => { const s = document.createElement('script'); s.src = '/flows/support/agent_b_call_recorder.js'; document.head.appendChild(s); return true; })()"
+        },
+        { "wait": 500 },
+        {
+          "eval": "(() => { const s = Array.from(document.querySelectorAll('.question-select')).filter(x => !x.disabled).pop(); const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        { "waitText": "报表已就绪", "timeout": 60000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'READY'" },
+        { "eval": "window.__callRecorder.calls.filter(c => { if (c.url.indexOf('/api/agent/chat/stream') < 0) return false; try { return JSON.parse(c.body).message === '__advance__'; } catch (e) { return false; } }).length > 0" },
+        { "screenshot": "b01-04-问完之后原操作仍然可用" }
+      ]
+    },
+    {
+      "name": "B-02 含糊输入先澄清-澄清单独展示-原菜单不动",
+      "url": "http://127.0.0.1:8155/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "(() => { const s = document.createElement('script'); s.src = '/flows/support/agent_b_call_recorder.js'; document.head.appendChild(s); return true; })()"
+        },
+        { "wait": 500 },
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报" },
+        { "press": "Enter" },
+        { "waitFor": ".question-select", "timeout": 30000 },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+
+        { "type": "#chat-input", "text": "继续弄一下" },
+        { "press": "Enter" },
+        { "waitFor": "[data-readonly-clarification]", "timeout": 30000 },
+
+        { "eval": "!!document.querySelector('[data-readonly-clarification]')" },
+        { "eval": "!document.querySelector('#chat-scroll').innerText.includes('需要你补充信息')" },
+        { "eval": "document.getElementById('state-badge').textContent === 'DEFINITION_DRAFT_READY'" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')[0].options).map(o => o.textContent.trim()).join(',') === '请选择,同意,修改,重新开始'" },
+        { "eval": "document.querySelectorAll('[data-readonly-clarification] .question-select').length === 0" },
+        { "eval": "!document.querySelector('[data-readonly-clarification]').innerText.includes('同意')" },
+        { "eval": "window.__callRecorder.calls.filter(c => { if (c.url.indexOf('/api/agent/chat/stream') < 0) return false; try { return JSON.parse(c.body).message === '__advance__'; } catch (e) { return false; } }).length === 0" },
+        { "screenshot": "b02-01-澄清单独展示且原菜单保留" }
+      ]
+    },
+    {
+      "name": "B-04 后端存了 pendingChoice 时-提问后刷新菜单由后端事实恢复",
+      "url": "http://127.0.0.1:8155/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报（带锁）" },
+        { "press": "Enter" },
+        { "waitFor": ".question-select", "timeout": 30000 },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+
+        { "type": "#chat-input", "text": "你有未完成的草稿吗？" },
+        { "press": "Enter" },
+        { "waitFor": "[data-readonly-answer]", "timeout": 30000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'DEFINITION_DRAFT_READY'" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+
+        { "eval": "(() => { window.location.reload(); return true; })()" },
+        { "wait": 4000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'DEFINITION_DRAFT_READY'" },
+        { "eval": "!!document.querySelector('[data-readonly-answer]')" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')[0].options).map(o => o.textContent.trim()).join(',') === '请选择,同意,修改,重新开始'" },
+        { "screenshot": "b04-01-后端存锁时刷新后菜单仍在" }
+      ]
+    },
+    {
+      "name": "B-05 菜单已作答后刷新-不恢复过时确认项",
+      "url": "http://127.0.0.1:8155/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报（不存锁）" },
+        { "press": "Enter" },
+        { "waitFor": ".question-select", "timeout": 30000 },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+
+        {
+          "eval": "(() => { const s = Array.from(document.querySelectorAll('.question-select')).filter(x => !x.disabled).pop(); const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        { "waitText": "报表已就绪", "timeout": 60000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'READY'" },
+
+        { "eval": "(() => { window.location.reload(); return true; })()" },
+        { "wait": 4000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'READY'" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).map(s => Array.from(s.options).map(o => o.textContent.trim()).join(',')).join('|') === '请选择,继续修改,确认并保存'" },
+        { "eval": "!Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).some(s => Array.from(s.options).map(o => o.textContent.trim()).includes('同意'))" },
+        { "screenshot": "b05-01-已作答的菜单不恢复" }
+      ]
+    },
+    {
+      "name": "B-03 读取失败答无法确认-不谎报没有草稿",
+      "url": "http://127.0.0.1:8155/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+
+        { "type": "#chat-input", "text": "当前对话有没有草稿（读取失败）" },
+        { "press": "Enter" },
+        { "waitFor": "[data-readonly-answer]", "timeout": 30000 },
+
+        { "eval": "document.querySelector('[data-readonly-answer]').innerText.includes('没法确认')" },
+        { "eval": "!document.querySelector('[data-readonly-answer]').innerText.includes('没有报表草稿')" },
+        { "eval": "document.getElementById('state-badge').textContent === 'ANALYZING'" },
+        { "screenshot": "b03-01-读取失败答无法确认" }
+      ]
+    }
+  ]
+}
