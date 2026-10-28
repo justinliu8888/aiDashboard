@@ -917,7 +917,10 @@ def is_readonly_question(message: str) -> bool:
         return False
     if not any(marker in text for marker in _QUESTION_MARKERS):
         return False
-    return any(subject in text for subject in _QUESTION_SUBJECTS)
+    # 业务对象表里 PUE 是小写，但用户在句首写大写 PUE 很常见。
+    # 认不出一句提问，后果是「提问」被当成「修改」——
+    # 设计流程里那会平白多出一版方案，所以这里按大小写不敏感匹配。
+    return any(subject in text.lower() for subject in _QUESTION_SUBJECTS)
 
 
 # --------------------------------------------------------------------------

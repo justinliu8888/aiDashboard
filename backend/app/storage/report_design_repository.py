@@ -162,6 +162,28 @@ class ReportDesignRepository(Protocol):
         上一成功方案保留。结果区分 committed / conflict。
         """
 
+    def commit_clarification(
+        self,
+        operation_id: str,
+        expected_revision: int | None,
+        clarification: str,
+        write_turn: WriteTurn | None = None,
+    ) -> CommitResult:
+        """提交一次**必要追问**（协调者补充的 v2 接口）。
+
+        澄清不是技术失败，也不是一次方案提交：
+
+            - 不改当前成功方案（上一版原样保留）；
+            - 不推进阶段（没有方案时仍是 PLAN_NEEDED，有方案时仍是
+              PLAN_WAITING_CONFIRM）；
+            - 不把操作记成 FAILED —— 那是技术失败的语义，
+              会让界面显示成「出错了」，而追问是正常的一轮；
+            - 操作记成 SUCCEEDED 且不关联任何方案版本，
+              这样同一条消息重发时能被认出「已经问过了」。
+
+        同样与 write_turn 回调同事务提交。
+        """
+
     def fail_operation(
         self, operation_id: str, safe_error: str | Mapping[str, Any]
     ) -> None:

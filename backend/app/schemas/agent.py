@@ -106,6 +106,16 @@ ALLOWED_TRANSITIONS: dict[AgentState, set[AgentState]] = {
 }
 
 
+# 设计动作（规格 #18「聊天与恢复接口」）：
+#   CONFIRM_PLAN  确认当前文字方案
+#   REQUEST_DATA  明确要求连接数据或出数
+#
+# 首波只实现 CONFIRM_PLAN 的**边界校验**（版本冲突、过期拒绝）；
+# 模板生成属于工单 02，REQUEST_DATA 属于工单 05，本工单不接。
+DESIGN_ACTION_CONFIRM_PLAN = "CONFIRM_PLAN"
+DESIGN_ACTION_REQUEST_DATA = "REQUEST_DATA"
+
+
 class AgentRequestContext(BaseModel):
     designSessionId: str | None = None
     reportPolicyId: str | None = None
@@ -116,6 +126,13 @@ class AgentRequestContext(BaseModel):
     projectId: str
     subjectRef: str
     subjectId: str
+
+    # 新建设计流程的动作与版本（规格 #18）。
+    # 按钮必须明确传递动作与所依据的版本，服务端据此做冲突检查；
+    # 客户端带的版本不能当授权依据，只用来识别「过期」。
+    designAction: str | None = None
+    planId: str | None = None
+    basePlanRevision: int | None = None
 
 
 class ValidationIssue(BaseModel):
@@ -240,6 +257,10 @@ class AgentResponseDomainObjects(BaseModel):
     changeSet: ChangeSet | None = None
     reportRunPreview: ReportRunPreview | None = None
     pendingEditPlan: PendingEditPlan | None = None
+    # 文字方案（规格 #18）。用 dict 而不是领域类型：
+    # 老会话恢复时可能缺新增字段，缺字段的旧记录仍要能读出来，
+    # 不能因为一个可选对象把整条会话读挂。
+    reportPlan: dict[str, Any] | None = None
 
 
 class AgentResponse(BaseModel):
@@ -248,6 +269,10 @@ class AgentResponse(BaseModel):
     state: AgentState
     reply: str
     designSessionId: str | None = None
+    # 新建设计阶段（规格 #18）。独立于 state：
+    # 旧草稿的 state 与只读问答的 turnKind 保持原义，
+    # 新建流程的「待确认方案」不借用 state 来表达。
+    designPhase: str | None = None
     domainObjects: AgentResponseDomainObjects = Field(
         default_factory=AgentResponseDomainObjects
     )
@@ -260,7 +285,21 @@ class AgentResponse(BaseModel):
     # 本轮性质。见 TURN_KIND_ACTION / TURN_KIND_QUERY_ANSWER。
     turnKind: str = TURN_KIND_ACTION
 
+    # 这一轮是不是已经落库了。设计流的成功轮由设计存储的同事务提交
+    # 一起写掉了会话行与消息，路由层不能再落一遍。
+    # 同样是**服务端内部字段**：不进 model_dump()。
+    _turn_persisted: bool = PrivateAttr(default=False)
+
     @property
     def isQueryAnswer(self) -> bool:
         """本轮是不是只读查询回答（不推进业务）。"""
         return self.turnKind == TURN_KIND_QUERY_ANSWER
+
+    @property
+    def turnPersisted(self) -> bool:
+        """本轮是否已经落库（设计流的同事务提交会置位）。"""
+        return self._turn_persisted
+
+    @turnPersisted.setter
+    def turnPersisted(self, value: bool) -> None:
+        self._turn_persisted = bool(value)

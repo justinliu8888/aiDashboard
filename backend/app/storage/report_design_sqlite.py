@@ -408,6 +408,124 @@ class SqliteReportDesignRepository:
             "alreadyCommitted": False,
         }
 
+    # ---------- 澄清（协调者补充的 v2 接口） ----------
+
+    def commit_clarification(
+        self,
+        operation_id: str,
+        expected_revision: int | None,
+        clarification: str,
+        write_turn: WriteTurn | None = None,
+    ) -> CommitResult:
+        """提交一次必要追问。
+
+        追问是**正常的一轮**，不是技术失败：
+
+            - 不改当前成功方案，上一版原样保留；
+            - 不推进阶段：没有方案时仍是 PLAN_NEEDED，
+              有方案时仍是 PLAN_WAITING_CONFIRM；
+            - 操作记成 SUCCEEDED 且不关联方案版本，
+              这样同一条消息重发时能认出「已经问过了」，
+              不会又问一遍。
+
+        仍与 write_turn 回调同事务提交：追问这一轮的消息和操作状态
+        要么一起落库，要么一起回滚。
+        """
+        text = str(clarification or "").strip()
+        if not text:
+            raise DesignPlanInvalidError("澄清内容不能为空")
+
+        with self._lock:
+            conn = self._conn
+            self._begin(conn)
+            try:
+                operation = self._fetch_operation(conn, operation_id)
+                if operation is None:
+                    raise DesignOperationStateError(f"未知操作：{operation_id}")
+                if operation.status == OPERATION_SUCCEEDED:
+                    state = self._fetch_design_state(conn, operation.session_id)
+                    conn.commit()
+                    return {
+                        "kind": COMMIT_KIND_COMMITTED,
+                        "operationId": operation_id,
+                        "sessionId": operation.session_id,
+                        "planId": operation.plan_id,
+                        "revision": operation.plan_revision,
+                        "designPhase": state.phase if state is not None else None,
+                        "plan": _load_json(state.plan_json)
+                        if state is not None
+                        else None,
+                        "alreadyCommitted": True,
+                    }
+                if operation.status == OPERATION_FAILED:
+                    raise DesignOperationStateError(f"操作已失败：{operation_id}")
+                if operation.expected_revision != expected_revision:
+                    raise DesignOperationStateError(
+                        f"提交的基础版本与认领时不一致：{operation_id}"
+                    )
+
+                state = self._fetch_design_state(conn, operation.session_id)
+                current_revision = state.revision if state is not None else None
+                if current_revision != expected_revision:
+                    message = (
+                        f"基础版本已变：当前 {current_revision}，"
+                        f"本次基于 {expected_revision}"
+                    )
+                    self._mark_failed(conn, operation_id, "revision_conflict", message)
+                    conn.commit()
+                    return {
+                        "kind": COMMIT_KIND_CONFLICT,
+                        "operationId": operation_id,
+                        "sessionId": operation.session_id,
+                        "currentPlan": _load_json(state.plan_json)
+                        if state is not None
+                        else None,
+                        "currentRevision": current_revision,
+                        "designPhase": state.phase if state is not None else None,
+                        "reason": "revision_mismatch",
+                        "error": {"code": "revision_conflict", "message": message},
+                    }
+
+                now = _now()
+                # 阶段不动：没有方案时是 PLAN_NEEDED，有方案时是
+                # PLAN_WAITING_CONFIRM。澄清不是方案提交，不推进阶段。
+                cursor = conn.execute(
+                    """
+                    UPDATE report_design_operations
+                       SET status = ?, plan_id = NULL, plan_revision = NULL,
+                           updated_at = ?
+                     WHERE operation_id = ? AND status = ?
+                    """,
+                    (OPERATION_SUCCEEDED, now, operation_id, OPERATION_PROCESSING),
+                )
+                if cursor.rowcount != 1:
+                    raise DesignOperationStateError(f"操作状态已变：{operation_id}")
+
+                if write_turn is not None:
+                    write_turn(conn)
+                    if not conn.in_transaction:
+                        logger.warning(
+                            "[report_design] write_turn 回调自行结束了事务，"
+                            "同事务提交无法保证：operation=%s",
+                            operation_id,
+                        )
+
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return {
+            "kind": COMMIT_KIND_COMMITTED,
+            "operationId": operation_id,
+            "sessionId": operation.session_id,
+            "planId": state.plan_id if state is not None else None,
+            "revision": state.revision if state is not None else None,
+            "designPhase": state.phase if state is not None else None,
+            "plan": _load_json(state.plan_json) if state is not None else None,
+            "alreadyCommitted": False,
+        }
+
     # ---------- 失败 ----------
 
     def fail_operation(

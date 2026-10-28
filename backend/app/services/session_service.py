@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import uuid
@@ -67,6 +68,16 @@ EDIT_STATE_KEYS = (
 # 澄清轮次的两种结果。只有「asked」占用户澄清轮次。
 CLARIFICATION_ASKED = "asked"
 CLARIFICATION_TECHNICAL_FAILURE = "technical_failure"
+
+
+def _dump_snapshot(value: Any) -> str | None:
+    """把快照 / payload 序列化成 JSON 文本。"""
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):  # pragma: no cover - 极端情况
+        return None
 
 
 def resolve_placeholders(definition: dict[str, Any]) -> dict[str, Any]:
@@ -272,12 +283,20 @@ class SessionService:
         只读问答轮、待确认期间的拒绝回复，都可能不带草稿回传。
         这时候要把库里的草稿、已保存定义和预览原样带着，
         不能因为一次交互就让恢复出来的会话少东西。
+
+        设计阶段与文字方案也在其中：一次失败轮、一次提问轮之后，
+        会话详情里那份方案必须还在 —— 恢复不能靠聊天正文。
         """
         if not previous:
             return snapshot
         result = dict(snapshot or {})
         for key in ("definition", "policy", "lastReportRun", "previewPayload"):
             if not isinstance(result.get(key), dict) and isinstance(previous.get(key), dict):
+                result[key] = previous[key]
+        # 设计阶段与方案是**原样带过**，不是「缺了才补」：
+        # 本轮响应没带设计状态时，库里那份就是权威。
+        for key in ("designPhase", "reportPlan"):
+            if key not in result and key in previous:
                 result[key] = previous[key]
         return result
 
@@ -312,6 +331,171 @@ class SessionService:
             previewRunId=None,
             snapshot=snapshot,
             messageCount=message_count,
+        )
+
+    # ---------- 同事务写入（设计流） ----------
+
+    def write_turn_inline(
+        self,
+        connection: Any,
+        *,
+        session_id: str,
+        user_text: str,
+        response: AgentResponse,
+        client_msg_id: str | None = None,
+        request: AgentRequest | None = None,
+    ) -> None:
+        """在**给定连接**上写这一轮，**不自行 commit**。
+
+        设计流（#19）需要「方案 + 阶段 + 操作结果 + 本轮消息」落进
+        **同一笔事务**：要么一起成功，要么一起回滚。
+
+        为什么不能直接用 ``record_turn``：它以及它下面的
+        ``upsert_session`` / ``append_message`` 都会自己 ``commit()``。
+        一旦被调用，事务就提前结束了，同事务提交不再成立 ——
+        就会出现「方案写进去了、消息没写进去」这种半截状态。
+
+        所以这里直接用传入的连接写 SQL，不碰任何会 commit 的旧方法。
+        """
+        import sqlite3
+
+        assert isinstance(connection, sqlite3.Connection)
+        now = datetime.now().isoformat(timespec="seconds")
+        is_advance = user_text.strip() == ADVANCE_MESSAGE
+
+        title = self._derive_title(session_id, user_text, is_advance)
+        state = self._state_to_store(session_id, response)
+        snapshot = self._build_snapshot(request, response) or {}
+        current = self._repo.get_session(session_id)
+        previous_snapshot = (current.snapshot if current else None) or {}
+        snapshot = self._carry_over_business_objects(snapshot, previous_snapshot)
+        snapshot = {**(snapshot or {}), **self._read_edit_state(session_id)}
+
+        existing = connection.execute(
+            "SELECT id FROM sessions WHERE id = ? AND deleted_at IS NULL",
+            (session_id,),
+        ).fetchone()
+        if existing is None:
+            # 已软删的行不能被 UPDATE 复活：先物理清掉再重新建行。
+            connection.execute(
+                "DELETE FROM sessions WHERE id = ? AND deleted_at IS NOT NULL",
+                (session_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO sessions (id, workspace_id, title, state, design_session_id,
+                                      report_definition_id, preview_run_id, message_count,
+                                      snapshot, pending_choice, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    session_id,
+                    None,
+                    title or "新对话",
+                    state,
+                    response.designSessionId,
+                    self._extract_definition_id(response),
+                    self._extract_preview_run_id(response),
+                    0,
+                    _dump_snapshot(snapshot),
+                    now,
+                    now,
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE sessions
+                   SET state = ?, title = COALESCE(?, title),
+                       design_session_id = COALESCE(?, design_session_id),
+                       report_definition_id = COALESCE(?, report_definition_id),
+                       preview_run_id = COALESCE(?, preview_run_id),
+                       snapshot = ?, updated_at = ?
+                 WHERE id = ?
+                """,
+                (
+                    state,
+                    title,
+                    response.designSessionId,
+                    self._extract_definition_id(response),
+                    self._extract_preview_run_id(response),
+                    _dump_snapshot(snapshot),
+                    now,
+                    session_id,
+                ),
+            )
+
+        # user 消息：内部控制消息不入库。
+        if not is_advance:
+            self._append_message_inline(
+                connection,
+                session_id=session_id,
+                role="user",
+                content=user_text,
+                client_msg_id=client_msg_id,
+            )
+        # assistant 消息：payload 存整个响应，恢复时可直接回放渲染。
+        self._append_message_inline(
+            connection,
+            session_id=session_id,
+            role="assistant",
+            content=response.reply,
+            payload=response.model_dump(mode="json"),
+            client_msg_id=self._reply_msg_id(client_msg_id),
+        )
+
+        count = connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE sessions SET message_count = ? WHERE id = ?", (count, session_id)
+        )
+
+    @staticmethod
+    def _append_message_inline(
+        connection: Any,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        payload: dict[str, Any] | None = None,
+        client_msg_id: str | None = None,
+    ) -> None:
+        """写一条消息，不 commit。幂等口径与旧 ``append_message`` 一致。"""
+        now = datetime.now().isoformat(timespec="seconds")
+        if client_msg_id:
+            existing = connection.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND client_msg_id = ?",
+                (session_id, client_msg_id),
+            ).fetchone()
+            if existing is not None:
+                connection.execute(
+                    """
+                    UPDATE messages SET role = ?, content = ?, payload = ?, created_at = ?
+                     WHERE id = ?
+                    """,
+                    (role, content, _dump_snapshot(payload), now, existing["id"]),
+                )
+                return
+        next_seq = connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO messages (session_id, seq, role, content, payload,
+                                  client_msg_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                next_seq,
+                role,
+                content,
+                _dump_snapshot(payload),
+                client_msg_id,
+                now,
+            ),
         )
 
     @staticmethod
@@ -392,6 +576,14 @@ class SessionService:
         editing_target = (response.debug or {}).get("editingTargetRegionId")
         if editing_target is not None:
             snapshot["editingTargetRegionId"] = editing_target
+
+        # 设计阶段与文字方案（#19）。恢复不能只依赖聊天正文、debug
+        # 或浏览器本地变量：方案与阶段必须跟着会话一起存下来。
+        if response.designPhase is not None:
+            snapshot["designPhase"] = response.designPhase
+            plan = response.domainObjects.reportPlan
+            if plan is not None:
+                snapshot["reportPlan"] = plan
 
         # 路由层已收集的槽位。下一轮恢复时带回 Deep Route，
         # 避免重新问用户已经答过的问题。

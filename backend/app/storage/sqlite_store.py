@@ -118,6 +118,15 @@ class SqliteSessionRepository:
                 self._conn = self._connect()
             return self._conn
 
+    @property
+    def lock(self) -> threading.RLock:
+        """共用写锁。
+
+        设计存储（#19 的 C 模块）必须注入**同一条连接**和**同一把锁**：
+        同一把锁保证两边的写不会交错，同一条连接才能真的落进同一笔事务。
+        """
+        return self._lock
+
     def _connect(self) -> sqlite3.Connection:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self._db_path), check_same_thread=False)

@@ -112,6 +112,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const chatScroll = $("chat-scroll");
 const previewRoot = $("preview-root");
 const previewEmpty = $("preview-empty");
+const planRoot = $("plan-root");
 let activeRequest = null;
 let requestEpoch = 0;
 let lockedChoice = null;
@@ -122,6 +123,99 @@ let sessionRestoreToken = 0;
 // 历史回放期间是否已经画过业务菜单。
 // 查询轮也会把原待确认菜单带回来，已经画过就别再画一张重复的。
 let businessMenuReplayed = false;
+
+// --------------------------------------------------------------------------
+// 文字方案（#19 先确认，再生成）
+//
+// 方案模块（workbench_plan.js）只负责「把方案显示出来、把确认意图交回来」：
+//   - 它不发 HTTP；
+//   - 它不发 __advance__；
+//   - 它不改旧菜单。
+//
+// 所以这里的职责是：
+//   1. 把服务端的 designPhase / reportPlan 交给它渲染；
+//   2. busy / error / canConfirm 由**这一处**统一决策，
+//      不从历史文案里猜「用户到底确认了没有」；
+//   3. 收到确认回调后，由上层发请求（请求里带动作与所依据的版本）。
+// --------------------------------------------------------------------------
+
+const planState = {
+  designPhase: null,
+  reportPlan: null,
+  busy: false,
+  error: null,
+};
+
+/** 能不能确认：只由明确的几个条件决定，不靠文案猜。 */
+function planCanConfirm(state = planState) {
+  if (!state) return false;
+  if (state.busy) return false;
+  if (state.error) return false;
+  if (state.designPhase !== "PLAN_WAITING_CONFIRM") return false;
+  const plan = state.reportPlan;
+  if (!plan || !plan.id || !plan.revision) return false;
+  return true;
+}
+
+function renderPlanModule() {
+  if (!planRoot) return;
+  const api = window.WorkbenchPlan;
+  if (!api) return;
+  const hasPlan = !!(planState.reportPlan || planState.designPhase);
+  // 有方案时，右侧草稿预览的空态让位（避免「还没有草稿」误导）。
+  previewRoot.classList.toggle("plan-active", hasPlan);
+  if (!hasPlan) {
+    api.clear(planRoot);
+    return;
+  }
+  api.render(
+    planRoot,
+    {
+      designPhase: planState.designPhase,
+      reportPlan: planState.reportPlan,
+      busy: planState.busy,
+      error: planState.error,
+      canConfirm: planCanConfirm(),
+    },
+    { onAction: handlePlanAction }
+  );
+}
+
+/** 从一次响应里同步方案状态。 */
+function syncPlanFromResponse(data) {
+  if (!data) return;
+  const phase = data.designPhase || null;
+  const plan = data.domainObjects?.reportPlan || null;
+  if (!phase && !plan) return;
+  planState.designPhase = phase || planState.designPhase;
+  if (plan) planState.reportPlan = plan;
+  // 出错时展示错误条；成功时清掉上一次的错误。
+  planState.error = data.error ? data.error.message || data.error.code || null : null;
+  renderPlanModule();
+}
+
+/** 从会话详情里恢复方案（刷新 / 重建服务后）。 */
+function restorePlanFromDetail(detail) {
+  const snapshot = detail?.snapshot || {};
+  planState.designPhase = snapshot.designPhase || null;
+  planState.reportPlan = snapshot.reportPlan || null;
+  planState.busy = false;
+  planState.error = null;
+  renderPlanModule();
+}
+
+/** 确认回调：模块只交回意图，真正的请求由上层发。 */
+function handlePlanAction(action) {
+  if (!action || action.designAction !== "CONFIRM_PLAN") return;
+  if (!planCanConfirm()) return;
+  sendMessage("确认", {
+    designAction: {
+      designAction: "CONFIRM_PLAN",
+      planId: action.planId,
+      basePlanRevision: action.basePlanRevision,
+    },
+  });
+}
 
 // 对话区贴底跟随：用户上滑后暂停自动滚动，回到底部后恢复
 const CHAT_BOTTOM_THRESHOLD = 48;
@@ -1330,7 +1424,7 @@ async function postAgentStream(body, debugCard, signal) {
   return finalData;
 }
 
-async function sendMessage(text, { fromChoice = false } = {}) {
+async function sendMessage(text, { fromChoice = false, designAction = null } = {}) {
   if (!text || activeRequest || advanceTimers.size) return;
   if (lockedChoice && fromChoice) {
     // 从菜单里选的必须是菜单自己的选项。
@@ -1373,6 +1467,9 @@ async function sendMessage(text, { fromChoice = false } = {}) {
   if (session.designSessionId) context.designSessionId = session.designSessionId;
   if (session.reportDefinitionId) context.reportDefinitionId = session.reportDefinitionId;
   if (session.baseDefinitionRevision != null) context.baseDefinitionRevision = session.baseDefinitionRevision;
+  // 设计动作（#19）：按钮明确传递动作与所依据的版本。
+  // 服务端据此做版本冲突检查 —— 客户端带的版本只用来识别「过期」。
+  if (designAction) Object.assign(context, designAction);
   if (session.editingTargetRegionId) context.selectedRegionId = session.editingTargetRegionId;
   // 客户可见正文卡片的顺序：后端按这个顺序理解「第三个」这类说法
   const visibleRegionIds = visibleBodyRegionIds();
@@ -1418,6 +1515,12 @@ async function sendMessage(text, { fromChoice = false } = {}) {
     controller, thinking, debugCard,
     resumeRequest: { body: JSON.parse(JSON.stringify(body)), fromChoice, isAdvance },
   };
+  // 方案在处理中：确认入口置灰，避免用户对着上一版点确认。
+  if (planState.designPhase || planState.reportPlan) {
+    planState.busy = true;
+    planState.error = null;
+    renderPlanModule();
+  }
   syncInputControls();
   let data;
   try {
@@ -1440,9 +1543,17 @@ async function sendMessage(text, { fromChoice = false } = {}) {
       removeBubble(thinking);
       syncInputControls();
     }
+    // 本轮结束：方案不再「处理中」。确认入口恢复可用与否，
+    // 交给 planCanConfirm 按当前状态重新判定。
+    if (planState.busy) {
+      planState.busy = false;
+      renderPlanModule();
+    }
   }
 
   if (epoch !== requestEpoch) return;
+  // 方案状态跟着响应走：成功、失败、冲突都如实反映到方案卡片上。
+  syncPlanFromResponse(data);
   if (fromChoice) clearChoiceLock();
   if (data.error) {
     appendAiText(`[${data.error.code}] ${data.error.message}`);
@@ -2445,6 +2556,10 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   session.baseDefinitionRevision = session.definition?.metadata?.revision ?? null;
   writeLastSessionId(detail.sessionId);
 
+  // 恢复文字方案（#19）：方案与阶段存在服务端快照里，
+  // 不依赖聊天正文、debug 或浏览器本地变量。
+  restorePlanFromDetail(detail);
+
   // 选择锁以后端为准：回放时用它替换历史问题对象，
   // 这样回放出来的下拉框与 lockedChoice 是同一个引用，选完能正常继续
   const pending = detail.pendingChoice?.question || null;
@@ -2630,6 +2745,12 @@ function startNewSession() {
   chatScroll.innerHTML = "";
   previewRoot.innerHTML = "";
   previewRoot.appendChild(previewEmpty);
+  // 新对话没有方案：清掉上一条对话的方案卡片。
+  planState.designPhase = null;
+  planState.reportPlan = null;
+  planState.busy = false;
+  planState.error = null;
+  renderPlanModule();
   setState("ANALYZING");
   updateMeta();
   renderSessionList();

@@ -39,7 +39,13 @@ def _persist_turn(request: AgentRequest, response: AgentResponse) -> None:
     """把这一轮对话落库。
 
     落库在请求成功返回之后才做：被中断的请求（用户点停止）不留下半截记录。
+
+    设计流（#19）的成功轮例外：方案、阶段、操作结果与本轮消息是在
+    **同一笔事务**里提交掉的（由设计存储调用），这里再落一遍会写出
+    重复消息。响应上的 ``turnPersisted`` 就是这个信号。
     """
+    if getattr(response, "turnPersisted", False):
+        return
     session_key = session_service.resolve_session_id(request)
     session_service.record_turn(
         session_id=session_key,

@@ -53,6 +53,7 @@ from app.services.recorded_progress_service import (
     boundary_clause,
     boundary_stated,
 )
+from app.services.report_design_service import report_design_service
 from app.services.request_timeline import log_timeline_step
 from app.services.session_context import bind_session_key, current_session_key
 from app.services.session_fact_service import session_fact_service
@@ -560,6 +561,29 @@ class AgentService:
                 uiActions=["resume_unavailable"],
             )
 
+        # 设计流（#19）：新建流程先给文字方案。
+        #
+        # 位置很讲究：
+        #   - 在旧流程的待确认菜单锁之后：老流程的选择锁不能被绕过；
+        #   - 在「先看模板」提前分流**之前**：规格写明「先看模板」这类
+        #     提前分流也必须进入新建流程，不能被旧的模板流劫持。
+        #
+        # 提问（只读）不改设计版本：交给旧查询链路回答，
+        # 答完再把设计状态挂回响应（见下方 _handle_design_question）。
+        design_query = False
+        design_query_state: dict[str, Any] | None = None
+        design_state = report_design_service.load_state(request)
+        if design_state is not None or report_design_service.is_new_build(request):
+            if report_design_service.is_readonly_question(request.message):
+                design_query = True
+                design_query_state = design_state
+            else:
+                design_response = await report_design_service.handle(
+                    request, emit=emit
+                )
+                if design_response is not None:
+                    return design_response
+
         if pending_guard is None and template_preview_flow.is_request(request):
             result = template_preview_flow.start(request)
             await _emit(emit, "stage", {
@@ -707,6 +731,14 @@ class AgentService:
         # 只读查询轮：查事实、回答，不推进业务。
         # 必须在 _apply_context_route 之前判定 —— 那里的 JUMP_STATE 会真的
         # 保存草稿，等于绕过待确认菜单。
+        if design_query:
+            # 设计流程里的提问：走旧查询链路回答，但**不改设计版本**，
+            # 并且把设计阶段、方案版本和旧菜单原样带回。
+            # 路由层可能把这句话判成别的意图（模型不可用时尤其如此），
+            # 这里以「设计流程内的提问」为准，不让它变成一次生成。
+            response = await self._handle_readonly_query(request, route, pending_guard)
+            report_design_service.attach_design_state(response, design_query_state)
+            return response
         if self._is_readonly_query_turn(request, route, pending_guard):
             return await self._handle_readonly_query(request, route, pending_guard)
         if pending_guard is not None:
