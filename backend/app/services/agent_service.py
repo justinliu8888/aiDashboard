@@ -417,62 +417,77 @@ class AgentService:
         if pending:
             pending_state, question = pending
             if request.state != pending_state:
-                return self._pending_choice_required(request, pending_state, question)
-            allowed_values = {option.value for option in question.options} | (
-                {"重新开始"} if question.allowRestart else set()
-            )
-            if request.message not in allowed_values:
-                pending_guard = (pending_state, question)
-            else:
-                session_service.save_pending_choice(session_key, None)
-                if question.id == EDIT_CHOICE_ID:
-                    return self._handle_pending_edit_choice(request, session_key)
-                if question.id.startswith("template_preview_"):
-                    result = template_preview_flow.answer(request, question.id)
-                    await _emit(emit, "stage", {
-                        "stage": "template_preview_choice",
-                        "choice": question.id,
-                        "responseState": result.state.value,
-                    })
-                    return self._remember_choice(result)
-                if question.id == "template_edit_confirm":
-                    if request.message == CONFIRM_BUTTON_VALUE:
-                        return self._save_placeholder(request, RouteDecision())
-                    if request.message == RESTART_BUTTON_VALUE:
-                        return AgentResponse(
-                            conversationId=request.conversationId,
-                            state=AgentState.ANALYZING,
-                            reply="好的，我们重新开始。请描述你想生成的新报表。",
-                            uiActions=["restart_from_template_editing"],
-                        )
-                    return self._editing_prompt_response(
-                        request,
-                        reply="好的，请描述你想怎样修改当前草稿。",
+                # 客户端状态与服务端的待确认状态不符（客户端过期 / 不同步）。
+                #
+                # 原来是直接拒绝，让客户端回去按菜单选。但「菜单在」这件事
+                # 由服务端说了算，客户端状态过期不该让**只读提问**也被拒：
+                # 只读提问没有任何可绕过的执行权限，放行进查询链路，
+                # 问完原菜单和待确认计划照旧（查询轮不落库选择锁、
+                # 不重建业务对象）。
+                #
+                # 操作指令仍然照旧拒绝 —— 这个口子不能变成绕过确认的入口。
+                if routing_rules.is_readonly_question(request.message):
+                    pending_guard = (pending_state, question)
+                else:
+                    return self._pending_choice_required(
+                        request, pending_state, question
                     )
-                if question.id == "ready_action":
-                    if request.message == "继续修改":
-                        if request.snapshots.reportDefinition is None:
-                            return self._remember_choice(AgentResponse(
+            else:
+                allowed_values = {option.value for option in question.options} | (
+                    {"重新开始"} if question.allowRestart else set()
+                )
+                if request.message not in allowed_values:
+                    pending_guard = (pending_state, question)
+                else:
+                    session_service.save_pending_choice(session_key, None)
+                    if question.id == EDIT_CHOICE_ID:
+                        return self._handle_pending_edit_choice(request, session_key)
+                    if question.id.startswith("template_preview_"):
+                        result = template_preview_flow.answer(request, question.id)
+                        await _emit(emit, "stage", {
+                            "stage": "template_preview_choice",
+                            "choice": question.id,
+                            "responseState": result.state.value,
+                        })
+                        return self._remember_choice(result)
+                    if question.id == "template_edit_confirm":
+                        if request.message == CONFIRM_BUTTON_VALUE:
+                            return self._save_placeholder(request, RouteDecision())
+                        if request.message == RESTART_BUTTON_VALUE:
+                            return AgentResponse(
                                 conversationId=request.conversationId,
-                                state=AgentState.READY,
-                                reply="当前报表草稿未随请求带回，无法继续修改。请恢复草稿后重试。",
-                                designSessionId=request.context.designSessionId,
-                                questions=self._ready_questions(),
-                                uiActions=["show_ready_actions"],
-                            ))
+                                state=AgentState.ANALYZING,
+                                reply="好的，我们重新开始。请描述你想生成的新报表。",
+                                uiActions=["restart_from_template_editing"],
+                            )
                         return self._editing_prompt_response(
                             request,
-                            reply="好的，请描述你想怎样修改当前报表。",
+                            reply="好的，请描述你想怎样修改当前草稿。",
                         )
-                    action = "发布" if request.message == "发布" else "导出 PDF"
-                    return self._remember_choice(AgentResponse(
-                        conversationId=request.conversationId,
-                        state=AgentState.READY,
-                        reply=f"{action}流程尚未接入（Mock），请继续从下拉框选择。",
-                        designSessionId=request.context.designSessionId,
-                        questions=self._ready_questions(),
-                        uiActions=["show_ready_actions"],
-                    ))
+                    if question.id == "ready_action":
+                        if request.message == "继续修改":
+                            if request.snapshots.reportDefinition is None:
+                                return self._remember_choice(AgentResponse(
+                                    conversationId=request.conversationId,
+                                    state=AgentState.READY,
+                                    reply="当前报表草稿未随请求带回，无法继续修改。请恢复草稿后重试。",
+                                    designSessionId=request.context.designSessionId,
+                                    questions=self._ready_questions(),
+                                    uiActions=["show_ready_actions"],
+                                ))
+                            return self._editing_prompt_response(
+                                request,
+                                reply="好的，请描述你想怎样修改当前报表。",
+                            )
+                        action = "发布" if request.message == "发布" else "导出 PDF"
+                        return self._remember_choice(AgentResponse(
+                            conversationId=request.conversationId,
+                            state=AgentState.READY,
+                            reply=f"{action}流程尚未接入（Mock），请继续从下拉框选择。",
+                            designSessionId=request.context.designSessionId,
+                            questions=self._ready_questions(),
+                            uiActions=["show_ready_actions"],
+                        ))
 
         if pending_guard is None and request.message.strip() in {
             EDIT_ACCEPT, EDIT_ADJUST, EDIT_CANCEL,

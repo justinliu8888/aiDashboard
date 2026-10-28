@@ -962,3 +962,94 @@ def test_direct_reply_is_still_allowed_for_explicit_generation_requests():
     ):
         guarded = context_engine._guard_direct_reply(concierge, _route_request(message))
         assert guarded.action is not ConciergeAction.DEEP_ROUTE, message
+
+
+# ---------- 9. 待确认入口：客户端状态与服务端不符时仍要能问 ----------
+
+
+def test_readonly_question_is_answered_even_when_client_state_is_stale(client):
+    """服务端挂着待确认修改计划时，客户端状态过期也要能提问。
+
+    服务端知道「菜单在」—— 菜单是服务端事实。客户端状态过期不该
+    让只读提问被拒：只读提问没有任何可绕过的执行权限，问完原菜单
+    和计划照旧。
+    """
+    session_service.repository.save_pending_edit_plan(
+        "sess_stale_state",
+        {
+            "planId": "plan_stale",
+            "draftRevision": 0,
+            "summary": "把名称改成新日报",
+            "changes": [],
+        },
+    )
+    session_service.repository.upsert_session(
+        session_id="sess_stale_state",
+        state="USER_EDITING_TEMPLATE",
+        title="待确认计划会话",
+        snapshot={"definition": _definition().model_dump(mode="json")},
+    )
+
+    body = {
+        "agentProtocolVersion": "1.0",
+        "conversationId": "sess_stale_state",
+        "sessionId": "sess_stale_state",
+        # 客户端带的是过期状态（服务端实际在 USER_EDITING_TEMPLATE）
+        "state": "WAITING_USER_CONFIRM",
+        "message": "你有未完成的草稿吗？",
+        "context": {
+            "projectId": "project_001",
+            "subjectRef": "machine_room",
+            "subjectId": "room_a",
+        },
+    }
+    response = client.post("/api/agent/chat", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["turnKind"] == TURN_KIND_QUERY_ANSWER
+    assert "A 机房能耗日报" in payload["reply"]
+    # 原待确认计划还在
+    plan = session_service.load_pending_plan("sess_stale_state")
+    assert plan is not None and plan.planId == "plan_stale"
+
+
+def test_non_readonly_input_is_still_rejected_on_stale_client_state(client):
+    """但只读提问的例外不能变成绕过确认的入口：操作指令照样被拒。"""
+    session_service.repository.save_pending_edit_plan(
+        "sess_stale_state2",
+        {
+            "planId": "plan_stale2",
+            "draftRevision": 0,
+            "summary": "把名称改成新日报",
+            "changes": [],
+        },
+    )
+    session_service.repository.upsert_session(
+        session_id="sess_stale_state2",
+        state="USER_EDITING_TEMPLATE",
+        title="待确认计划会话",
+        snapshot={"definition": _definition().model_dump(mode="json")},
+    )
+
+    body = {
+        "agentProtocolVersion": "1.0",
+        "conversationId": "sess_stale_state2",
+        "sessionId": "sess_stale_state2",
+        "state": "WAITING_USER_CONFIRM",
+        "message": "接受修改",
+        "context": {
+            "projectId": "project_001",
+            "subjectRef": "machine_room",
+            "subjectId": "room_a",
+        },
+    }
+    response = client.post("/api/agent/chat", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["turnKind"] != TURN_KIND_QUERY_ANSWER
+    assert payload["uiActions"] == ["selection_required"]
+    # 原计划没被动过
+    plan = session_service.load_pending_plan("sess_stale_state2")
+    assert plan is not None and plan.planId == "plan_stale2"
