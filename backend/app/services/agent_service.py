@@ -718,6 +718,26 @@ class AgentService:
                 reason="规则无法确定编辑计划，交给受约束 ReAct 查证",
                 collectedInfo=dict(request.collectedInfo),
             )
+        elif design_turn and design_state is None and not readonly_rule:
+            # 新建设计轮**不跑**旧路由。
+            #
+            # 这一轮一定归设计流程管（design_turn 已判定），也不是只读提问
+            # （readonly_rule 为假），所以路由结果**没有人消费** ——
+            # 设计轮只用自己的方案上下文（当前方案 + 简短历史），不读 route。
+            #
+            # 旧路由是一次真实模型往返，实测 60~150 秒；在这里等于让用户
+            # 先等一个用不上的结果，才看到自己的方案。
+            #
+            # 顺带的好处：旧路由会把「昨日」「默认能耗指标」这类默认值
+            # 写进 collectedInfo 落进快照 —— 设计流程没有让用户指定这些，
+            # 不该由默认值无声替代。
+            route = RouteDecision(
+                userIntent=UserIntent.NEW_TASK,
+                routingAction=RoutingAction.CONTINUE_CURRENT,
+                engineStage="design_new_build",
+                reason="新建流程：这一轮直接进设计流程，不跑旧路由",
+                collectedInfo=dict(request.collectedInfo),
+            )
         else:
             route = await context_engine.route(request, emit=emit)
         # 路由层已经把「历史已收集」和「本轮新收集」合并好了。

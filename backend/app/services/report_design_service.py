@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -84,6 +85,148 @@ UI_ACTION_PLAN_READY = "plan_ready"
 UI_ACTION_PLAN_CLARIFICATION = "plan_clarification"
 UI_ACTION_PLAN_CONFIRM_PENDING = "plan_confirm_pending"
 UI_ACTION_PLAN_RETRY = "plan_retry"
+
+
+# --------------------------------------------------------------------------
+# 确认语气的识别
+#
+# 规格 #18：「按钮明确传递动作与版本；自然语言确认由服务端识别，
+# 并绑定服务端当前方案版本」，以及「「差不多了」等不能确定是否认可的
+# 表达不直接推进，返回明确确认入口」「一次消息同时提出修改和确认时，
+# 先展示更新后的方案并等待对该版本的确认」。
+#
+# 判定方式是「剥掉确认词之后还剩不剩实质内容」：
+# 只有确认词 → 纯确认；剩下还有要求 → 不是确认，是修改。
+# --------------------------------------------------------------------------
+
+#: 空白与标点。判断语义时先去掉它们。
+_NOISE_PATTERN = re.compile(r"[\s，。！？、；：,.!?;:~…—\-·\"'“”‘’（）()【】\[\]]+")
+
+#: 明确认可的说法。
+_CONFIRM_MARKERS: tuple[str, ...] = (
+    "确认",
+    "确定",
+    "同意",
+    "没问题",
+    "就按这个",
+    "就按这份",
+    "就按它",
+    "照这个",
+    "照这份",
+    "就这样",
+    "可以",
+    "好的",
+    "好",
+    "行",
+    "ok",
+)
+
+#: 确认时常见的、没有信息量的填充词。剥掉它们才知道这句话是不是「只有确认」。
+_CONFIRM_FILLERS: tuple[str, ...] = (
+    "方案",
+    "这个",
+    "这份",
+    "当前",
+    "这一",
+    "最新",
+    "一下",
+    "一份",
+    "吧",
+    "了",
+    "的",
+    "啊",
+    "呀",
+    "哦",
+)
+
+#: 确认句里可以剩下的连接词。它们只是把确认语气连上，不带要求。
+#:
+#: 判定宁可保守：残留里出现任何**别的**内容，就当这条消息还带着要求 ——
+#: 规格写明「一次消息同时提出修改和确认时，先展示更新后的方案」，
+#: 误当成修改只是多出一版方案，误当成确认会**丢掉**用户的修改要求。
+_CONFIRM_CONNECTORS: tuple[str, ...] = (
+    "按",
+    "照",
+    "继续",
+    "执行",
+    "往下",
+    "下去",
+    "就这样",
+    "就行",
+    "这么办",
+    "来",
+    "走",
+    "办",
+)
+
+#: 模糊认可：不能确定是否认可。规格 #18 明确要求「不直接推进」。
+_VAGUE_APPROVAL_MARKERS: tuple[str, ...] = (
+    "差不多了",
+    "差不太多",
+    "差不多",
+    "就那样",
+    "就这样吧",
+    "先这样",
+    "基本可以",
+    "基本行",
+    "可以吧",
+    "行吧",
+)
+
+#: 「第 2 版」这类版本指代。确认哪一版由服务端决定，不需要用户再说一遍。
+_VERSION_PATTERN = re.compile(r"第\d+版")
+
+
+def _normalize(message: str) -> str:
+    """去掉空白与标点，只留下可判定的字。"""
+    return _NOISE_PATTERN.sub("", message or "")
+
+
+def _strip_markers(text: str, markers: tuple[str, ...]) -> str:
+    rest = text
+    for marker in markers:
+        rest = rest.replace(marker, "")
+    return rest
+
+
+def is_pure_confirmation(message: str) -> bool:
+    """这句话是不是**纯粹**在认可当前方案。
+
+    剥掉确认词与填充词之后，剩下���能是连接词（「按」「继续」这类）——
+    只要还剩下别的内容，就说明这条消息**带着要求**，那是修改而不是确认。
+
+    「确认」是；「确认，按这个方案继续」也是；
+    「改成柱状图，确认」不是。
+    """
+    text = _normalize(message)
+    if not text:
+        return False
+    # 模糊认可优先：「行吧」这类不算明确确认（调用方按模糊认可处理）。
+    if is_vague_approval(text):
+        return False
+    if not any(marker in text for marker in _CONFIRM_MARKERS):
+        return False
+    rest = _strip_markers(text, _CONFIRM_MARKERS)
+    rest = _VERSION_PATTERN.sub("", rest)
+    rest = _strip_markers(rest, _CONFIRM_FILLERS)
+    rest = _strip_markers(rest, _CONFIRM_CONNECTORS)
+    return not rest
+
+
+def is_vague_approval(message: str) -> bool:
+    """这句话是不是「不能确定是否认可」的说法。
+
+    「差不多了」「行吧」这类。规格要求它们**不推进**设计版本，
+    只返回明确确认入口。
+    """
+    text = _normalize(message)
+    if not text:
+        return False
+    if not any(marker in text for marker in _VAGUE_APPROVAL_MARKERS):
+        return False
+    rest = _strip_markers(text, _VAGUE_APPROVAL_MARKERS)
+    rest = _strip_markers(rest, _CONFIRM_FILLERS)
+    return not rest
 
 
 class ReportDesignService:
@@ -298,10 +441,68 @@ class ReportDesignService:
             return None
 
         action = (request.context.designAction or "").strip().upper()
+        current_plan = (state or {}).get("reportPlan")
+
+        # 模糊认可先判：「差不多了」这类不能确定是否认可，
+        # 不能推进设计版本，只能返回明确确认入口（规格 #18）。
+        if isinstance(current_plan, dict) and current_plan:
+            if is_vague_approval(request.message):
+                return self._handle_vague_approval(request, state=state)
+
         if action == DESIGN_ACTION_CONFIRM_PLAN:
+            # 按钮确认。消息里还夹着修改要求时不能只确认旧版本 ——
+            # 规格写明「一次消息同时提出修改和确认时，先展示更新后的方案
+            # 并等待对该版本的确认」。
+            if is_pure_confirmation(request.message):
+                return self._handle_confirm_action(request, state=state)
+            return await self._handle_design_turn(
+                request, state=state, emit=emit
+            )
+
+        # 自然语言确认：服务端识别，绑定服务端当前方案版本（规格 #18）。
+        if is_pure_confirmation(request.message):
             return self._handle_confirm_action(request, state=state)
 
         return await self._handle_design_turn(request, state=state, emit=emit)
+
+    def _handle_vague_approval(
+        self,
+        request: AgentRequest,
+        *,
+        state: dict[str, Any] | None,
+    ) -> AgentResponse:
+        """模糊认可：不推进版本，返回明确确认入口。
+
+        规格 #18：「「差不多了」等不能确定是否认可的表达不直接推进，
+        返回明确确认入口。」工单 01 验收也写明「不把最初需求或模糊认可
+        当作确认」。
+
+        所以这里既不确认，也不生成新方案 —— 方案与版本原样保留，
+        只把「确认方案」这个入口摆在用户面前。
+        """
+        current_plan = (state or {}).get("reportPlan") or {}
+        current_revision = current_plan.get("revision")
+        message = (
+            "我理解你对这份方案大致认可，但还不能确定是不是要按它生成，"
+            "所以我没有改动方案，也没有替你确认。"
+            f"当前是第 {current_revision} 版，请点「确认方案」明确确认，"
+            "或者告诉我要改哪里。"
+        )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.ANALYZING,
+            reply=message,
+            designSessionId=request.context.designSessionId,
+            designPhase=(state or {}).get("designPhase")
+            or DESIGN_PHASE_PLAN_WAITING_CONFIRM,
+            domainObjects=AgentResponseDomainObjects(reportPlan=current_plan),
+            uiActions=[UI_ACTION_PLAN_CONFIRM_PENDING],
+            debug={
+                "designOutcome": "vague_approval_needs_explicit_confirm",
+                "planRevision": current_revision,
+                "planId": current_plan.get("id"),
+            },
+        )
 
     def _handle_confirm_action(
         self,

@@ -20,7 +20,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services.report_design_service import report_design_service
+from app.services.context_engine import context_engine
+from app.services.report_design_service import (
+    is_pure_confirmation,
+    is_vague_approval,
+    report_design_service,
+)
 from app.services.session_service import session_service
 from app.storage.report_design_repository import (
     OPERATION_FAILED,
@@ -555,7 +560,166 @@ def test_confirm_plan_for_another_plan_is_rejected(client, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# 8. 旧流程保持原语义
+# 8. 自然语言确认、模糊认可、修改与确认同条消息
+#
+# 规格 #18：
+#   - 「自然语言确认由服务端识别，并绑定服务端当前方案版本」；
+#   - 「「差不多了」等不能确定是否认可的表达不直接推进，返回明确确认入口」；
+#   - 「一次消息同时提出修改和确认时，先展示更新后的方案并等待对该版本的确认」。
+#
+# 工单 01 验收：「不把最初需求或模糊认可当作确认」。
+# --------------------------------------------------------------------------
+
+
+def test_natural_language_confirm_binds_current_plan_version(client, monkeypatch):
+    """自然语言「确认」由服务端识别，绑定服务端当前方案版本。
+
+    服务端认得这句是在认可当前方案，所以：
+      - 不再跑一次模型（模型调用次数不变）；
+      - 版本不变，方案 id 不变；
+      - 行为与按钮确认一致：如实说明模板生成尚未接入。
+    """
+    model = install_model(monkeypatch, RecordingModel(_candidate()))
+    built = _post(client, "生成 PUE 报表", message_id="msg_1").json()
+    plan = built["domainObjects"]["reportPlan"]
+    calls_before = len(model.calls)
+
+    payload = _post(client, "确认", message_id="msg_2").json()
+
+    assert len(model.calls) == calls_before
+    assert payload["designPhase"] == "PLAN_WAITING_CONFIRM"
+    confirmed = payload["domainObjects"]["reportPlan"]
+    assert confirmed["revision"] == plan["revision"]
+    assert confirmed["id"] == plan["id"]
+    assert payload["toolRequests"] == []
+    assert "还没有接入" in payload["reply"]
+
+
+def test_vague_approval_does_not_advance_design_version(client, monkeypatch):
+    """「差不多了」不推进设计版本，返回明确确认入口。"""
+    model = install_model(monkeypatch, RecordingModel(_candidate()))
+    built = _post(client, "生成 PUE 报表", message_id="msg_1").json()
+    plan = built["domainObjects"]["reportPlan"]
+    calls_before = len(model.calls)
+
+    payload = _post(client, "差不多了", message_id="msg_2").json()
+
+    assert len(model.calls) == calls_before
+    assert payload["designPhase"] == "PLAN_WAITING_CONFIRM"
+    assert payload["domainObjects"]["reportPlan"]["revision"] == plan["revision"]
+    # 明确确认入口
+    assert "确认" in payload["reply"]
+    assert payload["toolRequests"] == []
+
+
+def test_modify_and_confirm_same_message_shows_updated_version(client, monkeypatch):
+    """一条消息同时提出修改和确认：先展示更新后的方案，再等确认。
+
+    确认动作不能把同一句里的修改要求丢掉 —— 规格写明
+    「一次消息同时提出修改和确认时，先展示更新后的方案并等待对该版本的确认」。
+    """
+
+    def responder(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        current = _current_plan_from(messages) or {}
+        sections = [dict(s) for s in (current.get("sections") or [])]
+        sections.append(
+            {
+                "id": "section_trend",
+                "title": "PUE 趋势",
+                "metricIntents": ["PUE"],
+                "componentType": "line_chart",
+            }
+        )
+        return _candidate(sections=sections)
+
+    install_model(monkeypatch, RecordingModel(responder=responder))
+    built = _post(client, "生成 PUE 报表", message_id="msg_1").json()
+    plan = built["domainObjects"]["reportPlan"]
+
+    payload = _post(
+        client,
+        "改成柱状图，确认",
+        message_id="msg_2",
+        context={
+            "designAction": "CONFIRM_PLAN",
+            "planId": plan["id"],
+            "basePlanRevision": plan["revision"],
+        },
+    ).json()
+
+    assert payload["designPhase"] == "PLAN_WAITING_CONFIRM"
+    updated = payload["domainObjects"]["reportPlan"]
+    assert updated["revision"] == plan["revision"] + 1
+    assert updated["id"] == plan["id"]
+    assert len(updated["sections"]) == len(plan["sections"]) + 1
+
+
+def test_confirmation_phrase_with_modification_is_not_a_confirmation(
+    client, monkeypatch
+):
+    """「可以」后面还带着要求，就不是纯确认，要按修改处理。"""
+    install_model(monkeypatch, RecordingModel(_candidate()))
+    built = _post(client, "生成 PUE 报表", message_id="msg_1").json()
+    plan = built["domainObjects"]["reportPlan"]
+
+    payload = _post(client, "可以，再加一个趋势板块", message_id="msg_2").json()
+
+    assert payload["domainObjects"]["reportPlan"]["revision"] == plan["revision"] + 1
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "确认",
+        "确认。",
+        "好的",
+        "可以",
+        "就按这个方案来",
+        "确认，按这个方案继续",
+        "确认第2版",
+        "没问题了",
+        "同意",
+    ],
+)
+def test_pure_confirmation_phrases_are_recognized(message: str) -> None:
+    """明确认可的说法要被服务端认出来。"""
+    assert is_pure_confirmation(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "改成柱状图，确认",
+        "可以，再加一个趋势板块",
+        "确认一下加个折线图",
+        "PUE 报表确认一下",
+    ],
+)
+def test_messages_with_requirements_are_not_pure_confirmation(message: str) -> None:
+    """带着要求的句子不算纯确认。"""
+    assert is_pure_confirmation(message) is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["差不多了", "行吧", "基本可以", "先这样吧", "差不多"],
+)
+def test_vague_approval_phrases_are_recognized(message: str) -> None:
+    """模糊认可要被认出来。"""
+    assert is_vague_approval(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["差不多了，再加个板块", "生成 PUE 报表", "确认", "把标题改成 PUE 分析"],
+)
+def test_non_vague_messages_are_not_vague_approval(message: str) -> None:
+    """带要求或明确的句子不算模糊认可。"""
+    assert is_vague_approval(message) is False
+
+
+# --------------------------------------------------------------------------
+# 9. 旧流程保持原语义
 # --------------------------------------------------------------------------
 
 
@@ -645,6 +809,50 @@ def test_question_first_session_can_still_start_a_new_build(client, monkeypatch)
     built = _post(client, "生成一份 PUE 报表", message_id="q_2").json()
     assert built["designPhase"] == "PLAN_WAITING_CONFIRM"
     assert built["domainObjects"]["reportPlan"]["revision"] == 1
+
+
+def test_new_build_does_not_run_the_old_router(client, monkeypatch):
+    """新建设计轮不跑旧路由。
+
+    旧路由是一次真实模型往返（实测 60~150 秒），而它在新建轮的结果
+    **没有人消费** —— 设计流程只用自己的方案上下文（当前方案 + 简短历史）。
+    让用户先等一个用不上的结果才看到自己的方案，是白等的。
+
+    顺带的好处：旧路由会把「昨日」「默认能耗指标」这类默认值写进
+    collectedInfo 落进快照 —— 设计流程没有让用户指定这些。
+    """
+    calls: list[str] = []
+
+    async def _record(request, emit=None):  # type: ignore[no-untyped-def]
+        calls.append(getattr(request, "message", ""))
+        raise AssertionError("新建设计轮不该跑旧路由")
+
+    monkeypatch.setattr(context_engine, "route", _record)
+    install_model(monkeypatch, RecordingModel(_candidate()))
+
+    payload = _post(client, "生成 PUE 报表", message_id="msg_1").json()
+
+    assert calls == []
+    assert payload["designPhase"] == "PLAN_WAITING_CONFIRM"
+
+
+def test_readonly_question_still_runs_the_old_router(client, monkeypatch):
+    """只读提问轮仍然跑旧路由 —— 查询链路要用它的判定。"""
+    calls: list[str] = []
+
+    async def _record(request, emit=None):  # type: ignore[no-untyped-def]
+        calls.append(getattr(request, "message", ""))
+        from app.services.context_engine import RouteDecision
+
+        return RouteDecision(reason="stub")
+
+    monkeypatch.setattr(context_engine, "route", _record)
+    install_model(monkeypatch, RecordingModel(_candidate()))
+
+    payload = _post(client, "PUE 是什么意思？", message_id="msg_1").json()
+
+    assert calls == ["PUE 是什么意思？"]
+    assert payload["turnKind"] == "query_answer"
 
 
 def test_readonly_question_is_not_hijacked_by_template_flow(client, monkeypatch):
