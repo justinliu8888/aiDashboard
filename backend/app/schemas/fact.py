@@ -14,7 +14,6 @@
 """
 from __future__ import annotations
 
-import re
 from enum import Enum
 from typing import Any
 
@@ -118,8 +117,6 @@ LIVE_PROGRESS_CLAIM_MARKERS: tuple[str, ...] = (
     "百分之",
 )
 
-#: 答案里出现这种写法，就是在编百分比。
-LIVE_PROGRESS_PERCENT_PATTERN = re.compile(r"\d+\s*%")
 
 
 class DraftFacts(BaseModel):
@@ -199,6 +196,10 @@ class SessionFacts(BaseModel):
 __all__ = [
     "DOMAIN_STATUS_TO_FACT_STATUS",
     "FACT_STATUSES",
+    "LIVE_PROGRESS_CLAIM_MARKERS",
+    "RECORDED_NOT_LIVE_MARKERS",
+    "RECORDED_STAGE_DISCLOSURE",
+    "RECORDED_STATE_MARKERS",
     "DraftFacts",
     "FactStatus",
     "SessionFacts",

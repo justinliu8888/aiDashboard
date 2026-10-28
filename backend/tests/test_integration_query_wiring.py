@@ -1328,8 +1328,12 @@ def test_recorded_boundary_is_stated_once_on_the_deterministic_path(post_chat):
 
     response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
 
+    from app.schemas.fact import RECORDED_STAGE_DISCLOSURE
+
     assert "不是实时" in response["reply"]
-    assert response["reply"].count("不是实时进度") == 1
+    # 断言共用层口径句本身：只数一句里的片段，重复追加是数不出来的。
+    assert response["reply"].count(RECORDED_STAGE_DISCLOSURE) == 1
+    assert response["reply"].count("不是实时") == 1
 
 
 def test_boundary_needs_both_halves_recorded_and_not_live(post_chat, monkeypatch):
@@ -1420,3 +1424,83 @@ def test_capability_question_about_time_dimension_does_not_get_boundary(
     response = post_chat("报表支持按预计时间筛选吗？", state="WAITING_USER_CONFIRM").json()
 
     assert "不是实时任务进度" not in response["reply"]
+
+
+def test_fallback_must_not_claim_a_recorded_stage_when_there_is_none(
+    post_chat, monkeypatch
+):
+    """服务端没有可核实的记录时，兜底话术不能替用户断言「已记录」。
+
+    会话不存在 / 读不到 / 范围不符时，如实说「无法确认」；
+    说成「已记录了业务阶段」是服务端自己编事实。
+    """
+    from app.services.agent_service import agent_service
+
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent("实时进度到 30% 了。"),
+    )
+
+    response = post_chat("刚才那份做到哪一步了？", state="ANALYZING").json()
+
+    assert "30%" not in response["reply"]
+    # 没有可核实记录时，不能替用户断言「已记录了业务阶段」，
+    # 要如实说读不到（用的是事实里的 reason）。
+    assert "已记录" not in response["reply"]
+    assert "这次查询没有完成" in response["reply"]
+
+
+def test_denial_wording_is_not_mistaken_for_a_live_progress_claim(
+    post_chat, monkeypatch
+):
+    """「无法提供实时进度」是在守红线，不能当成编造进度。"""
+    from app.services.agent_service import agent_service
+
+    _upsert_session(
+        "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
+    )
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent("无法提供实时进度：系统没有实时任务状态来源。"),
+    )
+
+    response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
+
+    assert "无法提供实时进度" in response["reply"]
+    assert "已记录" in response["reply"]
+
+
+def test_capability_question_with_status_filter_is_not_a_progress_question(
+    post_chat, monkeypatch
+):
+    """能力问题里的「状态」是筛选维度，不是进度信号。"""
+    from app.services.agent_service import agent_service
+
+    _upsert_session("conv_test", state="WAITING_USER_CONFIRM")
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent("支持按状态筛选，粒度可以选到小时。"),
+    )
+
+    response = post_chat("报表支持按状态筛选吗？", state="WAITING_USER_CONFIRM").json()
+
+    assert "不是实时任务进度" not in response["reply"]
+
+
+def test_metric_percentage_is_not_taken_for_fabricated_progress(post_chat, monkeypatch):
+    """指标口径里的百分比不是进度。"""
+    from app.services.agent_service import agent_service
+
+    _upsert_session("conv_test", state="WAITING_USER_CONFIRM")
+    monkeypatch.setattr(
+        agent_service,
+        "_agent",
+        _stub_agent("毛利率这个指标可以算，当前是 12.5%。"),
+    )
+
+    response = post_chat("毛利率支持吗？", state="WAITING_USER_CONFIRM").json()
+
+    assert "12.5%" in response["reply"]

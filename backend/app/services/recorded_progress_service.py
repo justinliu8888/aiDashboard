@@ -540,7 +540,7 @@ def _summary(
         return "当前对话的服务端已记录内容里没有报表草稿、已保存定义或预览。"
     return (
         f"当前对话已记录的阶段是{stage_label}，下一步：{next_step}"
-        "这是已记录的状态，不是实时进度。"
+        f"{RECORDED_STAGE_DISCLOSURE}"
     )
 
 
