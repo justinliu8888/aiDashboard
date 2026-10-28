@@ -1267,3 +1267,15 @@ def test_recorded_boundary_is_not_appended_twice(post_chat, monkeypatch):
     response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
 
     assert response["reply"].count("不是实时任务进度") == 1
+
+
+def test_recorded_boundary_is_stated_once_on_the_deterministic_path(post_chat):
+    """Fake 路径本身就说清了这条边界：不能被服务端再追加一遍。"""
+    _upsert_session(
+        "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
+    )
+
+    response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
+
+    assert "已记录" in response["reply"]
+    assert response["reply"].count("不是实时进度") == 1
