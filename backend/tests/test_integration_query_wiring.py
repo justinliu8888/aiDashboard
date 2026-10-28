@@ -1139,3 +1139,47 @@ def test_query_keeps_the_stored_menu_unchanged(client):
     assert [q["id"] for q in payload["questions"]] == ["template_edit_confirm"]
     after = session_service.repository.get_session("sess_has_menu").pendingChoice
     assert after["question"]["options"] == stored["question"]["options"]
+
+
+# ---------- 11. 进度模块不得编造事实，且要与共用层结论一致 ----------
+
+
+def test_progress_tool_does_not_fabricate_region_count_for_a_malformed_draft(
+    bound_context,
+):
+    """草稿里的 regions 不是列表时，进度工具不能报一个编出来的区块数。
+
+    ``len("not-a-list")`` 是 10 —— 一次提问就能让用户看到「含 10 个区块」
+    这种凭空捏造的数字。而且同一条会话在草稿查询里是「读不到」，
+    在进度查询里却变成「查到了」，两处结论互相矛盾。
+    """
+    from app.schemas.fact import FactStatus
+    from app.services.session_fact_service import session_fact_service
+    from app.tools.get_recorded_progress_tool import run
+
+    broken = {
+        "metadata": {"id": "def_bad_regions", "name": "坏草稿", "revision": 0},
+        "regions": "not-a-list",
+    }
+    session_service.repository.upsert_session(
+        session_id="conv_int",
+        state="WAITING_USER_CONFIRM",
+        title="坏区块草稿",
+        snapshot={"definition": broken},
+    )
+
+    facts = session_fact_service.load(
+        session_id="conv_int",
+        project_id="project_001",
+        subject_ref="machine_room",
+        subject_id="room_a",
+    )
+    result = run()
+
+    # 共用层：草稿解析不了 -> 读不到
+    assert facts.status is FactStatus.UNAVAILABLE
+    # 进度层：必须同一个结论，不能说「查到了」
+    assert result["status"] == FactStatus.UNAVAILABLE.value
+    assert result["availability"] == "UNAVAILABLE"
+    # 更不能报出编出来的区块数
+    assert result["draft"]["regionCount"] in (0, None)

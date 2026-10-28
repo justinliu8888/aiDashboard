@@ -26,6 +26,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.session import PENDING_PLAN_KEY, PendingEditPlan
 from app.services.definition_save_service import definition_save_service
 from app.services.preview_service import preview_service
@@ -137,6 +138,12 @@ def describe_recorded_progress(
         return _permission_denied_result(denied)
 
     facts = _extract_facts(record, session_id)
+    if facts.get("draftUnreadable"):
+        # 草稿解析不了 = 读不到，不是「没有草稿」。与共用层同一个结论：
+        # 共用层这时是 UNAVAILABLE（``session_fact_service`` 校验草稿失败）。
+        return _unavailable_result(
+            "服务端保存的报表草稿无法解析，暂时无法确认已记录进度。"
+        )
     if not _has_any_object(facts):
         return _no_object_result(record, facts)
 
@@ -217,19 +224,37 @@ def _extract_facts(record: Any, session_id: str | None = None) -> dict[str, Any]
 
     草稿、待确认修改计划、已保存定义、报表预览分开处理，
     草稿 revision 与保存 revision 不混用。
+
+    草稿用**同一套校验**（``ReportDefinitionDraft``）解析，
+    与共用层 ``session_fact_service`` 保持一致（ADR 0002 §7.1）：
+    解析不了就是「读不到」，不能自己按原始字典算出区块数 ——
+    ``len("not-a-list")`` 是 10，凭空报一个区块数就是编事实。
     """
     snapshot = record.snapshot if isinstance(record.snapshot, dict) else {}
 
     definition = snapshot.get("definition")
+    draft_unreadable = False
     if isinstance(definition, dict):
-        metadata = definition.get("metadata") or {}
-        regions = definition.get("regions") or []
-        draft = {
-            "exists": True,
-            "name": str(metadata.get("name") or ""),
-            "revision": _as_int(metadata.get("revision")),
-            "regionCount": len(regions),
-        }
+        try:
+            parsed = ReportDefinitionDraft.model_validate(definition)
+        except ValidationError:
+            parsed = None
+            draft_unreadable = True
+        if parsed is not None:
+            metadata = parsed.metadata or {}
+            draft = {
+                "exists": True,
+                "name": str(metadata.get("name") or ""),
+                "revision": _as_int(metadata.get("revision")),
+                "regionCount": len(parsed.regions or []),
+            }
+        else:
+            draft = {
+                "exists": False,
+                "name": "",
+                "revision": None,
+                "regionCount": 0,
+            }
     else:
         draft = {
             "exists": False,
@@ -269,6 +294,7 @@ def _extract_facts(record: Any, session_id: str | None = None) -> dict[str, Any]
 
     return {
         "draft": draft,
+        "draftUnreadable": draft_unreadable,
         "savedDefinition": saved_definition,
         "preview": preview,
         "pendingEditPlan": _extract_pending_plan(record),
