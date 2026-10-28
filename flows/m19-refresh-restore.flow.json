@@ -1,0 +1,46 @@
+{
+  "outDir": "../.selfcheck/flow-m19-refresh-restore",
+  "waitMs": 1500,
+  "timeout": 240000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "M-19 刷新后恢复确认选项：草稿与下拉都回来，选同意后到 READY",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析。" },
+        { "press": "Enter" },
+
+        { "waitFor": "#state-badge", "timeout": 10000 },
+        { "waitText": "WAITING_USER_CONFIRM", "timeout": 240000 },
+        { "waitFor": ".question-select", "timeout": 30000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'WAITING_USER_CONFIRM'" },
+        { "eval": "!!document.querySelector('.question-select')" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "screenshot": "m19-01-刷新前已出草稿待确认" },
+
+        { "eval": "(() => { window.location.reload(); return true; })()" },
+        { "wait": 4000 },
+
+        { "waitText": "WAITING_USER_CONFIRM", "timeout": 60000 },
+        { "waitFor": ".question-select", "timeout": 30000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'WAITING_USER_CONFIRM'" },
+        { "eval": "!!document.querySelector('.question-select')" },
+        { "eval": "!document.querySelector('.question-select').disabled" },
+        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "screenshot": "m19-02-刷新后草稿与确认下拉都恢复" },
+
+        { "eval": "(() => { const s = [...document.querySelectorAll('.question-select')].pop(); s.value = '同意'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()" },
+        { "waitText": "报表已就绪", "timeout": 240000 },
+        { "wait": 1500 },
+        { "eval": "document.getElementById('state-badge').textContent === 'READY'" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('设备耗电排名')" },
+        { "screenshot": "m19-03-同意后到 READY" }
+      ]
+    }
+  ]
+}

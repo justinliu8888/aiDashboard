@@ -68,6 +68,29 @@ function newMessageId() {
   return "msg_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
 }
 
+// -------- 上次会话的落点 --------
+// 刷新后默认回到空态、要人工从历史列表里翻，是这个工作台最容易被投诉的一点。
+// 把当前 sessionId 记在 localStorage，页面启动时自动接回来；恢复不了也给明确提示，
+// 历史入口始终保留。
+const LAST_SESSION_KEY = "ai-report:last-session-id";
+
+function readLastSessionId() {
+  try {
+    return window.localStorage.getItem(LAST_SESSION_KEY) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeLastSessionId(sessionId) {
+  try {
+    if (sessionId) window.localStorage.setItem(LAST_SESSION_KEY, sessionId);
+    else window.localStorage.removeItem(LAST_SESSION_KEY);
+  } catch (e) {
+    // 隐私模式 / 存储被禁用：不影响主流程，只是刷新后不能自动恢复。
+  }
+}
+
 const DEFAULT_CONTEXT = {
   projectId: "project_001",
   subjectRef: "machine_room",
@@ -85,6 +108,13 @@ let activeRequest = null;
 let requestEpoch = 0;
 let lockedChoice = null;
 const advanceTimers = new Set();
+
+// 最近一次画出来的「确认下拉」问题对象。
+// 回放历史会话时后端可能没带 pending_choice（下拉框会被 disable 成死的），
+// 用它兜底把锁补上，历史恢复后仍然能选、能继续推进。
+let lastConfirmQuestion = null;
+// 会话恢复的竞态令牌：恢复途中用户点了「新建对话」就让这次恢复作废。
+let sessionRestoreToken = 0;
 
 // 对话区贴底跟随：用户上滑后暂停自动滚动，回到底部后恢复
 const CHAT_BOTTOM_THRESHOLD = 48;
@@ -589,13 +619,15 @@ function appendConfirmActions(question, { lock = true } = {}) {
   }
   const wrap = aiBubble(`
     <div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3">
-      <label class="block text-sm text-slate-700 leading-relaxed mb-2.5">请先选择如何处理当前草稿：</label>
+      <label class="block text-sm text-slate-700 leading-relaxed mb-2.5">${esc(question.prompt || "请先选择如何处理当前草稿：")}</label>
       <select class="question-select w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700" data-question-id="${esc(question.id || "")}">
         <option value="">请选择</option>
-        ${question.options.map((option) => `<option value="${esc(option.value)}">${esc(option.label)}</option>`).join("")}
+        ${question.options.map((option) => `<option value="${esc(option.value ?? option.label)}">${esc(option.label ?? option.value)}</option>`).join("")}
       </select>
     </div>
   `);
+  // 记下这个下拉：回放历史会话时后端可能没存 pending_choice，靠它把锁补回来。
+  lastConfirmQuestion = question;
   if (lock) setChoiceLock(question);
   wrap.querySelector(".question-select").addEventListener("change", (event) => {
     if (lockedChoice?.id === question?.id && event.target.value) {
@@ -603,6 +635,58 @@ function appendConfirmActions(question, { lock = true } = {}) {
     }
   });
 }
+
+// -------- 确认问题归一化 --------
+// 后端给的问题对象不一定带 selectionOnly（例如业务 Agent 的 confirm_change）。
+// 前端要的是一个**能点的下拉框**：把选项补齐、强制走单选，再交给 appendConfirmActions。
+function normalizeConfirmQuestion(question) {
+  if (!question || typeof question !== "object") return null;
+  const options = (question.options || [])
+    .filter((option) => option && (option.value || option.label))
+    .map((option) => ({ value: option.value ?? option.label, label: option.label ?? option.value }));
+  if (!options.length) return null;
+  return {
+    id: question.id || "definition_draft_confirm",
+    prompt: question.prompt || "请选择如何处理这份草稿：",
+    expects: question.expects || "SINGLE_CHOICE",
+    selectionOnly: true,
+    allowRestart: !!question.allowRestart,
+    options,
+  };
+}
+
+// DEFINITION_DRAFT_READY 优先认这些问题 id；认不到再退回「第一个带选项的问题」。
+const DEFINITION_DRAFT_CONFIRM_IDS = [
+  "confirm_change",
+  "confirm_draft",
+  "definition_draft_confirm",
+  "template_edit_confirm",
+  "confirm",
+];
+
+function resolveDefinitionDraftQuestion(data) {
+  const questions = (data?.questions || []).filter(Boolean);
+  if (!questions.length) return null;
+  const picked =
+    questions.find((question) => DEFINITION_DRAFT_CONFIRM_IDS.includes(question.id)) ||
+    questions.find((question) => question.selectionOnly && question.options?.length) ||
+    questions.find((question) => question.options?.length);
+  return normalizeConfirmQuestion(picked);
+}
+
+// 后端只给了 changeSet、没给问题时的兜底确认项。
+// 没有它，用户在 DEFINITION_DRAFT_READY 就只剩一张变更卡，没有任何「继续」的办法。
+const FALLBACK_DRAFT_CONFIRM_QUESTION = {
+  id: "definition_draft_confirm",
+  prompt: "请选择如何处理这份草稿：",
+  expects: "SINGLE_CHOICE",
+  selectionOnly: true,
+  options: [
+    { value: "同意", label: "同意" },
+    { value: "修改", label: "修改" },
+    { value: "重新开始", label: "重新开始" },
+  ],
+};
 
 function appendAiThinking() {
   const bubble = aiBubble(`
@@ -621,7 +705,13 @@ function removeBubble(bubble) {
 }
 
 function appendAiQuestions(questions, { lock = true } = {}) {
-  const html = questions
+  const list = (questions || []).filter(Boolean);
+  // 没有问题就别画一张空卡：空卡只有边框没有内容，用户看起来像卡住了。
+  if (!list.length) {
+    if (lock) appendAiText("暂时没有需要补充的信息，请直接描述你的报表需求。");
+    return;
+  }
+  const html = list
     .map((q) => {
       const useSelect = q.selectionOnly;
       let controls = "";
@@ -664,7 +754,7 @@ function appendAiQuestions(questions, { lock = true } = {}) {
   wrap.querySelectorAll(".opt-btn").forEach((btn) => {
     btn.addEventListener("click", () => sendMessage(btn.dataset.answer));
   });
-  const required = questions.find((q) => q.selectionOnly && q.options?.length);
+  const required = list.find((q) => q.selectionOnly && q.options?.length);
   if (required && lock) setChoiceLock(required);
   wrap.querySelectorAll(".question-select").forEach((select) => {
     select.addEventListener("change", () => {
@@ -735,37 +825,51 @@ function appendAiChangeSet(changeSet, { interactive = true } = {}) {
     .map((i) => `<li class="flex gap-1.5"><span class="mono text-[11px] text-slate-700">${esc(i.regionId)}</span><span class="text-slate-600">${esc(i.note)}</span></li>`)
     .join("");
 
+  // 卡片正文单独抽出来：可交互版和历史归档版共用同一份内容。
+  // （以前归档版引用了一个作用域外的 `html`，回放历史会话时直接抛 ReferenceError，
+  //   整个 restoreSession 崩掉，右侧草稿、选择锁、确认下拉全部恢复不了。）
+  const bodyHtml = `
+    <div class="space-y-1.5">${changed || '<div class="text-xs text-slate-400">无变更</div>'}</div>
+    ${unchangedTags ? `<div><div class="text-[11px] text-slate-500 mb-1">未变化</div><div class="flex flex-wrap gap-1">${unchangedTags}</div></div>` : ""}
+    ${impactList ? `<div><div class="text-[11px] text-slate-500 mb-1">影响说明</div><ul class="space-y-0.5 text-xs">${impactList}</ul></div>` : ""}`;
+
+  const headerHtml = `
+    <div class="px-3.5 py-2.5 bg-fuchsia-50 border-b border-fuchsia-100 flex items-center gap-2">
+      <iconify-icon class="text-fuchsia-700" icon="mdi:file-swap-outline"></iconify-icon>
+      <span class="text-sm font-semibold text-fuchsia-900">AI 变更确认</span>
+      <span class="text-[10px] text-fuchsia-700 bg-white border border-fuchsia-200 rounded px-1.5 py-px ml-auto">baseRev=${changeSet.baseDefinitionRevision}</span>
+    </div>`;
+
+  if (!interactive) {
+    // 历史回放：只展示内容，不给「接受/拒绝」按钮。
+    aiBubble(`
+    <div class="rounded-xl border border-fuchsia-200 bg-white overflow-hidden">
+      ${headerHtml}
+      <div class="p-3 space-y-3">
+        ${bodyHtml}
+        <div class="pt-1 text-[11px] text-slate-400">历史变更（已归档，不可再次操作）</div>
+      </div>
+    </div>
+    `);
+    return;
+  }
+
   const wrap = aiBubble(`
     <div class="rounded-xl border border-fuchsia-200 bg-white overflow-hidden">
-      <div class="px-3.5 py-2.5 bg-fuchsia-50 border-b border-fuchsia-100 flex items-center gap-2">
-        <iconify-icon class="text-fuchsia-700" icon="mdi:file-swap-outline"></iconify-icon>
-        <span class="text-sm font-semibold text-fuchsia-900">AI 变更确认</span>
-        <span class="text-[10px] text-fuchsia-700 bg-white border border-fuchsia-200 rounded px-1.5 py-px ml-auto">baseRev=${changeSet.baseDefinitionRevision}</span>
-      </div>
+      ${headerHtml}
       <div class="p-3 space-y-3">
-        <div class="space-y-1.5">${changed || '<div class="text-xs text-slate-400">无变更</div>'}</div>
-        ${unchangedTags ? `<div><div class="text-[11px] text-slate-500 mb-1">未变化</div><div class="flex flex-wrap gap-1">${unchangedTags}</div></div>` : ""}
-        ${impactList ? `<div><div class="text-[11px] text-slate-500 mb-1">影响说明</div><ul class="space-y-0.5 text-xs">${impactList}</ul></div>` : ""}
-        ${
-          interactive
-            ? `<div class="flex gap-1.5 pt-1">
+        ${bodyHtml}
+        <div class="flex gap-1.5 pt-1">
           <button class="btn-accept inline-flex items-center gap-1 rounded-lg bg-fuchsia-700 hover:bg-fuchsia-800 text-white text-xs font-medium px-2.5 py-1.5 transition">
             <iconify-icon class="text-sm" icon="mdi:check"></iconify-icon>接受变更
           </button>
           <button class="btn-reject inline-flex items-center gap-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-2.5 py-1.5 border border-slate-200 transition">
             <iconify-icon class="text-sm text-slate-500" icon="mdi:close"></iconify-icon>拒绝
           </button>
-        </div>`
-            : `<div class="pt-1 text-[11px] text-slate-400">历史变更（已归档，不可再次操作）</div>`
-        }
+        </div>
       </div>
     </div>
   `);
-
-  if (!interactive) {
-    aiBubble(html);
-    return;
-  }
 
   wrap.querySelector(".btn-accept").addEventListener("click", () => applyChangeSet(changeSet, wrap));
   wrap.querySelector(".btn-reject").addEventListener("click", () => {
@@ -1169,6 +1273,8 @@ async function sendMessage(text, { fromChoice = false } = {}) {
     try {
       const created = await sessionApi.create();
       session.sessionId = created.sessionId;
+      // 记下当前会话，刷新后能自动接回来
+      writeLastSessionId(session.sessionId);
     } catch (err) {
       toast("创建会话失败：" + err.message);
       return;
@@ -1307,8 +1413,8 @@ async function sendMessage(text, { fromChoice = false } = {}) {
       appendAiText(data.reply || "我需要你再补充一些信息：");
       if (pendingPlan) {
         renderPendingPlan();
-      } else {
-        appendAiQuestions(data.questions || []);
+      } else if (data.questions?.length) {
+        appendAiQuestions(data.questions);
       }
       break;
     case "BLOCKED_OR_UNSUPPORTED":
@@ -1387,7 +1493,13 @@ async function sendMessage(text, { fromChoice = false } = {}) {
       break;
     case "RENDERING":
       appendAiText(data.reply || "正在渲染报表界面…");
-      await renderFinalReport();
+      // 渲染出问题（图表库挂了、某个区域数据异常）不能把状态机按死在 RENDERING。
+      try {
+        await renderFinalReport();
+      } catch (err) {
+        console.error("[AI Report] 渲染报表失败", err);
+        appendAiText("报表渲染遇到问题，已跳过部分内容，流程继续。");
+      }
       if (epoch !== requestEpoch) return;
       queueAdvance(450, epoch);
       break;
@@ -1395,13 +1507,33 @@ async function sendMessage(text, { fromChoice = false } = {}) {
       appendAiText(data.reply || "报表已就绪。");
       appendReadyActions(data.questions?.find((question) => question.id === "ready_action"));
       break;
-    case "DEFINITION_DRAFT_READY":
+    case "DEFINITION_DRAFT_READY": {
+      // 这个状态以前只画一张变更卡：右侧没有草稿、没有确认下拉、也没有输入锁，
+      // 用户既看不到草稿也走不下去（死路）。
+      // 现在：草稿同步到右侧 + 变更卡 + 一个一定能点的确认下拉。
+      const draft = data.domainObjects?.reportDefinitionDraft;
+      if (draft) {
+        session.definition = draft;
+        session.policy = data.domainObjects?.reportPolicyDraft || session.policy;
+        session.reportDefinitionId = draft?.metadata?.id || session.reportDefinitionId;
+        session.baseDefinitionRevision = draft?.metadata?.revision ?? session.baseDefinitionRevision;
+        renderPreview(session.definition);
+      }
+      appendAiText(data.reply || "已生成修改方案。");
       if (data.domainObjects?.changeSet) {
         appendAiChangeSet(data.domainObjects.changeSet);
+      }
+      if (pendingPlan) {
+        // 有待确认计划时，计划卡自带「接受修改 / 继续调整 / 取消」，不再叠一层确认下拉。
+        renderPendingPlan();
       } else {
-        appendAiText("已生成修改方案。");
+        // 后端给了 questions 就用它的（id、选项值要和后端的 pending_choice 对得上）；
+        // 只给了 changeSet 就补一套兜底确认项，保证这个状态永远有路可走。
+        const confirmQuestion = resolveDefinitionDraftQuestion(data) || FALLBACK_DRAFT_CONFIRM_QUESTION;
+        appendConfirmActions(confirmQuestion);
       }
       break;
+    }
     default:
       appendAiText(`当前状态：${data.state}`);
       // 后端新增的状态如果带了待确认计划，一样要画出来并锁住输入
@@ -1474,8 +1606,9 @@ function appendReadyActions(question, { lock = true } = {}) {
 
 // -------- 应用 ChangeSet --------
 function applyChangeSet(cs, bubbleWrap) {
-  if (!session.definition) {
-    toast("当前没有草稿，无法应用变更");
+  if (!session.definition?.regions) {
+    // 没有草稿可改：别让用户以为按钮坏了，明确告诉他走下面的确认下拉。
+    toast("当前没有可修改的草稿，请在下方确认下拉里选择如何处理。");
     return;
   }
 
@@ -1545,7 +1678,60 @@ function syncPreviewEditability() {
   });
 }
 
+// -------- 生成参数来源（系统暂选 / 用户指定） --------
+// 后端把每个生成参数的来源写在 definition.metadata.generationInputs 里。
+// 以前只在聊天气泡和顶部 metadata 里出现，右侧草稿面板看不到，
+// 用户分不清哪些是自己提的、哪些是系统替他选的。
+const GENERATION_INPUT_LABELS = {
+  room: "机房",
+  time: "时间",
+  metric: "指标",
+  scope: "范围",
+  source: "数据源",
+  grain: "粒度",
+  device: "设备",
+};
+
+function renderGenerationInputs(definition) {
+  const inputs = definition?.metadata?.generationInputs;
+  if (!inputs || typeof inputs !== "object") return "";
+  const entries = Object.entries(inputs).filter(([, item]) => item && typeof item === "object");
+  if (!entries.length) return "";
+
+  const chips = entries
+    .map(([field, item]) => {
+      const source = readText(item.source) || "未标注";
+      const value = readText(item.value);
+      const fromUser = /用户/.test(source);
+      const chipClass = fromUser
+        ? "bg-blue-50 text-blue-700 border-blue-200"
+        : "bg-slate-100 text-slate-600 border-slate-200";
+      const badgeClass = fromUser
+        ? "bg-white border border-blue-200 text-blue-700"
+        : "bg-white border border-slate-200 text-slate-600";
+      const label = GENERATION_INPUT_LABELS[field] || field;
+      return `
+      <span class="inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] ${chipClass}" data-generation-input="${esc(field)}" data-generation-source="${esc(source)}">
+        <span class="text-slate-500">${esc(label)}</span>
+        ${value ? `<span class="font-medium text-slate-800">${esc(value)}</span>` : ""}
+        <span class="rounded px-1 py-px text-[10px] ${badgeClass}">${esc(source)}</span>
+      </span>`;
+    })
+    .join("");
+
+  return `
+    <div class="mt-3 pt-3 border-t border-slate-100" data-generation-inputs>
+      <div class="flex items-center gap-1.5 text-[11px] text-slate-500 mb-1.5">
+        <iconify-icon class="text-slate-400" icon="mdi:source-branch"></iconify-icon>生成参数来源
+      </div>
+      <div class="flex flex-wrap gap-1.5">${chips}</div>
+    </div>`;
+}
+
 function renderPreview(definition, highlightRegionIds = []) {
+  // 先销毁旧图表实例：直接 innerHTML="" 只会移除 DOM，
+  // ECharts 实例仍然持有对已脱离文档节点的引用，内存泄漏 + 后续 resize 报错。
+  destroyCharts();
   if (!definition || !definition.regions?.length) {
     previewRoot.innerHTML = "";
     previewRoot.appendChild(previewEmpty);
@@ -1574,6 +1760,7 @@ function renderPreview(definition, highlightRegionIds = []) {
           <span>区域数: <span class="mono">${bodyRegions.length}</span></span>
           <span>数据集: ${Object.keys(definition.datasets || {}).map((d) => `<span class="mono">${esc(d)}</span>`).join(", ") || "—"}</span>
         </div>
+        ${renderGenerationInputs(definition)}
       </div>
     </div>
   `;
@@ -1764,6 +1951,13 @@ function renderAnalysis(region) {
 // -------- 节点 11 RENDERING：用真实预览数据渲染 --------
 const _chartInstances = [];
 
+// 图表库可用性：CDN 挂了（断网 / 被墙 / CSP 拦了）也不能让整条状态机卡在 RENDERING。
+// 以前这里是 `echarts.init(...)` 裸调，CDN 一失败就抛 ReferenceError，
+// renderFinalReport 整个 reject，queueAdvance 永远不会执行 —— 页面永远停在 RENDERING。
+function hasEcharts() {
+  return typeof window !== "undefined" && !!window.echarts && typeof window.echarts.init === "function";
+}
+
 function destroyCharts() {
   for (const c of _chartInstances.splice(0)) {
     try { c.dispose(); } catch (e) {}
@@ -1780,35 +1974,38 @@ async function renderFinalReport() {
   previewRoot.innerHTML = "";
   previewRoot.classList.remove("preview-editable"); // 成稿不可编辑
 
+  const snapshot = payload.snapshot || {};
+  const yoy = Number(snapshot.yoyPercent || 0);
+  const yoyColor = yoy >= 0 ? "text-rose-600" : "text-emerald-600";
+  const yoyArrow = yoy >= 0 ? "mdi:arrow-up" : "mdi:arrow-down";
+
   // 顶部摘要
   const header = document.createElement("div");
   header.className = "bg-white rounded-xl border border-slate-200 p-5";
-  const yoy = payload.snapshot.yoyPercent;
-  const yoyColor = yoy >= 0 ? "text-rose-600" : "text-emerald-600";
-  const yoyArrow = yoy >= 0 ? "mdi:arrow-up" : "mdi:arrow-down";
   header.innerHTML = `
     <div class="flex items-start justify-between gap-4 flex-wrap">
       <div class="min-w-0">
         <div class="flex items-center gap-2 flex-wrap">
-          <h2 class="text-lg font-semibold text-slate-900">${esc(payload.reportName)}</h2>
+          <h2 class="text-lg font-semibold text-slate-900">${esc(payload.reportName || "报表预览")}</h2>
           <span class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-emerald-50 text-emerald-700 border-emerald-200">
             <iconify-icon class="text-sm" icon="mdi:check-circle-outline"></iconify-icon>预览就绪
           </span>
         </div>
         <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
-          <span>机房：<span class="mono">${esc(payload.snapshot.roomName)}</span></span>
-          <span>日期：<span class="mono">${esc(payload.logicalDate)}</span></span>
-          <span>runId：<span class="mono">${esc(payload.reportRunId)}</span></span>
+          <span>机房：<span class="mono">${esc(snapshot.roomName || "—")}</span></span>
+          <span>日期：<span class="mono">${esc(payload.logicalDate || "—")}</span></span>
+          <span>runId：<span class="mono">${esc(payload.reportRunId || "—")}</span></span>
         </div>
       </div>
       <div class="rounded-lg border border-slate-200 bg-slate-50 px-5 py-3">
         <div class="text-[11px] text-slate-500">总耗电（kWh）</div>
-        <div class="text-2xl font-semibold text-slate-900 mt-1">${payload.snapshot.totalEnergyKwh}</div>
+        <div class="text-2xl font-semibold text-slate-900 mt-1">${esc(snapshot.totalEnergyKwh ?? "—")}</div>
         <div class="text-[11px] mt-1 inline-flex items-center gap-0.5 ${yoyColor}">
-          <iconify-icon icon="${yoyArrow}" class="text-sm"></iconify-icon>${Math.abs(yoy)}% 相比昨日
+          <iconify-icon icon="${yoyArrow}" class="text-sm"></iconify-icon>${Math.abs(yoy)}% 较前一日
         </div>
       </div>
     </div>
+    ${renderGenerationInputs(session.definition)}
   `;
   previewRoot.appendChild(header);
 
@@ -1830,7 +2027,9 @@ async function renderFinalReport() {
   }
 
   // 每个 region 一张卡（标题区跳过：头部已经显示报表名）
-  for (const region of payload.regions) {
+  // 单个区域渲染失败只影响它自己：其余区域照常出，状态机照常往前走。
+  const failedRegions = [];
+  for (const region of payload.regions || []) {
     if (isTitleRegion(region)) continue;
     const card = document.createElement("div");
     card.className = "bg-white rounded-xl border border-slate-200 p-5";
@@ -1843,9 +2042,35 @@ async function renderFinalReport() {
     `;
     const body = card.querySelector(".region-body");
     previewRoot.appendChild(card);
-    renderFinalRegion(body, region, payload);
+    try {
+      renderFinalRegion(body, region, payload);
+    } catch (err) {
+      console.error("[AI Report] 区域渲染失败", region?.regionId, err);
+      failedRegions.push(region?.regionId || region?.componentType || "未知区域");
+      body.innerHTML = `
+        <div class="rounded-lg bg-rose-50 border border-rose-200 p-3 text-xs text-rose-700">
+          这个区域渲染失败：${esc(err?.message || String(err))}。其余区域和后续流程不受影响。
+        </div>`;
+    }
   }
-  requestAnimationFrame(() => _chartInstances.forEach((chart) => chart.resize()));
+
+  if (failedRegions.length) {
+    const failBanner = document.createElement("div");
+    failBanner.className = "bg-rose-50 border border-rose-200 rounded-xl p-4";
+    failBanner.innerHTML = `
+      <div class="flex items-start gap-2">
+        <iconify-icon icon="mdi:alert-circle-outline" class="text-rose-600 text-lg mt-0.5"></iconify-icon>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-semibold text-rose-900 mb-1">部分区域没有渲染出来</div>
+          <div class="text-xs text-rose-800">${failedRegions.map((id) => `<span class="mono">${esc(id)}</span>`).join("、")} 渲染失败，其余内容已正常展示。</div>
+        </div>
+      </div>`;
+    previewRoot.appendChild(failBanner);
+  }
+
+  requestAnimationFrame(() => _chartInstances.forEach((chart) => {
+    try { chart.resize(); } catch (e) {}
+  }));
 }
 
 function renderFinalRegion(container, region, payload) {
@@ -1890,38 +2115,63 @@ function renderFinalRegion(container, region, payload) {
         <tbody class="divide-y divide-slate-100">${bodyRows}</tbody>
       </table>`;
   } else if (t === "CHART") {
+    // 图表库不可用时给占位，不抛异常：数据已经就绪，不能因为一个 CDN 挂了就卡住整条流程。
+    if (!hasEcharts()) {
+      container.innerHTML = `
+      <div class="rounded-lg bg-amber-50 border border-amber-200 h-[260px] flex items-center justify-center px-4">
+        <div class="text-center text-amber-700">
+          <iconify-icon class="text-3xl" icon="mdi:chart-line-variant"></iconify-icon>
+          <div class="text-sm mt-1">图表库加载失败，但数据已就绪</div>
+          <div class="text-[11px] mt-1">ECharts CDN 不可用；该区域的图表暂时画不出来，后续流程不受影响。</div>
+        </div>
+      </div>`;
+      return;
+    }
     const div = document.createElement("div");
     div.style.height = "260px";
     container.appendChild(div);
     const kind = p.chartKind || "LINE";
-    const chart = echarts.init(div);
-    _chartInstances.push(chart);
-    chart.setOption({
-      tooltip: { trigger: "axis" },
-      grid: { left: 50, right: 20, top: 24, bottom: 36 },
-      xAxis: {
-        type: "category",
-        data: p.xLabels || [],
-        axisLabel: { fontSize: 11 },
-      },
-      yAxis: {
-        type: "value",
-        name: "kWh",
-        nameTextStyle: { fontSize: 10, color: "#64748b" },
-        axisLabel: { fontSize: 11 },
-      },
-      series: [
-        {
-          name: "耗电",
-          data: p.yValues || [],
-          type: kind === "BAR" ? "bar" : "line",
-          smooth: true,
-          areaStyle: kind === "AREA" ? { opacity: 0.3 } : undefined,
-          itemStyle: { color: "#2563eb" },
-          lineStyle: { color: "#2563eb" },
+    let chart = null;
+    try {
+      chart = window.echarts.init(div);
+      _chartInstances.push(chart);
+      chart.setOption({
+        tooltip: { trigger: "axis" },
+        grid: { left: 50, right: 20, top: 24, bottom: 36 },
+        xAxis: {
+          type: "category",
+          data: p.xLabels || [],
+          axisLabel: { fontSize: 11 },
         },
-      ],
-    });
+        yAxis: {
+          type: "value",
+          name: "kWh",
+          nameTextStyle: { fontSize: 10, color: "#64748b" },
+          axisLabel: { fontSize: 11 },
+        },
+        series: [
+          {
+            name: "耗电",
+            data: p.yValues || [],
+            type: kind === "BAR" ? "bar" : "line",
+            smooth: true,
+            areaStyle: kind === "AREA" ? { opacity: 0.3 } : undefined,
+            itemStyle: { color: "#2563eb" },
+            lineStyle: { color: "#2563eb" },
+          },
+        ],
+      });
+    } catch (err) {
+      console.error("[AI Report] 图表初始化失败", err);
+      container.innerHTML = `
+      <div class="rounded-lg bg-amber-50 border border-amber-200 h-[260px] flex items-center justify-center px-4">
+        <div class="text-center text-amber-700">
+          <iconify-icon class="text-3xl" icon="mdi:chart-line-variant"></iconify-icon>
+          <div class="text-sm mt-1">图表库加载失败，但数据已就绪</div>
+          <div class="text-[11px] mt-1">${esc(err?.message || String(err))}</div>
+        </div>
+      </div>`;
+    }
   } else if (t === "DATA_QUALITY") {
     const items = [
       { label: "覆盖率", value: p.coverage != null ? (p.coverage * 100).toFixed(1) + "%" : "—" },
@@ -2052,21 +2302,30 @@ async function deleteSession(sessionId) {
 }
 
 // 还原会话：把消息逐条回放，再恢复状态机位置、报表预览和选择锁
-async function restoreSession(sessionId) {
+// 返回 { ok, missing }：
+//   ok=true            恢复成功
+//   ok=false,missing  会话已经不存在（404），自动恢复的落点可以清掉
+//   ok=false,其他      忙 / 网络故障 / 被更新的操作作废，落点要留着下次再试
+async function restoreSession(sessionId, { silent = false, token = null } = {}) {
   if (isBusy()) {
-    toast("请先停止正在生成的请求");
-    return;
+    if (!silent) toast("请先停止正在生成的请求");
+    return { ok: false, missing: false };
   }
+  const myToken = token ?? ++sessionRestoreToken;
   let detail;
   try {
     detail = await sessionApi.detail(sessionId);
   } catch (err) {
-    toast("打开会话失败：" + err.message);
-    return;
+    const missing = /404/.test(err.message || "");
+    if (!silent) toast(missing ? "这个会话已经不存在了。" : "打开会话失败：" + err.message);
+    return { ok: false, missing };
   }
+  // 恢复途中用户点了「新建对话」：这次恢复作废，不要把旧会话画到新会话界面上。
+  if (myToken !== sessionRestoreToken) return { ok: false, missing: false };
 
   clearChoiceLock();
   lastPendingPlan = null;
+  lastConfirmQuestion = null;
   destroyCharts();
   chatScroll.innerHTML = "";
   previewRoot.innerHTML = "";
@@ -2084,6 +2343,7 @@ async function restoreSession(sessionId) {
   session.lastReportRun = detail.snapshot?.lastReportRun ?? null;
   session.previewPayload = detail.snapshot?.previewPayload ?? null;
   session.baseDefinitionRevision = session.definition?.metadata?.revision ?? null;
+  writeLastSessionId(detail.sessionId);
 
   // 选择锁以后端为准：回放时用它替换历史问题对象，
   // 这样回放出来的下拉框与 lockedChoice 是同一个引用，选完能正常继续
@@ -2091,6 +2351,9 @@ async function restoreSession(sessionId) {
 
   // 回放消息：assistant 消息带 payload，能重建结构化卡片
   for (const message of detail.messages) {
+    // __advance__ 是前端自动推进用的内部控制消息，不是用户说的话。
+    // 后端一般不会入库（万一入库了也别在刷新后显示成一条用户气泡）。
+    if (message.role === "user" && String(message.content || "").trim() === "__advance__") continue;
     if (message.role === "user") {
       appendUser(message.content);
     } else if (message.payload) {
@@ -2102,7 +2365,11 @@ async function restoreSession(sessionId) {
 
   // 恢复右侧报表预览
   if (session.previewPayload) {
-    await renderFinalReport();
+    try {
+      await renderFinalReport();
+    } catch (err) {
+      console.error("[AI Report] 恢复预览失败", err);
+    }
   } else if (session.definition) {
     renderPreview(session.definition);
   } else {
@@ -2113,11 +2380,33 @@ async function restoreSession(sessionId) {
   setState(detail.state);
   updateMeta();
 
-  // 恢复选择锁：后端 pending_choice 是权威来源
+  // 恢复选择锁：后端 pending_choice 是权威来源；
+  // 后端没存（例如只有 changeSet 的变更方案）就用回放时画出来的确认下拉兜底，
+  // 否则下拉框会被 disable 成死的，恢复后依然走不下去。
   if (pending) setChoiceLock(pending);
+  else if (lastConfirmQuestion) setChoiceLock(lastConfirmQuestion);
 
   await renderSessionList();
   scrollChatBottom(true);
+  return { ok: true, missing: false };
+}
+
+// 刷新后自动接回上次那条会话。
+// 恢复不了就明确告诉用户「没接回来，但历史还在」，而不是让人对着一片空白猜。
+// 只有会话确实被删了（404）才丢掉落点；后端临时连不上要留着，下次刷新还能接回来。
+async function autoRestoreSession() {
+  const savedId = readLastSessionId();
+  if (!savedId) return false;
+  const token = ++sessionRestoreToken;
+  const result = await restoreSession(savedId, { silent: true, token });
+  if (result.ok) return true;
+  if (result.missing) {
+    writeLastSessionId(null);
+    toast("上次的对话已经被删除，请从左侧历史里重新选择。");
+  } else {
+    toast("上次的对话没能自动恢复（后端可能没连上），已保留在左侧历史里，请手动选择。");
+  }
+  return false;
 }
 
 // 回放一条历史 assistant 消息：复用 sendMessage 的渲染分支，但不触发自动推进
@@ -2173,10 +2462,18 @@ function replayAssistantMessage(data, pending = null) {
       }
       break;
     }
-    case "DEFINITION_DRAFT_READY":
+    case "DEFINITION_DRAFT_READY": {
+      // 历史回放：把变更卡和确认下拉都画出来。
+      // 少了下拉框，恢复后的会话就是一个「看得见、点不动」的死路。
+      const questions = bindPending(data.questions || []);
+      appendAiText(data.reply || "");
       if (data.domainObjects?.changeSet) appendAiChangeSet(data.domainObjects.changeSet, { interactive: false });
-      else appendAiText(data.reply || "");
+      const confirmQuestion =
+        resolveDefinitionDraftQuestion({ questions }) ||
+        (data.domainObjects?.changeSet ? FALLBACK_DRAFT_CONFIRM_QUESTION : null);
+      if (confirmQuestion) appendConfirmActions(confirmQuestion, { lock: false });
       break;
+    }
     default:
       appendAiText(data.reply || "");
   }
@@ -2184,11 +2481,15 @@ function replayAssistantMessage(data, pending = null) {
 
 // 新建对话：清空现场，向后端要一个新的会话 id
 function startNewSession() {
+  // 「新建对话」时如果还有恢复任务在跑，让它作废：不要把旧会话画到新会话界面上。
+  sessionRestoreToken++;
   // 用「摘下」而不是「掐断」：在途请求继续跑完并落库，
   // 用户之前说的话才会留在历史里（掐断会让后端不落库，那一轮就凭空消失了）。
+  // 摘下来之后它的响应靠 requestEpoch 判定，不会再画到这个新会话的界面上。
   if (activeRequest || advanceTimers.size) detachActiveRequest();
   clearChoiceLock();
   lastPendingPlan = null;
+  lastConfirmQuestion = null;
   destroyCharts();
   session.sessionId = null;
   session.conversationId = "conv_" + Date.now() + "_" + requestEpoch;
@@ -2203,6 +2504,9 @@ function startNewSession() {
   session.previewPayload = null;
   session.pendingResume = null;
   session.workspaceId = null;
+  // 新对话还没有自己的 sessionId（要等第一条消息才向后端要），
+  // 先把自动恢复的落点清掉，免得刷新后又跳回上一条对话。
+  writeLastSessionId(null);
   chatScroll.innerHTML = "";
   previewRoot.innerHTML = "";
   previewRoot.appendChild(previewEmpty);
@@ -2238,11 +2542,14 @@ $("chat-input").addEventListener("input", (e) => {
 });
 
 $("btn-new-session").addEventListener("click", () => {
-  if (isBusy()) {
-    toast("请先停止正在生成的请求");
-    return;
-  }
+  // 生成中也允许新建：在途请求被「摘下」继续在后台跑完并落库，
+  // 它的响应靠 requestEpoch 判定，不会污染这个新会话（详见 detachActiveRequest）。
+  // 上一条对话随时可以从左侧历史里点回来。
+  const wasBusy = isBusy();
   startNewSession();
+  if (wasBusy) {
+    toast("上一个请求还在后台生成，完成后可在左侧历史对话里查看。");
+  }
   appendAiText("新对话已就绪。描述你的报表需求，我会生成结构化报表草稿。");
 });
 
@@ -2269,5 +2576,7 @@ $("btn-stop").addEventListener("click", cancelActiveRequest);
   }
   setState("ANALYZING");
   updateMeta();
-  renderSessionList();
+  await renderSessionList();
+  // 刷新后自动接回上次那条会话；接不回来也会明确提示，历史入口始终保留。
+  await autoRestoreSession();
 })();

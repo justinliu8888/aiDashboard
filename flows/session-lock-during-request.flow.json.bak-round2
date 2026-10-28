@@ -1,0 +1,48 @@
+{
+  "outDir": "../.selfcheck/flow-session-lock",
+  "waitMs": 1500,
+  "timeout": 90000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "会话管理-生成中新建对话切到新会话，旧会话继续落库",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 300 },
+        { "type": "#chat-input", "text": "你好" },
+        { "press": "Enter" },
+        { "wait": 800 },
+        { "eval": "!!document.querySelector('#btn-stop') && !document.querySelector('#btn-stop').classList.contains('hidden')" },
+
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+        { "assertText": "上一个请求还在后台生成" },
+        { "eval": "document.querySelector('#chat-scroll').innerText.includes('新对话已就绪')" },
+        { "eval": "!document.querySelector('#chat-scroll').innerText.includes('你好')" },
+        { "waitFor": "#session-list .session-item[title=\"你好\"]", "timeout": 120000 },
+        { "screenshot": "lock-01-生成中新建对话切到新会话" }
+      ]
+    },
+    {
+      "name": "会话管理-生成中点历史会话被拦住",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "wait": 800 },
+        { "click": "#btn-new-session" },
+        { "wait": 300 },
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报" },
+        { "press": "Enter" },
+        { "wait": 800 },
+        { "waitFor": "#session-list .session-item[title=\"你好\"]", "timeout": 30000 },
+        { "click": "#session-list .session-item[title=\"你好\"]" },
+        { "wait": 300 },
+        { "assertText": "请先停止正在生成的请求" },
+        { "eval": "document.querySelector('#chat-scroll').innerText.includes('生成 A 机房昨日能耗日报')" },
+        { "screenshot": "lock-02-生成中切历史会话被拦" }
+      ]
+    }
+  ]
+}

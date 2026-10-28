@@ -14,7 +14,9 @@
         { "assertVisible": "#session-nav" },
         { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析" },
         { "press": "Enter" },
-        { "waitFor": "#session-list .session-item[title^=\"生成 A 机房昨日能耗日报\"]", "timeout": 120000 },
+        { "wait": 1200 },
+        { "eval": "(() => { const el = document.querySelector('#session-list .session-item.nav-item-active'); return (typeof session !== 'undefined' && session && session.sessionId) || (el && el.dataset ? el.dataset.sessionId : null) || null; })()", "save": "sid", "timeout": 30000 },
+        { "waitFor": "#session-list .session-item[data-session-id=\"{{sid}}\"]", "timeout": 120000 },
         { "assertCount": "#session-list .session-item", "count": 1, "op": ">=" },
         { "assertText": "生成 A 机房昨日能耗日报" },
         { "screenshot": "session-01-新建对话入列" }
@@ -26,9 +28,11 @@
       "continueOnError": false,
       "steps": [
         { "wait": 800 },
+        { "eval": "(() => { const el = document.querySelector('#session-list .session-item.nav-item-active'); return (typeof session !== 'undefined' && session && session.sessionId) || (el && el.dataset ? el.dataset.sessionId : null) || null; })()", "save": "sid", "timeout": 30000 },
         { "assertCount": "#session-list .session-item", "count": 1, "op": ">=" },
-        { "click": "#session-list .session-item[title^=\"生成 A 机房昨日能耗日报\"]" },
+        { "click": "#session-list .session-item[data-session-id=\"{{sid}}\"]" },
         { "wait": 1200 },
+        { "eval": "(() => { const el = document.querySelector('#session-list .session-item.nav-item-active'); return (typeof session !== 'undefined' && session && session.sessionId) || (el && el.dataset ? el.dataset.sessionId : null) || null; })() === sid" },
         { "assertText": "生成 A 机房昨日能耗日报" },
         { "assertVisible": "#preview-root" },
         { "assertVisible": ".question-select" },
@@ -41,7 +45,8 @@
       "continueOnError": false,
       "steps": [
         { "wait": 800 },
-        { "click": "#session-list .session-item[title^=\"生成 A 机房昨日能耗日报\"]" },
+        { "eval": "(() => { const el = document.querySelector('#session-list .session-item.nav-item-active'); return (typeof session !== 'undefined' && session && session.sessionId) || (el && el.dataset ? el.dataset.sessionId : null) || null; })()", "save": "sid", "timeout": 30000 },
+        { "click": "#session-list .session-item[data-session-id=\"{{sid}}\"]" },
         { "wait": 1200 },
         {
           "eval": "(() => { const s = document.querySelector('.question-select'); if (!s) return false; s.value = s.options[1] ? s.options[1].value : s.options[0].value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"

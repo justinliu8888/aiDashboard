@@ -13,6 +13,7 @@ CATALOG_MACHINE_ROOM_ENERGY: dict[str, Any] = {
     "fields": {
         "deviceId": {"dataType": "STRING", "semanticType": "IDENTIFIER"},
         "deviceName": {"dataType": "STRING"},
+        "deviceType": {"dataType": "STRING", "semanticType": "CATEGORY"},
         "timestamp": {"dataType": "DATETIME", "semanticType": "TIMESTAMP"},
         "energyKwh": {
             "dataType": "DECIMAL",
@@ -34,6 +35,7 @@ CATALOG_EAS_ENERGY_DETAIL: dict[str, Any] = {
     "fields": {
         "deviceId": {"dataType": "STRING", "semanticType": "IDENTIFIER"},
         "deviceName": {"dataType": "STRING"},
+        "deviceType": {"dataType": "STRING", "semanticType": "CATEGORY"},
         "timestamp": {"dataType": "DATETIME", "semanticType": "TIMESTAMP"},
         "energyKwh": {
             "dataType": "DECIMAL",
@@ -128,3 +130,37 @@ AUTHORIZED_SCOPE: dict[str, Any] = {
     # 工具层按它过滤目录 / 指标，防止模型跨对象探测。
     "subjectIds": {"machine_room": ["room_a"]},
 }
+
+
+# ---------- 设备类别 ----------
+#
+# 「只统计空调设备」「不要统计机架、PDU 和 UPS」这类过滤需要按设备类别走，
+# 所以设备类别是目录里的一等字段（deviceType），不是从名字猜的。
+# 值用稳定的英文枚举，中文只作为别名给模型 / 用户看。
+DEVICE_TYPE_RACK = "RACK"
+DEVICE_TYPE_PDU = "PDU"
+DEVICE_TYPE_CRAC = "CRAC"
+DEVICE_TYPE_UPS = "UPS"
+
+DEVICE_TYPES: dict[str, str] = {
+    DEVICE_TYPE_RACK: "机架",
+    DEVICE_TYPE_PDU: "配电",
+    DEVICE_TYPE_CRAC: "空调",
+    DEVICE_TYPE_UPS: "不间断电源",
+}
+
+# 自然语言 -> 设备类别枚举。模型解析用户表述时用它对齐到 deviceType。
+DEVICE_TYPE_ALIASES: dict[str, str] = {
+    "机架": DEVICE_TYPE_RACK,
+    "机柜": DEVICE_TYPE_RACK,
+    "rack": DEVICE_TYPE_RACK,
+    "配电": DEVICE_TYPE_PDU,
+    "pdu": DEVICE_TYPE_PDU,
+    "空调": DEVICE_TYPE_CRAC,
+    "crac": DEVICE_TYPE_CRAC,
+    "精密空调": DEVICE_TYPE_CRAC,
+    "不间断": DEVICE_TYPE_UPS,
+    "ups": DEVICE_TYPE_UPS,
+    "不间断电源": DEVICE_TYPE_UPS,
+}
+

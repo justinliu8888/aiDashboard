@@ -1,0 +1,100 @@
+{
+  "outDir": "../.selfcheck/flow-agent-b",
+  "serveCmd": "python3 support/agent_b_mock_server.py 8100",
+  "port": 8100,
+  "waitMs": 1500,
+  "timeout": 60000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "DEFINITION_DRAFT_READY-有确认下拉-右侧有草稿-能推进到 READY",
+      "url": "http://127.0.0.1:8100/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 300 },
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报" },
+        { "press": "Enter" },
+        { "waitFor": ".question-select", "timeout": 30000 },
+
+        { "eval": "document.getElementById('state-badge').textContent === 'DEFINITION_DRAFT_READY'" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')[0].options).map(o => o.textContent.trim()).join(',') === '请选择,同意,修改,重新开始'" },
+        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "assertText": "AI 变更确认" },
+
+        { "eval": "document.querySelectorAll('#preview-root [data-region-id]').length === 5" },
+        { "assertText": "设备耗电排名" },
+        { "eval": "!!document.querySelector('#preview-root [data-generation-inputs]')" },
+        { "eval": "document.querySelector('#preview-root [data-generation-inputs]').innerText.includes('系统暂选')" },
+        { "eval": "document.querySelector('#preview-root [data-generation-inputs]').innerText.includes('用户指定')" },
+        { "screenshot": "agentb-01-草稿就绪有确认下拉" },
+
+        {
+          "eval": "(() => { const s = Array.from(document.querySelectorAll('.question-select')).filter(x => !x.disabled).pop(); const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        { "waitText": "报表已就绪", "timeout": 60000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'READY'" },
+        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "screenshot": "agentb-02-确认后一路推进到 READY" }
+      ]
+    },
+    {
+      "name": "ECharts 不可用-不卡 RENDERING-流程继续到 READY",
+      "url": "http://127.0.0.1:8100/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 300 },
+        { "eval": "(() => { window.echarts = undefined; return true; })()" },
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报" },
+        { "press": "Enter" },
+        { "waitFor": ".question-select", "timeout": 30000 },
+        {
+          "eval": "(() => { const s = Array.from(document.querySelectorAll('.question-select')).filter(x => !x.disabled).pop(); const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        { "waitText": "报表已就绪", "timeout": 60000 },
+        { "eval": "document.getElementById('state-badge').textContent === 'READY'" },
+        { "assertText": "图表库加载失败，但数据已就绪" },
+        { "eval": "document.querySelector('#preview-root').innerText.includes('设备耗电排名')" },
+        { "screenshot": "agentb-03-图表库挂了仍推进到 READY" }
+      ]
+    },
+    {
+      "name": "刷新后自动恢复会话-草稿与确认控件都还在",
+      "url": "http://127.0.0.1:8100/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "wait": 2500 },
+        { "eval": "document.querySelector('#chat-scroll').innerText.includes('生成 A 机房昨日能耗日报')" },
+        { "eval": "document.getElementById('state-badge').textContent === 'READY'" },
+        { "eval": "document.querySelector('#preview-root').innerText.includes('设备耗电排名')" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length >= 1" },
+        { "eval": "document.querySelector('#chat-scroll').innerText.includes('AI 变更确认')" },
+        { "eval": "!document.querySelector('#chat-scroll').innerText.includes('__advance__')" },
+        { "screenshot": "agentb-04-刷新后自动恢复" }
+      ]
+    },
+    {
+      "name": "生成中新建对话-新旧会话不串数据-旧会话不丢",
+      "url": "http://127.0.0.1:8100/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 300 },
+        { "type": "#chat-input", "text": "你好" },
+        { "press": "Enter" },
+        { "wait": 800 },
+        { "eval": "!!document.querySelector('#btn-stop') && !document.querySelector('#btn-stop').classList.contains('hidden')" },
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+        { "eval": "document.querySelector('#chat-scroll').innerText.includes('新对话已就绪')" },
+        { "eval": "!document.querySelector('#chat-scroll').innerText.includes('你好')" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "waitFor": "#session-list .session-item[title=\"你好\"]", "timeout": 30000 },
+        { "eval": "document.querySelector('#session-list .session-item[title=\"你好\"]') !== null" },
+        { "screenshot": "agentb-05-新旧会话不串数据" }
+      ]
+    }
+  ]
+}

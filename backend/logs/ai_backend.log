@@ -1,9 +1,0 @@
-2026-10-16 16:44:48,742 INFO [app.routers.agent] [agent.chat] step=router_received conversationId=conv_debug_hello state=ANALYZING message='你好'
-2026-10-16 16:44:48,742 INFO [app.services.agent_service] [agent.chat] step=service_start conversationId=conv_debug_hello state=ANALYZING impl=AgentScopeReportAgent
-2026-10-16 16:44:48,743 INFO [app.services.agent_service] [agent.chat] step=context_route_start conversationId=conv_debug_hello state=ANALYZING
-2026-10-16 16:44:48,743 INFO [app.services.context_engine] [context_engine] step=route_start conversationId=conv_debug_hello state=ANALYZING message='你好' concierge_timeout=8s router_timeout=20s
-2026-10-16 16:44:48,743 INFO [app.services.context_engine] [context_engine] step=route_local_greeting conversationId=conv_debug_hello elapsed_total_ms=0.1
-2026-10-16 16:44:48,743 INFO [app.services.agent_service] [agent.chat] step=context_route_done conversationId=conv_debug_hello elapsed_ms=0.5 state=ANALYZING intent=CHITCHAT action=ANSWER_IN_PLACE target=None ready=False missing=[] reason='local simple greeting shortcut'
-2026-10-16 16:44:48,743 INFO [app.services.agent_service] [agent.chat] step=apply_context_route conversationId=conv_debug_hello action=ANSWER_IN_PLACE target=None
-2026-10-16 16:44:48,743 INFO [app.services.agent_service] [agent.chat] step=context_route_intercepted conversationId=conv_debug_hello elapsed_total_ms=1.0 response_state=ANALYZING uiActions=['suggest_prompt']
-2026-10-16 16:44:48,743 INFO [app.routers.agent] [agent.chat] step=router_return conversationId=conv_debug_hello elapsed_ms=1.9 response_state=ANALYZING uiActions=['suggest_prompt'] error=None

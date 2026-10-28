@@ -17,8 +17,10 @@
           "text": "生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析"
         },
         { "press": "Enter" },
+        { "wait": 1200 },
+        { "eval": "(() => { const el = document.querySelector('#session-list .session-item.nav-item-active'); return (typeof session !== 'undefined' && session && session.sessionId) || (el && el.dataset ? el.dataset.sessionId : null) || null; })()", "save": "sid", "timeout": 30000 },
         { "waitFor": "#preview-root .region-name", "timeout": 120000 },
-        { "click": "#session-list .session-item[title^=\"生成 A 机房昨日能耗日报\"]" },
+        { "click": "#session-list .session-item[data-session-id=\"{{sid}}\"]" },
         { "wait": 3000 },
         { "assertVisible": ".question-select" },
         { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s=>!s.disabled).length > 0" },

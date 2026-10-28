@@ -1,0 +1,34 @@
+{
+  "outDir": "../.selfcheck/flow-new-during-request",
+  "waitMs": 1500,
+  "timeout": 90000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "新建对话-请求进行中切到新会话，旧会话不丢且不串数据",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 300 },
+        { "type": "#chat-input", "text": "你好" },
+        { "press": "Enter" },
+        { "wait": 800 },
+        { "eval": "!!document.querySelector('#btn-stop') && !document.querySelector('#btn-stop').classList.contains('hidden')" },
+
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "document.querySelector('#chat-scroll').innerText.includes('新对话已就绪')" },
+        { "eval": "!document.querySelector('#chat-scroll').innerText.includes('你好')" },
+        { "eval": "document.getElementById('state-badge').textContent === 'ANALYZING'" },
+
+        { "waitFor": "#session-list .session-item[title=\"你好\"]", "timeout": 120000 },
+        { "eval": "document.querySelector('#session-list .session-item[title=\"你好\"]') !== null" },
+        { "eval": "document.querySelector('#preview-root').innerText.includes('还没有草稿')" },
+        { "screenshot": "new-during-request-01-新会话独立且历史仍在列" }
+      ]
+    }
+  ]
+}

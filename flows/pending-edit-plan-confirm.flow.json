@@ -36,8 +36,9 @@
         { "eval": "document.getElementById('chat-input').disabled === true" },
         { "eval": "document.getElementById('btn-send').disabled === true" },
         {
-          "eval": "document.querySelectorAll('#preview-root [data-region-id]').length === 5"
+          "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId).sort().join(',') === 'region_analysis,region_data_quality,region_device_ranking,region_hourly_trend,region_total_energy'"
         },
+        { "eval": "document.querySelector('#preview-root [data-region-id=\"region_report_title\"]') === null" },
         {
           "eval": "document.querySelectorAll('#preview-root [data-region-id]')[2].getAttribute('data-region-id') === 'region_hourly_trend'"
         },

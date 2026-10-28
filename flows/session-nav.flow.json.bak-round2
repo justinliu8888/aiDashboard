@@ -1,0 +1,70 @@
+{
+  "outDir": "../.selfcheck/flow-session",
+  "waitMs": 1500,
+  "timeout": 12000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "会话管理-新建对话并落库",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 300 },
+        { "assertVisible": "#session-nav" },
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析" },
+        { "press": "Enter" },
+        { "waitFor": "#session-list .session-item[title^=\"生成 A 机房昨日能耗日报\"]", "timeout": 120000 },
+        { "assertCount": "#session-list .session-item", "count": 1, "op": ">=" },
+        { "assertText": "生成 A 机房昨日能耗日报" },
+        { "screenshot": "session-01-新建对话入列" }
+      ]
+    },
+    {
+      "name": "会话管理-点开历史会话恢复现场",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "wait": 800 },
+        { "assertCount": "#session-list .session-item", "count": 1, "op": ">=" },
+        { "click": "#session-list .session-item[title^=\"生成 A 机房昨日能耗日报\"]" },
+        { "wait": 1200 },
+        { "assertText": "生成 A 机房昨日能耗日报" },
+        { "assertVisible": "#preview-root" },
+        { "assertVisible": ".question-select" },
+        { "screenshot": "session-02-恢复历史会话" }
+      ]
+    },
+    {
+      "name": "会话管理-恢复后选择下拉项继续对话",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "wait": 800 },
+        { "click": "#session-list .session-item[title^=\"生成 A 机房昨日能耗日报\"]" },
+        { "wait": 1200 },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select'); if (!s) return false; s.value = s.options[1] ? s.options[1].value : s.options[0].value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        { "wait": 2500 },
+        { "assertCount": "#chat-scroll > div", "count": 3, "op": ">=" },
+        { "screenshot": "session-03-恢复后继续对话" }
+      ]
+    },
+    {
+      "name": "会话管理-搜索过滤",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "wait": 800 },
+        { "type": "#session-search", "text": "不存在的关键词zzz" },
+        { "wait": 800 },
+        { "assertText": "还没有历史对话" },
+        { "eval": "(() => { const el = document.querySelector('#session-search'); el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); return true; })()" },
+        { "wait": 800 },
+        { "assertCount": "#session-list .session-item", "count": 1, "op": ">=" },
+        { "screenshot": "session-04-搜索过滤" }
+      ]
+    }
+  ]
+}

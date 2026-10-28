@@ -2,27 +2,44 @@
 
 生产版会由 Java 预览引擎跑实际 SQL/ClickHouse 查询。这里用确定性的伪随机，
 让同一个 roomId + logicalDate 多次预览结果一致，方便前端联调和截图。
+
+**时区口径（第二轮修复 A1-P3-02）**：
+报表定义里的时间窗带 `timezone`（默认 ``Asia/Shanghai``，与
+``edit_time_resolver.DEFAULT_TIMEZONE`` 同源）。趋势点的时间戳必须与
+**同一个时区**自洽：``2026-10-25T00:00:00+08:00`` 表示的就是**上海时间**
+的 10-25 00:00。此前这里硬编码 ``tzinfo=timezone.utc``，标着
+``2026-10-25T00:00:00+00:00``（= 上海 10-25 08:00），与定义里的
+``Asia/Shanghai`` 自相矛盾：下游若按真实时刻解析，整条「昨日」窗口会偏 8 小时。
 """
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from app.data.machine_room_energy import (
+    DEVICE_TYPE_CRAC,
+    DEVICE_TYPE_PDU,
+    DEVICE_TYPE_RACK,
+    DEVICE_TYPE_UPS,
+)
+from app.services.edit_time_resolver import DEFAULT_TIMEZONE
 
 
 # 机房 A 的设备清单（10 台）
 ROOM_A_DEVICES: list[dict[str, str]] = [
-    {"deviceId": "rack_01", "deviceName": "A-1 机架"},
-    {"deviceId": "rack_02", "deviceName": "A-2 机架"},
-    {"deviceId": "rack_03", "deviceName": "A-3 机架"},
-    {"deviceId": "rack_04", "deviceName": "A-4 机架"},
-    {"deviceId": "rack_05", "deviceName": "A-5 机架"},
-    {"deviceId": "pdu_01", "deviceName": "PDU-01 配电"},
-    {"deviceId": "pdu_02", "deviceName": "PDU-02 配电"},
-    {"deviceId": "crac_01", "deviceName": "CRAC-01 空调"},
-    {"deviceId": "crac_02", "deviceName": "CRAC-02 空调"},
-    {"deviceId": "ups_01", "deviceName": "UPS-01 不间断"},
+    {"deviceId": "rack_01", "deviceName": "A-1 机架", "deviceType": DEVICE_TYPE_RACK},
+    {"deviceId": "rack_02", "deviceName": "A-2 机架", "deviceType": DEVICE_TYPE_RACK},
+    {"deviceId": "rack_03", "deviceName": "A-3 机架", "deviceType": DEVICE_TYPE_RACK},
+    {"deviceId": "rack_04", "deviceName": "A-4 机架", "deviceType": DEVICE_TYPE_RACK},
+    {"deviceId": "rack_05", "deviceName": "A-5 机架", "deviceType": DEVICE_TYPE_RACK},
+    {"deviceId": "pdu_01", "deviceName": "PDU-01 配电", "deviceType": DEVICE_TYPE_PDU},
+    {"deviceId": "pdu_02", "deviceName": "PDU-02 配电", "deviceType": DEVICE_TYPE_PDU},
+    {"deviceId": "crac_01", "deviceName": "CRAC-01 空调", "deviceType": DEVICE_TYPE_CRAC},
+    {"deviceId": "crac_02", "deviceName": "CRAC-02 空调", "deviceType": DEVICE_TYPE_CRAC},
+    {"deviceId": "ups_01", "deviceName": "UPS-01 不间断", "deviceType": DEVICE_TYPE_UPS},
 ]
 
 
@@ -44,6 +61,7 @@ class DeviceEnergy:
     deviceId: str
     deviceName: str
     energyKwh: float
+    deviceType: str = ""
 
 
 @dataclass
@@ -60,6 +78,7 @@ class RoomEnergySnapshot:
     deviceRanking: list[DeviceEnergy]
     quality: dict[str, Any]
     anomalies: list[dict[str, Any]]
+    timezone: str = DEFAULT_TIMEZONE  # 趋势点时间戳所用的 IANA 时区
 
 
 def _minute_points(
@@ -96,21 +115,64 @@ def _hourly_shape() -> list[float]:
     return base
 
 
-def _default_logical_date() -> str:
-    return (date.today() - timedelta(days=1)).isoformat()
+def _resolve_timezone(name: str | None) -> ZoneInfo:
+    """把 IANA 时区名解析成 ZoneInfo；认不出来就回落到报表默认时区。
+
+    非法时区名不能让预览直接炸掉（预览是链路最后一步，炸了就出不来数），
+    但也不能悄悄按 UTC 出数——回落到定义侧的默认时区，两边口径才一致。
+    """
+    if not name:
+        return ZoneInfo(DEFAULT_TIMEZONE)
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        return ZoneInfo(DEFAULT_TIMEZONE)
 
 
-def _normalize_logical_date(logical_date: str | None) -> str:
+def definition_timezone(definition: dict[str, Any] | None) -> str:
+    """从报表定义里取时间窗时区（取不到就用报表默认时区）。
+
+    调用方（预览层）拿它给 :func:`build_snapshot` 传参，
+    保证**数据侧的时间戳与定义侧声明的时区是同一个**。
+    """
+    if not isinstance(definition, dict):
+        return DEFAULT_TIMEZONE
+    defaults = definition.get("defaults") or {}
+    window = defaults.get("timeWindow") or {}
+    value = window.get("value") if isinstance(window.get("value"), dict) else window
+    tz = value.get("timezone") or window.get("timezone")
+    return str(tz) if tz else DEFAULT_TIMEZONE
+
+
+def _default_logical_date(tz: ZoneInfo) -> str:
+    """「昨天」= 报表时区里的昨天。
+
+    不能用 ``date.today()``：那是**机器本地时区**的今天，和报表时区
+    不一定同一天；跨时区部署时会把「昨日」窗口整体挪一天。
+    """
+    return (datetime.now(tz).date() - timedelta(days=1)).isoformat()
+
+
+def _normalize_logical_date(logical_date: str | None, tz: ZoneInfo) -> str:
     if logical_date:
         return logical_date
-    return _default_logical_date()
+    return _default_logical_date(tz)
 
 
 def build_snapshot(
-    *, room_id: str, room_name: str, logical_date: str | None = None
+    *,
+    room_id: str,
+    room_name: str,
+    logical_date: str | None = None,
+    timezone: str = DEFAULT_TIMEZONE,
 ) -> RoomEnergySnapshot:
-    """生成某机房某天的能耗快照。"""
-    ld = _normalize_logical_date(logical_date)
+    """生成某机房某天的能耗快照。
+
+    ``timezone`` 必须与报表定义 ``defaults.timeWindow.timezone`` 一致，
+    否则趋势点的 ISO 串会与定义自相矛盾（见模块头说明）。
+    """
+    tz = _resolve_timezone(timezone)
+    ld = _normalize_logical_date(logical_date, tz)
 
     # 总耗电：机房 A 典型值在 4800~5600 kWh
     total = round(_hash_float(f"total/{room_id}/{ld}", 4800, 5600), 1)
@@ -121,7 +183,8 @@ def build_snapshot(
     shape = _hourly_shape()
     shape_sum = sum(shape)
     hourly: list[HourlyPoint] = []
-    base_dt = datetime.combine(date.fromisoformat(ld), time(0, 0), tzinfo=timezone.utc)
+    # 一天从**报表时区的 00:00** 开始；点上的钟点就是报表时区的钟点。
+    base_dt = datetime.combine(date.fromisoformat(ld), time(0, 0), tzinfo=tz)
     for h, w in enumerate(shape):
         noise = _hash_float(f"hour/{room_id}/{ld}/{h}", 0.9, 1.1)
         value = round(total * (w / shape_sum) * noise, 1)
@@ -152,6 +215,7 @@ def build_snapshot(
                 deviceId=d["deviceId"],
                 deviceName=d["deviceName"],
                 energyKwh=round(total * (w / weight_sum), 1),
+                deviceType=d.get("deviceType", ""),
             )
         )
     devices.sort(key=lambda x: x.energyKwh, reverse=True)
@@ -196,6 +260,7 @@ def build_snapshot(
             "freshnessSeconds": freshness,
         },
         anomalies=anomalies,
+        timezone=str(tz.key),
     )
 
 
@@ -206,6 +271,7 @@ def snapshot_to_dict(snap: RoomEnergySnapshot) -> dict[str, Any]:
         "logicalDate": snap.logicalDate,
         "totalEnergyKwh": snap.totalEnergyKwh,
         "yoyPercent": snap.yoyPercent,
+        "timezone": snap.timezone,
         "hourlyTrend": [
             {"timestamp": p.timestamp, "energyKwh": p.energyKwh}
             for p in snap.hourlyTrend
@@ -219,6 +285,7 @@ def snapshot_to_dict(snap: RoomEnergySnapshot) -> dict[str, Any]:
                 "deviceId": d.deviceId,
                 "deviceName": d.deviceName,
                 "energyKwh": d.energyKwh,
+                "deviceType": d.deviceType,
             }
             for d in snap.deviceRanking
         ],

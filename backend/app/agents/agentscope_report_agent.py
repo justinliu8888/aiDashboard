@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,11 @@ from app.schemas.agent import (
 )
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.report_policy import ReportPolicyDraft
+from app.services.report_draft_service import (
+    DefinitionBuildError,
+    compose_unsupported_style_disclosure,
+)
+from app.services import routing_rules
 from app.tools.context import (
     ToolContext,
     bind_tool_context,
@@ -62,6 +68,60 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "report_generation.md"
 _EDIT_PROMPT_PATH = Path(__file__).parent / "prompts" / "template_edit.md"
+
+
+#: 句子里出现「样式/版式/标题/柱状图…」这类词时，才去纠正它的「已生效」说法。
+_STYLE_SUBJECT_RE = re.compile(
+    r"(样式|版式|布局|标题|柱状图|条形图|等宽|独占[一1]行|字号|对齐|颜色)"
+)
+
+#: 声称「已经照做」的动词。
+_APPLIED_VERB_RE = re.compile(
+    r"已(?:经)?(?:作为|以|按)?[^，。；、\n]{0,16}?(?:一并)?(?:提交|应用|落实|生效)"
+)
+
+#: 纠正后的措辞：明确说「没生效」，而不是「已提交」。
+_APPLIED_CLAIM_REPLACEMENT = "当前模板不支持，未生效"
+
+#: 模型「随时可以改成柱状图」这类承诺 —— 图形类型在模板层是写死的 LINE，
+#: 承诺能改就是承诺了一件做不到的事，必须一起纠正。
+_CHART_KIND_OFFER_RE = re.compile(
+    r"(?:如需|如果需要|若需要|需要)?(?:把|将|再)?(?:趋势图|图表|折线图)?"
+    r"(?:改成|换成|改为|调成|变更为|变成)[^，。；、\n]{0,8}"
+    r"(?:柱状图|条形图)[^，。；、\n]{0,12}"
+    r"(?:随时告诉我|告诉我|跟我说|说一声|我来改|就可以改)?"
+)
+
+
+def _neutralize_applied_style_claims(reply: str) -> str:
+    """纠正模型「已按要求提交/应用了版式样式」的说法。
+
+    模型在版式诉求没落实时会说「已作为样式要求一并提交」——
+    这句话会被读成「已经做到了」，正是要修的偏离。
+    这里把它换成「当前模板不支持，未生效」。
+
+    只改**同时**含「样式/版式类词」和「已生效类动词」的句子，
+    不会误伤「已生成 A 机房昨日能耗日报草稿」这类如实描述。
+    """
+    text = reply or ""
+    if not text:
+        return text
+
+    def _fix_sentence(sentence: str) -> str:
+        if not _STYLE_SUBJECT_RE.search(sentence):
+            return sentence
+        sentence = _APPLIED_VERB_RE.sub(_APPLIED_CLAIM_REPLACEMENT, sentence)
+        return _CHART_KIND_OFFER_RE.sub(_APPLIED_CLAIM_REPLACEMENT, sentence)
+
+    # 按句号/问号/感叹号/换行切句，保留分隔符。
+    parts = re.split(r"([。！？\n])", text)
+    fixed: list[str] = []
+    for index, part in enumerate(parts):
+        if index % 2 == 0:
+            fixed.append(_fix_sentence(part))
+        else:
+            fixed.append(part)
+    return "".join(fixed)
 
 
 class AgentScopeReportAgent:
@@ -484,19 +544,58 @@ class AgentScopeReportAgent:
         runner = get_runner("build_definition_draft")
         assert runner is not None
 
+        # 未生效的版式/样式诉求：**确定性**识别，不依赖模型怎么表达。
+        # 三处来源统一核对：原始输入（用户原话）+ 路由槽位（collectedInfo）+
+        # 最终定义（模型写进 styleHints 被装配层拒掉的，在组装层合并）。
+        # 只靠模型把诉求写进 styleHints 的老路径，覆盖不全：模型可能把诉求
+        # 写进 collectedInfo 自由文本、或者只写在回复散文里。
+        unsupported_requests = routing_rules.collect_unsupported_style_requests(
+            message=request.message,
+            collected_info=getattr(request, "collectedInfo", None),
+        )
+
         try:
             built = runner(
                 reportName=plan.get("reportName") or "能耗日报",
                 roomId=plan.get("roomId") or request.context.subjectId,
                 includeTrend=bool(plan.get("includeTrend", True)),
+                # 路由层解析出来的结构化条件必须原样进入组装层，
+                # 否则用户要的时间窗 / 数据源 / 过滤会在这一步被默认值覆盖。
+                sourceRef=plan.get("sourceRef"),
+                grainUnit=plan.get("grainUnit"),
+                timeWindow=plan.get("timeWindow"),
+                metricRefs=plan.get("metricRefs"),
+                componentRequests=plan.get("componentRequests"),
+                excludedRegions=plan.get("excludedRegions"),
+                filters=plan.get("filters"),
+                limit=plan.get("limit"),
+                topN=plan.get("topN"),
+                derivedColumns=plan.get("derivedColumns"),
+                styleHints=plan.get("styleHints"),
+                unsupportedStyleRequests=unsupported_requests,
+                capabilityEvidence=plan.get("capabilityEvidence"),
             )
             policy = ReportPolicyDraft.model_validate(built["policyDraft"])
             definition = ReportDefinitionDraft.model_validate(built["definitionDraft"])
+        except DefinitionBuildError as exc:
+            # 条件不被目录 / 指标 / 授权范围支持：明确阻断，
+            # 不能退回默认草稿 —— 那会让用户拿到一份统计的是别的东西的报表。
+            logger.warning("草稿组装被阻断 code=%s message=%s", exc.code, exc.message)
+            return self._blocked_generate_response(request, exc)
         except Exception as exc:  # noqa: BLE001
             logger.exception("草稿组装或校验失败：%s", exc)
             return self._fallback.handle(request)
 
         reply = plan.get("reply") or f"已生成 {policy.name} 草稿，请确认。"
+        # 组装层汇总的「没生效诉求」要在这里说清楚：
+        # 用户提了「柱状图 / 左右等宽 / 标题22pt」这类当前模板做不到的要求，
+        # 报表照常出，但要明确告诉用户哪几项**没有生效**，
+        # 不能用「已提交」「已一并处理」这类说法替代结果。
+        unsupported = (definition.metadata or {}).get("unsupportedStyleRequests") or []
+        if unsupported:
+            disclosure = compose_unsupported_style_disclosure(unsupported)
+            if disclosure:
+                reply = f"{disclosure}\n{_neutralize_applied_style_claims(reply)}"
         session_id = request.context.designSessionId or f"session_{uuid.uuid4().hex[:8]}"
 
         return AgentResponse(
@@ -532,6 +631,28 @@ class AgentScopeReportAgent:
                 "confirm_framework",
                 "reject_framework",
                 "request_modification",
+            ],
+        )
+
+    def _blocked_generate_response(
+        self, request: AgentRequest, error: DefinitionBuildError
+    ) -> AgentResponse:
+        """组装层拒绝出草稿时的阻断响应。
+
+        越权范围 / 未知指标 / 粒度或数据源不支持 —— 这些必须明确告诉用户，
+        而不是默默换一份默认草稿。
+        """
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.BLOCKED_OR_UNSUPPORTED,
+            reply=error.message,
+            designSessionId=request.context.designSessionId,
+            blocks=[
+                AgentBlock(
+                    code=error.code,
+                    message=error.message,
+                    alternatives=error.alternatives,
+                )
             ],
         )
 

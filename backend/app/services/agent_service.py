@@ -26,6 +26,7 @@ from app.schemas.agent import (
     ADVANCE_MESSAGE,
     ALLOWED_TRANSITIONS,
     AGENT_PROTOCOL_VERSION,
+    AgentBlock,
     AgentError,
     AgentQuestion,
     AgentRequest,
@@ -188,7 +189,12 @@ class AgentService:
         session_key = bind_session_key(request)
         # 恢复上一轮路由层收集到的槽位：本轮路由在它基础上继续补全，
         # 不会重新问用户已经答过的问题。
-        request.collectedInfo = session_service.load_collected_info(session_key)
+        loaded_collected = session_service.load_collected_info(session_key)
+        # resolvedInputs / systemDefaults 是上一轮路由算出来的派生结果，
+        # 下一轮要重算，不能当作「用户说过的槽位」继承。
+        for reserved in ("resolvedInputs", "systemDefaults"):
+            loaded_collected.pop(reserved, None)
+        request.collectedInfo = loaded_collected
         pending_raw = session_service.load_pending_choice(session_key)
         pending = None
         if pending_raw:
@@ -407,6 +413,15 @@ class AgentService:
         # 路由层已经把「历史已收集」和「本轮新收集」合并好了。
         # 写回请求对象：业务 Agent 要用它，落库也要靠它跨轮保留。
         request.collectedInfo = dict(route.collectedInfo or {})
+        # resolvedInputs：定义组装层真正要消费的结构化结果（用户指定 > 系统暂选）。
+        # 单独放一个键，避免系统默认值被当成「用户说过的」在下一轮压住新值。
+        if route.resolvedInputs:
+            request.collectedInfo["resolvedInputs"] = dict(route.resolvedInputs)
+            request.collectedInfo["systemDefaults"] = {
+                key: route.resolvedInputs[key]
+                for key in route.defaultInputKeys
+                if key in route.resolvedInputs
+            }
         log_timeline_step("context_route_done")
         await _emit(
             emit,
@@ -1600,13 +1615,43 @@ class AgentService:
             )
 
         if action == RoutingAction.BLOCK:
-            return self._protocol_error(
-                request,
-                code="BLOCKED_BY_CONTEXT_ENGINE",
-                message=route.reply or "这个操作当前不支持。",
-            )
+            return self._blocked_by_route(request, route)
 
         return None
+
+    def _blocked_by_route(
+        self, request: AgentRequest, route: RouteDecision
+    ) -> AgentResponse:
+        """路由层明确阻断：越权范围 / 未登记指标。
+
+        必须给前端可展示的 blocks（code / message / alternatives），
+        而不是只回一个协议错误 —— 否则用户看到的是「操作失败」，
+        不知道到底哪里越权、哪个指标没登记。
+        """
+        message = route.blockMessage or route.reply or "这个操作当前不支持。"
+        reply = route.reply or message
+        code = route.blockCode or "OUT_OF_SCOPE"
+        logger.info(
+            "[agent.chat] step=blocked_by_route conversationId=%s code=%s message=%r",
+            request.conversationId,
+            code,
+            message,
+        )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.BLOCKED_OR_UNSUPPORTED,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            blocks=[
+                AgentBlock(
+                    code=code,
+                    message=message,
+                    alternatives=list(route.blockAlternatives),
+                )
+            ],
+            error=AgentError(code="BLOCKED_BY_CONTEXT_ENGINE", message=reply),
+            uiActions=["continue_editing"],
+        )
 
     def _save_placeholder(
         self, request: AgentRequest, route: RouteDecision

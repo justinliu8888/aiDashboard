@@ -1,6 +1,14 @@
-"""探索性“先看模版”：只从当前可运行的 Mock 能力中补默认项。"""
+"""探索性“先看模版”：只从当前可运行的 Mock 能力中补默认项。
+
+关键约束（来自本轮缺陷 M-06-ROUTE-001）：
+    - 不能只因为出现「模板 / 模版」就劫持请求；
+    - 用户同时给出的业务条件（数据源、粒度、设备过滤、TopN、派生列……）
+      必须完整传给 builder，不能被模板流的固定模板悄悄吞掉；
+    - 报表名和「要不要趋势图」不能写死，要用用户已经说过的 / 已经解析出来的信息。
+"""
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from typing import Any
@@ -16,9 +24,14 @@ from app.schemas.agent import (
     QuestionOption,
     ToolRequest,
 )
+from app.services import routing_rules
 from app.services.catalog_mock_service import list_catalogs
 from app.services.metric_mock_service import list_metrics
-from app.services.report_draft_service import build_definition_draft, build_policy_draft
+from app.services.report_draft_service import (
+    DefinitionBuildError,
+    build_definition_draft,
+    build_policy_draft,
+)
 from app.services.scope_service import (
     is_project_authorized,
     is_subject_authorized,
@@ -26,16 +39,40 @@ from app.services.scope_service import (
 from app.services.session_context import current_session_key
 
 
+logger = logging.getLogger(__name__)
+
 _TEMPLATE_REQUEST = re.compile(r"(模板|模版)")
 _GENERATION_REQUEST = re.compile(r"(生成|做|看看|看个|给我|来个|来一)")
-_ROOM = re.compile(r"([A-Z])\s*机房|机房\s*([A-Z])|room_([a-z0-9_]+)", re.IGNORECASE)
-_OTHER_TIME = re.compile(r"(今天|今日|明天|前天|本周|上周|本月|最近|近\s*\d+\s*(天|小时)|\d+\s*(天|小时)|分钟|小时|实时|20\d{2}[-年/]\d{1,2})")
+_ROOM = routing_rules.ROOM_PATTERN  # 统一到规则层，避免两套机房正则
+_ROOM_TOKEN = routing_rules.ROOM_TOKEN_PATTERN
+
+# 「非昨日时间范围」判定。
+# 注意不要把「小时 / 分钟」当成时间范围：「小时趋势」「分钟级粒度」是粒度，不是时间窗。
+_OTHER_TIME = re.compile(
+    r"(今天|今日|明天|前天|本周|上周|本月|最近|近\s*\d+\s*(天|小时)"
+    r"|\d+\s*(天|小时)|实时|20\d{2}[-年/]\d{1,2})"
+)
 _OTHER_METRIC = re.compile(r"(pue|成本|电费|费用|温度|水耗|碳排放)", re.IGNORECASE)
 _CROSS_PROJECT = re.compile(r"(所有项目|全部项目|跨项目|所有机房|全部机房)")
 
 _ROOM_LABEL = "A 机房"
 _TIME_LABEL = "昨日"
 _METRIC_LABEL = "能耗日报（总耗电、设备排名、小时趋势）"
+_DEFAULT_REPORT_NAME = "A 机房能耗日报"
+
+
+def _builder_capability() -> tuple[frozenset[str], bool]:
+    """builder 当前接受哪些参数（带缓存，builder 被替换时缓存自动失效）。"""
+    return routing_rules.builder_capability()
+
+
+def _plan_builder_kwargs(slots: dict[str, Any]) -> dict[str, Any]:
+    """把解析出来的业务槽位映射成 builder 能接受的参数。
+
+    只传 builder 真正支持的参数；不支持的条件由 is_request() 提前交回正常路由，
+    不会在这里被静默丢弃。
+    """
+    return routing_rules.plan_builder_kwargs(slots)
 
 
 class TemplatePreviewFlow:
@@ -46,12 +83,27 @@ class TemplatePreviewFlow:
 
     @staticmethod
     def is_request(request: AgentRequest) -> bool:
-        return (
-            request.state in {AgentState.ANALYZING, AgentState.NEEDS_CLARIFICATION}
-            and bool(_TEMPLATE_REQUEST.search(request.message))
-            and bool(_GENERATION_REQUEST.search(request.message))
-            and "修改" not in request.message
-        )
+        if request.state not in {AgentState.ANALYZING, AgentState.NEEDS_CLARIFICATION}:
+            return False
+        if not _TEMPLATE_REQUEST.search(request.message):
+            return False
+        if not _GENERATION_REQUEST.search(request.message):
+            return False
+        if "修改" in request.message:
+            return False
+        # 平台支持、但模板流当前表达不了的业务条件 → 交回正常路由，
+        # 不要因为一个「模版」关键词就劫持整条请求。
+        return not TemplatePreviewFlow._has_unespressible_conditions(request.message)
+
+    @staticmethod
+    def _has_unespressible_conditions(message: str) -> bool:
+        """模板流当前表达不了的业务条件。
+
+        builder 已经支持的参数直接透传；只有「builder 接不住」的条件
+        才把请求交回正常路由，避免条件被模板流悄悄吞掉。
+        """
+        slots = routing_rules.explicit_slots(message)
+        return bool(routing_rules.unsupported_slots(slots))
 
     @staticmethod
     def _is_available(request: AgentRequest) -> bool:
@@ -112,7 +164,14 @@ class TemplatePreviewFlow:
         room_match = _ROOM.search(request.message)
         requested_room = None
         if room_match:
-            requested_room = f"room_{next(group for group in room_match.groups() if group).lower()}"
+            for group in room_match.groups():
+                if group:
+                    requested_room = f"room_{group.lower()}"
+                    break
+        else:
+            token = _ROOM_TOKEN.search(request.message)
+            if token:
+                requested_room = f"room_{token.group(1).lower()}"
         unsupported_time = bool(_OTHER_TIME.search(request.message))
         unsupported_metric = bool(_OTHER_METRIC.search(request.message))
         unsupported = []
@@ -140,6 +199,9 @@ class TemplatePreviewFlow:
             "time": _TIME_LABEL if ("昨日" in request.message or "昨天" in request.message) and not unsupported_time else None,
             "metric": _METRIC_LABEL if ("能耗" in request.message or "耗电" in request.message) and not unsupported_metric else None,
             "specified": set(),
+            # 规则层解析出来的业务条件：不再被模板流的固定模板吞掉。
+            "slots": routing_rules.explicit_slots(request.message),
+            "defaults": routing_rules.default_slots(request.message),
         }
         info["specified"] = {key for key in ("room", "time", "metric") if info[key]}
         if len(self._sessions) >= 256:
@@ -194,19 +256,92 @@ class TemplatePreviewFlow:
                 return self._ask(request, self._question(question_id, prompt, [(label, label)]), prompt)
         return self._generate(request, info)
 
+    @staticmethod
+    def _resolve_include_trend(slots: dict[str, Any], message: str) -> bool:
+        """要不要趋势图：用用户说过的 / 解析出来的，不写死 True。"""
+        return routing_rules.resolve_include_trend(slots)
+
     def _generate(self, request: AgentRequest, info: dict[str, Any]) -> AgentResponse:
         session_key = current_session_key() or request.conversationId
         self._sessions.pop(session_key, None)
-        report_name = "A 机房能耗日报"
+        slots: dict[str, Any] = dict(info.get("slots") or {})
+        defaults: dict[str, Any] = dict(info.get("defaults") or {})
+
+        # 报表名：用用户已经说过的名字，不再固定写死「A 机房能耗日报」。
+        report_name = (
+            slots.get("reportName")
+            or info.get("reportName")
+            or _DEFAULT_REPORT_NAME
+        )
+        room_id = slots.get("subjectId") or "room_a"
+        include_trend = self._resolve_include_trend(slots, request.message)
+
+        # 「只要 X」是白名单语义；「包含 X」不代表别的区块不要，
+        # 这时不能把 componentRequests 当白名单传下去，否则模板自带的
+        # 数据质量卡片会被静默删掉。
+        builder_slots = dict(slots)
+        if not routing_rules.is_exclusive_request(request.message):
+            builder_slots.pop("componentRequests", None)
+
         policy = build_policy_draft(report_name)
-        definition = build_definition_draft(report_name, "room_a", include_trend=True)
+        try:
+            definition = build_definition_draft(
+                report_name,
+                room_id,
+                include_trend=include_trend,
+                **_plan_builder_kwargs(builder_slots),
+            )
+        except DefinitionBuildError as exc:
+            # 组装层明确拒绝（数据源 / 粒度 / 授权 / 组件不支持）：
+            # 必须阻断并说明原因，不能退回一份「看起来对、其实不是那件事」的草稿。
+            logger.warning(
+                "[template_preview_flow] 组装被拒绝 code=%s message=%s",
+                exc.code,
+                exc.message,
+            )
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.BLOCKED_OR_UNSUPPORTED,
+                reply=exc.message,
+                designSessionId=request.context.designSessionId,
+                blocks=[
+                    AgentBlock(
+                        code=exc.code,
+                        message=exc.message,
+                        alternatives=list(exc.alternatives),
+                    )
+                ],
+                uiActions=["continue_editing"],
+            )
+
         fields = {"room": _ROOM_LABEL, "time": _TIME_LABEL, "metric": _METRIC_LABEL}
-        definition.metadata["generationInputs"] = {
+        # generationInputs：模板流既有的三段展示位，前端按这个契约渲染。
+        generation_inputs: dict[str, dict[str, Any]] = {
             field: {"value": value, "source": "用户指定" if field in info["specified"] else "系统暂选"}
             for field, value in fields.items()
         }
-        defaults = [value for field, value in fields.items() if field not in info["specified"]]
-        note = f"系统暂选：{'、'.join(defaults)}；可在草稿中继续修改。" if defaults else "条件均由你指定。"
+        definition.metadata["generationInputs"] = generation_inputs
+
+        # resolvedInputs：结构化槽位 + 来源标记，和路由层输出的字段同名同结构，
+        # 前端用同一套渲染逻辑就能展示「系统暂选 / 用户指定」。
+        resolved_inputs: dict[str, dict[str, Any]] = {}
+        for slot in routing_rules.SLOT_KEYS:
+            if slot == "subjectName":
+                continue
+            if slot in slots:
+                resolved_inputs[slot] = {"value": slots[slot], "source": "用户指定"}
+            elif slot in defaults:
+                resolved_inputs[slot] = {"value": defaults[slot], "source": "系统暂选"}
+        definition.metadata["resolvedInputs"] = resolved_inputs
+
+        defaults_used = [
+            field for field, value in fields.items() if field not in info["specified"]
+        ]
+        note = (
+            f"系统暂选：{'、'.join(defaults_used)}；可在草稿中继续修改。"
+            if defaults_used
+            else "条件均由你指定。"
+        )
         return AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.WAITING_USER_CONFIRM,

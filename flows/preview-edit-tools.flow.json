@@ -20,7 +20,10 @@
         { "waitFor": "#preview-root .region-name", "timeout": 120000 },
 
         { "eval": "document.querySelectorAll('#preview-root .report-title').length === 0" },
-        { "eval": "document.querySelectorAll('#preview-root .region-name').length === 5" },
+        { "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId).sort().join(',') === 'region_analysis,region_device_ranking,region_hourly_trend,region_total_energy'" },
+        { "eval": "document.querySelector('#preview-root [data-region-id=\"region_data_quality\"]') === null" },
+        { "eval": "document.querySelector('#preview-root [data-region-id=\"region_report_title\"]') === null" },
+        { "eval": "Array.from(document.querySelectorAll('#preview-root .region-name')).map(el => el.textContent.trim()).join('|') === '总耗电|设备耗电排名|小时趋势|分析说明'" },
         { "eval": "!Array.from(document.querySelectorAll('#preview-root .region-name')).some(n => n.textContent.includes('昨日能耗日报'))" },
         { "assertText": "设备耗电排名" },
 

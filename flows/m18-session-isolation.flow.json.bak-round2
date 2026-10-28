@@ -1,0 +1,54 @@
+{
+  "outDir": "../.selfcheck/flow-m18-session-isolation",
+  "waitMs": 1500,
+  "timeout": 240000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "M-18 生成中切新会话不串结果：A 的结果不落到 B，切回 A 还能继续确认到 READY",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析。" },
+        { "press": "Enter" },
+        { "wait": 1200 },
+        { "eval": "!!document.querySelector('#btn-stop') && !document.querySelector('#btn-stop').classList.contains('hidden')" },
+
+        { "click": "#btn-new-session" },
+        { "wait": 500 },
+        { "eval": "document.getElementById('state-badge').textContent === 'ANALYZING'" },
+        { "eval": "!document.querySelector('#chat-scroll').innerText.includes('生成 A 机房昨日能耗日报')" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('还没有草稿')" },
+        { "screenshot": "m18-01-生成中切到新会话B" },
+
+        { "type": "#chat-input", "text": "你好" },
+        { "press": "Enter" },
+        { "waitText": "智能报表助手", "timeout": 240000 },
+        { "eval": "document.getElementById('preview-root').innerText.includes('还没有草稿')" },
+        { "eval": "!document.querySelector('#preview-root').innerText.includes('设备耗电排名')" },
+        { "screenshot": "m18-02-B会话只有闲聊回复" },
+
+        { "waitFor": "#session-list .session-item[title^=\"生成 A 机房\"]", "timeout": 300000 },
+        { "wait": 1500 },
+        { "eval": "document.getElementById('preview-root').innerText.includes('还没有草稿')" },
+        { "eval": "!document.querySelector('#preview-root').innerText.includes('设备耗电排名')" },
+        { "screenshot": "m18-03-A跑完后B仍未被污染" },
+
+        { "click": "#session-list .session-item[title^=\"生成 A 机房\"]" },
+        { "wait": 2500 },
+        { "eval": "document.getElementById('state-badge').textContent === 'WAITING_USER_CONFIRM'" },
+        { "eval": "!!document.querySelector('.question-select')" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('设备耗电排名')" },
+        { "screenshot": "m18-04-切回A恢复草稿与确认下拉" },
+
+        { "eval": "(() => { const s = [...document.querySelectorAll('.question-select')].pop(); s.value = '同意'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()" },
+        { "waitText": "报表已就绪", "timeout": 240000 },
+        { "wait": 1500 },
+        { "eval": "document.getElementById('state-badge').textContent === 'READY'" },
+        { "screenshot": "m18-05-A继续确认到READY" }
+      ]
+    }
+  ]
+}

@@ -20,18 +20,25 @@ from time import perf_counter
 from typing import Any, Awaitable, Callable
 
 from openai import AsyncOpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.config import get_settings
 from app.schemas.agent import AgentRequest, AgentState
 from app.schemas.edit_plan import EditIntent, EditPlan
 from app.schemas.report_definition import ReportDefinitionDraft
+from app.services import routing_rules
 from app.services.request_timeline import log_timeline_step
+from app.services.scope_service import authorized_subject_ids
 
 
 logger = logging.getLogger(__name__)
 
 EmitEvent = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+#: collectedInfo 里由路由层自己写入的保留键，不能被当成「用户说过的槽位」参与合并。
+_RESERVED_COLLECTED_KEYS: frozenset[str] = frozenset(
+    {"resolvedInputs", "systemDefaults"}
+)
 
 
 def _short(text: str, limit: int = 1200) -> str:
@@ -59,6 +66,84 @@ class UserIntent(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+# 模型偶尔会输出后端枚举之外的 intent（例如 GENERATE_REPORT / CREATE_REPORT）。
+# 这些值语义上都是「开始一个新报表任务」，直接丢弃整份模型输出会让路由
+# 100% 降级到兜底路径。这里做一层显式映射，保证契约不匹配不会炸掉整轮路由。
+_INTENT_ALIASES: dict[str, UserIntent] = {
+    "GENERATE_REPORT": UserIntent.NEW_TASK,
+    "GENERATE_CUSTOM_REPORT": UserIntent.NEW_TASK,
+    "CREATE_REPORT": UserIntent.NEW_TASK,
+    "CREATE_CUSTOM_REPORT": UserIntent.NEW_TASK,
+    "GENERATE": UserIntent.NEW_TASK,
+    "NEW_REPORT": UserIntent.NEW_TASK,
+    "REPORT_GENERATION": UserIntent.NEW_TASK,
+    "CREATE": UserIntent.NEW_TASK,
+    "EDIT": UserIntent.MODIFY,
+    "MODIFY_DRAFT": UserIntent.MODIFY,
+    "CHANGE": UserIntent.MODIFY,
+    "UPDATE": UserIntent.MODIFY,
+    "CONFIRM_DRAFT": UserIntent.CONFIRM,
+    "APPROVE": UserIntent.CONFIRM,
+    "ACCEPT": UserIntent.CONFIRM,
+    "REGENERATE": UserIntent.REJECT,
+    "REDO": UserIntent.REJECT,
+    "RESTART": UserIntent.REJECT,
+    "QUESTION": UserIntent.ASK_QUESTION,
+    "QUERY": UserIntent.ASK_QUESTION,
+    "SMALL_TALK": UserIntent.CHITCHAT,
+    "GREETING": UserIntent.CHITCHAT,
+    "CANCEL_TASK": UserIntent.CANCEL,
+    "ABORT": UserIntent.CANCEL,
+    "PROVIDE_INFORMATION": UserIntent.PROVIDE_INFO,
+    "SUPPLEMENT": UserIntent.PROVIDE_INFO,
+    "FILL_INFO": UserIntent.PROVIDE_INFO,
+}
+
+#: 这些意图一定会改变状态机，不允许 Concierge 用 DIRECT_REPLY 绕过深路由。
+STATE_CHANGING_INTENTS: frozenset[UserIntent] = frozenset(
+    {
+        UserIntent.NEW_TASK,
+        UserIntent.PROVIDE_INFO,
+        UserIntent.CONFIRM,
+        UserIntent.MODIFY,
+        UserIntent.REJECT,
+        UserIntent.CANCEL,
+    }
+)
+
+
+def coerce_intent(value: Any, *, default: UserIntent = UserIntent.UNKNOWN) -> Any:
+    """把模型输出的 intent 收敛成后端枚举。
+
+    未知值不会抛错，而是落到 default —— 路由结果比模型原值更可信，
+    但静默吞掉错误会让问题不可观测，所以调用方要负责记日志。
+    """
+    if isinstance(value, UserIntent):
+        return value
+    if not isinstance(value, str):
+        return default
+    key = value.strip().upper()
+    if key in _INTENT_ALIASES:
+        return _INTENT_ALIASES[key]
+    try:
+        return UserIntent(key)
+    except ValueError:
+        return default
+
+
+def coerce_action(value: Any) -> "ConciergeAction":
+    """把模型输出的 action 收敛成后端枚举；未知值按更保守的深路由处理。"""
+    if isinstance(value, ConciergeAction):
+        return value
+    if isinstance(value, str):
+        key = value.strip().upper()
+        if key in {"DIRECT_REPLY", "DIRECT", "REPLY", "ANSWER"}:
+            return ConciergeAction.DIRECT_REPLY
+        if key in {"DEEP_ROUTE", "DEEP", "ROUTE", "ESCALATE"}:
+            return ConciergeAction.DEEP_ROUTE
+    return ConciergeAction.DEEP_ROUTE
+
+
 class RoutingAction(str, Enum):
     CONTINUE_CURRENT = "CONTINUE_CURRENT"
     JUMP_STATE = "JUMP_STATE"
@@ -80,6 +165,31 @@ class ConciergeDecision(BaseModel):
     reason: str = ""
     confidence: float = 0.0
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data: Any) -> Any:
+        """模型输出不合法时不要让整份决策作废。
+
+        以前这里直接 model_validate，遇到 GENERATE_REPORT 这种枚举外取值
+        会抛 ValidationError，Concierge 100% 失败、整轮白等一次模型调用。
+        """
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        if "userIntent" in normalized:
+            original = normalized["userIntent"]
+            coerced = coerce_intent(original)
+            if coerced is not original:
+                logger.warning(
+                    "[context_engine] concierge intent 归一化：%r -> %s",
+                    original,
+                    coerced.value,
+                )
+            normalized["userIntent"] = coerced
+        if "action" in normalized:
+            normalized["action"] = coerce_action(normalized["action"])
+        return normalized
+
 
 class RouteDecision(BaseModel):
     userIntent: UserIntent = UserIntent.UNKNOWN
@@ -97,6 +207,24 @@ class RouteDecision(BaseModel):
     engineStage: str = ""
     # 节点 5.5：当前消息是否属于模板编辑意图（供 AgentService / 下游观测使用）
     isTemplateEdit: bool = False
+    # 阻断说明：routingAction=BLOCK 时给出可展示的 code / message。
+    blockCode: str | None = None
+    blockMessage: str | None = None
+    blockAlternatives: list[str] = Field(default_factory=list)
+    # 节点 5.6：最终生效的结构化输入（用户指定 > 系统暂选），供定义组装层消费。
+    resolvedInputs: dict[str, Any] = Field(default_factory=dict)
+    # 其中来自系统默认的键名，前端据此标注「系统暂选」。
+    defaultInputKeys: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        if "userIntent" in normalized:
+            normalized["userIntent"] = coerce_intent(normalized["userIntent"])
+        return normalized
 
 
 # 节点 5.5 TemplateEditEngine 粗判用的关键词，与 agent_service.TEMPLATE_EDIT_HINT_WORDS 保持一致
@@ -150,24 +278,39 @@ _CONCIERGE_PROMPT = """
 - 当前没有足够业务意图，只需要引导用户说出报表需求。
 
 必须 DEEP_ROUTE 的场景：
+- 用户要生成 / 新建一份报表（哪怕句子里带「模板」「模版」「帮我做」）；
 - 确认 / 取消 / 重做 / 不做了；
 - 修改草稿或报表：删掉、改成、换成、不要这个；
 - 用户在问当前草稿、指标、图表含义；
+- 用户在补充信息、回答你上一轮的追问；
 - 任何涉及当前 state 流转、保存、校验、预览、打断流程的句子；
 - 任何你不确定是否会改变业务状态的句子。
+
+userIntent 只能从下面这 9 个值里选，不要自创：
+CONFIRM / MODIFY / REJECT / ASK_QUESTION / CHITCHAT / CANCEL / NEW_TASK / PROVIDE_INFO / UNKNOWN
+
+其中：
+- 要生成报表 → NEW_TASK；
+- 回答上一轮追问 → PROVIDE_INFO；
+- 确认 / 修改 / 重做 / 取消 → 对应 CONFIRM / MODIFY / REJECT / CANCEL；
+- 问草稿或指标含义 → ASK_QUESTION；
+- 打招呼、问你能做什么 → CHITCHAT；
+- 判断不了 → UNKNOWN。
+
+action 只能是 DIRECT_REPLY 或 DEEP_ROUTE。
 
 输出 JSON：
 {
   "action": "DIRECT_REPLY" 或 "DEEP_ROUTE",
-  "userIntent": "CHITCHAT" / "ASK_QUESTION" / "MODIFY" / "CONFIRM" / "CANCEL" / "UNKNOWN" 等，
+  "userIntent": "上面 9 个枚举值之一",
   "reply": "如果 DIRECT_REPLY，填自然回复；否则空字符串",
   "reason": "简短原因",
   "confidence": 0.0 到 1.0
 }
 
 DIRECT_REPLY 的回复示例：
-- “你好～我是云枢的智能报表助手，可以帮你生成机房能耗报表，也可以修改已有报表。你可以试试说：生成 A 机房昨日能耗日报。”
-- “我在～你可以直接说想生成什么报表，比如：生成 A 机房昨日能耗日报。”
+- "你好～我是云枢的智能报表助手，可以帮你生成机房能耗报表，也可以修改已有报表。你可以试试说：生成 A 机房昨日能耗日报。"
+- "我在～你可以直接说想生成什么报表，比如：生成 A 机房昨日能耗日报。"
 
 只能输出 JSON，不要 markdown。
 """.strip()
@@ -228,6 +371,22 @@ WAITING_USER_CONFIRM 下三个固定按钮的识别规则（必须严格命中�
 - targetState 必须是状态机枚举之一或 null；
 - confidence 是 0 到 1 的数字。
 
+默认能力（不要因为这些去追问用户）：
+- 数据源：机房能耗场景默认 sourceRef = catalog.machine_room.energy；
+- 时间窗口：用户说「昨日 / 昨天」就默认 timeRange = 昨日，不要再追问时间范围；
+- 粒度：用户没明说时，趋势默认 grainUnit = HOUR，日汇总 / 按天默认 grainUnit = DAY；
+- 指标：用户说「总耗电」就默认 metricRefs = ["metric.machine_room.total_energy"]，
+  出现「设备排名 / 各设备」时再加上 "metric.machine_room.device_energy"；
+- 对象：默认取请求上下文里的 subjectId / subjectRef。
+- 排名行数：用户没明说时默认 topN = 10（排名表显示耗电最高的 10 台），
+  不要因为 topN 没提到就追问用户。
+以上默认值只在用户没有明说时使用；用户明说了就以用户说的为准。
+
+必须 BLOCK、不要追问的场景（routingAction 用 BLOCK，reply 写清楚原因）：
+- 越权范围：所有项目 / 全部项目 / 跨项目 / 所有机房 / 未授权的机房；
+- 未登记指标：用户点名了指标目录里没有的指标（如「设备心情值」），
+  必须说明指标未登记，不能用耗电量或随机数代替，也不能改问时间或粒度。
+
 你还必须维护一张"已收集信息表"，字段名固定如下：
 - requiredInfo：当前节点推进还需要的槽位名列表，例如 ["subjectId","timeRange","metricRefs"]；
 - collectedInfo：已经拿到的槽位，key 与 requiredInfo 对应，value 是从对话里原样提取到的值。
@@ -237,7 +396,17 @@ WAITING_USER_CONFIRM 下三个固定按钮的识别规则（必须严格命中�
 - isReadyForNextStep：requiredInfo 全部拿到就是 true，否则 false；
 - nextQuestion：缺信息时的一句具体追问（不追问就留空字符串）。
 
-槽位命名只用这几个：subjectId、subjectRef、timeRange、metricRefs、grainUnit、reportName、sourceRef。
+槽位命名只用这几个：
+subjectId、subjectRef、timeRange、metricRefs、grainUnit、reportName、sourceRef、
+filters、excludedRegions、topN、derivedColumns、styleHints、componentRequests。
+
+取值约定：
+- filters：设备过滤，写成 {"deviceIds": ["CRAC-01", "CRAC-02"]}；
+- excludedRegions：被排除的设备类型，写成 ["机架", "PDU", "UPS"]；
+- topN：整数，例如 3；
+- derivedColumns：写成一个字符串数组，例如 ["previousDayEnergy", "dayOverDayGrowthRate", "shareOfTotal"]；
+- styleHints：写成一个字符串数组，例如 ["highlightRed"]；
+- componentRequests：写成一个字符串数组，例如 ["total", "ranking", "trend"]。
 """.strip()
 
 
@@ -413,6 +582,38 @@ class ContextEngine:
             self._settings.volc_context_concierge_timeout,
             self._settings.volc_context_router_timeout,
         )
+
+        # 规则层先判阻断：越权范围、未登记指标。
+        # 这两类请求必须明确阻断，不能先白等一次模型、再被追问时间或粒度。
+        blocked = self._rule_block(request)
+        if blocked is not None:
+            log_timeline_step("rule_block")
+            await _emit(
+                emit,
+                "stage",
+                {
+                    "stage": "rule_block",
+                    "state": request.state.value,
+                    "blockCode": blocked.blockCode,
+                    "reason": blocked.reason,
+                },
+            )
+            logger.info(
+                "[context_engine] step=rule_block conversationId=%s code=%s reason=%r elapsed_total_ms=%.1f",
+                request.conversationId,
+                blocked.blockCode,
+                blocked.reason,
+                (perf_counter() - total_started) * 1000,
+            )
+            return blocked
+
+        explicit = routing_rules.explicit_slots(
+            request.message, subject_id=request.context.subjectId
+        )
+        defaults = routing_rules.default_slots(
+            request.message, subject_id=request.context.subjectId
+        )
+
         if self._client is None:
             log_timeline_step("fallback_no_client")
             await _emit(emit, "stage", {"stage": "fallback_no_client"})
@@ -424,10 +625,36 @@ class ContextEngine:
             decision = self._fallback_route(request, "VOLC_API_KEY 未配置")
             decision.engineStage = "fallback_no_client"
             decision.isTemplateEdit = _detect_template_edit(request.message, request.state)
-            decision.collectedInfo = dict(request.collectedInfo or {})
+            self._resolve_inputs(decision, request, explicit, defaults)
             return decision
 
-        concierge = await self._run_concierge(request, emit=emit)
+        # Concierge：明显的新报表生成请求直接跳过。
+        # 先白等一次 Concierge 再因为枚举不匹配失败，是首轮耗时里最大的一块无产出开销。
+        if self._should_skip_concierge(request):
+            concierge = ConciergeDecision(
+                action=ConciergeAction.DEEP_ROUTE,
+                userIntent=UserIntent.NEW_TASK,
+                reason="明确的新报表生成请求，跳过 Concierge 直接深路由",
+                confidence=0.0,
+            )
+            await _emit(
+                emit,
+                "stage",
+                {
+                    "stage": "concierge_skipped",
+                    "state": request.state.value,
+                    "reason": concierge.reason,
+                },
+            )
+            logger.info(
+                "[context_engine] step=concierge_skipped conversationId=%s elapsed_total_ms=%.1f",
+                request.conversationId,
+                (perf_counter() - total_started) * 1000,
+            )
+        else:
+            concierge = await self._run_concierge(request, emit=emit)
+            concierge = self._guard_direct_reply(concierge, request)
+
         await _emit(
             emit,
             "stage",
@@ -465,7 +692,7 @@ class ContextEngine:
                 request.conversationId,
                 (perf_counter() - total_started) * 1000,
             )
-            return RouteDecision(
+            decision = RouteDecision(
                 userIntent=concierge.userIntent,
                 routingAction=RoutingAction.ANSWER_IN_PLACE,
                 confidence=concierge.confidence,
@@ -476,6 +703,8 @@ class ContextEngine:
                 isTemplateEdit=_detect_template_edit(request.message, request.state),
                 collectedInfo=dict(request.collectedInfo or {}),
             )
+            self._resolve_inputs(decision, request, explicit, defaults)
+            return decision
 
         try:
             router_started = perf_counter()
@@ -517,7 +746,7 @@ class ContextEngine:
                 temperature=0,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": self._compose_input(request)},
+                    {"role": "user", "content": self._compose_input(request, explicit, defaults)},
                 ],
                 response_format={"type": "json_object"},
                 timeout=self._settings.volc_context_router_timeout,
@@ -526,7 +755,7 @@ class ContextEngine:
             )
             log_timeline_step("deep_route_done")
             decision = self._parse_decision(raw)
-            decision.collectedInfo = self._merge_collected(request, decision)
+            self._resolve_inputs(decision, request, explicit, defaults)
             await _emit(
                 emit,
                 "stage",
@@ -551,6 +780,8 @@ class ContextEngine:
                             "nextQuestion": decision.nextQuestion,
                             "reply": decision.reply,
                             "reason": decision.reason,
+                            "resolvedInputs": decision.resolvedInputs,
+                            "defaultInputKeys": decision.defaultInputKeys,
                         },
                     },
                 },
@@ -582,8 +813,103 @@ class ContextEngine:
             decision = self._fallback_route(request, str(exc))
             decision.engineStage = "deep_route_failed_fallback"
             decision.isTemplateEdit = _detect_template_edit(request.message, request.state)
-            decision.collectedInfo = dict(request.collectedInfo or {})
+            self._resolve_inputs(decision, request, explicit, defaults)
             return decision
+
+    # ---------- 规则层辅助 ----------
+
+    @staticmethod
+    def _rule_block(request: AgentRequest) -> RouteDecision | None:
+        """确定性阻断：越权范围、未登记指标。"""
+        authorized = authorized_subject_ids(request.context.subjectRef)
+        block = routing_rules.detect_block(
+            request.message,
+            subject_ref=request.context.subjectRef,
+            subject_id=request.context.subjectId,
+            authorized_subject_ids=authorized or None,
+        )
+        if not block:
+            return None
+        return RouteDecision(
+            userIntent=UserIntent.NEW_TASK,
+            routingAction=RoutingAction.BLOCK,
+            confidence=0.95,
+            reply=str(block.get("reply") or ""),
+            blockCode=str(block.get("code") or "OUT_OF_SCOPE"),
+            blockMessage=str(block.get("message") or ""),
+            blockAlternatives=[str(item) for item in (block.get("alternatives") or [])],
+            reason=f"规则层阻断：{block.get('message')}",
+            engineStage="rule_block",
+            isReadyForNextStep=False,
+        )
+
+    @staticmethod
+    def _should_skip_concierge(request: AgentRequest) -> bool:
+        """明显的新报表生成请求：跳过 Concierge，直接进深路由。"""
+        if request.state not in {AgentState.ANALYZING, AgentState.NEEDS_CLARIFICATION}:
+            return False
+        if request.snapshots.reportDefinition is not None:
+            # 已经有草稿了，可能是改稿，不走「跳过」路径。
+            return False
+        if request.message.strip() in {"继续工作", "继续上一条", "继续刚才"}:
+            return False
+        return routing_rules.is_clear_generation_request(request.message)
+
+    @staticmethod
+    def _guard_direct_reply(
+        concierge: ConciergeDecision, request: AgentRequest
+    ) -> ConciergeDecision:
+        """DIRECT_REPLY 不允许绕过会改变状态的意图。"""
+        if concierge.action != ConciergeAction.DIRECT_REPLY:
+            return concierge
+        if concierge.userIntent not in STATE_CHANGING_INTENTS:
+            return concierge
+        logger.info(
+            "[context_engine] step=direct_reply_downgraded conversationId=%s intent=%s",
+            request.conversationId,
+            concierge.userIntent.value,
+        )
+        return concierge.model_copy(
+            update={
+                "action": ConciergeAction.DEEP_ROUTE,
+                "reply": "",
+                "reason": f"intent={concierge.userIntent.value} 会改变状态，强制深路由",
+            }
+        )
+
+    @staticmethod
+    def _resolve_inputs(
+        decision: RouteDecision,
+        request: AgentRequest,
+        explicit: dict[str, Any],
+        defaults: dict[str, Any],
+    ) -> RouteDecision:
+        """把显式槽位 / 默认能力合并进路由结果。
+
+        合并顺序：历史显式值 → 本轮模型抽到的 → 本轮规则抽到的显式值。
+        规则层抽到的优先级最高：本轮用户原话优先于历史结论（用户可以改主意）。
+        """
+        merged = ContextEngine._merge_collected(request, decision, explicit, defaults)
+        if not routing_rules.is_exclusive_request(request.message):
+            # 「包含 X」不等于「只要 X」。componentRequests 在组装层是白名单语义，
+            # 包含语义下照搬会把模板自带的区块也删掉，所以统一降级成参考信息。
+            requested = merged.get("componentRequests")
+            if requested:
+                merged.pop("componentRequests", None)
+                merged.setdefault("requestedComponents", requested)
+        decision.collectedInfo = merged
+        resolved: dict[str, Any] = dict(defaults)
+        default_keys: set[str] = set(defaults.keys())
+        for key, value in merged.items():
+            if key not in routing_rules.SLOT_KEYS:
+                continue
+            if value is None or value == "":
+                continue
+            resolved[key] = value
+            default_keys.discard(key)
+        decision.resolvedInputs = resolved
+        decision.defaultInputKeys = sorted(default_keys)
+        return decision
 
     async def _run_concierge(
         self, request: AgentRequest, emit: EmitEvent | None = None
@@ -721,23 +1047,54 @@ class ContextEngine:
 
     @staticmethod
     def _merge_collected(
-        request: AgentRequest, decision: RouteDecision
+        request: AgentRequest,
+        decision: RouteDecision,
+        explicit: dict[str, Any] | None = None,
+        defaults: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """把历史已收集的槽位和本轮新收集的槽位合并。
 
-        历史值优先保留 —— 用户之前明确说过的信息不能被这一轮的空值覆盖。
-        本轮新拿到的值只补空缺，不改已有结论。
+        合并优先级（从高到低）：
+            1. 本轮规则层从用户原话里抽到的显式值 —— 用户可以改主意；
+            2. 历史已收集的显式值 —— 用户之前明确说过的不能被这轮的空值覆盖；
+            3. 本轮模型抽到的值 —— 只补空缺。
+
+        系统默认值（sourceRef / grainUnit / timeRange 等）**不进入** collectedInfo：
+        否则上一轮的默认值会在下一轮压住用户明确指定的新值。
+        默认值统一放在 resolvedInputs 里，并单独用 defaultInputKeys 标注来源。
         """
+        explicit = explicit or {}
+        defaults = defaults or {}
         merged: dict[str, Any] = {}
         for key, value in (request.collectedInfo or {}).items():
-            if value is not None and value != "":
-                merged[key] = value
+            if key in _RESERVED_COLLECTED_KEYS:
+                continue
+            if value is None or value == "":
+                continue
+            merged[key] = value
         for key, value in (decision.collectedInfo or {}).items():
-            if key not in merged and value is not None and value != "":
+            if key in _RESERVED_COLLECTED_KEYS:
+                continue
+            if value is None or value == "":
+                continue
+            # 模型只是复述了系统默认值时，不固化成「用户指定」，
+            # 否则下一轮用户改了数据源会被旧默认值压住。
+            if key in defaults and value == defaults[key] and key not in explicit:
+                continue
+            if key not in merged:
                 merged[key] = value
+        for key, value in explicit.items():
+            if value is None or value == "":
+                continue
+            merged[key] = value
         return merged
 
-    def _compose_input(self, request: AgentRequest) -> str:
+    def _compose_input(
+        self,
+        request: AgentRequest,
+        explicit: dict[str, Any] | None = None,
+        defaults: dict[str, Any] | None = None,
+    ) -> str:
         ctx = request.context
         snapshots = request.snapshots
         draft = snapshots.reportDefinition
@@ -761,6 +1118,10 @@ class ContextEngine:
             # 历史轮次已问过、用户已答过的槽位。模型要在它基础上继续补全，
             # 不能每轮都重新问一遍同样的问题。
             "alreadyCollected": dict(request.collectedInfo or {}),
+            # 规则层已经抽到的显式槽位和系统默认值。
+            # 有了这份输入，模型就不该再追问数据源 / 粒度这类有默认值的问题。
+            "explicitlyStated": dict(explicit or {}),
+            "systemDefaults": dict(defaults or {}),
             "snapshotsSummary": {
                 "hasPolicy": policy is not None,
                 "hasDefinition": draft is not None,

@@ -1,0 +1,51 @@
+{
+  "outDir": "../.selfcheck/flow-preview-region-assertions",
+  "waitMs": 1500,
+  "timeout": 300000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "区域断言-标准日报：应有总耗电/排名/趋势/分析，且不含未被请求的数据质量区",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+        {
+          "type": "#chat-input",
+          "text": "生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析"
+        },
+        { "press": "Enter" },
+        { "waitFor": "#preview-root .region-name", "timeout": 300000 },
+
+        { "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId).sort().join(',') === 'region_analysis,region_device_ranking,region_hourly_trend,region_total_energy'" },
+        { "eval": "document.querySelector('#preview-root [data-region-id=\"region_data_quality\"]') === null" },
+        { "eval": "document.querySelector('#preview-root [data-region-id=\"region_report_title\"]') === null" },
+        { "eval": "Array.from(document.querySelectorAll('#preview-root .region-name')).map(el => el.textContent.trim()).join('|') === '总耗电|设备耗电排名|小时趋势|分析说明'" },
+        { "screenshot": "region-01-标准日报的区块集合" }
+      ]
+    },
+    {
+      "name": "区域断言-排除趋势：只要总耗电和排名，就不能出现趋势区和分析区",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 400 },
+        {
+          "type": "#chat-input",
+          "text": "生成 A 机房昨日能耗日报，只要总耗电和设备排名，不要趋势图"
+        },
+        { "press": "Enter" },
+        { "waitFor": "#preview-root .region-name", "timeout": 300000 },
+
+        { "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId).sort().join(',') === 'region_device_ranking,region_total_energy'" },
+        { "eval": "document.querySelector('#preview-root [data-region-id=\"region_hourly_trend\"]') === null" },
+        { "eval": "document.querySelector('#preview-root [data-region-id=\"region_analysis\"]') === null" },
+        { "eval": "document.querySelector('#preview-root [data-region-id=\"region_data_quality\"]') === null" },
+        { "eval": "Array.from(document.querySelectorAll('#preview-root .region-name')).map(el => el.textContent.trim()).join('|') === '总耗电|设备耗电排名'" },
+        { "screenshot": "region-02-排除趋势后的区块集合" }
+      ]
+    }
+  ]
+}

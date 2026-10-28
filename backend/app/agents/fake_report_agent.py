@@ -26,6 +26,7 @@ from app.services.report_draft_service import (
     build_definition_draft,
     build_policy_draft,
 )
+from app.services.routing_rules import plan_builder_kwargs, resolve_include_trend
 from app.data.machine_room_energy import (
     CATALOG_MACHINE_ROOM_ENERGY,
 )
@@ -51,11 +52,13 @@ class FakeReportAgent:
     def handle(self, request: AgentRequest) -> AgentResponse:
         state = request.state
 
-        # 1. 处理修改类意图（优先匹配，不受 state 限制）
-        if _PAT_TREND_7D.search(request.message):
-            return self._handle_change_trend_7d(request)
-        if _PAT_REMOVE_TREND.search(request.message):
-            return self._handle_change_remove_trend(request)
+        # 1. 处理修改类意图（只在改已有草稿时；首次生成里「不要趋势图」
+        #    是「别加趋势」的意思，不能被劫持成改稿）
+        if self._is_editing(request):
+            if _PAT_TREND_7D.search(request.message):
+                return self._handle_change_trend_7d(request)
+            if _PAT_REMOVE_TREND.search(request.message):
+                return self._handle_change_remove_trend(request)
 
         # 2. 按 state 分发
         if state == AgentState.ANALYZING:
@@ -84,13 +87,14 @@ class FakeReportAgent:
                 alternatives=["限定在当前项目", "限定在有权限的项目列表"],
             )
 
-        # 能力不支持（分钟级）
+        # 能力不支持（分钟级）。
+        # 数据源以路由层解析出来的为准：用户指定 eas_energy_detail 时，
+        # 分钟粒度是支持的，不能拿默认数据源的能力去阻断。
+        source_ref = self._resolved_source_ref(request)
         if _PAT_MINUTE.search(message) and (
             "能耗" in message or "耗电" in message
         ):
-            if not supports_grain(
-                CATALOG_MACHINE_ROOM_ENERGY["sourceRef"], "MINUTE"
-            ):
+            if not supports_grain(source_ref, "MINUTE"):
                 return self._blocked(
                     request,
                     code="CAPABILITY_NOT_SUPPORTED",
@@ -98,18 +102,14 @@ class FakeReportAgent:
                         f"{self._room_label(ctx.subjectId)} 能耗数据目前仅登记"
                         "小时和日粒度，无法提供分钟级历史。可改为小时趋势或日趋势。"
                     ),
-                    message_detail=(
-                        f"{CATALOG_MACHINE_ROOM_ENERGY['sourceRef']} 不支持分钟粒度"
-                    ),
+                    message_detail=f"{source_ref} 不支持分钟粒度",
                     alternatives=["改为小时趋势", "改为日趋势"],
                     extra_tool_requests=[
                         ToolRequest(
                             id="req_cat_1",
                             type="QUERY_CATALOG",
                             target="CatalogTool",
-                            arguments={
-                                "sourceRef": CATALOG_MACHINE_ROOM_ENERGY["sourceRef"]
-                            },
+                            arguments={"sourceRef": source_ref},
                         )
                     ],
                 )
@@ -129,15 +129,34 @@ class FakeReportAgent:
 
     # ---------- 正常生成 ----------
 
+    @staticmethod
+    def _resolved_inputs(request: AgentRequest) -> dict:
+        """路由层解析出来的结构化条件（用户指定 > 系统暂选）。"""
+        collected = getattr(request, "collectedInfo", None) or {}
+        resolved = collected.get("resolvedInputs")
+        return resolved if isinstance(resolved, dict) else {}
+
+    @classmethod
+    def _resolved_source_ref(cls, request: AgentRequest) -> str:
+        resolved = cls._resolved_inputs(request)
+        return str(resolved.get("sourceRef") or CATALOG_MACHINE_ROOM_ENERGY["sourceRef"])
+
     def _generate_full_draft(self, request: AgentRequest) -> AgentResponse:
         ctx = request.context
         room_label = self._room_label(ctx.subjectId)
-        report_name = f"{room_label}能耗日报"
+        resolved = self._resolved_inputs(request)
+        report_name = str(resolved.get("reportName") or f"{room_label}能耗日报")
+        room_id = str(resolved.get("subjectId") or ctx.subjectId)
+        include_trend = self._include_trend(resolved)
+
         policy = build_policy_draft(report_name)
+        # 路由层解析出来的条件原样交给组装层：数据源、粒度、时间窗、
+        # 指标、过滤、TopN、派生列、样式都不能在组装这一步被默认值覆盖。
         definition = build_definition_draft(
             report_name=report_name,
-            room_id=ctx.subjectId,
-            include_trend=True,
+            room_id=room_id,
+            include_trend=include_trend,
+            **plan_builder_kwargs(resolved),
         )
         session_id = ctx.designSessionId or _new_session_id()
 
@@ -176,6 +195,11 @@ class FakeReportAgent:
                 "request_modification",
             ],
         )
+
+    @staticmethod
+    def _include_trend(resolved: dict) -> bool:
+        """要不要趋势图：路由层解析出来的是「用户点名要哪些区块」，按它算。"""
+        return resolve_include_trend(resolved)
 
     # ---------- ChangeSet ----------
 
@@ -282,6 +306,24 @@ class FakeReportAgent:
         )
 
     # ---------- 工具 ----------
+
+    @staticmethod
+    def _is_editing(request: AgentRequest) -> bool:
+        """这句话是不是在改一份已经存在的草稿。
+
+        「不要趋势图」在改稿语境里是删区块，在首次生成语境里是
+        「别给我加趋势图」—— 两种含义必须分开，否则首次生成会被劫持成改稿。
+
+        判断依据是「有没有已有草稿」，不能看 state：路由层可能刚把 state
+        从 WAITING_USER_CONFIRM 改写成 ANALYZING。
+        """
+        if request.snapshots.reportDefinition is not None:
+            return True
+        ctx = request.context
+        return (
+            ctx.baseDefinitionRevision is not None
+            or bool(ctx.reportDefinitionId)
+        )
 
     @staticmethod
     def _room_label(room_id: str) -> str:
