@@ -55,6 +55,7 @@ from app.tools.registry import (
     get_runner,
     take_lookup_failure,
     to_agentscope_toolkit_async,
+    tools_for_query,
     tools_for_state,
 )
 from app.tools.submission import (
@@ -68,6 +69,7 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "report_generation.md"
 _EDIT_PROMPT_PATH = Path(__file__).parent / "prompts" / "template_edit.md"
+_QUERY_PROMPT_PATH = Path(__file__).parent / "prompts" / "query_answer.md"
 
 
 #: 句子里出现「样式/版式/标题/柱状图…」这类词时，才去纠正它的「已生效」说法。
@@ -132,6 +134,7 @@ class AgentScopeReportAgent:
         self._fallback = FakeReportAgent()
         self._system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
         self._edit_prompt = _EDIT_PROMPT_PATH.read_text(encoding="utf-8")
+        self._query_prompt = _QUERY_PROMPT_PATH.read_text(encoding="utf-8")
         self._model, self._init_err = self._init_model()
 
     # ---------- 初始化 ----------
@@ -171,17 +174,25 @@ class AgentScopeReportAgent:
 
         预算按当前节点给：编辑场景查证步数少，生成场景多给几步。
         工具也按当前节点收窄：模型看不到这个节点不该调的工具。
+
+        只读查询轮换一套工具：只注册事实工具和查询答案终结工具，
+        执行类工具结构上就调不到。
         """
         from agentscope.agent import Agent
 
-        toolkit = await to_agentscope_toolkit_async(tools_for_state(request.state))
+        query_mode = bool(getattr(request, "queryMode", False))
+        toolkit = await to_agentscope_toolkit_async(
+            tools_for_query() if query_mode else tools_for_state(request.state)
+        )
+        if query_mode:
+            system_prompt = self._query_prompt
+        elif request.state == AgentState.USER_EDITING_TEMPLATE:
+            system_prompt = self._edit_prompt
+        else:
+            system_prompt = self._system_prompt
         return Agent(
             name="ReportDraftAgent",
-            system_prompt=(
-                self._edit_prompt
-                if request.state == AgentState.USER_EDITING_TEMPLATE
-                else self._system_prompt
-            ),
+            system_prompt=system_prompt,
             model=self._model,
             toolkit=toolkit,
             react_config=self._build_react_config(request.state),
@@ -210,28 +221,40 @@ class AgentScopeReportAgent:
 
     # ---------- 入口 ----------
 
+    def _degraded_response(self, request: AgentRequest) -> AgentResponse:
+        """降级响应。
+
+        查询轮降级到 Fake 的查询路径（同一套事实工具、同一套事实口径）；
+        编辑态降级到「查证不可用」；其余降级到 FakeAgent。
+        """
+        if getattr(request, "queryMode", False):
+            return self._fallback.handle(request)
+        if request.state == AgentState.USER_EDITING_TEMPLATE:
+            return self._unavailable_edit_response(request)
+        return self._fallback.handle(request)
+
     def handle(self, request: AgentRequest) -> AgentResponse:
         """同步入口：兼容老调用方（会新建 loop，可能遇到连接池失效问题）。"""
         if self._model is None:
             logger.info("AgentScope 未就绪（%s），降级 FakeAgent", self._init_err)
-            return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
+            return self._degraded_response(request)
         try:
             plan = asyncio.run(self._run_agent(request))
         except Exception as exc:  # noqa: BLE001
             logger.exception("AgentScope 运行异常，降级 FakeAgent：%s", exc)
-            return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
+            return self._degraded_response(request)
         return self._dispatch(request, plan)
 
     async def ahandle(self, request: AgentRequest) -> AgentResponse:
         """async 入口：复用 FastAPI 的事件循环，避免 httpx 连接池跨 loop 失效。"""
         if self._model is None:
             logger.info("AgentScope 未就绪（%s），降级 FakeAgent", self._init_err)
-            return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
+            return self._degraded_response(request)
         try:
             plan = await self._run_agent(request)
         except Exception as exc:  # noqa: BLE001
             logger.exception("AgentScope 运行异常，降级 FakeAgent：%s", exc)
-            return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
+            return self._degraded_response(request)
         return self._dispatch(request, plan)
 
     def _dispatch(
@@ -244,15 +267,30 @@ class AgentScopeReportAgent:
         """
         if plan is None:
             logger.info("AgentScope 输出不合法，降级 FakeAgent")
+            if getattr(request, "queryMode", False):
+                return self._query_failure_response(request)
             return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
 
         submission = plan.get("submission")
-        if request.state == AgentState.USER_EDITING_TEMPLATE and (
+        query_mode = bool(getattr(request, "queryMode", False))
+        if query_mode:
+            # 只读查询轮只接受查询答案提交：编辑类终结工具在这里不合法。
+            if (
+                not isinstance(submission, dict)
+                or submission.get("tool") != "submit_query_answer"
+            ):
+                logger.warning("查询态拒绝非查询答案终结工具")
+                return self._query_failure_response(request)
+        elif request.state == AgentState.USER_EDITING_TEMPLATE and (
             not isinstance(submission, dict)
             or submission.get("tool") not in {"submit_edit_answer", "submit_edit_plan"}
         ):
             logger.warning("编辑态拒绝非编辑终结工具或旧式文本计划")
             return self._unavailable_edit_response(request)
+        elif isinstance(submission, dict) and submission.get("tool") == "submit_query_answer":
+            # 普通业务轮不接受只读答案提交：这个出口只在查询模式注册。
+            logger.warning("非查询轮拒绝只读答案提交")
+            return self._fallback.handle(request)
         if submission:
             response = self._dispatch_submission(request, submission)
             if response is not None:
@@ -262,12 +300,31 @@ class AgentScopeReportAgent:
         if mode == "FALLBACK":
             return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
         if mode == "GENERATE":
+            if query_mode:
+                # 查询轮不接受生成结论：结构上也没有组装工具。
+                return self._query_failure_response(request)
             return self._assemble_generate_response(request, plan)
         if mode == "CHITCHAT":
             return self._assemble_chitchat_response(request, plan)
 
         logger.warning("AgentScope 返回未知 mode=%s，降级", mode)
         return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
+
+    @staticmethod
+    def _query_failure_response(request: AgentRequest) -> AgentResponse:
+        """查询失败：如实说失败，不降级成要求补充生成条件的引导。"""
+        message = (
+            "这次查询没有完成，暂时无法确认当前对话的情况。"
+            "草稿和待确认操作都没有变化，可以稍后再问一次。"
+        )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=request.state,
+            reply=message,
+            designSessionId=request.context.designSessionId,
+            error=AgentError(code="QUERY_UNAVAILABLE", message=message),
+            debug={"queryMode": True, "queryOutcome": "technical_failure"},
+        )
 
     @staticmethod
     def _unavailable_edit_response(request: AgentRequest) -> AgentResponse:
@@ -307,6 +364,8 @@ class AgentScopeReportAgent:
             AgentState.USER_EDITING_TEMPLATE, AgentState.WAITING_USER_CONFIRM,
         }:
             return self._assemble_edit_answer(request, payload)
+        if tool == "submit_query_answer" and getattr(request, "queryMode", False):
+            return self._assemble_query_answer(request, payload)
         if tool == "submit_edit_plan":
             return self._assemble_edit_response(request, payload)
         if tool == "submit_fix_plan":
@@ -338,6 +397,9 @@ class AgentScopeReportAgent:
 
             # 第一次调用：由 AgentScope 跑完整 ReAct 循环（Reason → Tool → Observation → ...）
             reply_msg = await agent.reply(user_msg)
+            if getattr(request, "queryMode", False) and take_lookup_failure():
+                logger.warning("查询态事实工具查证失败，不接受本轮答案")
+                return None
             if request.state in {AgentState.USER_EDITING_TEMPLATE, AgentState.WAITING_USER_CONFIRM} and take_lookup_failure():
                 logger.warning("编辑态事实工具查证失败，不接受本轮候选结论")
                 return None
@@ -368,6 +430,9 @@ class AgentScopeReportAgent:
                 ],
             )
             reply_msg2 = await agent.reply(repair_msg)
+            if getattr(request, "queryMode", False) and take_lookup_failure():
+                logger.warning("查询态修复轮事实工具查证失败")
+                return None
             if request.state in {AgentState.USER_EDITING_TEMPLATE, AgentState.WAITING_USER_CONFIRM} and take_lookup_failure():
                 logger.warning("编辑态修复轮事实工具查证失败")
                 return None
@@ -838,6 +903,38 @@ class AgentScopeReportAgent:
                 "verifiedFacts": answer.facts,
                 "limitations": answer.limitations,
                 "suggestions": answer.suggestions,
+            },
+        )
+
+    def _assemble_query_answer(
+        self, request: AgentRequest, payload: dict[str, Any]
+    ) -> AgentResponse:
+        """只读查询的答案：状态不动，不带任何执行动作。
+
+        状态与业务对象的归一化由 ``AgentService._normalize_query_answer`` 兜底，
+        这里只保证「模型交上来的东西本身是合法答案」。
+        """
+        from app.tools.schemas import QueryAnswerPayload
+
+        try:
+            answer = QueryAnswerPayload.model_validate(payload)
+        except Exception:
+            return self._query_failure_response(request)
+        reply = answer.reply
+        if answer.needsClarification and answer.clarificationQuestion:
+            reply = f"{reply}\n{answer.clarificationQuestion}"
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=request.state,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            debug={
+                "queryMode": True,
+                "queryOutcome": "clarification" if answer.needsClarification else "answer",
+                "verifiedFacts": answer.facts,
+                "limitations": answer.limitations,
+                "suggestions": answer.suggestions,
+                "needsClarification": answer.needsClarification,
             },
         )
 

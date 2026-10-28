@@ -18,6 +18,17 @@ AGENT_PROTOCOL_VERSION = "1.0"
 # 用户从未输入过它，落库时要跳过（见 session_service.record_turn）。
 ADVANCE_MESSAGE = "__advance__"
 
+# 本轮的性质。
+#
+#   action        正常业务轮：可能推进状态机（默认）
+#   query_answer  只读查询回答轮：只回答，不推进业务
+#
+# 前端靠 turnKind 判断「这一轮不要自动推进」：查询回答可能保留着
+# SAVE_DEFINITION_DRAFT / VALIDATING 这类会自动 __advance__ 的状态，
+# 不能只看 state 就再推一次。
+TURN_KIND_ACTION = "action"
+TURN_KIND_QUERY_ANSWER = "query_answer"
+
 
 class AgentState(str, Enum):
     ANALYZING = "ANALYZING"
@@ -167,6 +178,10 @@ class AgentRequest(BaseModel):
     # 所以 01_接口协议.md 的 AgentRequest 字段表不需要加它。
     _collected_info: dict[str, Any] = PrivateAttr(default_factory=dict)
 
+    # 本轮是不是只读查询轮。同样是服务端内部字段：只有 AgentService
+    # 在路由判定后写入，业务 Agent 据此换工具白名单和系统提示词。
+    _query_mode: bool = PrivateAttr(default=False)
+
     @property
     def collectedInfo(self) -> dict[str, Any]:
         return self._collected_info
@@ -174,6 +189,15 @@ class AgentRequest(BaseModel):
     @collectedInfo.setter
     def collectedInfo(self, value: dict[str, Any] | None) -> None:
         self._collected_info = dict(value or {})
+
+    @property
+    def queryMode(self) -> bool:
+        """本轮是不是只读查询轮（只查事实、只提交答案，不推进业务）。"""
+        return self._query_mode
+
+    @queryMode.setter
+    def queryMode(self, value: bool) -> None:
+        self._query_mode = bool(value)
 
 
 class QuestionOption(BaseModel):
@@ -233,3 +257,10 @@ class AgentResponse(BaseModel):
     uiActions: list[str] = Field(default_factory=list)
     error: AgentError | None = None
     debug: dict[str, Any] = Field(default_factory=dict)
+    # 本轮性质。见 TURN_KIND_ACTION / TURN_KIND_QUERY_ANSWER。
+    turnKind: str = TURN_KIND_ACTION
+
+    @property
+    def isQueryAnswer(self) -> bool:
+        """本轮是不是只读查询回答（不推进业务）。"""
+        return self.turnKind == TURN_KIND_QUERY_ANSWER

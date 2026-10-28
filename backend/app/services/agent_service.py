@@ -35,15 +35,23 @@ from app.schemas.agent import (
     AgentState,
     QuestionOption,
     ToolRequest,
+    TURN_KIND_QUERY_ANSWER,
 )
 from app.schemas.edit_plan import EditIntent, EditPlan
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.session import PendingEditPlan
-from app.services.context_engine import RouteDecision, RoutingAction, context_engine
+from app.services import routing_rules
+from app.services.context_engine import (
+    RouteDecision,
+    RoutingAction,
+    UserIntent,
+    context_engine,
+)
 from app.services.definition_save_service import definition_save_service
 from app.services.preview_service import preview_service
 from app.services.request_timeline import log_timeline_step
 from app.services.session_context import bind_session_key, current_session_key
+from app.services.session_fact_service import session_fact_service
 from app.services.session_service import session_service
 from app.services.edit_reference_resolver import resolve_visible_reference
 from app.services.edit_time_resolver import resolve_time_expression
@@ -152,6 +160,178 @@ class AgentService:
             )
         return response
 
+    # ---------- 只读查询轮（工单 #13 / #14） ----------
+
+    @staticmethod
+    def _pending_choice_required(
+        request: AgentRequest,
+        state: AgentState,
+        question: AgentQuestion,
+    ) -> AgentResponse:
+        """待确认期间收到非只读提问的输入：仍然必须从原菜单里选。
+
+        菜单原样带回，草稿和待确认计划都不动。
+        说不清是提问还是操作时，给一句针对性的澄清，而不是让用户重述。
+        """
+        if routing_rules.has_operation_command(request.message):
+            reply = (
+                "请先从下拉框选择一项再继续操作。"
+                "如果只是想问当前对话的情况（草稿、进度、能力），直接问就行。"
+            )
+        else:
+            reply = (
+                "这句我没太明白：你是想修改这份报表（说清楚改哪一处），"
+                "还是想先问当前对话的情况？"
+                "原来的选择我给你留着，也可以直接从下拉框选。"
+            )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=state,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            questions=[question],
+            uiActions=["selection_required"],
+        )
+
+    def _is_readonly_query_turn(
+        self,
+        request: AgentRequest,
+        route: RouteDecision,
+        pending_guard: tuple[AgentState, AgentQuestion] | None,
+    ) -> bool:
+        """本轮是不是只读查询（查事实、只回答，不推进业务）。"""
+        if request.message == ADVANCE_MESSAGE:
+            # 内部控制消息，永远不是用户提问。
+            return False
+        if route.userIntent is UserIntent.ASK_QUESTION:
+            return True
+        if pending_guard is not None:
+            # 待确认入口：模型没能给出可判定意图时，只有**明确的只读提问**
+            # 才进查询链路；其它输入（操作指令、填选项、含糊话）仍然被拒，
+            # 不能绕过菜单确认约束。
+            return route.userIntent is UserIntent.UNKNOWN and (
+                routing_rules.is_readonly_question(request.message)
+            )
+        if (
+            request.state is AgentState.USER_EDITING_TEMPLATE
+            and request.snapshots.reportDefinition is not None
+        ):
+            # 编辑态跳过了通用路由（避免把模糊编辑误判成闲聊），
+            # 这里用规则层的只读提问判定兜底。
+            return routing_rules.is_readonly_question(request.message)
+        return False
+
+    async def _handle_readonly_query(
+        self,
+        request: AgentRequest,
+        route: RouteDecision,
+        pending_guard: tuple[AgentState, AgentQuestion] | None,
+    ) -> AgentResponse:
+        """只读查询轮：查事实、回答，本轮不推进业务。"""
+        request.queryMode = True
+        handle = getattr(self._agent, "ahandle", None)
+        try:
+            if handle is not None:
+                response = await handle(request)
+            else:
+                response = self._agent.handle(request)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[agent.chat] step=readonly_query_failed conversationId=%s",
+                request.conversationId,
+            )
+            response = self._query_failure_response(request)
+        response.debug = {
+            **(response.debug or {}),
+            "contextEngineStage": route.engineStage or "unknown",
+            "contextEngineIntent": route.userIntent.value,
+            "contextEngineReason": route.reason,
+        }
+        return self._remember_choice(
+            self._normalize_query_answer(request, response, pending_guard)
+        )
+
+    def _normalize_query_answer(
+        self,
+        request: AgentRequest,
+        response: AgentResponse,
+        pending_guard: tuple[AgentState, AgentQuestion] | None,
+    ) -> AgentResponse:
+        """把查询轮收敛成「不推进业务」的契约。
+
+        这里做的是**服务端强制**，不依赖模型自觉，也不只靠 Prompt：
+            - 状态回到本轮进入时的状态；
+            - 业务对象用服务端可信记录，不回写请求快照；
+            - 原待确认菜单保留，不出现无关生成选项；
+            - 不发起任何执行类工具请求。
+        """
+        response.state = request.state
+        response.turnKind = TURN_KIND_QUERY_ANSWER
+        response.toolRequests = []
+        response.uiActions = ["query_answer"]
+
+        facts = session_fact_service.load(
+            session_id=current_session_key() or request.conversationId,
+            project_id=request.context.projectId,
+            subject_ref=request.context.subjectRef,
+            subject_id=request.context.subjectId,
+            request_has_draft=request.snapshots.reportDefinition is not None,
+        )
+        response.domainObjects = AgentResponseDomainObjects(
+            reportDefinitionDraft=(
+                facts.definition or request.snapshots.reportDefinition
+            ),
+            reportPolicyDraft=facts.policy or request.snapshots.reportPolicy,
+        )
+        response.questions = self._preserved_menu(request, pending_guard)
+        response.debug = {
+            **(response.debug or {}),
+            "queryMode": True,
+            "factStatus": facts.status.value,
+        }
+        return response
+
+    def _preserved_menu(
+        self,
+        request: AgentRequest,
+        pending_guard: tuple[AgentState, AgentQuestion] | None,
+    ) -> list[AgentQuestion]:
+        """查询回答之后仍然要能用的原业务菜单。"""
+        if pending_guard is not None:
+            return [pending_guard[1]]
+        raw = session_service.load_pending_choice(
+            current_session_key() or request.conversationId
+        )
+        if isinstance(raw, dict):
+            try:
+                AgentState(raw["state"])
+                return [AgentQuestion(**raw["question"])]
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "[agent.chat] step=pending_choice_invalid conversationId=%s raw=%s",
+                    request.conversationId,
+                    raw,
+                )
+        if request.state is AgentState.WAITING_USER_CONFIRM:
+            return self._editing_confirm_questions()
+        return []
+
+    @staticmethod
+    def _query_failure_response(request: AgentRequest) -> AgentResponse:
+        """查询失败：如实说失败，不降级成「请补充生成条件」的引导。"""
+        message = (
+            "这次查询没有完成，暂时无法确认当前对话的情况。"
+            "草稿和待确认操作都没有变化，可以稍后再问一次。"
+        )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=request.state,
+            reply=message,
+            designSessionId=request.context.designSessionId,
+            error=AgentError(code="QUERY_UNAVAILABLE", message=message),
+            debug={"queryMode": True, "queryOutcome": "technical_failure"},
+        )
+
     async def chat(
         self, request: AgentRequest, emit: EmitEvent | None = None
     ) -> AgentResponse:
@@ -211,70 +391,80 @@ class AgentService:
         if session_service.load_pending_plan(session_key):
             # 待决计划比旧的其他选择锁更权威；确认不能被迟到的题目覆盖。
             pending = (AgentState.USER_EDITING_TEMPLATE, self._pending_edit_question())
+
+        # 待确认入口（工单 #14）：
+        #
+        #   - 选项值 -> 走原来的确认流程，一行不改；
+        #   - 其它自由输入 -> 先不拒绝，交给路由判定这是不是**只读提问**。
+        #     是只读提问就放行进查询链路，问完原菜单和待确认计划照旧；
+        #     不是只读提问，仍然按原来的「必须从菜单里选」拒绝。
+        #
+        # pending_guard 非空时，本轮**不允许**触发任何执行动作
+        # （接受修改 / 确认报表 / 保存 / 校验 / 预览 / 生成草稿）。
+        pending_guard: tuple[AgentState, AgentQuestion] | None = None
         if pending:
             pending_state, question = pending
-            if request.state != pending_state or request.message not in {
-                option.value for option in question.options
-            } | ({"重新开始"} if question.allowRestart else set()):
-                return AgentResponse(
-                    conversationId=request.conversationId,
-                    state=pending_state,
-                    reply="请先从下拉框选择一项，不能直接输入或跳转。",
-                    designSessionId=request.context.designSessionId,
-                    questions=[question],
-                    uiActions=["selection_required"],
-                )
-            session_service.save_pending_choice(session_key, None)
-            if question.id == EDIT_CHOICE_ID:
-                return self._handle_pending_edit_choice(request, session_key)
-            if question.id.startswith("template_preview_"):
-                result = template_preview_flow.answer(request, question.id)
-                await _emit(emit, "stage", {
-                    "stage": "template_preview_choice",
-                    "choice": question.id,
-                    "responseState": result.state.value,
-                })
-                return self._remember_choice(result)
-            if question.id == "template_edit_confirm":
-                if request.message == CONFIRM_BUTTON_VALUE:
-                    return self._save_placeholder(request, RouteDecision())
-                if request.message == RESTART_BUTTON_VALUE:
-                    return AgentResponse(
-                        conversationId=request.conversationId,
-                        state=AgentState.ANALYZING,
-                        reply="好的，我们重新开始。请描述你想生成的新报表。",
-                        uiActions=["restart_from_template_editing"],
-                    )
-                return self._editing_prompt_response(
-                    request,
-                    reply="好的，请描述你想怎样修改当前草稿。",
-                )
-            if question.id == "ready_action":
-                if request.message == "继续修改":
-                    if request.snapshots.reportDefinition is None:
-                        return self._remember_choice(AgentResponse(
+            if request.state != pending_state:
+                return self._pending_choice_required(request, pending_state, question)
+            allowed_values = {option.value for option in question.options} | (
+                {"重新开始"} if question.allowRestart else set()
+            )
+            if request.message not in allowed_values:
+                pending_guard = (pending_state, question)
+            else:
+                session_service.save_pending_choice(session_key, None)
+                if question.id == EDIT_CHOICE_ID:
+                    return self._handle_pending_edit_choice(request, session_key)
+                if question.id.startswith("template_preview_"):
+                    result = template_preview_flow.answer(request, question.id)
+                    await _emit(emit, "stage", {
+                        "stage": "template_preview_choice",
+                        "choice": question.id,
+                        "responseState": result.state.value,
+                    })
+                    return self._remember_choice(result)
+                if question.id == "template_edit_confirm":
+                    if request.message == CONFIRM_BUTTON_VALUE:
+                        return self._save_placeholder(request, RouteDecision())
+                    if request.message == RESTART_BUTTON_VALUE:
+                        return AgentResponse(
                             conversationId=request.conversationId,
-                            state=AgentState.READY,
-                            reply="当前报表草稿未随请求带回，无法继续修改。请恢复草稿后重试。",
-                            designSessionId=request.context.designSessionId,
-                            questions=self._ready_questions(),
-                            uiActions=["show_ready_actions"],
-                        ))
+                            state=AgentState.ANALYZING,
+                            reply="好的，我们重新开始。请描述你想生成的新报表。",
+                            uiActions=["restart_from_template_editing"],
+                        )
                     return self._editing_prompt_response(
                         request,
-                        reply="好的，请描述你想怎样修改当前报表。",
+                        reply="好的，请描述你想怎样修改当前草稿。",
                     )
-                action = "发布" if request.message == "发布" else "导出 PDF"
-                return self._remember_choice(AgentResponse(
-                    conversationId=request.conversationId,
-                    state=AgentState.READY,
-                    reply=f"{action}流程尚未接入（Mock），请继续从下拉框选择。",
-                    designSessionId=request.context.designSessionId,
-                    questions=self._ready_questions(),
-                    uiActions=["show_ready_actions"],
-                ))
+                if question.id == "ready_action":
+                    if request.message == "继续修改":
+                        if request.snapshots.reportDefinition is None:
+                            return self._remember_choice(AgentResponse(
+                                conversationId=request.conversationId,
+                                state=AgentState.READY,
+                                reply="当前报表草稿未随请求带回，无法继续修改。请恢复草稿后重试。",
+                                designSessionId=request.context.designSessionId,
+                                questions=self._ready_questions(),
+                                uiActions=["show_ready_actions"],
+                            ))
+                        return self._editing_prompt_response(
+                            request,
+                            reply="好的，请描述你想怎样修改当前报表。",
+                        )
+                    action = "发布" if request.message == "发布" else "导出 PDF"
+                    return self._remember_choice(AgentResponse(
+                        conversationId=request.conversationId,
+                        state=AgentState.READY,
+                        reply=f"{action}流程尚未接入（Mock），请继续从下拉框选择。",
+                        designSessionId=request.context.designSessionId,
+                        questions=self._ready_questions(),
+                        uiActions=["show_ready_actions"],
+                    ))
 
-        if request.message.strip() in {EDIT_ACCEPT, EDIT_ADJUST, EDIT_CANCEL}:
+        if pending_guard is None and request.message.strip() in {
+            EDIT_ACCEPT, EDIT_ADJUST, EDIT_CANCEL,
+        }:
             return AgentResponse(
                 conversationId=request.conversationId,
                 state=AgentState.USER_EDITING_TEMPLATE,
@@ -286,7 +476,7 @@ class AgentService:
                 ),
             )
 
-        if request.state == AgentState.READY:
+        if pending_guard is None and request.state == AgentState.READY:
             # 单进程重启后待选项可能丢失；仍先恢复必选题，不允许直接路由自由文本。
             return self._remember_choice(AgentResponse(
                 conversationId=request.conversationId,
@@ -297,7 +487,9 @@ class AgentService:
                 uiActions=["show_ready_actions"],
             ))
 
-        if request.message.strip() in {"继续工作", "继续上一条", "继续刚才"}:
+        if pending_guard is None and request.message.strip() in {
+            "继续工作", "继续上一条", "继续刚才",
+        }:
             logger.info(
                 "[agent.chat] step=resume_unavailable conversationId=%s state=%s",
                 request.conversationId,
@@ -310,7 +502,7 @@ class AgentService:
                 uiActions=["resume_unavailable"],
             )
 
-        if template_preview_flow.is_request(request):
+        if pending_guard is None and template_preview_flow.is_request(request):
             result = template_preview_flow.start(request)
             await _emit(emit, "stage", {
                 "stage": "template_preview_start",
@@ -321,7 +513,7 @@ class AgentService:
 
         # 节点 6-11 的自动推进：前端收到上一个状态后再发一次 __advance__
         # 跳过 ContextEngine，直接按 state 走对应 handler。
-        if request.message == ADVANCE_MESSAGE:
+        if pending_guard is None and request.message == ADVANCE_MESSAGE:
             auto_started = perf_counter()
             start_stage_by_state = {
                 AgentState.SAVE_DEFINITION_DRAFT: "auto_advance_start",
@@ -370,7 +562,10 @@ class AgentService:
                 )
                 return self._remember_choice(auto)
 
-        template_edit = await self._try_handle_template_edit(request)
+        # 待确认期间不接受自由输入触发的编辑动作：编辑只能从原菜单走。
+        template_edit = None
+        if pending_guard is None:
+            template_edit = await self._try_handle_template_edit(request)
         if template_edit is not None:
             await _emit(
                 emit,
@@ -451,6 +646,16 @@ class AgentService:
         )
 
         state_before_apply = request.state.value
+        # 只读查询轮：查事实、回答，不推进业务。
+        # 必须在 _apply_context_route 之前判定 —— 那里的 JUMP_STATE 会真的
+        # 保存草稿，等于绕过待确认菜单。
+        if self._is_readonly_query_turn(request, route, pending_guard):
+            return await self._handle_readonly_query(request, route, pending_guard)
+        if pending_guard is not None:
+            # 不是只读提问：维持原来的约束，必须从菜单里选。
+            return self._pending_choice_required(
+                request, pending_guard[0], pending_guard[1]
+            )
         intercepted = self._apply_context_route(request, route)
         await _emit(
             emit,
