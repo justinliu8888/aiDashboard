@@ -620,6 +620,22 @@ class AgentService:
         design_acknowledgement = is_pure_confirmation(
             request.message
         ) or is_vague_approval(request.message)
+        # 这些设计轮**不跑**旧路由：
+        #   - 新建轮：路由结果没有人消费；
+        #   - 纯确认 / 模糊认可：都不是提问，不走查询链路；
+        #   - 没有疑问语气：这一轮是要求，不是提问，路由判定用不上。
+        #
+        # 旧路由是一次真实模型往返（实测 60~150 秒）。在这些轮次里，
+        # 用户要先等一个用不上的结果才看到自己的方案。
+        #
+        # 有疑问语气的轮次仍然跑旧路由：规则层只覆盖「指向报表业务对象」
+        # 的提问，「你能做什么？」这类元问题要靠路由层再判一次，
+        # 免得一句提问平白多出一版方案。
+        design_skips_router = design_turn and (
+            (design_state is None and not readonly_rule)
+            or design_acknowledgement
+            or not routing_rules.looks_like_question(request.message)
+        )
 
         if (
             pending_guard is None
@@ -727,12 +743,7 @@ class AgentService:
                 reason="规则无法确定编辑计划，交给受约束 ReAct 查证",
                 collectedInfo=dict(request.collectedInfo),
             )
-        elif design_turn and (
-            # 新建轮：结果没有人消费。
-            (design_state is None and not readonly_rule)
-            # 纯确认 / 模糊认可：都不是提问，不走查询链路。
-            or design_acknowledgement
-        ):
+        elif design_skips_router:
             # 这些设计轮**不跑**旧路由。
             #
             # 旧路由是一次真实模型往返，实测 60~150 秒；在这些轮次里它的
@@ -816,6 +827,8 @@ class AgentService:
                 and design_state is not None
                 # 纯确认 / 模糊认可不是提问，别再问一次路由层。
                 and not design_acknowledgement
+                # 这一轮没跑旧路由（没有疑问语气），路由判定用不上。
+                and not design_skips_router
             ):
                 is_question = self._is_readonly_query_turn(
                     request, route, pending_guard

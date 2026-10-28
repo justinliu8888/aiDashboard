@@ -923,6 +923,52 @@ def test_readonly_question_still_runs_the_old_router(client, monkeypatch):
     assert payload["turnKind"] == "query_answer"
 
 
+def test_modification_turn_does_not_run_the_old_router(client, monkeypatch):
+    """修改轮没有疑问语气，不必跑旧路由 —— 那一轮本来要等 60~150 秒。"""
+    calls: list[str] = []
+
+    async def _record(request, emit=None):  # type: ignore[no-untyped-def]
+        calls.append(getattr(request, "message", ""))
+        raise AssertionError("修改轮不该跑旧路由")
+
+    monkeypatch.setattr(context_engine, "route", _record)
+    install_model(monkeypatch, RecordingModel(_candidate(), _candidate()))
+
+    _post(client, "生成 PUE 报表", message_id="msg_1")
+    payload = _post(client, "再加一个趋势板块", message_id="msg_2").json()
+
+    assert calls == []
+    assert payload["designPhase"] == "PLAN_WAITING_CONFIRM"
+    assert payload["domainObjects"]["reportPlan"]["revision"] == 2
+
+
+def test_unrecognized_capability_question_still_runs_the_old_router(
+    client, monkeypatch
+):
+    """规则层没认出来的元问题，仍要请路由层判一次。
+
+    「你能做什么？」不指向报表业务对象，规则层认不出来；
+    不问路由层就会把它当成一次修改，平白多出一版方案。
+    """
+    calls: list[str] = []
+
+    async def _record(request, emit=None):  # type: ignore[no-untyped-def]
+        calls.append(getattr(request, "message", ""))
+        from app.services.context_engine import RouteDecision, UserIntent
+
+        return RouteDecision(userIntent=UserIntent.ASK_QUESTION, reason="stub")
+
+    monkeypatch.setattr(context_engine, "route", _record)
+    install_model(monkeypatch, RecordingModel(_candidate(), _candidate()))
+
+    _post(client, "生成 PUE 报表", message_id="msg_1")
+    payload = _post(client, "你能做什么？", message_id="msg_2").json()
+
+    assert calls == ["你能做什么？"]
+    assert payload["turnKind"] == "query_answer"
+    assert payload["domainObjects"]["reportPlan"]["revision"] == 1
+
+
 def test_confirmation_turn_does_not_run_the_old_router(client, monkeypatch):
     """纯确认轮不跑旧路由 —— 点一下确认不该白等 60~150 秒。
 

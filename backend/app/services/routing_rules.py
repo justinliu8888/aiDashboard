@@ -890,6 +890,30 @@ _OPERATION_VERBS: tuple[str, ...] = (
 )
 
 
+def looks_like_question(message: str) -> bool:
+    """这句话有没有**疑问语气**。
+
+    与 :func:`is_readonly_question` 的区别：那个还要求疑问**指向**报表业务
+    对象，这个只看语气。用来回答「这句话有没有可能是提问」——
+
+        比如设计流程里规则层没认出来（没指向业务对象的元问题）时，
+        要不要再请路由层判一次。
+
+    判定要求：
+
+        1. 有疑问标记；
+        2. 没有明确的改动动词（带问号的指令仍然是指令）。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if is_clear_generation_request(text):
+        return False
+    if has_operation_command(text):
+        return False
+    return any(marker in text for marker in _QUESTION_MARKERS)
+
+
 def has_operation_command(message: str) -> bool:
     """这句话里有没有明确的下指令动词。
 
