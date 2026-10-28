@@ -6,6 +6,14 @@
 
 const API_BASE = window.AI_REPORT_API_BASE || window.location.origin;
 
+// 只读问答的前端判断规则（纯函数模块，无 DOM 依赖）。
+// 本文件和 workbench_query.js 必须成对加载：缺了它就没法判断「本轮是不是只读问答」，
+// 而这条判断决定要不要推进业务——宁可明确报错，也不要在缺规则的情况下照常跑。
+const WorkbenchQuery = window.WorkbenchQuery;
+if (!WorkbenchQuery) {
+  throw new Error("workbench_query.js 未加载：无法判断只读问答，工作台拒绝以不确定的规则运行。");
+}
+
 // -------- 会话状态 --------
 // sessionId  由后端生成，一条对话从建到删永不改变（数据库主键）
 // conversationId 前端生成，一次请求线程；停止生成时会换新
@@ -109,12 +117,11 @@ let requestEpoch = 0;
 let lockedChoice = null;
 const advanceTimers = new Set();
 
-// 最近一次画出来的「确认下拉」问题对象。
-// 回放历史会话时后端可能没带 pending_choice（下拉框会被 disable 成死的），
-// 用它兜底把锁补上，历史恢复后仍然能选、能继续推进。
-let lastConfirmQuestion = null;
 // 会话恢复的竞态令牌：恢复途中用户点了「新建对话」就让这次恢复作废。
 let sessionRestoreToken = 0;
+// 历史回放期间是否已经画过业务菜单。
+// 查询轮也会把原待确认菜单带回来，已经画过就别再画一张重复的。
+let businessMenuReplayed = false;
 
 // 对话区贴底跟随：用户上滑后暂停自动滚动，回到底部后恢复
 const CHAT_BOTTOM_THRESHOLD = 48;
@@ -132,14 +139,18 @@ function isBusy() {
 function syncInputControls() {
   const busy = isBusy();
   const input = $("chat-input");
-  input.disabled = busy || !!lockedChoice;
+  // 待确认菜单存在时**不锁输入**：只读提问要能发出去（工单 02 / 规格 #12）。
+  // 旧版本在这里把输入整个锁死，用户在待确认期间问一句都问不了。
+  // 执行侧的约束由后端负责——自由输入不能绕过接受修改 / 确认报表。
+  input.disabled = busy;
   input.placeholder = lockedChoice
-    ? "请从上方下拉框选择，不能自由输入"
+    ? "可以先问只读问题，或从上方下拉框选择"
     : "描述报表需求，或输入修改要求…";
-  $("btn-send").disabled = busy || !!lockedChoice;
-  $("btn-send").classList.toggle("opacity-50", busy || !!lockedChoice);
+  $("btn-send").disabled = busy;
+  $("btn-send").classList.toggle("opacity-50", busy);
   $("btn-stop").classList.toggle("hidden", !busy);
   document.querySelectorAll("[data-quick], #btn-regenerate").forEach((button) => {
+    // 快捷生成 / 重新生成是**操作**，不是提问：待确认菜单没选完之前仍然不给点。
     button.disabled = busy || !!lockedChoice;
   });
   const selects = document.querySelectorAll(".question-select");
@@ -607,6 +618,7 @@ function finishDebugTrace(card, status) {
 
 // 草稿确认阶段只接受后端给出的单选值；选“修改”后才开放编辑输入。
 // lock=false 用于回放历史消息：渲染出选项卡，但不抢占当前输入锁
+// 返回值：实际画出来的业务菜单（没有菜单时返回 null），供历史回放判断菜单是否仍然有效。
 function appendConfirmActions(question, { lock = true } = {}) {
   if (!question?.selectionOnly || !question.options?.length) {
     // 确认项缺失：只提示，不去抢输入锁。
@@ -615,7 +627,7 @@ function appendConfirmActions(question, { lock = true } = {}) {
     if (lock) {
       appendAiText("确认选项未就绪，请新建对话后重新生成草稿。");
     }
-    return;
+    return null;
   }
   const wrap = aiBubble(`
     <div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3">
@@ -626,14 +638,14 @@ function appendConfirmActions(question, { lock = true } = {}) {
       </select>
     </div>
   `);
-  // 记下这个下拉：回放历史会话时后端可能没存 pending_choice，靠它把锁补回来。
-  lastConfirmQuestion = question;
   if (lock) setChoiceLock(question);
+  else businessMenuReplayed = true;
   wrap.querySelector(".question-select").addEventListener("change", (event) => {
     if (lockedChoice?.id === question?.id && event.target.value) {
       sendMessage(event.target.value, { fromChoice: true });
     }
   });
+  return question;
 }
 
 // -------- 确认问题归一化 --------
@@ -769,6 +781,60 @@ function appendAiQuestions(questions, { lock = true } = {}) {
       if (lockedChoice?.id === required?.id) sendMessage("重新开始", { fromChoice: true });
     });
   });
+}
+
+// -------- 只读问答的展示 --------
+// 只读回答与必须选择的业务菜单分开展示：
+//   - 回答不套「需要你补充信息」的壳，也不带无关的生成选项；
+//   - 只读澄清单独成卡，不占用业务菜单的选择锁，原待确认操作保持可用；
+//   - 两张卡都不改草稿、不改 revision、不动右侧预览。
+function appendAiReadOnlyAnswer(text) {
+  aiBubble(
+    `<div data-readonly-answer="1" class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">${esc(text)}</div>`
+  );
+}
+
+function appendAiReadOnlyClarification(text) {
+  const wrap = aiBubble(`
+    <div data-readonly-clarification="1" class="rounded-xl border border-slate-200 bg-slate-50/70 overflow-hidden">
+      <div class="px-3.5 py-2.5 bg-slate-100/70 border-b border-slate-200 flex items-center gap-2">
+        <iconify-icon class="text-slate-500" icon="mdi:help-circle-outline"></iconify-icon>
+        <span class="text-sm font-semibold text-slate-700">先确认一下你要问什么</span>
+      </div>
+      <div class="p-3 space-y-2">
+        <div class="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">${esc(text)}</div>
+      </div>
+    </div>
+  `);
+  // 只读澄清不带选项：后端契约里澄清问题是一句自由文本（拼在 reply 里），
+  // 而 questions 装的是**原业务菜单**——绝不能把它当成澄清选项再画一遍。
+  return wrap;
+}
+
+/**
+ * 渲染一轮只读问答。
+ * @param kind "ANSWER" | "CLARIFICATION"
+ */
+function renderReadOnlyAnswer(data, kind) {
+  const reply = data.reply || "";
+  if (kind === WorkbenchQuery.READ_ONLY_CLARIFICATION) {
+    appendAiReadOnlyClarification(reply || "我想先确认一下你要问什么。");
+    return;
+  }
+  appendAiReadOnlyAnswer(reply || "这次没有查到可以确认的内容。");
+}
+
+// 查询轮会把原待确认菜单原样带回（后端共用契约 ADR 0002）。
+// 页面上已经有菜单时不重复画一张；确实没有菜单时才补画，
+// 保证「答案与菜单分开展示、且原操作始终可用」。
+function resolveQueryPreservedMenu(data) {
+  const questions = (data?.questions || []).filter(Boolean);
+  if (!questions.length) return null;
+  const picked =
+    questions.find((question) => DEFINITION_DRAFT_CONFIRM_IDS.includes(question.id)) ||
+    questions.find((question) => question.selectionOnly && question.options?.length) ||
+    questions.find((question) => question.options?.length);
+  return picked ? normalizeConfirmQuestion(picked) : null;
 }
 
 function appendAiBlocks(blocks) {
@@ -1114,6 +1180,7 @@ function isRepeatedPlan(plan) {
 
 // 渲染「待确认的修改」：具体摘要 + 接受 / 继续调整 / 取消。
 // 这张卡只描述计划，不动草稿；真正写草稿由后端收到「接受修改」后做。
+// 返回值：这份计划对应的业务菜单（过期计划没有可选菜单，返回 null）。
 function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
   if (!plan) return null;
 
@@ -1171,7 +1238,7 @@ function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
     );
     // 过期计划不再提供可选项，同时把之前那轮的输入锁放掉
     if (lock) clearChoiceLock();
-    return wrap;
+    return null;
   }
 
   // 选项值固定用契约里的三个中文词（发回后端的消息正文就是它），
@@ -1206,8 +1273,10 @@ function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
     }
   });
 
-  if (lock) setChoiceLock({ id: questionId, selectionOnly: true, options });
-  return wrap;
+  const menuQuestion = { id: questionId, selectionOnly: true, options };
+  if (lock) setChoiceLock(menuQuestion);
+  else businessMenuReplayed = true;
+  return menuQuestion;
 }
 
 // -------- 请求 --------
@@ -1263,10 +1332,16 @@ async function postAgentStream(body, debugCard, signal) {
 
 async function sendMessage(text, { fromChoice = false } = {}) {
   if (!text || activeRequest || advanceTimers.size) return;
-  if (lockedChoice && (!fromChoice || !(lockedChoice.options.some((o) => (o.value || o.label) === text)
-    || (lockedChoice.allowRestart && text === "重新开始")))) {
-    toast("请先从下拉框选择");
-    return;
+  if (lockedChoice && fromChoice) {
+    // 从菜单里选的必须是菜单自己的选项。
+    // 自由输入不再被前端拦（只读提问要走这条路），执行约束由后端把关。
+    const allowed =
+      lockedChoice.options?.some((o) => (o.value || o.label) === text) ||
+      (lockedChoice.allowRestart && text === "重新开始");
+    if (!allowed) {
+      toast("请先从下拉框选择");
+      return;
+    }
   }
   // 首次对话前先向后端要一个会话 id
   if (!session.sessionId && !session.pendingResume) {
@@ -1329,8 +1404,10 @@ async function sendMessage(text, { fromChoice = false } = {}) {
     if (session.lastReportRun) body.snapshots.lastReportRun = session.lastReportRun;
   }
 
-  // 修改语义：命中某个区域时提示 Agent
-  if (!pendingResume && session.state === "WAITING_USER_CONFIRM" && /趋势/.test(text)) {
+  // 修改语义：命中某个区域时提示 Agent。
+  // 只在明确是「要改」的说法时给；「你支持分钟趋势吗？」是提问，
+  // 不该被当成要改趋势图（规格 #12：问能力不得夹带执行）。
+  if (!pendingResume && session.state === "WAITING_USER_CONFIRM" && WorkbenchQuery.shouldHintTrendRegion(text)) {
     context.selectedRegionId = "region_hourly_trend";
   }
 
@@ -1372,11 +1449,31 @@ async function sendMessage(text, { fromChoice = false } = {}) {
     return;
   }
 
+  // 只读问答：不推进业务。
+  // 这一轮只是回答问题或澄清意图，业务状态、待确认菜单、待确认修改计划、
+  // 右侧预览和 __advance__ 自动推进全部保持原样（规格 #12 / 工单 01、02）。
+  const readOnlyKind = WorkbenchQuery.readOnlyAnswerKind(data);
+
   // 同步会话态
-  setState(data.state);
+  if (!WorkbenchQuery.shouldPreserveBusinessState(data)) {
+    setState(data.state);
+  }
   if (data.designSessionId) session.designSessionId = data.designSessionId;
-  if (data.debug && Object.prototype.hasOwnProperty.call(data.debug, "editingTargetRegionId")) {
+  if (!readOnlyKind && data.debug && Object.prototype.hasOwnProperty.call(data.debug, "editingTargetRegionId")) {
     session.editingTargetRegionId = data.debug.editingTargetRegionId || null;
+  }
+
+  if (readOnlyKind) {
+    // 只读回答单独展示：不画业务确认菜单、不改右侧预览、不触发自动推进。
+    renderReadOnlyAnswer(data, readOnlyKind);
+    // 查询轮带回的原菜单：屏幕上还没有菜单时才补画（已有就不重复画）。
+    if (!lockedChoice) {
+      const preservedMenu = resolveQueryPreservedMenu(data);
+      if (preservedMenu) appendConfirmActions(preservedMenu);
+    }
+    updateMeta();
+    renderSessionList();
+    return;
   }
 
   // 待确认编辑计划：后端下发候选计划，前端只负责展示 + 等用户选择，绝不自己改草稿。
@@ -1467,20 +1564,20 @@ async function sendMessage(text, { fromChoice = false } = {}) {
         }
       }
       appendAiText(data.reply || "草稿已保存，接下来进入校验。");
-      // 自动推进到 VALIDATING
-      queueAdvance(450, epoch);
+      // 自动推进到 VALIDATING（只读问答不推进）
+      if (WorkbenchQuery.shouldAutoAdvance(data)) queueAdvance(450, epoch);
       break;
     case "VALIDATING":
       appendAiText(data.reply || "正在校验报表定义…");
-      // 需要再推一次，这次会真正校验并给出通过/失败
-      queueAdvance(650, epoch);
+      // 需要再推一次，这次会真正校验并给出通过/失败（只读问答不推进）
+      if (WorkbenchQuery.shouldAutoAdvance(data)) queueAdvance(650, epoch);
       break;
     case "VALIDATION_FAILED":
       appendAiText(data.reply || "校验未通过，请检查报表定义。");
       break;
     case "PREVIEWING":
       appendAiText(data.reply || "正在跑预览…");
-      queueAdvance(900, epoch);
+      if (WorkbenchQuery.shouldAutoAdvance(data)) queueAdvance(900, epoch);
       break;
     case "PREVIEW_READY":
       if (data.domainObjects?.reportRunPreview) {
@@ -1489,7 +1586,7 @@ async function sendMessage(text, { fromChoice = false } = {}) {
       appendAiText(data.reply || "预览已就绪。");
       await fetchAndStorePreview(epoch);
       if (epoch !== requestEpoch) return;
-      queueAdvance(500, epoch);
+      if (WorkbenchQuery.shouldAutoAdvance(data)) queueAdvance(500, epoch);
       break;
     case "RENDERING":
       appendAiText(data.reply || "正在渲染报表界面…");
@@ -1501,7 +1598,7 @@ async function sendMessage(text, { fromChoice = false } = {}) {
         appendAiText("报表渲染遇到问题，已跳过部分内容，流程继续。");
       }
       if (epoch !== requestEpoch) return;
-      queueAdvance(450, epoch);
+      if (WorkbenchQuery.shouldAutoAdvance(data)) queueAdvance(450, epoch);
       break;
     case "READY":
       appendAiText(data.reply || "报表已就绪。");
@@ -1579,13 +1676,14 @@ function sendTemplateEditAction(message, regionId = null) {
 
 // 节点 12 READY：先选下一步，选“继续修改”后才开放输入。
 // lock=false 用于回放历史消息：渲染出下拉框，但不抢占当前输入锁
+// 返回值：实际画出来的业务菜单（没有菜单时返回 null）。
 function appendReadyActions(question, { lock = true } = {}) {
   if (!question?.selectionOnly || !question.options?.length) {
     // 同 appendConfirmActions：缺选项时不抢输入锁，避免把已有下拉框全 disable 掉。
     if (lock) {
       appendAiText("就绪操作未就绪，请新建对话后重试。");
     }
-    return;
+    return null;
   }
   const wrap = aiBubble(`
     <div class="rounded-xl rounded-tl-sm border border-emerald-200 bg-white px-3.5 py-3">
@@ -1597,11 +1695,13 @@ function appendReadyActions(question, { lock = true } = {}) {
     </div>
   `);
   if (lock) setChoiceLock(question);
+  else businessMenuReplayed = true;
   wrap.querySelector(".question-select").addEventListener("change", (event) => {
     if (lockedChoice?.id === question?.id && event.target.value) {
       sendMessage(event.target.value, { fromChoice: true });
     }
   });
+  return question;
 }
 
 // -------- 应用 ChangeSet --------
@@ -2325,7 +2425,7 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
 
   clearChoiceLock();
   lastPendingPlan = null;
-  lastConfirmQuestion = null;
+  businessMenuReplayed = false;
   destroyCharts();
   chatScroll.innerHTML = "";
   previewRoot.innerHTML = "";
@@ -2350,14 +2450,19 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   const pending = detail.pendingChoice?.question || null;
 
   // 回放消息：assistant 消息带 payload，能重建结构化卡片
+  // 顺带记下回放过程：哪些是业务菜单、哪些是只读问答，
+  // 用来判断刷新后原来那份菜单是不是还开着（别把已经答过的菜单恢复出来）。
+  const replayEvents = [];
   for (const message of detail.messages) {
     // __advance__ 是前端自动推进用的内部控制消息，不是用户说的话。
     // 后端一般不会入库（万一入库了也别在刷新后显示成一条用户气泡）。
     if (message.role === "user" && String(message.content || "").trim() === "__advance__") continue;
     if (message.role === "user") {
       appendUser(message.content);
+      replayEvents.push({ type: "user", content: message.content });
     } else if (message.payload) {
-      replayAssistantMessage(message.payload, pending);
+      const menu = replayAssistantMessage(message.payload, pending);
+      replayEvents.push({ type: "assistant", response: message.payload, menu: menu || null });
     } else {
       appendAiText(message.content);
     }
@@ -2381,10 +2486,14 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   updateMeta();
 
   // 恢复选择锁：后端 pending_choice 是权威来源；
-  // 后端没存（例如只有 changeSet 的变更方案）就用回放时画出来的确认下拉兜底，
-  // 否则下拉框会被 disable 成死的，恢复后依然走不下去。
+  // 后端没存（例如只有 changeSet 的变更方案）就用回放过程判断出来的那份菜单兜底，
+  // 但只认**还没被答掉**的那份：问一句只读问题不会关掉菜单，
+  // 答完菜单或后续业务动作则视为菜单已失效，恢复时不能把过时确认项摆回来。
   if (pending) setChoiceLock(pending);
-  else if (lastConfirmQuestion) setChoiceLock(lastConfirmQuestion);
+  else {
+    const openMenu = WorkbenchQuery.resolveOpenMenuAfterReplay(replayEvents);
+    if (openMenu) setChoiceLock(openMenu);
+  }
 
   await renderSessionList();
   scrollChatBottom(true);
@@ -2412,33 +2521,44 @@ async function autoRestoreSession() {
 // 回放一条历史 assistant 消息：复用 sendMessage 的渲染分支，但不触发自动推进
 // pending 是后端给出的当前选择锁；用它替换历史问题对象，
 // 这样回放出来的下拉框与 lockedChoice 是同一个对象，选项仍然可用
+// 返回值：这条消息画出来的业务菜单（没有菜单时返回 null）。
 function replayAssistantMessage(data, pending = null) {
   const bindPending = (questions) => {
     if (!pending || !questions?.length) return questions;
     return questions.map((q) => (q.id === pending.id ? pending : q));
   };
 
+  // 只读问答的历史回放：照常展示回答，但不重画业务菜单、不改状态、不推进。
+  const readOnlyKind = WorkbenchQuery.readOnlyAnswerKind(data);
+  if (readOnlyKind) {
+    renderReadOnlyAnswer(data, readOnlyKind);
+    // 查询轮带回的原菜单：还没画过业务菜单时才补画一张。
+    if (!businessMenuReplayed) {
+      const preservedMenu = resolveQueryPreservedMenu(data);
+      if (preservedMenu) return appendConfirmActions(preservedMenu, { lock: false });
+    }
+    return null;
+  }
+
   switch (data.state) {
     case "ANALYZING":
     case "NEEDS_CLARIFICATION":
       appendAiText(data.reply || "");
       if (data.questions?.length) appendAiQuestions(bindPending(data.questions), { lock: false });
-      break;
+      return null;
     case "BLOCKED_OR_UNSUPPORTED":
       if (data.blocks?.length) appendAiBlocks(data.blocks);
       else appendAiText(data.reply || "");
-      break;
+      return null;
     case "WAITING_USER_CONFIRM": {
       const questions = bindPending(data.questions || []);
       appendAiText(data.reply || "");
-      appendConfirmActions(questions.find((q) => q.id === "template_edit_confirm"), { lock: false });
-      break;
+      return appendConfirmActions(questions.find((q) => q.id === "template_edit_confirm"), { lock: false });
     }
     case "READY": {
       const questions = bindPending(data.questions || []);
       appendAiText(data.reply || "");
-      appendReadyActions(questions.find((q) => q.id === "ready_action"), { lock: false });
-      break;
+      return appendReadyActions(questions.find((q) => q.id === "ready_action"), { lock: false });
     }
     case "USER_EDITING_TEMPLATE": {
       appendAiText(data.reply || "");
@@ -2447,20 +2567,20 @@ function replayAssistantMessage(data, pending = null) {
       const plan = readPendingEditPlan(data);
       if (plan) {
         const planQuestion = resolvePlanQuestion(data) || (hasContractChoices(pending) ? pending : null);
-        appendPendingEditPlan(plan, { lock: false, question: planQuestion });
+        const menu = appendPendingEditPlan(plan, { lock: false, question: planQuestion });
         lastPendingPlan = { planId: plan.planId, draftRevision: plan.draftRevision };
-        break;
+        return menu;
       }
       appendTemplateEditSummary(data.domainObjects?.changeSet, data.debug?.markdownPreview);
       // 草稿编辑态有一组必选的确认项（同意/修改/重新开始）。
       // 回放时必须把下拉框画出来，否则恢复后输入框被锁住却没有可点的选项。
       const questions = bindPending(data.questions || []);
       if (data.uiActions?.includes("confirm_template_edit")) {
-        appendConfirmActions(questions.find((q) => q.id === "template_edit_confirm"), { lock: false });
+        return appendConfirmActions(questions.find((q) => q.id === "template_edit_confirm"), { lock: false });
       } else if (questions.length) {
         appendAiQuestions(questions, { lock: false });
       }
-      break;
+      return null;
     }
     case "DEFINITION_DRAFT_READY": {
       // 历史回放：把变更卡和确认下拉都画出来。
@@ -2471,11 +2591,12 @@ function replayAssistantMessage(data, pending = null) {
       const confirmQuestion =
         resolveDefinitionDraftQuestion({ questions }) ||
         (data.domainObjects?.changeSet ? FALLBACK_DRAFT_CONFIRM_QUESTION : null);
-      if (confirmQuestion) appendConfirmActions(confirmQuestion, { lock: false });
-      break;
+      if (confirmQuestion) return appendConfirmActions(confirmQuestion, { lock: false });
+      return null;
     }
     default:
       appendAiText(data.reply || "");
+      return null;
   }
 }
 
@@ -2489,7 +2610,6 @@ function startNewSession() {
   if (activeRequest || advanceTimers.size) detachActiveRequest();
   clearChoiceLock();
   lastPendingPlan = null;
-  lastConfirmQuestion = null;
   destroyCharts();
   session.sessionId = null;
   session.conversationId = "conv_" + Date.now() + "_" + requestEpoch;
@@ -2521,7 +2641,9 @@ document.querySelector("[data-quick]").addEventListener("click", (event) => {
 });
 
 $("btn-send").addEventListener("click", () => {
-  if (lockedChoice || activeRequest || advanceTimers.size) return;
+  // 待确认菜单存在时也允许发送：只读提问要走这条路（工单 02）。
+  // 执行操作的约束由后端把关，这里不再拦自由输入。
+  if (activeRequest || advanceTimers.size) return;
   const text = $("chat-input").value.trim();
   if (!text) return;
   $("chat-input").value = "";

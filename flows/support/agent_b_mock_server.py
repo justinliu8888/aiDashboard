@@ -255,6 +255,7 @@ class Store:
                 "designSessionId": None,
                 "reportDefinitionId": None,
                 "workspaceId": None,
+                "advanceCalls": 0,
             }
             return session_id
 
@@ -293,6 +294,7 @@ class Store:
             "pendingChoice": record["pendingChoice"],
             "pendingEditPlan": None,
             "messages": record["messages"],
+            "advanceCalls": record.get("advanceCalls", 0),
             "createdAt": "2026-10-26T09:00:00",
             "updatedAt": "2026-10-26T09:00:00",
         }
@@ -412,6 +414,99 @@ def build_response(record: dict, message: str, save_pending: bool) -> dict:
     return response
 
 
+# ---------------------------------------------------------------- 只读问答
+
+# 只读问答的判定（前端无关，只为了让交互流可复现）：
+#   疑问句            → 只读事实回答
+#   含糊说法          → 只读意图澄清
+#   含「读取失败」     → 读取不可得，答「无法确认」
+#   其余              → 走原来的业务脚本
+CLARIFY_TRIGGERS = {"继续弄一下", "继续一下", "再弄一下", "弄一下"}
+READ_FAIL_MARKERS = ("读取失败", "查不到服务端")
+
+
+def classify_user_message(text: str) -> str:
+    stripped = text.strip()
+    if stripped in CLARIFY_TRIGGERS:
+        return "clarify"
+    if any(marker in stripped for marker in READ_FAIL_MARKERS):
+        return "read_fail"
+    if stripped.endswith("吗") or stripped.endswith("?") or stripped.endswith("？"):
+        return "query"
+    return "business"
+
+
+def build_read_only_response(record: dict, kind: str) -> dict:
+    """只读问答的响应：只回答，不推进业务。
+
+    形状对齐后端共用契约（docs/adr/0002）：
+      turnKind = "query_answer"          → 前端据此判定「本轮不推进」
+      uiActions = ["query_answer"]        → 同义标记
+      state 原样保留（业务状态不变）
+      questions = 原待确认菜单（后端原样带回）
+      toolRequests = []                   → 不发起任何执行动作
+      debug.queryOutcome = answer | clarification
+
+    关键约束：
+      - 不带 domainObjects 的改动（不改草稿、不改预览）
+      - 不动 pendingChoice（原待确认操作保留）
+      - 不消耗 turn（不占用业务脚本的推进位）
+    """
+    state = record["state"]
+    definition = record["snapshot"].get("definition") or {}
+    metadata = definition.get("metadata") or {}
+
+    # 后端契约：查询轮把原待确认菜单原样带回
+    preserved_menu = []
+    if record.get("pendingChoice"):
+        preserved_menu = [record["pendingChoice"]["question"]]
+    elif state == "WAITING_USER_CONFIRM":
+        preserved_menu = [TEMPLATE_EDIT_CONFIRM_QUESTION]
+
+    if kind == "clarify":
+        return {
+            "state": state,
+            "reply": "我想先确认一下你要问什么，免得答错对象。",
+            "turnKind": "query_answer",
+            "uiActions": ["query_answer"],
+            "questions": preserved_menu,
+            "toolRequests": [],
+            "debug": {"queryMode": True, "queryOutcome": "clarification", "needsClarification": True},
+            "elapsedMs": 30,
+        }
+
+    if kind == "read_fail":
+        # 读取不可得：答「无法确认」，不能答「没有」
+        return {
+            "state": state,
+            "reply": "我现在没法确认当前对话的草稿状态，暂时不能给你准确答复。",
+            "turnKind": "query_answer",
+            "uiActions": ["query_answer"],
+            "questions": preserved_menu,
+            "toolRequests": [],
+            "debug": {"queryMode": True, "queryOutcome": "answer", "factStatus": "UNAVAILABLE"},
+            "elapsedMs": 30,
+        }
+
+    if metadata.get("name"):
+        reply = (
+            f"当前对话里有一份草稿「{metadata['name']}」"
+            f"（revision {metadata.get('revision')}），还没有确认。下一步请从上面的菜单里选怎么处理。"
+        )
+    else:
+        reply = "当前对话里没有报表草稿。"
+    return {
+        "state": state,
+        "reply": reply,
+        "turnKind": "query_answer",
+        "uiActions": ["query_answer"],
+        "questions": preserved_menu,
+        "toolRequests": [],
+        "debug": {"queryMode": True, "queryOutcome": "answer", "factStatus": "FOUND"},
+        "elapsedMs": 30,
+    }
+
+
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
@@ -496,7 +591,19 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(FIRST_TURN_DELAY_SECONDS)
             # 消息里带「带锁」→ 后端存 pending_choice；否则不存（模拟真实 AgentScope 的 confirm_change）
             save_pending = "带锁" in message
-            response = build_response(record, message, save_pending)
+            if message.strip() == "__advance__":
+                record["advanceCalls"] = record.get("advanceCalls", 0) + 1
+
+            # 只读问答：走独立分支，不消耗业务脚本的推进位，也不改任何业务对象
+            kind = classify_user_message(message)
+            if kind in ("query", "clarify", "read_fail"):
+                response = build_read_only_response(record, kind)
+            else:
+                response = build_response(record, message, save_pending)
+            # 消息里带「不存锁」→ 后端不保存 pending_choice，
+            # 用来验证前端「后端没存锁时靠回放恢复菜单、且不恢复已作答菜单」的兜底逻辑。
+            if "不存锁" in message:
+                record["pendingChoice"] = None
             # 和真后端一致：__advance__ 是内部控制消息，不作为 user 消息入库
             if message.strip() != "__advance__":
                 record["messages"].append(

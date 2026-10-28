@@ -5,36 +5,7 @@
   "ignore": ["modao.cc"],
   "pages": [
     {
-      "name": "home",
-      "path": "/v3/report-ai-workspace%20v3/home.html",
-      "title": "报表策略",
-      "selectors": ["h1", "header nav a", "main"],
-      "texts": ["报表策略", "新建策略"],
-      "counts": ["header nav a>=1"]
-    },
-    {
       "name": "workbench",
-      "path": "/v3/report-ai-workspace%20v3/workbench.html",
-      "title": "工作台",
-      "selectors": ["h1", "textarea, input[type=text]"],
-      "texts": ["机房能耗日报", "AI 报表助理"]
-    },
-    {
-      "name": "validation",
-      "path": "/v3/report-ai-workspace%20v3/validation.html",
-      "title": "校验",
-      "selectors": ["h1"],
-      "texts": ["校验与试运行", "执行节点"]
-    },
-    {
-      "name": "result",
-      "path": "/v3/report-ai-workspace%20v3/result.html",
-      "title": "报表结果",
-      "selectors": ["h1", "main"],
-      "texts": ["机房能耗日报", "数据完整度"]
-    },
-    {
-      "name": "workbench-live",
       "path": "/frontend/pages/workbench.html",
       "title": "AI 报表生成工作台",
       "waitMs": 2500,
@@ -42,12 +13,34 @@
       "selectors": [
         "h1",
         "#chat-input",
+        "#btn-send",
         "#state-badge",
+        "#footer-state",
         "#session-nav",
-        "#preview-root"
+        "#session-list",
+        "#session-search",
+        "#preview-root",
+        "#draft-badge",
+        "[data-quick]",
+        "#btn-regenerate"
       ],
-      "texts": ["AI 报表助理", "机房能耗日报", "新建对话"],
-      "counts": ["#session-nav>=1", "#chat-input>=1", "#state-badge>=1", "#preview-root>=1"]
+      "texts": [
+        "AI 报表助理",
+        "机房能耗日报",
+        "新建对话",
+        "重新生成",
+        "尚无草稿",
+        "ANALYZING"
+      ],
+      "counts": [
+        "#session-nav>=1",
+        "#session-list>=1",
+        "#chat-input>=1",
+        "#btn-send>=1",
+        "#state-badge>=1",
+        "#preview-root>=1",
+        "[data-quick]>=1"
+      ]
     }
   ]
 }
