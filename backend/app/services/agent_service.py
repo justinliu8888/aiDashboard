@@ -828,6 +828,17 @@ class AgentService:
                 # 前端要据此继续显示那份待确认的方案。
                 report_design_service.attach_design_state(response, design_state)
                 return response
+            # 设计轮不把旧路由的收集结果带进快照。
+            #
+            # 旧路由是旧流程的槽位采集器，它会把「昨日」「默认能耗指标」
+            # 这类**系统暂选**写进 collectedInfo。设计会话里方案才是需求的
+            # 权威记录，把这些默认值写进快照，等于让用户没指定的条件
+            # 悄悄顶替 —— 工单 01 验收明确要求「未指定的条件注明假设，
+            # 不被默认值无声替代」。
+            #
+            # 只在这一条（设计轮）清：查询轮的回答要用会话事实，
+            # 旧流程的轮次一个字都不动。
+            request.collectedInfo = {}
             design_response = await report_design_service.handle(
                 request, emit=emit, state=design_state
             )

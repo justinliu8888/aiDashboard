@@ -946,6 +946,46 @@ def test_confirmation_turn_does_not_run_the_old_router(client, monkeypatch):
     assert "还没有接入" in payload["reply"]
 
 
+def test_design_turn_does_not_persist_router_defaults_into_the_snapshot(
+    client, monkeypatch
+):
+    """设计会话的快照里不该出现旧路由的系统默认值。
+
+    工单 01 验收：「未指定的条件注明假设，不被默认值无声替代」。
+    旧路由是旧流程的槽位采集器，它会把「昨日」「默认能耗指标」这类
+    **系统暂选**写进 collectedInfo；设计会话里方案才是需求的权威记录。
+    """
+    from app.services.context_engine import RouteDecision
+
+    async def _route_with_defaults(request, emit=None):  # type: ignore[no-untyped-def]
+        return RouteDecision(
+            collectedInfo={
+                "subjectId": "room_a",
+                "timeRange": "昨日",
+                "metricRefs": ["metric.machine_room.total_energy"],
+            },
+            resolvedInputs={
+                "timeRange": "昨日",
+                "metricRefs": ["metric.machine_room.total_energy"],
+            },
+            defaultInputKeys=["timeRange", "metricRefs"],
+        )
+
+    monkeypatch.setattr(context_engine, "route", _route_with_defaults)
+    install_model(monkeypatch, RecordingModel(_candidate(), _candidate()))
+
+    _post(client, "生成 PUE 报表", message_id="msg_1")
+    _post(client, "再加一个趋势板块", message_id="msg_2")
+
+    snapshot = client.get("/api/sessions/sess_design_1").json()["snapshot"]
+    collected = snapshot.get("collectedInfo") or {}
+
+    assert "resolvedInputs" not in collected
+    assert "systemDefaults" not in collected
+    assert collected.get("timeRange") is None
+    assert collected.get("metricRefs") is None
+
+
 def test_readonly_question_is_not_hijacked_by_template_flow(client, monkeypatch):
     """只读提问不能被「先看模板」提前分流劫持。
 
