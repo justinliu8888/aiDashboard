@@ -1,0 +1,57 @@
+{
+  "baseDir": "../..",
+  "serveCmd": "python3 -m http.server 8914",
+  "port": 8914,
+  "outDir": "../../.selfcheck/report-plan",
+  "waitMs": 1200,
+  "ignore": [],
+  "pages": [
+    {
+      "name": "report-plan-harness",
+      "path": "/frontend/tests/report_plan_harness.html",
+      "title": "D 模块自检 harness",
+      "waitMs": 1200,
+      "selectors": [
+        "#plan-root",
+        ".plan-module",
+        ".plan-status",
+        ".plan-topic",
+        ".plan-requirements",
+        ".plan-sections",
+        ".plan-section",
+        ".plan-section-title",
+        ".plan-component-type",
+        ".plan-assumptions",
+        ".plan-suggestions",
+        ".plan-references",
+        ".plan-list-item",
+        ".plan-actions",
+        ".plan-confirm",
+        "#action-log"
+      ],
+      "texts": [
+        "PUE 专题报表",
+        "PUE 总览",
+        "PUE 趋势",
+        "分区明细",
+        "指标卡",
+        "折线图",
+        "表格",
+        "PUE 统计口径待核实，数据待连接",
+        "可以再补一个机柜级 PUE 分布的饼图",
+        "尚未接受",
+        "待确认方案",
+        "确认方案",
+        "测试 harness",
+        "不接后端"
+      ],
+      "counts": [
+        ".plan-module>=1",
+        ".plan-section>=3",
+        ".plan-confirm>=1",
+        ".plan-list-item>=1",
+        "#action-log>=1"
+      ]
+    }
+  ]
+}
