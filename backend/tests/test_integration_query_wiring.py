@@ -1183,3 +1183,87 @@ def test_progress_tool_does_not_fabricate_region_count_for_a_malformed_draft(
     assert result["availability"] == "UNAVAILABLE"
     # 更不能报出编出来的区块数
     assert result["draft"]["regionCount"] in (0, None)
+
+
+# ---------- 12. 进度类回答必须说清「已记录 / 非实时」这条边界 ----------
+
+
+def test_recorded_boundary_must_reach_the_visible_reply(post_chat, monkeypatch):
+    """模型把边界写进 limitations（页面不渲染）时，服务端要补进 reply。
+
+    工单 #03：「回答明确是已记录状态，不冒充实时任务监控」；
+    父规格 #12：「数据可能不是实时的，应以用户可理解的方式说明」。
+
+    页面只渲染 ``reply``，``limitations`` 是结构化字段、用户看不到。
+    真实模型验收里出现过：边界被写进 ``limitations``，``reply`` 里只字未提，
+    用户读到的回答既没说是「已记录」，也没说不是实时。
+    """
+    from app.schemas.agent import AgentResponse, AgentState
+    from app.services.agent_service import agent_service
+
+    _upsert_session(
+        "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
+    )
+
+    class _StubAgent:
+        """模拟真实模型：边界只写在 limitations 里，reply 里漏了。"""
+
+        def handle(self, request):
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.WAITING_USER_CONFIRM,
+                reply=(
+                    "刚才那份报表目前停在「等你确认草稿」这一步。"
+                    "现在还差最后一步：你确认这份草稿。"
+                ),
+                turnKind=TURN_KIND_QUERY_ANSWER,
+                debug={
+                    "queryMode": True,
+                    "limitations": [
+                        "当前进度来自服务端已记录的会话状态，"
+                        "不是实时任务监控，没有百分比或剩余时间",
+                    ],
+                },
+            )
+
+    monkeypatch.setattr(agent_service, "_agent", _StubAgent())
+
+    response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
+
+    assert response["turnKind"] == "query_answer"
+    assert "已记录" in response["reply"]
+    assert "不是实时" in response["reply"]
+
+
+def test_recorded_boundary_is_not_appended_twice(post_chat, monkeypatch):
+    """答案里已经说清了这条边界时，不要再追加一遍。"""
+    from app.schemas.agent import AgentResponse, AgentState
+    from app.services.agent_service import agent_service
+
+    _upsert_session(
+        "conv_test", state="WAITING_USER_CONFIRM", definition=_definition()
+    )
+
+    class _StubAgent:
+        def handle(self, request):
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.WAITING_USER_CONFIRM,
+                reply=(
+                    "这是服务端已记录的业务阶段，不是实时任务进度。"
+                    "刚才那份报表停在「等你确认草稿」这一步。"
+                ),
+                turnKind=TURN_KIND_QUERY_ANSWER,
+                debug={
+                    "queryMode": True,
+                    "limitations": [
+                        "这是服务端已记录的业务阶段，不是实时任务进度",
+                    ],
+                },
+            )
+
+    monkeypatch.setattr(agent_service, "_agent", _StubAgent())
+
+    response = post_chat("刚才那份做到哪一步了？", state="WAITING_USER_CONFIRM").json()
+
+    assert response["reply"].count("不是实时任务进度") == 1

@@ -111,6 +111,35 @@ _STAGE_NEXT_STEPS: dict[str, str] = {
 #: 查询范围固定为当前对话。不自动遍历历史，不声称检索过所有会话。
 SCOPE_CURRENT_CONVERSATION = "CURRENT_CONVERSATION"
 
+#: 「这是已记录的状态、不是实时进度」这条边界的标志说法。
+#:
+#: 工单 #03 要求「回答明确是已记录状态，不冒充实时任务监控」，
+#: 父规格 #12 要求「数据可能不是实时的，应以用户可理解的方式说明」。
+#: 答案里出现其中之一，才算把这条边界说清楚了。
+BOUNDARY_MARKERS: tuple[str, ...] = ("已记录", "实时")
+
+
+def boundary_stated(reply: str) -> bool:
+    """用户可见答案里是否已经说清了「已记录 / 非实时」这条边界。"""
+    text = reply or ""
+    return any(marker in text for marker in BOUNDARY_MARKERS)
+
+
+def boundary_clause(limitations: list[str] | None) -> str:
+    """从模型声明的限制里挑出「已记录 / 非实时」这条边界。
+
+    模型常把这条边界写进 ``limitations``（结构化字段，页面不渲染），
+    却漏在 ``reply``（页面唯一展示的文本）之外。这里把那一句挑出来，
+    交给服务端补进可见答案 —— 口径不依赖模型自觉。
+
+    挑不出来就返回空字符串：没有这条边界就不硬塞。
+    """
+    for item in limitations or []:
+        text = str(item or "").strip()
+        if text and any(marker in text for marker in BOUNDARY_MARKERS):
+            return text
+    return ""
+
 
 def describe_recorded_progress(
     session_id: str | None,
