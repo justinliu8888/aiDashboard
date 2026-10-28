@@ -17,11 +17,8 @@
 
 import { resolveGridLayout, DEFAULT_GRID_CONFIG, GRID_COLUMNS } from '../layout/grid-layout.mjs';
 
-/** 宿主需要引入的样式表相对路径（相对本模块） */
-export const REPORT_GRID_STYLESHEET = '../styles/report-grid.css';
-
 /** 缩放手柄种类：右侧 / 底部 / 右下角 */
-export const HANDLE_KINDS = Object.freeze(['e', 's', 'se']);
+const HANDLE_KINDS = Object.freeze(['e', 's', 'se']);
 
 /** 视为「点击」的位移阈值（px） */
 const CLICK_THRESHOLD_PX = 3;
@@ -78,7 +75,8 @@ export function mountReportGrid(root, options = {}) {
     destroyed: false,
   };
 
-  const columns = positiveInt(state.config.columns) || GRID_COLUMNS;
+  // 契约 §1.1/§1.4：列数固定 12，不随 config 变化，避免渲染与几何校验口径不一致
+  const columns = GRID_COLUMNS;
   const regionEntries = new Map();
   const previewEls = new Map();
   let currentPlacements = new Map();

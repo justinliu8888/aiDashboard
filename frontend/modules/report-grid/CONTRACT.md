@@ -35,6 +35,9 @@ mountReportGrid(root, { items, readonly, config, renderContent, onIntent, onSele
 文件：`frontend/modules/report-grid/page/report-grid.mjs`（ESM）。
 `page/report-grid.mjs` **只允许**从 `../layout/grid-layout.mjs` 导入 `resolveGridLayout`、`DEFAULT_GRID_CONFIG`、`GRID_COLUMNS` 三个名字，不得改动布局模块文件。
 
+页面模块的**公开导出只有 `mountReportGrid`**：样式表由宿主自行引入
+`frontend/modules/report-grid/styles/report-grid.css`，模块不注入、不打包样式。
+
 ### 1.3 数据形状
 
 ```js
@@ -62,12 +65,24 @@ null | undefined                   // 初始化
 {
   kind: "success",
   placements: [{ regionId, placement: { type: "GRID", column, row, columnSpan, rowSpan } }],  // 全部 item，顺序同 items
-  affectedRegionIds: string[],    // 目标优先，其后为实际被让位的 ID
+  affectedRegionIds: string[],    // 见下方「受影响集合」定义
 }
 
 // 失败返回
 { kind: "invalid", code, message }
 ```
+
+#### 受影响集合（affectedRegionIds）
+
+受影响集合 = **目标 + 实际被让位的区域 + 因输入非法而被补齐的区域**。
+
+- 目标永远排第一。
+- 其余按「原 row → 原 column → regionId」确定性排序。
+- **合法且未被让位的区域不在集合内**（无关组件不动）。
+- 初始化补齐项计入集合的原因：父规格要求「保存前的初始化…按现有组件顺序补齐」，
+  补齐结果必须能随意图回到宿主并被保存，否则非法 placement 会一直留在宿主模型里。
+  冻结接口没有单独的「补齐结果」通道，因此随意图一并回传。
+- 集合为空表示本次手势没有产生任何变化，宿主据此不提交任何修改。
 
 ### 1.4 配置（`DEFAULT_GRID_CONFIG`）
 
@@ -82,6 +97,9 @@ null | undefined                   // 初始化
 ```
 
 `config` 传入时与默认值浅合并。**这些是展示用预备配置，不代表生产最小尺寸或完整 TemplateDesign 已冻结。**
+
+`columns` **固定为 12**，不随 `config` 变化：布局层与页面层都按 12 列校验与渲染，
+传入其他值按 12 处理，避免渲染口径与几何校验口径不一致。
 
 ## 2. 布局语义（冻结）
 
@@ -124,7 +142,8 @@ null | undefined                   // 初始化
      affectedRegionIds: string[],
    }
    ```
-   `placements` 只含受影响区域（目标 + 必要让位者），不含无关组件。`resolveGridLayout` 返回的 `placements` 才是全量集合。
+   `placements` 只含**受影响区域**（目标 + 实际让位者 + 因输入非法而被补齐的区域，见「受影响集合」），
+   不含合法且未被让位的无关组件。`resolveGridLayout` 返回的 `placements` 才是全量集合。
 5. **零变更不回调**：若 `affectedRegionIds` 为空（结果与输入一致），**不调用** `onIntent`，视图回到输入布局。
 6. **输入不被冒充为设计**：`onIntent` 是布局**提案**，不含 `operationId` / `revision`，不发 HTTP，不表示已保存。回调后视图以**宿主输入**为准。
 7. **预览仅是临时状态**：手势过程中展示落位预览（目标新落位 + 让位者新位置），视觉上可区分。松手后模块回到输入布局，由宿主 `update(view)` 写入新视图。宿主未调用 `update` 时不保留内部位置。
@@ -182,19 +201,24 @@ null | undefined                   // 初始化
 
 ## 7. 验证命令（自有 harness，不碰集成线）
 
+检查产物的**默认输出目录**是仓库根的 `.selfcheck/report-grid/`（已被根 `.gitignore` 忽略，
+不会污染 worktree）。任务期的日志、截图与报告请用 `--out-dir` 显式指向临时资源目录
+`/Users/peiliu/Desktop/海悟/20261012 智能报表功能/.agent-runtime/grid-prep-g/`。
+
 ```bash
 # 静态自检
 node /Users/peiliu/Desktop/海悟/.trae/skills/frontend-self-check/scripts/selfcheck.mjs \
   --config frontend/modules/report-grid/checks/selfcheck.json \
-  --out-dir <自有运行目录>
+  --out-dir /Users/peiliu/Desktop/海悟/20261012\ 智能报表功能/.agent-runtime/grid-prep-g/combined/selfcheck
 
 # 交互冒烟（选择 / 只读切换 / 重建）
 node /Users/peiliu/Desktop/海悟/.trae/skills/frontend-interaction-check/scripts/interact.mjs \
   --config frontend/modules/report-grid/checks/interaction.flow.json \
-  --out-dir <自有运行目录>
+  --out-dir /Users/peiliu/Desktop/海悟/20261012\ 智能报表功能/.agent-runtime/grid-prep-g/combined/interaction
 
 # 真实鼠标拖拽 / 缩放（必须记录起终坐标、回调次数、JS 错误、截图）
-node frontend/modules/report-grid/checks/drag-check.mjs --out-dir <自有运行目录>
+node frontend/modules/report-grid/checks/drag-check.mjs \
+  --out-dir /Users/peiliu/Desktop/海悟/20261012\ 智能报表功能/.agent-runtime/grid-prep-g/combined/drag
 ```
 
 拖拽验证**不得**用直接调用布局方法、改 DOM 或注入最终快照冒充。断言通过 ≠ 拖拽通过。

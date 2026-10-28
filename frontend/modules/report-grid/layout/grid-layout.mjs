@@ -68,7 +68,8 @@ function placementChanged(before, after) {
 function mergeConfig(config) {
   const source = config && typeof config === 'object' ? config : {};
   const merged = { ...DEFAULT_GRID_CONFIG, ...source };
-  if (!isPositiveInt(merged.columns)) merged.columns = DEFAULT_GRID_CONFIG.columns;
+  // 契约 §1.1/§1.4：列数固定 12，不接受 config 覆盖，避免与页面渲染口径不一致
+  merged.columns = GRID_COLUMNS;
   if (!isPositiveInt(merged.defaultMinColumnSpan)) {
     merged.defaultMinColumnSpan = DEFAULT_GRID_CONFIG.defaultMinColumnSpan;
   }

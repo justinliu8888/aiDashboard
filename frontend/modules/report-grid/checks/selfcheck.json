@@ -1,6 +1,6 @@
 {
   "baseDir": "../../../..",
-  "outDir": "../../../../.agent-runtime/grid-prep-g/page/selfcheck",
+  "outDir": "../../../../.selfcheck/report-grid/selfcheck",
   "serveCmd": "node frontend/modules/report-grid/checks/static-server.mjs --port 8930",
   "port": 8930,
   "waitMs": 1200,
