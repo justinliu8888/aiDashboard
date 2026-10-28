@@ -17,6 +17,7 @@ from typing import Any
 
 from app.services.recorded_progress_service import describe_recorded_progress
 from app.services.session_context import current_session_key
+from app.schemas.fact import to_fact_status
 from app.tools.base import LOOKUP_STATES, ToolCategory
 from app.tools.context import current_tool_context
 
@@ -44,8 +45,13 @@ def run() -> dict[str, Any]:
     会话 id 从请求级上下文取（``session_context``），业务对象范围从工具上下文取。
     """
     ctx = current_tool_context()
-    return describe_recorded_progress(
+    result = describe_recorded_progress(
         current_session_key(),
         subject_ref=ctx.subject_ref if ctx is not None else None,
         subject_id=ctx.subject_id if ctx is not None else None,
     )
+    # 对共用层暴露折算后的四态事实状态（ADR 0002 §7.1）：
+    # 领域里的 availability 是细粒度词表，共用层只认 FOUND / ABSENT /
+    # UNAVAILABLE / FORBIDDEN。折算在工具层做，领域服务不用改自己的契约。
+    result["status"] = to_fact_status(result.get("availability")).value
+    return result

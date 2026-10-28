@@ -1,0 +1,428 @@
+"""合流接入测试：工单 #13/#14/#15/#16 在同一个集成工作区里真正接上。
+
+这一组测试盯的是**集成**，不是单个模块的内部实现：
+
+    - C 的 ``get_recorded_progress`` 与 D 的 ``check_product_capability``
+      真的进了查询 Toolkit（不是开发期替身注册）；
+    - 两个领域模块对共用层暴露 ``status``（``FactStatus`` 四态）；
+    - 领域状态折成共用事实状态时语义不塌陷：
+      「登记但不支持」仍是 FOUND 但必须披露执行限制，
+      「缺上下文」仍是 FOUND 但必须给澄清，
+      「读取失败」「无权限」「确实没有」互不混淆；
+    - 两个工具的 ``summary`` 能进入用户可见答案，
+      不回退成把原始 JSON 甩给用户；
+    - 响应级契约以 ``AgentResponse.turnKind`` 为准，
+      领域标记（``answerKind`` / ``outcome``）不作为前端判断依据。
+
+接口测试走聊天 HTTP 入口与真实 AgentScope Toolkit，不测私有函数。
+"""
+from __future__ import annotations
+
+import pytest
+
+from app.schemas.agent import TURN_KIND_QUERY_ANSWER, AgentState
+from app.schemas.fact import FACT_STATUSES, FactStatus
+from app.services.session_service import session_service
+from app.tools import registry
+from app.tools.base import ToolCategory
+
+
+PROGRESS_TOOL = "get_recorded_progress"
+CAPABILITY_TOOL = "check_product_capability"
+
+
+# ---------- 夹具 ----------
+
+
+def _definition():
+    from app.services.report_draft_service import build_definition_draft
+
+    return build_definition_draft("A 机房能耗日报", "room_a")
+
+
+def _upsert_session(
+    session_id: str = "sess_int",
+    *,
+    state: str = "WAITING_USER_CONFIRM",
+    definition=None,
+    snapshot: dict | None = None,
+):
+    payload = dict(snapshot or {})
+    if definition is not None:
+        payload["definition"] = definition.model_dump(mode="json")
+    return session_service.repository.upsert_session(
+        session_id=session_id,
+        state=state,
+        title="合流测试会话",
+        snapshot=payload,
+    )
+
+
+@pytest.fixture()
+def bound_context(monkeypatch):
+    """绑定本轮工具上下文 + 会话 key，模拟一次真实请求。"""
+    from app.services.session_context import bind_session_key
+    from app.tools.context import ToolContext, bind_tool_context, clear_tool_context
+
+    class _Request:
+        sessionId = None
+        conversationId = "conv_int"
+
+    bind_session_key(_Request())
+    bind_tool_context(
+        ToolContext(
+            state=AgentState.ANALYZING,
+            subject_ref="machine_room",
+            subject_id="room_a",
+            project_id="project_001",
+            definition=None,
+        )
+    )
+    yield
+    clear_tool_context()
+
+
+# ---------- 1. 正式工具接入：真的注册进查询 Toolkit ----------
+
+
+def test_progress_and_capability_tools_are_in_the_real_registry():
+    """C / D 的工具必须在正式注册表里，不是 monkeypatch 替身。"""
+    names = {tool.NAME for tool in registry.list_tools()}
+
+    assert PROGRESS_TOOL in names
+    assert CAPABILITY_TOOL in names
+
+
+def test_progress_and_capability_tools_are_in_the_query_toolset():
+    """查询模式的 Toolkit 必须包含这两个事实工具。"""
+    names = {tool.NAME for tool in registry.tools_for_query()}
+
+    assert PROGRESS_TOOL in names
+    assert CAPABILITY_TOOL in names
+
+
+def test_real_agentscope_toolkit_registers_and_runs_both_fact_tools():
+    """**真实 AgentScope Toolkit** 里能查到并真的调用这两个工具。
+
+    替身注册测试不能证明正式接入：这里用生产查询工具集建 Toolkit，
+    再从 Toolkit 自己列出的 schema 里找工具名。
+    """
+    import asyncio
+    import json
+
+    from agentscope.message import ToolCallBlock
+    from agentscope.state import AgentState as ScopeAgentState
+
+    from app.services.session_context import bind_session_key
+    from app.tools.context import ToolContext, bind_tool_context, clear_tool_context
+    from app.tools.registry import to_agentscope_toolkit_async, tools_for_query
+
+    class _Request:
+        sessionId = None
+        conversationId = "conv_int"
+
+    async def _drain(gen):
+        chunks = []
+        async for chunk in gen:
+            chunks.append(chunk)
+        return chunks
+
+    async def scenario():
+        bind_session_key(_Request())
+        bind_tool_context(
+            ToolContext(
+                state=AgentState.ANALYZING,
+                subject_ref="machine_room",
+                subject_id="room_a",
+                project_id="project_001",
+                definition=None,
+            )
+        )
+        try:
+            toolkit = await to_agentscope_toolkit_async(tools_for_query())
+            schemas = await toolkit.get_tool_schemas()
+            names = {
+                (item.get("function") or {}).get("name")
+                for item in schemas
+            }
+            assert PROGRESS_TOOL in names
+            assert CAPABILITY_TOOL in names
+
+            # 真调用一次：证明注册进 Toolkit 之后确实能被模型调到。
+            progress_call = ToolCallBlock(
+                type="tool_call",
+                id="call_progress",
+                name=PROGRESS_TOOL,
+                input=json.dumps({}),
+            )
+            chunks = await _drain(
+                toolkit.call_tool(progress_call, ScopeAgentState())
+            )
+            payload = json.loads(chunks[0].content[0].text)
+            assert payload["status"] in FACT_STATUSES
+            assert payload["summary"].strip()
+        finally:
+            clear_tool_context()
+
+    asyncio.run(scenario())
+
+
+def test_registering_both_tools_keeps_tool_contracts_valid():
+    """注册之后，工具契约自洽校验仍然全通过。"""
+    assert registry.validate_tool_contracts() == []
+
+
+def test_registered_tools_stay_read_only_fact_tools():
+    """两个工具都必须是只读事实工具，不能变成执行出口。"""
+    by_name = {tool.NAME: tool for tool in registry.list_tools()}
+
+    for name in (PROGRESS_TOOL, CAPABILITY_TOOL):
+        tool = by_name[name]
+        assert tool.CATEGORY is ToolCategory.FACT
+        assert tool.IS_READ_ONLY is True
+        assert getattr(tool, "IS_QUERY_ONLY", False) is False
+
+
+# ---------- 2. 领域状态 -> 共用事实状态 ----------
+
+
+def test_progress_tool_exposes_shared_fact_status(bound_context):
+    """进度工具对共用层暴露 status，且取值合法。"""
+    from app.tools.get_recorded_progress_tool import run
+
+    _upsert_session("conv_int", definition=_definition())
+
+    result = run()
+
+    assert result["status"] in FACT_STATUSES
+    assert result["status"] == FactStatus.FOUND.value
+
+
+def test_capability_tool_exposes_shared_fact_status(bound_context):
+    """能力工具对共用层暴露 status，且取值合法。"""
+    from app.tools.check_product_capability_tool import run
+
+    result = run(sourceRef="catalog.machine_room.energy", grainUnit="MINUTE")
+
+    assert result["status"] in FACT_STATUSES
+
+
+def test_domain_availability_is_folded_into_shared_status(bound_context):
+    """C 的 availability 必须折成共用 status，不能各说各话。"""
+    from app.tools.get_recorded_progress_tool import run
+    from app.schemas.fact import to_fact_status
+
+    _upsert_session("conv_int", definition=_definition())
+    result = run()
+
+    assert result["status"] == to_fact_status(result["availability"]).value
+
+
+def test_domain_outcome_is_folded_into_shared_status(bound_context):
+    """D 的 outcome 必须折成共用 status，不能各说各话。"""
+    from app.tools.check_product_capability_tool import run
+    from app.schemas.fact import to_fact_status
+
+    result = run(sourceRef="catalog.machine_room.energy", grainUnit="MINUTE")
+
+    assert result["status"] == to_fact_status(result["outcome"]).value
+
+
+def test_registered_but_not_supported_is_found_but_discloses_the_limit(bound_context):
+    """「目录登记但链路不支持」：事实查到了（FOUND），但限制必须披露。"""
+    from app.tools.check_product_capability_tool import run
+
+    result = run(sourceRef="catalog.machine_room.energy", grainUnit="MINUTE")
+
+    assert result["outcome"] == "REGISTERED_NOT_SUPPORTED"
+    assert result["status"] == FactStatus.FOUND.value
+    # 限制不能因为 status=FOUND 就丢掉。
+    assert result["execution"]["generation"]["supported"] is False
+    assert result["execution"]["generation"]["reason"]
+    assert result["mustState"]
+
+
+def test_missing_context_is_found_but_asks_for_clarification(bound_context):
+    """「缺上下文」：事实查到了（FOUND），但必须给必要澄清。"""
+    from app.tools.check_product_capability_tool import run
+
+    result = run()
+
+    assert result["outcome"] == "MISSING_CONTEXT"
+    assert result["status"] == FactStatus.FOUND.value
+    assert result["clarification"]
+    assert result["clarification"].get("question")
+
+
+def test_unregistered_is_absent_and_unauthorized_is_forbidden(bound_context):
+    """「确实没有」是 ABSENT，「无权限」是 FORBIDDEN，两者不能混淆。"""
+    from app.tools.check_product_capability_tool import run
+    from app.tools.context import ToolContext, bind_tool_context, clear_tool_context
+
+    unknown = run(sourceRef="catalog.does.not.exist")
+    assert unknown["outcome"] == "NOT_REGISTERED"
+    assert unknown["status"] == FactStatus.ABSENT.value
+
+    # 换一个业务对象范围：目录条目不可见 -> 无权限，不是「不存在」。
+    bind_tool_context(
+        ToolContext(
+            state=AgentState.ANALYZING,
+            subject_ref="other_room",
+            subject_id="room_b",
+            project_id="project_001",
+            definition=None,
+        )
+    )
+    try:
+        unauthorized = run(sourceRef="catalog.machine_room.energy")
+    finally:
+        clear_tool_context()
+
+    assert unauthorized["outcome"] == "NOT_AUTHORIZED"
+    assert unauthorized["status"] == FactStatus.FORBIDDEN.value
+    # 无权限时不能泄露该对象的粒度 / 字段细节。
+    assert unauthorized["catalog"]["supportedGrains"] == []
+    assert unauthorized["catalog"]["fields"] == []
+
+
+def test_progress_unavailable_is_not_reported_as_absent(bound_context, monkeypatch):
+    """读取失败是 UNAVAILABLE，不能说成「确实没有」。"""
+    from app.tools.get_recorded_progress_tool import run
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("数据库不可用")
+
+    monkeypatch.setattr(
+        "app.services.recorded_progress_service.session_service.repository.get_session",
+        _boom,
+    )
+
+    result = run()
+
+    assert result["availability"] == "UNAVAILABLE"
+    assert result["status"] == FactStatus.UNAVAILABLE.value
+    assert result["status"] != FactStatus.ABSENT.value
+
+
+# ---------- 3. summary 能进入用户可见答案 ----------
+
+
+def test_progress_tool_carries_a_user_facing_summary(bound_context):
+    """进度工具带一句面向用户的话，能并进回答。"""
+    from app.tools.get_recorded_progress_tool import run
+
+    _upsert_session("conv_int", definition=_definition())
+
+    result = run()
+
+    assert isinstance(result.get("summary"), str)
+    assert result["summary"].strip()
+
+
+def test_capability_tool_carries_a_user_facing_summary(bound_context):
+    """能力工具带一句面向用户的话，能并进回答。"""
+    from app.tools.check_product_capability_tool import run
+
+    result = run(sourceRef="catalog.machine_room.energy", grainUnit="MINUTE")
+
+    assert isinstance(result.get("summary"), str)
+    assert result["summary"].strip()
+
+
+def test_capability_summary_keeps_catalog_execution_and_data_boundary(bound_context):
+    """能力回答必须保住：目录登记、执行支持、模拟数据 / 生产接通边界。"""
+    from app.tools.check_product_capability_tool import run
+
+    result = run(sourceRef="catalog.machine_room.energy", grainUnit="MINUTE")
+
+    blob = " ".join(
+        [
+            result["summary"],
+            " ".join(result.get("mustState") or []),
+            str(result.get("catalog")),
+            str(result.get("execution")),
+            str(result.get("dataSource")),
+        ]
+    )
+    # 目录登记与链路支持的区别
+    assert "目录" in blob
+    # 模拟业务数据 vs 生产接通
+    assert "模拟" in blob or "生产" in blob
+    # 数据源取数模式必须给出明确说法
+    assert result["dataSource"]["mode"] in {"SIMULATED", "PRODUCTION"}
+    assert result["dataSource"]["productionConnected"] is (
+        result["dataSource"]["mode"] == "PRODUCTION"
+    )
+
+
+def test_progress_summary_marks_recorded_not_realtime(bound_context):
+    """进度回答要说明是已记录阶段，不是实时监控。"""
+    from app.tools.get_recorded_progress_tool import run
+
+    _upsert_session("conv_int", definition=_definition())
+
+    result = run()
+
+    assert result["isRealtime"] is False
+    assert "已记录" in result["summary"] or "实时" in result["summary"]
+
+
+# ---------- 4. 聊天 HTTP 入口：三类查询真的可用 ----------
+
+
+def test_chat_query_reply_contains_progress_facts_not_raw_json(post_chat):
+    """问进度：答案里有可读事实，不是原始 JSON。"""
+    _upsert_session("conv_test", definition=_definition())
+
+    response = post_chat("刚才那份做到哪一步了？", state="ANALYZING").json()
+
+    assert response["turnKind"] == TURN_KIND_QUERY_ANSWER
+    assert response["reply"].strip()
+    # 不能把工具返回体原样甩给用户。
+    assert '{"answerKind"' not in response["reply"]
+    assert '"availability"' not in response["reply"]
+    # 要能看出是「已记录」而不是实时。
+    assert "已记录" in response["reply"] or "实时" in response["reply"]
+
+
+def test_chat_query_reply_contains_capability_facts_not_raw_json(post_chat):
+    """问能力：答案里有可读事实，不是原始 JSON。"""
+    response = post_chat("你支持分钟趋势吗？", state="ANALYZING").json()
+
+    assert response["turnKind"] == TURN_KIND_QUERY_ANSWER
+    assert response["reply"].strip()
+    assert '{"outcome"' not in response["reply"]
+    assert '"mustState"' not in response["reply"]
+
+
+def test_chat_query_reply_keeps_capability_data_boundary(post_chat):
+    """能力回答要保留模拟数据 / 生产接通的边界。"""
+    response = post_chat("能耗成本和 PUE 能出吗？", state="ANALYZING").json()
+
+    assert response["turnKind"] == TURN_KIND_QUERY_ANSWER
+    assert "模拟" in response["reply"] or "生产" in response["reply"]
+
+
+def test_chat_query_answer_uses_turn_kind_as_the_contract(post_chat):
+    """前端判断依据是 turnKind，不是领域标记。"""
+    _upsert_session("conv_test", definition=_definition())
+
+    response = post_chat("现在进度到哪了？", state="ANALYZING").json()
+
+    assert response["turnKind"] == TURN_KIND_QUERY_ANSWER
+    # 领域标记不得顶替响应契约。
+    assert "answerKind" not in response
+    assert "outcome" not in response
+    assert "availability" not in response
+
+
+def test_chat_query_answer_does_not_advance_business(post_chat):
+    """保留推进状态的查询回答不推进业务。"""
+    _upsert_session("conv_test", state="VALIDATING", definition=_definition())
+
+    response = post_chat("校验到哪一步了？", state="VALIDATING").json()
+
+    assert response["state"] == "VALIDATING"
+    assert response["turnKind"] == TURN_KIND_QUERY_ANSWER
+    assert response["uiActions"] == ["query_answer"]
+    assert response["toolRequests"] == []

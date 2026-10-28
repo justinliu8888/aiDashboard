@@ -461,9 +461,43 @@ def _base_result(
         },
         "limitations": list(_LIMITATIONS),
         "facts": list(fact_lines) if fact_lines is not None else _describe_facts(facts),
+        # 面向用户的一句话。确定性回答（Fake 路径）与真实模型都靠它，
+        # 没有它就会把整包 JSON 当答案甩给用户。
+        "summary": _summary(
+            availability=availability,
+            stage_label=stage_label,
+            reason=reason,
+            next_step=next_step,
+        ),
     }
     result.update(facts)
     return result
+
+
+def _summary(
+    *,
+    availability: str,
+    stage_label: str,
+    reason: str,
+    next_step: str,
+) -> str:
+    """把结果压成一句面向用户的话。
+
+    口径要求：
+        - 读不到就说读不到，不说成「没有」；
+        - 有对象时说清是**已记录**的阶段，不是实时进度；
+        - 不附加与本轮无关的生成选项。
+    """
+    if availability == AVAILABILITY_UNAVAILABLE:
+        return f"暂时无法确认当前对话的已记录进度：{reason}。"
+    if availability == AVAILABILITY_PERMISSION_DENIED:
+        return f"无法确认当前对话的已记录进度：{reason}。"
+    if availability == AVAILABILITY_NO_OBJECT:
+        return "当前对话的服务端已记录内容里没有报表草稿、已保存定义或预览。"
+    return (
+        f"当前对话已记录的阶段是{stage_label}，下一步：{next_step}"
+        "这是已记录的状态，不是实时进度。"
+    )
 
 
 #: 每份结果都带的限制说明。

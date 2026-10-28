@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.schemas.fact import to_fact_status
 from app.services import product_capability_service
 from app.tools.base import LOOKUP_STATES, ToolCategory
 from app.tools.context import require_scope
@@ -87,7 +88,7 @@ def run(
     失败绝不能降级成「不支持」或「数据不存在」。
     """
     scope = require_scope()
-    return product_capability_service.describe_capability(
+    result = product_capability_service.describe_capability(
         project_id=scope.project_id,
         subject_ref=scope.subject_ref,
         subject_id=scope.subject_id,
@@ -96,3 +97,9 @@ def run(
         grain_unit=grainUnit,
         component=component,
     )
+    # 对共用层暴露折算后的四态事实状态（ADR 0002 §7.1）：
+    # REGISTERED_NOT_SUPPORTED / MISSING_CONTEXT 都仍是 FOUND ——
+    # 事实查到了，限制和澄清在别处披露；NOT_REGISTERED 是 ABSENT，
+    # NOT_AUTHORIZED 是 FORBIDDEN。折算在工具层做。
+    result["status"] = to_fact_status(result.get("outcome")).value
+    return result

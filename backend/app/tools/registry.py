@@ -24,9 +24,11 @@ from app.config import get_settings
 from app.tools import (
     build_definition_draft_tool,
     check_capability_tool,
+    check_product_capability_tool,
     get_current_draft_tool,
     get_current_region_tool,
     get_current_session_status_tool,
+    get_recorded_progress_tool,
     get_validation_result_tool,
     search_catalog_tool,
     search_metric_tool,
@@ -59,6 +61,9 @@ _TOOLS: list[Any] = [
     get_current_region_tool,
     get_current_session_status_tool,
     get_validation_result_tool,
+    # 只读查询的领域事实工具（工单 #15 已记录进度 / #16 实际产品能力）
+    get_recorded_progress_tool,
+    check_product_capability_tool,
     # 确定性组装
     build_definition_draft_tool,
     # 终结工具

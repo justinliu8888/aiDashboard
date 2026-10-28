@@ -95,7 +95,7 @@ def describe_capability(
     component = _clean(component)
 
     if source_ref:
-        return _describe_source(
+        result = _describe_source(
             project_id=project_id,
             subject_ref=subject_ref,
             subject_id=subject_id,
@@ -104,8 +104,8 @@ def describe_capability(
             grain_unit=grain_unit,
             component=component,
         )
-    if metric_ref:
-        return _describe_metric(
+    elif metric_ref:
+        result = _describe_metric(
             project_id=project_id,
             subject_ref=subject_ref,
             subject_id=subject_id,
@@ -113,13 +113,67 @@ def describe_capability(
             grain_unit=grain_unit,
             component=component,
         )
-    return _describe_scope(
-        project_id=project_id,
-        subject_ref=subject_ref,
-        subject_id=subject_id,
-        grain_unit=grain_unit,
-        component=component,
-    )
+    else:
+        result = _describe_scope(
+            project_id=project_id,
+            subject_ref=subject_ref,
+            subject_id=subject_id,
+            grain_unit=grain_unit,
+            component=component,
+        )
+
+    # 面向用户的一句话：确定性回答（Fake 路径）与真实模型都靠它。
+    # 没有它就会把整包 JSON 当答案甩给用户。
+    result["summary"] = _summary_for(result)
+    return result
+
+
+#: 能力回答必须一直带着的取数来源说明。
+#: 「目录里有」和「链路能生成」是两件事，「链路能生成」和「生产取数已接通」
+#: 又是两件事 —— 少说一件就会被读成虚假承诺。
+_DATA_SOURCE_NOTE = "预览链路的数值来自模拟业务数据，尚未接通真实 EAS / Java 生产取数。"
+
+
+def _summary_for(result: dict[str, Any]) -> str:
+    """把能力核对结果压成一句面向用户的话。
+
+    口径要求：
+        - 「目录登记」与「链路支持」分开说，不能拿目录条目承诺能生成；
+        - 「模拟业务数据」与「生产接通」分开说，不能宣称已接通生产取数；
+        - 缺上下文时给针对性澄清，不替用户挑数据源；
+        - 无权限时只说公开边界，不泄露该对象的细节。
+    """
+    outcome = str(result.get("outcome") or "")
+    execution = result.get("execution") or {}
+    generation = execution.get("generation") or {}
+    reason = str(generation.get("reason") or "").strip()
+
+    if outcome == OUTCOME_NOT_REGISTERED:
+        return (
+            "当前授权范围的数据目录里没有登记这个对象，"
+            "我不能核对它的能力边界。" + _DATA_SOURCE_NOTE
+        )
+    if outcome == OUTCOME_NOT_AUTHORIZED:
+        return (
+            "当前账号没有这个对象的访问权限，无法核对它的能力边界。"
+            + _DATA_SOURCE_NOTE
+        )
+    if outcome == OUTCOME_REGISTERED_NOT_SUPPORTED:
+        detail = reason or "当前生成模板不支持它"
+        return (
+            "这个对象在数据目录里已登记，但当前产品链路不支持它，"
+            f"不能承诺生成成功：{detail}。" + _DATA_SOURCE_NOTE
+        )
+    if outcome == OUTCOME_MISSING_CONTEXT:
+        clarification = result.get("clarification") or {}
+        question = str(clarification.get("question") or "").strip()
+        return (
+            "当前授权范围内可以核对的数据源与粒度如上，"
+            + (question or "要回答具体能力，还需要你说明是哪个数据源或指标。")
+            + _DATA_SOURCE_NOTE
+        )
+    # OUTCOME_OK
+    return "当前产品链路支持这项能力。" + _DATA_SOURCE_NOTE
 
 
 # ---------- 按数据源核对 ----------
