@@ -4,10 +4,10 @@
   "sessionId": "sess_tpl_1",
   "payload": {
     "previewContext": {
-      "definitionId": "rplan_5c1191789828",
+      "definitionId": "rplan_5710ef37bcbb",
       "definitionVersion": 1,
       "timezone": "Asia/Shanghai",
-      "anchorTime": "2026-10-29T21:14:13.274559+08:00",
+      "anchorTime": "2026-10-29T22:37:57.105620+08:00",
       "windowStart": "2026-10-22T00:00:00+08:00",
       "windowEnd": "2026-10-29T00:00:00+08:00",
       "grainUnit": "DAY",
@@ -19,12 +19,14 @@
         "name": "PUE 总览",
         "role": "SUMMARY",
         "componentType": "METRIC_CARD",
+        "dataSource": "simulated",
+        "capabilityPending": true,
         "payload": {
           "label": "PUE 总览",
           "value": 1.7,
           "unit": "",
           "precision": 1,
-          "yoyPercent": 9.4,
+          "yoyPercent": 2.9,
           "comparisonAvailable": true,
           "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
           "dataSource": "simulated",
@@ -47,12 +49,14 @@
         "name": "总电费",
         "role": "SUMMARY",
         "componentType": "METRIC_CARD",
+        "dataSource": "simulated",
+        "capabilityPending": true,
         "payload": {
           "label": "总电费",
           "value": 26150.46,
           "unit": "元",
           "precision": 2,
-          "yoyPercent": 9.4,
+          "yoyPercent": 5.0,
           "comparisonAvailable": true,
           "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
           "dataSource": "simulated",
@@ -75,6 +79,8 @@
         "name": "总耗电趋势",
         "role": "TREND",
         "componentType": "CHART",
+        "dataSource": "simulated",
+        "capabilityPending": false,
         "payload": {
           "chartKind": "LINE",
           "grain": "DAY",
@@ -137,6 +143,8 @@
         "name": "设备耗电明细",
         "role": "DETAIL",
         "componentType": "TABLE",
+        "dataSource": "simulated",
+        "capabilityPending": false,
         "payload": {
           "columns": [
             {
@@ -149,7 +157,11 @@
               "id": "col_2",
               "label": "耗电量",
               "fieldRef": "section_4.col_2",
-              "format": null
+              "format": {
+                "kind": "NUMBER",
+                "precision": 1,
+                "unitLabel": "kWh"
+              }
             }
           ],
           "rowNumber": true,
@@ -213,11 +225,11 @@
         "daily"
       ],
       "templateBinding": {
-        "templateId": "rtpl_7da44d4152d7",
+        "templateId": "rtpl_dd364c11546e",
         "templateRevision": 1,
-        "planId": "rplan_5c1191789828",
+        "planId": "rplan_5710ef37bcbb",
         "planRevision": 1,
-        "definitionId": "rplan_5c1191789828",
+        "definitionId": "rplan_5710ef37bcbb",
         "definitionVersion": 1
       },
       "pendingNotes": [
@@ -735,7 +747,12 @@
             {
               "id": "col_2",
               "label": "耗电量",
-              "fieldRef": "section_4.col_2"
+              "fieldRef": "section_4.col_2",
+              "format": {
+                "kind": "NUMBER",
+                "precision": 1,
+                "unitLabel": "kWh"
+              }
             }
           ],
           "rowNumber": true
@@ -763,7 +780,12 @@
               {
                 "id": "col_2",
                 "label": "耗电量",
-                "fieldRef": "section_4.col_2"
+                "fieldRef": "section_4.col_2",
+                "format": {
+                  "kind": "NUMBER",
+                  "precision": 1,
+                  "unitLabel": "kWh"
+                }
               }
             ],
             "metrics": [
@@ -832,18 +854,18 @@
         "daily"
       ],
       "templateBinding": {
-        "templateId": "rtpl_7da44d4152d7",
+        "templateId": "rtpl_dd364c11546e",
         "templateRevision": 1,
-        "planId": "rplan_5c1191789828",
+        "planId": "rplan_5710ef37bcbb",
         "planRevision": 1,
-        "definitionId": "rplan_5c1191789828",
+        "definitionId": "rplan_5710ef37bcbb",
         "definitionVersion": 1
       },
       "pendingNotes": [
         "「PUE 总览」「PUE」口径待核实：当前数据源没有登记这个字段，算不出数值。",
         "「总电费」「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。"
       ],
-      "definitionId": "def_b6804ece"
+      "definitionId": "def_f0ea1285"
     },
     "parameters": {},
     "policyBinding": {
@@ -1355,7 +1377,12 @@
             {
               "id": "col_2",
               "label": "耗电量",
-              "fieldRef": "section_4.col_2"
+              "fieldRef": "section_4.col_2",
+              "format": {
+                "kind": "NUMBER",
+                "precision": 1,
+                "unitLabel": "kWh"
+              }
             }
           ],
           "rowNumber": true
@@ -1383,7 +1410,12 @@
               {
                 "id": "col_2",
                 "label": "耗电量",
-                "fieldRef": "section_4.col_2"
+                "fieldRef": "section_4.col_2",
+                "format": {
+                  "kind": "NUMBER",
+                  "precision": 1,
+                  "unitLabel": "kWh"
+                }
               }
             ],
             "metrics": [
@@ -1440,7 +1472,7 @@
     }
   },
   "plan": {
-    "id": "rplan_5c1191789828",
+    "id": "rplan_5710ef37bcbb",
     "revision": 1,
     "topic": "A 机房能耗日报",
     "requirements": {
@@ -1510,7 +1542,11 @@
             "id": "col_2",
             "label": "耗电量",
             "fieldRef": "section_4.col_2",
-            "format": null
+            "format": {
+              "kind": "NUMBER",
+              "precision": 1,
+              "unitLabel": "kWh"
+            }
           }
         ]
       }
@@ -1529,10 +1565,10 @@
   "stageApproveCarriesPayload": false,
   "stageRestorePayload": {
     "previewContext": {
-      "definitionId": "rplan_5c1191789828",
+      "definitionId": "rplan_5710ef37bcbb",
       "definitionVersion": 1,
       "timezone": "Asia/Shanghai",
-      "anchorTime": "2026-10-29T21:14:13.274559+08:00",
+      "anchorTime": "2026-10-29T22:37:57.105620+08:00",
       "windowStart": "2026-10-22T00:00:00+08:00",
       "windowEnd": "2026-10-29T00:00:00+08:00",
       "grainUnit": "DAY",
@@ -1544,12 +1580,14 @@
         "name": "PUE 总览",
         "role": "SUMMARY",
         "componentType": "METRIC_CARD",
+        "dataSource": "simulated",
+        "capabilityPending": true,
         "payload": {
           "label": "PUE 总览",
           "value": 1.7,
           "unit": "",
           "precision": 1,
-          "yoyPercent": 9.4,
+          "yoyPercent": 2.9,
           "comparisonAvailable": true,
           "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
           "dataSource": "simulated",
@@ -1572,12 +1610,14 @@
         "name": "总电费",
         "role": "SUMMARY",
         "componentType": "METRIC_CARD",
+        "dataSource": "simulated",
+        "capabilityPending": true,
         "payload": {
           "label": "总电费",
           "value": 26150.46,
           "unit": "元",
           "precision": 2,
-          "yoyPercent": 9.4,
+          "yoyPercent": 5.0,
           "comparisonAvailable": true,
           "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
           "dataSource": "simulated",
@@ -1600,6 +1640,8 @@
         "name": "总耗电趋势",
         "role": "TREND",
         "componentType": "CHART",
+        "dataSource": "simulated",
+        "capabilityPending": false,
         "payload": {
           "chartKind": "LINE",
           "grain": "DAY",
@@ -1662,6 +1704,8 @@
         "name": "设备耗电明细",
         "role": "DETAIL",
         "componentType": "TABLE",
+        "dataSource": "simulated",
+        "capabilityPending": false,
         "payload": {
           "columns": [
             {
@@ -1674,7 +1718,11 @@
               "id": "col_2",
               "label": "耗电量",
               "fieldRef": "section_4.col_2",
-              "format": null
+              "format": {
+                "kind": "NUMBER",
+                "precision": 1,
+                "unitLabel": "kWh"
+              }
             }
           ],
           "rowNumber": true,

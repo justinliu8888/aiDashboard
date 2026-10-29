@@ -430,8 +430,9 @@ test("未接通的指标额外写明「能力待接通」，并说明具体项",
 // 两者不同名 —— 「label 相等」判不出主量，主量会在「其它指标」清单里再出现一次
 //（同一个数字在卡片上出现两次）。
 //
-// 这里把真实载荷**抄**进测试（那个文件是别人的成果，不改），并用一条用例守住
-// 「抄的形状与真实形状一致」，免得抄着抄着抄成一套与真实形状不一致的假数据。
+// 这里**直接读 harness**（不抄一份）：抄的那份会跟着后端形状一起漂移
+//（区域级多了 dataSource / capabilityPending、噪声数字也变了），
+// 抄一份就得跟着抄一次。形状本身由下面那条「形状守卫」用例钉住。
 
 const HARNESS_HTML = readFileSync(new URL("./page_accept_harness.html", import.meta.url), "utf8");
 
@@ -452,7 +453,7 @@ function extractHarnessVar(name) {
   throw new Error(`${name} 的大括号没有配平`);
 }
 
-/** harness 里真实产出的 region_3 载荷与定义（抄形状用的原件）。 */
+/** harness 里真实产出的 region_3 载荷与定义（原件，不是抄的）。 */
 function harnessRealMetricCard() {
   const payload = JSON.parse(extractHarnessVar("REAL_PAYLOAD"));
   const definition = JSON.parse(extractHarnessVar("DEFINITION"));
@@ -462,73 +463,19 @@ function harnessRealMetricCard() {
   };
 }
 
-/** 真实载荷（抄自 harness 的 region_3）。 */
-const REAL_METRIC_CARD_PAYLOAD = {
-  label: "总电费概览",
-  value: 26150.46,
-  unit: "元",
-  precision: 2,
-  yoyPercent: -4.1,
-  comparisonAvailable: true,
-  windowLabel: "2026-10-22 ~ 2026-10-28（7 天）",
-  dataSource: "simulated",
-  metrics: [
-    {
-      metricKey: "metric.machine_room.energy_cost",
-      label: "能耗成本",
-      kind: "cost",
-      unit: "元",
-      value: 26150.46,
-      precision: 2,
-      capabilityPending: true,
-      pendingReason: "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
-    },
-  ],
-};
+const HARNESS_REAL = harnessRealMetricCard();
 
-const REAL_METRIC_CARD_REGION = {
-  regionId: "region_3",
-  name: "总电费概览",
-  role: "SUMMARY",
-  componentType: "METRIC_CARD",
-  payload: REAL_METRIC_CARD_PAYLOAD,
-};
+/** 真实载荷（直接取自 harness 的 region_3）。 */
+const REAL_METRIC_CARD_PAYLOAD = HARNESS_REAL.region.payload;
+
+/** 真实区域（直接取自 harness 的 region_3）。 */
+const REAL_METRIC_CARD_REGION = HARNESS_REAL.region;
 
 /** 真实定义里 region_3 那一块（绑定 + 纯结构描述）。 */
-const REAL_METRIC_CARD_DEF_REGION = {
-  id: "region_3",
-  name: "总电费概览",
-  role: "SUMMARY",
-  component: {
-    type: "METRIC_CARD",
-    metric: { id: "", label: "总电费概览", fieldRef: "", format: { kind: "NUMBER", precision: 1, unitLabel: "" } },
-  },
-  templateBinding: {
-    sectionId: "section_3",
-    dataStatus: "placeholder",
-    placeholderReason: "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
-    dataSourceLabel: null,
-    metricRefs: ["metric.machine_room.energy_cost"],
-    pendingReason: null,
-    previewSpec: {
-      role: "SUMMARY",
-      kind: "cost",
-      unit: "元",
-      capabilityPending: true,
-      columns: [],
-      metrics: [
-        {
-          metricKey: "metric.machine_room.energy_cost",
-          label: "能耗成本",
-          kind: "cost",
-          unit: "元",
-          capabilityPending: true,
-          pendingReason: "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
-        },
-      ],
-    },
-  },
-};
+const REAL_METRIC_CARD_DEF_REGION = HARNESS_REAL.defRegion;
+
+/** 真实载荷里那张卡的主量数值（断言用，不写死数字）。 */
+const REAL_CARD_VALUE = String(REAL_METRIC_CARD_PAYLOAD.value);
 
 /** 假 DOM 元素：够 renderRegionCard 用（建元素、写 innerHTML、挂子节点、记住 querySelector 的结果）。 */
 function makeFakeCardElement(tagName = "div") {
@@ -588,23 +535,36 @@ function loadCardApi() {
   );
 }
 
-test("抄进测试的载荷与 harness 的真实形状一致（不写死一套假数据）", () => {
+test("harness 里的真实形状仍是本测试假设的形状（不写死一套假数据）", () => {
   const real = harnessRealMetricCard();
   assert.ok(real.region && real.defRegion, "harness 里没有 region_3");
 
-  // 抄的每个字段都与真实载荷一致，且没凭空多出字段。
-  for (const [key, value] of Object.entries(REAL_METRIC_CARD_PAYLOAD)) {
-    assert.ok(key in real.region.payload, `真实载荷里没有 ${key}，抄的形状已经过时了`);
-    assert.deepEqual(value, real.region.payload[key], `抄的 ${key} 与真实载荷不一致`);
+  // 区域级：后端现在**七个**键（多出 dataSource / capabilityPending）。
+  assert.deepEqual(
+    Object.keys(real.region).sort(),
+    ["capabilityPending", "componentType", "dataSource", "name", "payload", "regionId", "role"]
+  );
+  assert.equal(real.region.dataSource, "simulated");
+  assert.equal(typeof real.region.capabilityPending, "boolean");
+  // 区域级能力标记 = 该区域各项指标的逻辑或。
+  assert.equal(
+    real.region.capabilityPending,
+    (real.region.payload.metrics || []).some((m) => m.capabilityPending === true)
+  );
+
+  // 载荷级：主量在顶层，逐项指标在 metrics[] 里。
+  for (const key of ["label", "value", "unit", "precision", "metrics"]) {
+    assert.ok(key in real.region.payload, `真实载荷里没有 ${key}`);
   }
-  for (const [key, value] of Object.entries(REAL_METRIC_CARD_PAYLOAD.metrics[0])) {
+  assert.ok(real.region.payload.metrics.length >= 1, "真实载荷里没有逐项指标");
+  for (const key of ["metricKey", "label", "kind", "unit", "value", "capabilityPending"]) {
     assert.ok(key in real.region.payload.metrics[0], `真实指标里没有 ${key}`);
-    assert.deepEqual(value, real.region.payload.metrics[0][key], `抄的指标 ${key} 与真实载荷不一致`);
   }
-  for (const [key, value] of Object.entries(REAL_METRIC_CARD_DEF_REGION.templateBinding)) {
-    assert.ok(key in real.defRegion.templateBinding, `真实定义里没有 ${key}`);
-    assert.deepEqual(value, real.defRegion.templateBinding[key], `抄的 templateBinding.${key} 与真实定义不一致`);
+  // 定义侧：绑定与纯结构描述。
+  for (const key of ["sectionId", "dataStatus", "metricRefs", "previewSpec"]) {
+    assert.ok(key in real.defRegion.templateBinding, `真实定义里没有 templateBinding.${key}`);
   }
+  assert.ok(real.defRegion.templateBinding.previewSpec.metrics.length >= 1, "定义侧没有逐项指标");
 
   // 这个缺陷依赖的两条真实关系：两处 label 不同名、主量的值与单位在顶层。
   assert.equal(real.region.payload.label, "总电费概览");
@@ -617,8 +577,8 @@ test("指标卡主量只渲染一次（真实形状：payload.label 是区域名
   const api = loadCardApi();
   const { html } = renderCard(api, REAL_METRIC_CARD_REGION, REAL_METRIC_CARD_DEF_REGION);
 
-  // 主量 26150.46 在卡片正文里只出现一次（不再在「其它指标」清单里再来一遍）。
-  assert.equal((html.match(/26150\.46/g) || []).length, 1, "主量渲染了多次");
+  // 主量（取自 harness 的真实数值）在卡片正文里只出现一次（不再在「其它指标」清单里再来一遍）。
+  assert.equal(html.split(REAL_CARD_VALUE).length - 1, 1, "主量渲染了多次");
   assert.ok(!html.includes('data-region-metric="metric.machine_room.energy_cost"'), "主量还在「其它指标」清单里");
 
   // 大数字上方写的是**指标名**（卡片标题已经是区域名，不必再写一遍）。
@@ -648,7 +608,7 @@ test("多指标卡片：主量只画一次，真正的「其它指标」留在�
   };
   const { html } = renderCard(api, region, REAL_METRIC_CARD_DEF_REGION);
 
-  assert.equal((html.match(/26150\.46/g) || []).length, 1, "主量渲染了多次");
+  assert.equal(html.split(REAL_CARD_VALUE).length - 1, 1, "主量渲染了多次");
   assert.equal((html.match(/37357\.8/g) || []).length, 1, "其它指标应出现一次");
   assert.ok(!html.includes('data-region-metric="metric.machine_room.energy_cost"'), "主量不该在「其它指标」清单里");
   assert.ok(html.includes('data-region-metric="metric.machine_room.total_energy"'), "其它指标应留在清单里");
@@ -677,8 +637,8 @@ test("主量判定不靠位置：主量排在清单后面也认得出来（按�
   };
   const { html } = renderCard(api, region, null);
 
-  // 值+单位对得上的是主量（能耗成本 26150.46 元），不是清单第一条。
-  assert.equal((html.match(/26150\.46/g) || []).length, 1, "主量渲染了多次");
+  // 值+单位对得上的是主量（能耗成本，取自 harness 的真实数值），不是清单第一条。
+  assert.equal(html.split(REAL_CARD_VALUE).length - 1, 1, "主量渲染了多次");
   assert.ok(!html.includes('data-region-metric="metric.machine_room.energy_cost"'), "主量不该在「其它指标」清单里");
   assert.ok(html.includes('data-region-metric="metric.machine_room.total_energy"'), "其它指标应留在清单里");
 });
@@ -711,10 +671,13 @@ test("授权类原因不标成「能力待接通」：角标按原因分文案",
 
 test("区域级 capabilityPending 缺失时仍能从 payload.metrics[] 聚合出标记", () => {
   const api = loadCardApi();
-  // 真实后端目前不产出区域级 capabilityPending（标记在 payload.metrics[] 里）。
-  assert.equal(REAL_METRIC_CARD_REGION.capabilityPending, undefined, "真实载荷没有区域级标记");
+  // 真实后端**现在**产出区域级 capabilityPending；这一条守的是**回退口径**：
+  // 老载荷（只有逐项标记）也要能标出「能力待接通」。
+  assert.equal(REAL_METRIC_CARD_REGION.capabilityPending, true, "真实载荷现在带区域级标记");
+  const legacy = { ...REAL_METRIC_CARD_REGION };
+  delete legacy.capabilityPending;
 
-  const { badge } = renderCard(api, REAL_METRIC_CARD_REGION, null);
+  const { badge } = renderCard(api, legacy, null);
   assert.ok(badge.includes("能力待接通"), `未接通的区域不能被当成已接通：${badge}`);
   assert.ok(badge.includes("能耗成本"), "要说明是哪个指标：");
 });
@@ -737,6 +700,7 @@ test("区域级与逐项都没有：不标成未接通", () => {
   const api = loadCardApi();
   const region = {
     ...REAL_METRIC_CARD_REGION,
+    capabilityPending: false,
     payload: {
       ...REAL_METRIC_CARD_PAYLOAD,
       metrics: [{ ...REAL_METRIC_CARD_PAYLOAD.metrics[0], capabilityPending: false, pendingReason: null }],

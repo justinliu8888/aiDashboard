@@ -106,17 +106,19 @@
       ]
     },
     {
-      "name": "page-accept-04-table-rows-2-no-truncated-badge",
+      "name": "page-accept-04-table-rows-2-truncated-by-reconciliation",
       "path": "/frontend/tests/page_accept_harness.html?scene=truncated",
       "title": "工单 08b 页面层验收 harness",
       "waitMs": 2000,
       "ignore": ["/health", "/api/sessions"],
       "selectors": [
-        "#preview-root [data-region-id=\"region_7\"] table tbody tr"
+        "#preview-root [data-region-id=\"region_7\"] table tbody tr",
+        "#preview-root [data-table-truncated]"
       ],
       "texts": [
         "设备耗电明细",
-        "UPS-01 不间断"
+        "UPS-01 不间断",
+        "仅显示前 2 行"
       ],
       "counts": [
         "#preview-root [data-region-id=\"region_7\"] table tbody tr==2"

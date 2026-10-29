@@ -92,7 +92,7 @@
         { "assertText": "kWh" },
         { "assertText": "总电费" },
         { "assertText": "26150.46" },
-        { "assertText": "242.4" },
+        { "assertText": "242.6" },
         { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_1\"] .text-3xl'); return v ? /\\d/.test(v.textContent) && !v.textContent.includes('—') : false; })()" },
         { "eval": "(() => { const t = document.querySelector('#preview-root').textContent; return !t.includes('暂无数值') && !t.includes('图表占位') && !t.includes('表格样例占位') && !t.includes('暂无数据'); })()" },
         { "assertCount": "#preview-root [data-region-id=\"region_7\"] table tbody tr", "count": 10, "op": "===" },
@@ -121,8 +121,11 @@
         { "assertText": "单位：kWh" },
 
         { "eval": "(() => { const texts = Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(c => c.textContent); return texts.some(t => t.includes('role: SUMMARY')) && texts.some(t => t.includes('role: DETAIL')) && texts.some(t => t.includes('role: DESCRIPTION')); })()" },
-        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; return p.regions.every(r => Object.keys(r).sort().join(',') === 'componentType,name,payload,regionId,role'); })()" },
-        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; const t = p.regions.find(r => r.componentType === 'TABLE'); return !!t && t.payload.columns.every(c => c.format === null); })()" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; return p.regions.every(r => Object.keys(r).sort().join(',') === 'capabilityPending,componentType,dataSource,name,payload,regionId,role'); })()" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; return p.regions.every(r => r.dataSource === 'simulated' && typeof r.capabilityPending === 'boolean'); })()" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; const d = typeof session !== 'undefined' ? session.definition : null; if (!p || !d) return false; return p.regions.every(r => { const def = (d.regions || []).find(x => x.id === r.regionId) || {}; const spec = ((def.templateBinding || {}).previewSpec) || {}; const metrics = (r.payload.metrics && r.payload.metrics.length) ? r.payload.metrics : (spec.metrics || []); return r.capabilityPending === metrics.some(m => m.capabilityPending === true); }); })()" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; const declared = p.regions.find(r => r.regionId === 'region_6'); const energy = declared.payload.columns.find(c => c.label === '耗电'); const name = declared.payload.columns.find(c => c.label === '设备名称'); return !!energy && !!energy.format && energy.format.unitLabel === 'kWh' && (!name.format || name.format.unitLabel === undefined); })()" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; const filled = p.regions.find(r => r.regionId === 'region_7'); const energy = filled.payload.columns.find(c => c.label === '耗电量'); const name = filled.payload.columns.find(c => c.label === '设备名称'); return !!energy && !!energy.format && energy.format.unitLabel === 'kWh' && (!name.format || name.format.unitLabel === undefined); })()" },
 
         { "assertNotText": "仅显示前" },
 
@@ -171,7 +174,7 @@
       ]
     },
     {
-      "name": "08b-04 表格只留 2 行：真实形状下判不出截断（后端没给 truncated / totalRows，也没给列单位 format）",
+      "name": "08b-04 表格只留 2 行：真实形状下靠勾稽反推判出截断（后端没给 truncated / totalRows，但列带单位）",
       "path": "/frontend/tests/page_accept_harness.html?scene=truncated",
       "continueOnError": false,
       "steps": [
@@ -182,10 +185,10 @@
         { "assertText": "设备耗电明细" },
         { "assertText": "UPS-01 不间断" },
 
-        { "assertHidden": "#preview-root [data-table-truncated]" },
-        { "assertNotText": "仅显示前" },
-        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; const t = p.regions.find(r => r.regionId === 'region_7'); if (!t) return false; return t.payload.truncated === undefined && t.payload.totalRows === undefined && t.payload.columns.every(c => c.format === null); })()" },
-        { "screenshot": "08b-08-表格只留2行真实形状判不出截断" }
+        { "assertVisible": "#preview-root [data-table-truncated]" },
+        { "assertText": "仅显示前 2 行" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; const t = p.regions.find(r => r.regionId === 'region_7'); if (!t) return false; return t.payload.truncated === undefined && t.payload.totalRows === undefined && t.payload.columns.some(c => c.format && c.format.unitLabel === 'kWh'); })()" },
+        { "screenshot": "08b-08-表格只留2行靠勾稽反推判出截断" }
       ]
     },
     {
