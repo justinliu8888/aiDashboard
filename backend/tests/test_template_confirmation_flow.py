@@ -488,6 +488,41 @@ def test_invalid_component_type_at_confirmation_fails_and_names_the_section(clie
     assert stored["definitionDraft"] is None
 
 
+def test_metric_intent_missing_is_judged_by_the_same_authority(client, monkeypatch):
+    """编排层与方案契约层用**同一份判据**：取数板块缺指标意图，一样被拦下。
+
+    编排层过去自己抄了一份**只查组件类型**的弱判据（权威判据还查取数板块的
+    指标意图），两份会漂移。现在编排层直接调用方案契约层的
+    ``validate_section_contract``，所以「缺指标意图」在确认期就会被点名拦下，
+    而不是拖到模板层才炸。
+    """
+    _, plan = _plan(client, monkeypatch)
+    conn = session_service.repository.conn
+    row = conn.execute(
+        "SELECT plan_json FROM report_design_sessions WHERE session_id = ?",
+        ("sess_tpl_1",),
+    ).fetchone()
+    dirty = json.loads(row[0])
+    dirty["sections"][0]["componentType"] = "table"
+    dirty["sections"][0].pop("metricIntents", None)
+    conn.execute(
+        "UPDATE report_design_sessions SET plan_json = ? WHERE session_id = ?",
+        (json.dumps(dirty, ensure_ascii=False), "sess_tpl_1"),
+    )
+    conn.commit()
+
+    payload = _confirm_plan(client, plan, "confirm_plan")
+
+    assert payload["error"]["code"] == "PLAN_COMPONENT_TYPE_INVALID"
+    # 错误文案要**点名是哪个板块**（#36 / #39 的硬契约）。
+    assert "总耗电概览" in payload["error"]["message"]
+    assert "metricIntents" in payload["error"]["message"]
+    # 没有模板、也没有草稿：不猜形状、不静默放行。
+    stored = report_design_service.repository.load("sess_tpl_1")
+    assert stored["templateDesign"] is None
+    assert stored["definitionDraft"] is None
+
+
 # --------------------------------------------------------------------------
 # 5. 历史兼容入口与既有链路
 # --------------------------------------------------------------------------
@@ -688,6 +723,42 @@ def test_confirmation_rejects_other_session_scope_without_changing_draft(client,
     after = client.get("/api/sessions/sess_tpl_1").json()
     assert after["snapshot"] == before["snapshot"]
     assert after["state"] == before["state"]
+
+
+def test_legacy_template_ready_session_never_asks_to_confirm_template(client, monkeypatch):
+    """历史会话（``TEMPLATE_READY``）不再要求用户去「确认模板」。
+
+    需求稿 §2.4：中间页的「要求用户输入『确认模板』的提示」要下线。
+    新流程的落点只有 ``DRAFT_READY``（#36 起确认方案一次到位），
+    ``TEMPLATE_READY`` 只可能出现在**改造前**创建的会话里 —— 那一支也
+    必须按草稿就绪的语义说话，不能再把用户引回已下线的模板中间页。
+
+    这里把会话的阶段直接改成 ``TEMPLATE_READY``，模拟一个历史会话，
+    然后走**真实链路**发一条模糊认可（「差不多了」）：这一轮会命中
+    历史分支，回复与 ``uiActions`` 都不该再出现「确认模板」。
+    """
+    install_model(monkeypatch, RecordingModel(_candidate()))
+    _post(client, "生成 A 机房最近 7 天能耗报表")
+
+    # 改造成历史态：阶段停在 TEMPLATE_READY（改造前创建的会话就是这个样子）。
+    conn = session_service.repository.conn
+    conn.execute(
+        "UPDATE report_design_sessions SET design_phase = ? WHERE session_id = ?",
+        ("TEMPLATE_READY", "sess_tpl_1"),
+    )
+    conn.commit()
+    assert report_design_service.repository.load("sess_tpl_1")["designPhase"] == "TEMPLATE_READY"
+
+    payload = _post(client, "差不多了", message_id="vague_legacy").json()
+
+    assert payload["error"] is None
+    # 不再要求用户输入「确认模板」，也不再给「确认模板」这个动作。
+    assert "确认模板" not in payload["reply"]
+    assert "confirm_template" not in payload["uiActions"]
+    # 但要说清下一步是草稿（DRAFT_READY 语义），而不是模板中间页。
+    assert "草稿" in payload["reply"]
+    # 模糊认可仍要给出**明确的确认入口**（规格 #18），只是那个入口不是「确认模板」。
+    assert "确认" in payload["reply"]
 
 
 def test_reused_plan_message_id_does_not_confirm_plan(client, monkeypatch):
