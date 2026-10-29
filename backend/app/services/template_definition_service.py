@@ -252,6 +252,25 @@ def _plan_context(time_window: dict[str, Any], grain: str) -> dict[str, Any]:
     }
 
 
+def _plan_grain_unit(plan: Mapping[str, Any] | None) -> str | None:
+    """方案里定稿的时间粒度（``requirements.grainUnit``）。
+
+    **方案是粒度的唯一权威**：用户在方案里确认的粒度，转换层不许自己
+    再推定一个（那正是「用户说按小时、图上出日点」这种静默收窄的来源）。
+    方案没写（历史方案 / 字段缺失）时返回 None，由调用方按既有规则兜底。
+    """
+    requirements = (plan or {}).get("requirements") or {}
+    if not isinstance(requirements, Mapping):
+        return None
+    raw = requirements.get("grainUnit")
+    if raw is None:
+        return None
+    # 枚举（GrainUnit）取它的值；普通字符串原样用。
+    value = getattr(raw, "value", raw)
+    unit = str(value).strip().upper()
+    return unit or None
+
+
 def _plan_placement(kind: str, *, index: int) -> dict[str, Any]:
     """按方案顺序与声明的组件类型算出确定性占位（12 列网格）。
 
@@ -264,6 +283,27 @@ def _plan_placement(kind: str, *, index: int) -> dict[str, Any]:
     }
 
 
+def _align_resample_grain(region: dict[str, Any], grain: str) -> None:
+    """把区域管道里重采样节点的粒度对齐到方案粒度。
+
+    区域上下文（``context.grain``）说的是「这个板块按什么粒度画」，
+    管道里的 ``RESAMPLE`` 节点说的是「执行层按什么粒度出数」——
+    两者必须一致，否则同一份报表两套口径（界面按小时、执行按天）。
+    """
+    data = region.get("data")
+    if not isinstance(data, dict):
+        return
+    pipeline = data.get("pipeline")
+    if not isinstance(pipeline, dict):
+        return
+    nodes = pipeline.get("nodes")
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if isinstance(node, dict) and node.get("type") == "RESAMPLE":
+            node["grain"] = {"unit": grain}
+
+
 def build_template_definition(
     template: dict[str, Any], plan: dict[str, Any], subject_id: str,
 ) -> ReportDefinitionDraft:
@@ -271,10 +311,18 @@ def build_template_definition(
     window = (plan.get("requirements") or {}).get("timeRange")
     seed = build_definition_draft(current.title, subject_id, timeRange=window,
                                   componentRequests=["total"])
-    # 区域级时间窗与粒度：一律取**方案时间窗**解析出来的结果（取数区与占位区同源）。
+    # 区域级时间窗：一律取**方案时间窗**解析出来的结果（取数区与占位区同源）。
     # 复用草稿组装层的解析结果，而不是在转换层再解析一遍 → 两层口径不可能漂移。
     plan_time_window = deepcopy(seed.regions[1]["context"]["timeWindow"])
-    plan_grain = str((seed.defaults.get("grain") or {}).get("unit") or "DAY")
+    # 粒度：**方案定稿的那一份**（唯一权威）。
+    # 转换层不再从草稿组装层另取一个 —— 那样「用户说按周、定义里是按天」
+    # 就成了静默收窄（规格：方案、模板、区域定义和窗口解析完整传递，
+    # 不在转换或渲染时临时收窄）。方案没写粒度时才回退到组装层的默认。
+    plan_grain = _plan_grain_unit(plan) or str(
+        (seed.defaults.get("grain") or {}).get("unit") or "DAY"
+    )
+    # 定义级默认粒度同样跟方案一致：造数器与预览上下文都从 defaults.grain 读它。
+    seed.defaults["grain"] = {"unit": plan_grain}
     regions: list[dict[str, Any]] = []
     supported_refs = {METRIC_TOTAL_ENERGY["metricRef"], METRIC_DEVICE_ENERGY["metricRef"]}
     # 主循环按**方案板块**遍历（不是按模板区域）：数量 / 顺序 / 标题 / 组件类型
@@ -329,6 +377,9 @@ def build_template_definition(
             converted.setdefault("context", {})["grain"] = {
                 "mode": "REPLACE", "value": {"unit": plan_grain}
             }
+            # 管道里的重采样粒度跟区域上下文同源：否则执行层按天出数、
+            # 界面按小时画点，同一份报表两套口径。
+            _align_resample_grain(converted, plan_grain)
             if device:
                 # 设备级指标卡：执行绑定指向设备耗电口径（这是**实现层**绑定，
                 # 不是展示口径；展示口径一律按方案的时间窗 —— 不收窄到最后一天）。

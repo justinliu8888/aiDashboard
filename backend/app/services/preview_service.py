@@ -1313,14 +1313,32 @@ def resolve_preview_context(
 
     ``existing`` 通常来自会话快照里的 ``previewContext``。已经存在且
     定义版本对得上就原样复用 —— 不重新生成、不随日期变化。
+
+    上下文身份取**定义自己**的那一套：
+
+    - 新定义 → ``metadata.templateBinding`` 里登记的（方案 id + 方案 revision）；
+    - 历史定义（没有 ``templateBinding``）→ 定义自身的 ``metadata.id`` /
+      ``metadata.revision``。
+
+    这与前端「先读 templateBinding、读不到再回退 ``metadata.id`` /
+    ``metadata.revision``」是**同一套口径**：两边算出同一个身份，
+    前端才不会把这份载荷当成过期版本丢掉（ADR 0004 §5.10：结构完整的
+    旧会话同样按模拟数据渲染）。这里**不再**退回字面量
+    ``"definition"`` / ``1`` —— 那与前端的回退值永远对不上。
     """
     binding = _definition_binding(definition)
+    metadata = definition.get("metadata") if isinstance(definition, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
     definition_id = str(
         binding.get("definitionId")
+        or metadata.get("id")
         or (plan or {}).get("id")
         or "definition"
-    )
+    ).strip() or "definition"
     definition_version = binding.get("definitionVersion")
+    if definition_version is None:
+        definition_version = metadata.get("revision")
     if definition_version is None:
         definition_version = (plan or {}).get("revision")
     if definition_version is None:
@@ -1333,6 +1351,9 @@ def resolve_preview_context(
         definition,
         definition_id=definition_id,
         definition_version=definition_version,
+        # 粒度跟定义走：定义里的默认粒度就是方案定稿的那一份，
+        # 预览上下文必须原样带着（不在这里临时收窄成天）。
+        grain_unit=_definition_grain_unit(definition),
         anchor_time=anchor_time,
     )
 

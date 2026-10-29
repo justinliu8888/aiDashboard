@@ -273,14 +273,19 @@ def _resolve_zone(name: str | None) -> tuple[str, ZoneInfo]:
 
 
 def _normalize_grain(value: Any) -> str | None:
-    """把粒度归一成受支持的取值；明确给了非法值就报错。"""
+    """把粒度归一成受支持的取值；明确给了非法值就报错。
+
+    **不支持的粒度必须明确失败**（而不是悄悄换成天）：方案里按周 / 按月
+    是用户确认过的口径，造不出来就要说清楚造不出来、为什么、改成什么。
+    """
     if value is None or str(value).strip() == "":
         return None
     grain = str(value).strip().upper()
     if grain not in SUPPORTED_GRAINS:
         raise SimulatedDataError(
             "UNRESOLVED_GRAIN",
-            f"无法解析的时间粒度：{value!r}；受支持的取值为 {' / '.join(SUPPORTED_GRAINS)}。",
+            f"无法解析的时间粒度：{value!r}；受支持的取值为 {' / '.join(SUPPORTED_GRAINS)}。"
+            "示意数据只能按这几个粒度生成，请把方案里的时间粒度改成其中之一后重试。",
         )
     return grain
 
