@@ -118,7 +118,7 @@ function extractConstBlock(name) {
 }
 
 /** 把选中的片段放进沙箱跑一遍，返回它们组成的 API。 */
-function loadApi(names, extraStatements = [], extractors = {}) {
+function loadApi(names, extraStatements = [], extractors = {}, globals = {}) {
   const snippets = [
     ...extraStatements,
     ...names.map((name) => (extractors[name] || extractFunction)(name)),
@@ -128,6 +128,7 @@ function loadApi(names, extraStatements = [], extractors = {}) {
     session: null, // 每个用例自己填
     window: {},
     document: {},
+    ...globals, // 用例自己的沙箱全局（假 DOM、桩函数……）
   };
   vm.createContext(sandbox);
   vm.runInContext(snippets + "\n;globalThis.__api = {" + names.join(", ") + "};", sandbox);
@@ -140,6 +141,7 @@ function makeSession(overrides = {}) {
     definition: null,
     previewPayload: null,
     reportPreviewPayload: null,
+    reportPreviewError: null,
     ...overrides,
   };
 }
@@ -1189,4 +1191,248 @@ test("两条渲染后端产出同一种单位标记，且不写死单位", () =>
   // 单位一律来自载荷：整个图表块里不出现写死的单位字面量。
   assert.ok(!/["']kWh["']/.test(chartBlock), "图表渲染块不应出现写死的 kWh");
   assert.ok(!/["']耗电["']/.test(chartBlock), "图表渲染块不应出现写死的耗电");
+});
+
+// ---------------------------------------------------------------- 恢复会话失败（#53）
+//
+// 后端在「模拟载荷生成不出来」时（典型：方案要「按周统计」，示意数据只能按
+// 分钟 / 小时 / 天生成），把原因挂在会话读取响应的 snapshot.error 上
+// （code + 人话 message），而不是静默返回空快照。
+//
+// 前端要把这个原因**显示出来**：
+//   - 右侧面板顶上写明原因，不是一片空白；
+//   - 不伪造载荷、不画空壳卡片、不显示成「已校验 / 成功」；
+//   - 正常会话（有载荷、无 error）的行为一点不变。
+//
+// 聊天响应自带 error（AgentResponse.error）那条路径本来就有提示
+// （对话区一条 AI 回复），这里补一条回归断言把它钉住。
+
+/** 后端在恢复失败时给回来的形状（实测响应）。 */
+const RESTORE_ERROR = {
+  code: "UNRESOLVED_GRAIN",
+  message:
+    "示意数据没有生成出来：无法解析的时间粒度：'WEEK'；受支持的取值为 MINUTE / HOUR / DAY。示意数据只能按这几个粒度生成，请把方案里的时间粒度改成其中之一后重试。",
+};
+
+/** 假的面板 / 气泡节点：够用（清空、挂子节点、按属性或 dataset 找节点）。 */
+function makeFakePanelNode(tagName = "div") {
+  const el = {
+    tagName: String(tagName).toUpperCase(),
+    className: "",
+    classList: { add() {}, remove() {}, toggle() {} },
+    dataset: {},
+    textContent: "",
+    children: [],
+    appendChild(child) {
+      this.children.push(child);
+      return child;
+    },
+    setAttribute(name, value) {
+      this[name] = value;
+    },
+    getAttribute(name) {
+      return this[name] ?? null;
+    },
+    querySelector() {
+      return null;
+    },
+  };
+  let html = "";
+  Object.defineProperty(el, "innerHTML", {
+    get() {
+      return html;
+    },
+    set(value) {
+      html = value;
+      // 面板每次渲染前都先 innerHTML=""：子节点要跟着清掉。
+      if (!value) el.children.length = 0;
+    },
+  });
+  return el;
+}
+
+/** 按属性标记深度优先找节点（找不到返回 null）。 */
+function findByAttr(node, attr) {
+  for (const child of node.children || []) {
+    if (child[attr] !== undefined) return child;
+    const found = findByAttr(child, attr);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** 按 dataset 里的键深度优先找节点（找不到返回 null）。 */
+function findByDataset(node, key) {
+  for (const child of node.children || []) {
+    if (child.dataset && child.dataset[key] !== undefined) return child;
+    const found = findByDataset(child, key);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** 节点及其后代的文本。 */
+function textOf(node) {
+  let text = node.textContent || "";
+  for (const child of node.children || []) text += textOf(child);
+  return text;
+}
+
+/** 从源码里切出一段配平的大括号块（从 marker 开始）。 */
+function extractBlock(marker) {
+  const at = WORKBENCH_JS.indexOf(marker);
+  assert.ok(at >= 0, `源码里找不到 ${marker}`);
+  let depth = 0;
+  for (let i = at; i < WORKBENCH_JS.length; i += 1) {
+    if (WORKBENCH_JS[i] === "{") depth += 1;
+    else if (WORKBENCH_JS[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return WORKBENCH_JS.slice(at, i + 1);
+    }
+  }
+  throw new Error(`${marker} 的大括号没有配平`);
+}
+
+/**
+ * 面板渲染用到的源码片段（全部来自工作台主脚本的原文）。
+ *
+ * 面板头与区域卡片用桩函数代替：这一层要验的是「失败时面板画不画区域卡片」，
+ * 不是卡片长什么样（卡片由上面的用例守着）。
+ */
+function loadPanelApi(sessionState) {
+  const root = makeFakePanelNode("div");
+  const empty = makeFakePanelNode("div");
+  const renderedRegions = [];
+  const api = loadApi(
+    ["renderReportPanel", "renderPreviewErrorNotice", "readSessionRestoreError", "formatAgentError"],
+    [
+      "const previewRoot = globalThis.__previewRoot;",
+      "const previewEmpty = globalThis.__previewEmpty;",
+      "const _chartInstances = [];",
+      "const requestAnimationFrame = (fn) => fn();",
+      "function destroyCharts() {}",
+      "function isTitleRegion(region) { return region?.role === 'REPORT_TITLE'; }",
+      "function setPreviewEmptyHint(kind) { globalThis.__emptyHint = kind; }",
+      "function buildTotalsByUnit() { return {}; }",
+      "function renderPanelHeader() { const head = globalThis.__fakeNode(); head.dataset.panelHeader = '1'; return head; }",
+      "function renderRegionCard(region) { globalThis.__renderedRegions.push(region.regionId); const card = globalThis.__fakeNode(); card.dataset.regionId = region.regionId; return card; }",
+      "function syncPreviewEditability() {}",
+    ],
+    { renderReportPanel: extractFunctionDeep },
+    {
+      __previewRoot: root,
+      __previewEmpty: empty,
+      __renderedRegions: renderedRegions,
+      __fakeNode: () => makeFakePanelNode("div"),
+      document: { createElement: (tagName) => makeFakePanelNode(tagName) },
+    }
+  );
+  api.session = sessionState;
+  return { api, root, empty, renderedRegions };
+}
+
+/** 对话区用的源码片段（AI 气泡 + 失败提示，原文）。 */
+function loadChatApi() {
+  const chatScroll = makeFakePanelNode("div");
+  const api = loadApi(
+    ["aiBubble", "appendAiText", "appendAgentError", "formatAgentError"],
+    [
+      extractConst("esc"),
+      "const chatScroll = globalThis.__chatScroll;",
+      "const chatBubbleObserver = { observe() {} };",
+      "function scrollChatBottom() {}",
+    ],
+    {},
+    {
+      __chatScroll: chatScroll,
+      document: { createElement: (tagName) => makeFakePanelNode(tagName) },
+    }
+  );
+  return { api, chatScroll };
+}
+
+test("恢复会话的失败原因从 snapshot.error 里读出来（没有这个键就是正常会话）", () => {
+  const api = loadApi(["readSessionRestoreError"]);
+
+  const failed = api.__api.readSessionRestoreError({ snapshot: { error: RESTORE_ERROR } });
+  assert.equal(failed.code, "UNRESOLVED_GRAIN");
+  assert.ok(failed.message.includes("无法解析的时间粒度"), "原因要原样带回来");
+
+  // 正常会话：响应里没有 error 键。
+  assert.equal(api.__api.readSessionRestoreError({ snapshot: { reportPreviewPayload: SAMPLE_PAYLOAD } }), null);
+  assert.equal(api.__api.readSessionRestoreError({ snapshot: {} }), null);
+  assert.equal(api.__api.readSessionRestoreError({}), null);
+  assert.equal(api.__api.readSessionRestoreError(null), null);
+  // 空值 / 不是对象的 error 不当作失败原因（不凭空造一条出来）。
+  assert.equal(api.__api.readSessionRestoreError({ snapshot: { error: null } }), null);
+  assert.equal(api.__api.readSessionRestoreError({ snapshot: { error: {} } }), null);
+  assert.equal(api.__api.readSessionRestoreError({ snapshot: { error: "boom" } }), null);
+});
+
+test("恢复会话失败：右侧面板写明原因，且一个区域卡片都不画（不伪造载荷）", () => {
+  const { api, root, renderedRegions } = loadPanelApi(
+    makeSession({
+      definition: SAMPLE_DEFINITION,
+      reportPreviewPayload: null,
+      reportPreviewError: RESTORE_ERROR,
+    })
+  );
+  api.__api.renderReportPanel();
+
+  // 原因出现在面板上（刷新后也还在，不是空白）。
+  const notice = findByAttr(root, "data-preview-error");
+  assert.ok(notice, "恢复失败时右侧要有原因提示，不能一片空白");
+  const text = textOf(notice);
+  assert.ok(text.includes("无法解析的时间粒度"), `原因要写在面板上：${text}`);
+  assert.ok(text.includes("UNRESOLVED_GRAIN"), `错误码也要写明：${text}`);
+
+  // 不伪造载荷、不画空壳卡片：一个区域卡片都不画。
+  assert.equal(renderedRegions.length, 0, "失败时不该画区域卡片");
+  assert.equal(findByDataset(root, "regionId"), null, "面板里不该有区域节点");
+  // 只剩原因条：不摆「示意数据还没生成」的空态（失败时那句话是错的）。
+  assert.equal(root.children.length, 1, "面板里只应有原因条");
+});
+
+test("正常会话（有载荷、无 error）：不出现错误提示，既有渲染不变", () => {
+  const { api, root, renderedRegions } = loadPanelApi(
+    makeSession({
+      definition: SAMPLE_DEFINITION,
+      reportPreviewPayload: SAMPLE_PAYLOAD,
+      reportPreviewError: null,
+    })
+  );
+  api.__api.renderReportPanel();
+
+  assert.equal(findByAttr(root, "data-preview-error"), null, "正常会话不该出现失败提示");
+  assert.deepEqual(
+    renderedRegions,
+    SAMPLE_PAYLOAD.regions.map((region) => region.regionId),
+    "各区域照旧渲染"
+  );
+  assert.ok(findByDataset(root, "panelHeader"), "面板头照旧渲染");
+});
+
+test("聊天响应带 error：对话区把原因显示出来（回归钉住）", () => {
+  const { api, chatScroll } = loadChatApi();
+  api.__api.appendAgentError(RESTORE_ERROR);
+
+  const bubble = chatScroll.children[0];
+  assert.ok(bubble, "失败原因应当以一条 AI 回复出现在对话区");
+  assert.ok(bubble.innerHTML.includes("UNRESOLVED_GRAIN"), `错误码要写明：${bubble.innerHTML}`);
+  assert.ok(bubble.innerHTML.includes("无法解析的时间粒度"), `原因要写明：${bubble.innerHTML}`);
+});
+
+test("恢复会话那条路真的读了 snapshot.error，并把原因摆到面板与对话区", () => {
+  const restoreBlock = extractFunctionDeep("restoreSession");
+  assert.ok(restoreBlock.includes("readSessionRestoreError(detail)"), "恢复会话要读 snapshot.error");
+  assert.ok(
+    restoreBlock.includes("appendAgentError(session.reportPreviewError)"),
+    "恢复失败要在对话区说清楚原因"
+  );
+  assert.ok(restoreBlock.includes("renderReportPanel()"), "右侧面板照旧由那一个入口渲染");
+});
+
+test("聊天响应带 error 那条路仍然把原因显示出来（接线钉住）", () => {
+  const branch = extractBlock("if (data.error) {");
+  assert.ok(branch.includes("appendAgentError(data.error)"), "聊天响应的失败原因要显示出来");
 });
