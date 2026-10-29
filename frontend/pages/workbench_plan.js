@@ -704,7 +704,8 @@
     componentTypeLabel,
     designPhaseLabel,
     // 图表渲染器：模板中间页下线后**改由草稿路径复用**
-    // （草稿区域真的拿到 xLabels / yValues 时调用，见 workbench.js 的 renderRegion）。
+    // （事实：草稿路径的 region.data 是执行绑定描述符，不含 xLabels / yValues，
+    //  所以草稿面板当前不会真的调到这里；带数据点的预览走 ECharts 那条路）。
     // 需求稿 §3.3 点名保护这段代码，不得因为「没有调用方」而删掉。
     renderChart,
     render,
