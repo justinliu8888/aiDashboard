@@ -25,6 +25,16 @@
 卡片总量 = 设备表各行之和 = 能量趋势各桶之和；总电费 = 总耗电 × 单价；
 功率趋势按时长积分（积分回总耗电）；PUE 落在 1.2~1.8；告警约 5 条；
 机柜状态行数 = 设备数。
+
+**确定性（种子材料）**
+规格「按对象、逻辑日期、**区域**与字段组合哈希生成」：种子材料 =
+报表级（定义 + 定义版本 + 生成器版本 + 时间窗）+ **区域标识** + 对象 +
+逻辑日期 + 字段。区域级噪声（告警行、机柜行、趋势点、通用行、PUE、功率桶、
+指标卡示例值）都带区域标识 —— 同一份定义里两个板块的同类指标不撞值。
+
+同比（``yoyPercent``）**例外**：它按**量族**给，不按区域给 ——
+同一个量的同比跨区域共享；总电费与总耗电是同一个量族（能耗），必然同一个同比，
+否则同一份报表内部自相矛盾。
 """
 from __future__ import annotations
 
@@ -158,6 +168,18 @@ class _Context:
             f"{self.definition_id}|{self.definition_version}|{self.generator_version}|"
             f"{self.start.isoformat()}|{self.end.isoformat()}"
         )
+
+    def region_seed_scope(self, region_id: str) -> str:
+        """区域级种子材料：报表级种子 **+ 区域标识**。
+
+        规格「确定性：按对象、逻辑日期、**区域**与字段组合哈希生成」——
+        区域（报表板块）也是种子材料的一部分：同一份定义里两个板块的同类
+        指标不能撞出同一个值（趋势、告警、机柜、PUE、功率……）。
+
+        报表级前缀（定义 + 定义版本 + 生成器版本 + 时间窗）**原样保留**，
+        所以两份不同方案仍然各自一套噪声，不会共用同一批数。
+        """
+        return f"{self.seed_scope}|{region_id}"
 
 
 @dataclass
@@ -813,6 +835,44 @@ def _chart_units(
     return units
 
 
+# ---------------------------------------------------------------- 量族与同比
+
+
+def _metric_family(kind: str, metric_key: str, unit: str) -> str:
+    """量族：这个指标是**由哪个基础量算出来的**。
+
+    同比（``yoyPercent``）按量族给，不是按区域给 —— 同一个量的同比只能有
+    一个，否则同一份报表内部自相矛盾。
+
+    判据：
+
+    1. ``energy``（耗电）与 ``cost``（电费 = 耗电 × 单价）是**同一个基础量**
+       → 同一族（``energy``）：总耗电卡与总电费卡的同比必须相同；
+    2. ``pue`` / ``power`` / ``alarms`` / ``cabinet_status`` 各自一族
+       （PUE、实时功率、告警是各自的量，同比也各自不同）；
+    3. ``generic``（量身份认不出来）先看**单位**：``kWh`` 是能耗、``元`` 是能耗
+       折算出来的电费 → 都归能耗族；其余按 ``metricKey`` 分族（同一个指标键
+       是同一个量，不同指标键不是同一个量）。
+    """
+    if kind in (KIND_ENERGY, KIND_COST):
+        return "energy"
+    if kind == KIND_GENERIC:
+        text = str(unit or "").strip().lower()
+        if text in ("kwh", "元", "cny", "rmb"):
+            return "energy"
+        return f"generic:{metric_key}"
+    return kind
+
+
+def _yoy_for(ctx: _Context, family: str) -> float:
+    """某个量族的同比百分比。
+
+    种子**不含区域**：同一个量族（哪怕落在不同板块）给出同一个同比 ——
+    同一个量的同比只有一个。不同量族才各给各的。
+    """
+    return round(hash_float(f"yoy/{ctx.seed_scope}/{family}", -8.0, 20.0), 1)
+
+
 # ---------------------------------------------------------------- 列分类
 
 
@@ -935,7 +995,7 @@ def _metric_card_payload(
     buckets: list[_Bucket],
     powers: list[float],
     ctx: _Context,
-    yoy: float,
+    seed_scope: str,
 ) -> dict[str, Any]:
     component = region.get("component") or {}
     metric = component.get("metric") or {}
@@ -950,13 +1010,24 @@ def _metric_card_payload(
     ordered = [item for item in metrics if item["kind"] == kind] + [
         item for item in metrics if item["kind"] != kind
     ]
+    # 同比按**主量的量族**给：总耗电与总电费同族 → 同一个同比；
+    # PUE / 实时功率 / 告警各自一族 → 各自的同比。
+    primary_metric = ordered[0] if ordered else None
+    yoy = _yoy_for(
+        ctx,
+        _metric_family(
+            str((primary_metric or {}).get("kind") or kind),
+            str((primary_metric or {}).get("metricKey") or kind),
+            str((primary_metric or {}).get("unit") or ""),
+        ),
+    )
     for item in ordered:
         value = _metric_value(
             item["kind"],
             base=base,
             buckets=buckets,
             powers=powers,
-            seed=f"{ctx.seed_scope}|{item['metricKey']}",
+            seed=f"{seed_scope}|{item['metricKey']}",
             unit=item.get("unit") or "",
         )
         precision = declared_precision
@@ -1083,6 +1154,7 @@ def _table_payload(
     base: _Base,
     buckets: list[_Bucket],
     ctx: _Context,
+    seed_scope: str,
 ) -> dict[str, Any]:
     """表格载荷：按**列名**生成行，列的 fieldRef 一定能读到单元格。"""
     columns = _columns_of(region, spec)
@@ -1105,19 +1177,21 @@ def _table_payload(
     if kind == KIND_ALARMS:
         for index in range(ALARM_ROW_COUNT):
             device = base.devices[
-                int(hash_float(f"alarm/{ctx.seed_scope}/{index}", 0, len(base.devices) - 1e-6))
+                int(hash_float(f"alarm/{seed_scope}/{index}", 0, len(base.devices) - 1e-6))
                 % len(base.devices)
             ] if base.devices else None
             row: dict[str, Any] = {}
             for column, value_kind in zip(columns, kinds):
-                seed = f"alarm/{ctx.seed_scope}/{index}/{column['fieldRef']}"
+                seed = f"alarm/{seed_scope}/{index}/{column['fieldRef']}"
                 if value_kind in ("device_name", "device_id", "device_type") and device:
                     row[column["fieldRef"]] = _row_value(
                         value_kind, seed=seed, device=device, bucket=None,
                         hours=window_hours,
                     )
                 elif value_kind == "time":
-                    moment = _moment_in_window(ctx, index)
+                    moment = _moment_in_window(
+                        ctx, index, f"alarm/{seed_scope}/{index}"
+                    )
                     row[column["fieldRef"]] = moment.isoformat()
                 else:
                     row[column["fieldRef"]] = _row_value(
@@ -1129,7 +1203,7 @@ def _table_payload(
         for device in base.devices:
             row = {}
             for column, value_kind in zip(columns, kinds):
-                seed = f"cabinet/{ctx.seed_scope}/{device['deviceId']}/{column['fieldRef']}"
+                seed = f"cabinet/{seed_scope}/{device['deviceId']}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
                     value_kind, seed=seed, device=device, bucket=None,
                     hours=window_hours,
@@ -1139,7 +1213,7 @@ def _table_payload(
         for device in base.devices:
             row = {}
             for column, value_kind in zip(columns, kinds):
-                seed = f"device/{ctx.seed_scope}/{device['deviceId']}/{column['fieldRef']}"
+                seed = f"device/{seed_scope}/{device['deviceId']}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
                     value_kind, seed=seed, device=device, bucket=None,
                     hours=window_hours,
@@ -1149,7 +1223,7 @@ def _table_payload(
         for bucket in buckets:
             row = {}
             for column, value_kind in zip(columns, kinds):
-                seed = f"trend/{ctx.seed_scope}/{bucket.start.isoformat()}/{column['fieldRef']}"
+                seed = f"trend/{seed_scope}/{bucket.start.isoformat()}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
                     value_kind, seed=seed, device=None, bucket=bucket,
                     hours=window_hours,
@@ -1159,7 +1233,7 @@ def _table_payload(
         for bucket in buckets:
             row = {}
             for column, value_kind in zip(columns, kinds):
-                seed = f"series/{ctx.seed_scope}/{bucket.start.isoformat()}/{column['fieldRef']}"
+                seed = f"series/{seed_scope}/{bucket.start.isoformat()}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
                     value_kind, seed=seed, device=None, bucket=bucket,
                     hours=window_hours,
@@ -1169,7 +1243,7 @@ def _table_payload(
         for device in base.devices:
             row = {}
             for column, value_kind in zip(columns, kinds):
-                seed = f"generic/{ctx.seed_scope}/{device['deviceId']}/{column['fieldRef']}"
+                seed = f"generic/{seed_scope}/{device['deviceId']}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
                     value_kind, seed=seed, device=device, bucket=None,
                     hours=window_hours,
@@ -1184,12 +1258,18 @@ def _table_payload(
     }
 
 
-def _moment_in_window(ctx: _Context, index: int) -> datetime:
-    """告警发生时间：窗口内的一个确定时刻。"""
+def _moment_in_window(ctx: _Context, index: int, seed: str = "") -> datetime:
+    """告警发生时间：窗口内的一个确定时刻。
+
+    ``seed`` 非空时按种子在窗口内**错开**一点点：区域是种子材料的一部分，
+    同一份定义里两个告警板块的行不该整行撞上。
+    """
     span = _hours_between(ctx.start, ctx.end) * 3600.0
     if span <= 0:
         return ctx.start
     offset = span * ((index + 0.5) / ALARM_ROW_COUNT)
+    if seed:
+        offset += span * (hash_float(seed, 0.0, 1.0) - 0.5) / ALARM_ROW_COUNT
     return ctx.start + timedelta(seconds=offset)
 
 
@@ -1221,6 +1301,7 @@ def _chart_payload(
     buckets: list[_Bucket],
     powers: list[float],
     ctx: _Context,
+    seed_scope: str,
 ) -> dict[str, Any]:
     """图表载荷：轴、序列与点，横轴时间和点数一一对应。"""
     component = region.get("component") or {}
@@ -1258,12 +1339,12 @@ def _chart_payload(
                 values = list(powers)
             elif metric_kind == KIND_PUE:
                 values = [
-                    round(hash_float(f"pue/{ctx.seed_scope}/{b.start.isoformat()}", 1.2, 1.8 - 1e-6), 2)
+                    round(hash_float(f"pue/{seed_scope}/{b.start.isoformat()}", 1.2, 1.8 - 1e-6), 2)
                     for b in buckets
                 ]
             elif metric_kind == KIND_GENERIC:
                 values = [
-                    round(hash_float(f"generic/{ctx.seed_scope}/{b.start.isoformat()}", 10.0, 90.0), 1)
+                    round(hash_float(f"generic/{seed_scope}/{b.start.isoformat()}", 10.0, 90.0), 1)
                     for b in buckets
                 ]
             else:
@@ -1287,12 +1368,12 @@ def _chart_payload(
             ]
         elif metric_kind == KIND_PUE:
             values = [
-                round(hash_float(f"pue/{ctx.seed_scope}/{d['deviceId']}", 1.2, 1.8 - 1e-6), 2)
+                round(hash_float(f"pue/{seed_scope}/{d['deviceId']}", 1.2, 1.8 - 1e-6), 2)
                 for d in base.devices
             ]
         elif metric_kind == KIND_GENERIC:
             values = [
-                round(hash_float(f"generic/{ctx.seed_scope}/{d['deviceId']}", 10.0, 90.0), 1)
+                round(hash_float(f"generic/{seed_scope}/{d['deviceId']}", 10.0, 90.0), 1)
                 for d in base.devices
             ]
         else:
@@ -1455,8 +1536,6 @@ def generate_simulated_data(
     base = _build_base(definition, ctx)
     room_name = resolve_room_name(room_id_of_definition(definition))
     buckets = _buckets_for_grain(ctx, base, ctx.grain)
-    powers = _bucket_powers(base, buckets, ctx.seed_scope)
-    yoy = round(hash_float(f"yoy/{ctx.seed_scope}", -8.0, 20.0), 1)
 
     result: dict[str, dict[str, Any]] = {}
     for region in regions:
@@ -1478,29 +1557,31 @@ def generate_simulated_data(
         spec = _preview_spec(region)
         kind = _resolve_kind(region, spec)
         metrics = _resolve_metrics(region, spec, kind)
+        # 区域级种子材料：报表级种子 + 区域标识。
+        seed_scope = ctx.region_seed_scope(region_id)
         region_grain = _region_grain(region) or ctx.grain
         region_buckets = (
             buckets if region_grain == ctx.grain else _buckets_for_grain(ctx, base, region_grain)
         )
-        region_powers = (
-            powers if region_grain == ctx.grain
-            else _bucket_powers(base, region_buckets, ctx.seed_scope)
-        )
+        # 功率桶的噪声也带区域：两个功率趋势板块不该给出同一组点。
+        region_powers = _bucket_powers(base, region_buckets, seed_scope)
 
         if ctype == "METRIC_CARD":
             payload = _metric_card_payload(
                 region, spec, kind, metrics,
                 base=base, buckets=region_buckets, powers=region_powers,
-                ctx=ctx, yoy=yoy,
+                ctx=ctx, seed_scope=seed_scope,
             )
         elif ctype == "TABLE":
             payload = _table_payload(
                 region, spec, kind, base=base, buckets=region_buckets, ctx=ctx,
+                seed_scope=seed_scope,
             )
         elif ctype == "CHART":
             payload = _chart_payload(
                 region, spec, kind, metrics,
                 base=base, buckets=region_buckets, powers=region_powers, ctx=ctx,
+                seed_scope=seed_scope,
             )
         elif ctype == "DATA_QUALITY":
             payload = _data_quality_payload(base)
