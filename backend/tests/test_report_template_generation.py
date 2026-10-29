@@ -1098,6 +1098,9 @@ def test_draft_binding_passes_the_pending_reason_through():
     """``pendingReason`` 是模板层 ``data.pendingReason`` 的**透传**（#39 §0.4.1）。
 
     文案唯一来源是模板层（#38 产出）；草稿层不另写一句。
+
+    文案本身按 ADR 0004 换过口径：草稿阶段显示的是**模拟业务数据**，
+    不再是「数值待试运行产生」。
     """
     from app.services.template_definition_service import build_template_definition
 
@@ -1110,13 +1113,15 @@ def test_draft_binding_passes_the_pending_reason_through():
         data_status="bound", reason=None,
         region_data={
             "bindingStatus": "pending_execution",
-            "pendingReason": "数值待试运行产生，本区域尚未取数。",
+            "pendingReason": "本区域数值为模拟业务数据，接入真实数据后自动替换。",
         },
     )
     draft = build_template_definition(template, _plan_with(sections), "room_a")
 
     binding = draft.regions[0]["templateBinding"]
-    assert binding["pendingReason"] == "数值待试运行产生，本区域尚未取数。"
+    assert binding["pendingReason"] == "本区域数值为模拟业务数据，接入真实数据后自动替换。"
+    # 旧口径（「数值待试运行产生」）已经作废：草稿阶段一律用模拟业务数据渲染。
+    assert "待试运行" not in binding["pendingReason"]
     # bound 区域不是占位：placeholderReason 仍然是 None。
     assert binding["placeholderReason"] is None
     assert binding["dataStatus"] == "bound"

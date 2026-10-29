@@ -10,28 +10,31 @@
     2. 逐区域核对**当前已接通的能力**（目录 + 指标 + 授权范围）；
     3. 接得到的区域写明**绑定了哪个指标**、**用哪个时间窗**，
        并标明数据来源性质；
-    4. 接不到的区域保留占位，写明原因（数据待连接 / 口径待核实）。
+    4. 接不到的区域保留占位，写明原因（数据待连接 / 口径待核实 /
+       能力待接通）。
 
 同时守住两条边界：
 
     - **设计自由度不被缺数据拦住**（Q2：「先自由发挥，不要先确定数据库里
       有没有数据被拦截了」）—— 没有数据也要出模板，只是那一块是占位；
-    - **绝不编造数值**（Q11）—— 接不到就是占位，不是假数。
+    - **绝不编造真实业务数值或计算口径**（Q11）—— 草稿阶段显示的是系统
+      按固定种子生成的**模拟业务数据**，不是真实数据；PUE 这类尚未接通的
+      指标只标「能力待接通」，**不编造公式**。
 
-**取数不在这一层发生**（工单 04 / GitHub #38）：模板阶段只做能力核对，
-**不读业务数据、不算出任何数值**。页面上那一屏「看起来像真的」的数值
-一律留到**试运行**时产生 —— 那一层读的是草稿里的执行绑定，与模板里
-的展示数值无关。所以 ``dataStatus="bound"`` 现在意味着
-**「指标已绑定、能力可用」**，不代表「已经取到数」。
+**取数不在这一层发生**：模板阶段只做能力核对，**不读业务数据、不算出任何
+数值**。页面上那一屏数值由草稿阶段的模拟业务数据渲染产生（ADR 0004）——
+这一层给的是**绑定描述符**与**定稿栏目**，不含任何业务数值。所以
+``dataStatus="bound"`` 现在的意思是**「指标已绑定、能力可用」**，不代表
+「已经取到真实数」。
 
-数据来源说明：试运行取到的数据来自能耗 Mock 源
-（``mock_data_service``），不是生产能耗事实表。所以每个绑定到区域的
-数据来源仍然标明性质 —— 把演示数值当成生产数据，是比缺数据更严重的
-问题。
+数据来源说明：数值来自确定性生成的模拟业务数据，不是生产能耗事实表。
+所以每个绑定到区域的数据来源仍然标明性质 —— 把演示数值当成生产数据，
+是比缺数据更严重的问题。
 """
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -39,6 +42,7 @@ from typing import Any, Mapping
 from app.schemas.report_plan import COMPONENT_TYPE_VALUES, PlanContractError
 from app.schemas.template_design import (
     RegionDataStatus,
+    TemplateColumn,
     TemplateDesign,
     TemplateRegion,
 )
@@ -70,6 +74,20 @@ DATA_SOURCE_LABEL = "模拟数据（能耗 Mock 源，非生产事实表）"
 #: 就说明当前能力算不出这个数 —— 只能占位，不能编。
 _SOURCE = get_catalog(DEFAULT_SOURCE_REF) or {}
 _SOURCE_FIELDS = _SOURCE.get("fields") or {}
+
+#: 语义量身份（造数器按它决定造哪一类量）。
+#:
+#: 身份来自**指标口径**；口径对不上时再按方案的指标意图归一化
+#: （见 ``classify_metric_kind``）。**不按区域标题猜**。
+METRIC_KIND_BY_REF: dict[str, str] = {
+    METRIC_TOTAL_ENERGY["metricRef"]: "energy",
+    METRIC_DEVICE_ENERGY["metricRef"]: "energy",
+    METRIC_ENERGY_COST["metricRef"]: "cost",
+    METRIC_PUE["metricRef"]: "pue",
+}
+
+#: 合法的列取值键形态（行对象的键）。
+_COLUMN_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 #: 指标意图的常见措辞 → 指标口径。
 #:
@@ -241,6 +259,94 @@ def _metric_is_backed(metric: Mapping[str, Any]) -> tuple[bool, str | None]:
     return False, f"「{label}」口径待核实：当前数据源没有登记这个字段，算不出数值。"
 
 
+def classify_metric_kind(*, intent: str, metric_ref: str | None = None) -> str:
+    """把方案的指标意图归一化成**语义量身份**。
+
+    身份来自**指标口径**；口径对不上时再按方案的指标意图归一化 ——
+    「实时功率」「告警列表」「机柜状态」这些系统还没接通的量，身份是
+    **认得出来的**，区域因此能标「能力待接通」，而不是只说「数据待连接」。
+
+    认不出来时给 ``generic``：陌生指标照样有明确标注的示例，
+    **不按区域标题猜真实口径**。
+    """
+    if metric_ref and metric_ref in METRIC_KIND_BY_REF:
+        return METRIC_KIND_BY_REF[metric_ref]
+    text = (intent or "").strip().lower()
+    if not text:
+        return "generic"
+    if "功率" in text:
+        return "power"
+    if "告警" in text or "报警" in text:
+        return "alarms"
+    if ("机柜" in text or "机架" in text or "柜位" in text) and "状态" in text:
+        return "cabinet_status"
+    if "电费" in text or "成本" in text:
+        return "cost"
+    if "pue" in text or "电能使用效率" in text:
+        return "pue"
+    if "能耗" in text or "耗电" in text or "用电" in text or "电量" in text:
+        return "energy"
+    return "generic"
+
+
+def _column_key(section_id: str, column_id: str, index: int) -> str:
+    """缺键时按板块与栏目确定性生成取值键。"""
+    if _COLUMN_KEY_PATTERN.match(column_id):
+        return column_id
+    safe_section = re.sub(r"[^A-Za-z0-9_]", "_", section_id) or "section"
+    return f"{safe_section}_col_{index + 1}"
+
+
+def _unique_key(key: str, used: set[str]) -> str:
+    """取值键不能重复（显示名可以重复，键不行）。"""
+    if key not in used:
+        return key
+    index = 2
+    while f"{key}_{index}" in used:
+        index += 1
+    return f"{key}_{index}"
+
+
+def _normalize_columns(
+    section: Mapping[str, Any], *, section_id: str,
+) -> list[TemplateColumn]:
+    """把方案板块声明的栏目整理成**定稿列**。
+
+    - 顺序一律按方案声明，**不排序、不按标题猜列**；
+    - 缺 ``id`` / ``fieldRef`` 时按板块与栏目确定性补齐；
+    - 取值键重复时确定性改键（显示名可以重复，键不行）。
+    """
+    raw = section.get("columns")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    columns: list[TemplateColumn] = []
+    used_keys: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            continue
+        column_id = str(item.get("id") or "").strip() or f"col_{index + 1}"
+        label = str(item.get("label") or "").strip() or column_id
+        field_ref = str(item.get("fieldRef") or "").strip() or _column_key(
+            section_id, column_id, index + 1
+        )
+        field_ref = _unique_key(field_ref, used_keys)
+        used_keys.add(field_ref)
+        extra = {
+            key: value for key, value in item.items()
+            if key not in {"id", "label", "fieldRef", "format"}
+        }
+        columns.append(
+            TemplateColumn(
+                id=column_id,
+                label=label,
+                fieldRef=field_ref,
+                format=item.get("format") if isinstance(item.get("format"), Mapping) else None,
+                **extra,
+            )
+        )
+    return columns
+
+
 def _text_payload(section: Mapping[str, Any], room_name: str) -> dict[str, Any]:
     """文字块：本来就是说明文字，没有数值。"""
     content = str(section.get("description") or section.get("title") or "")
@@ -257,9 +363,11 @@ def _build_region(
 ) -> TemplateRegion:
     """把方案里的一个板块变成一个模板区域。
 
-    这里**只做能力核对，不取数**（工单 04 / GitHub #38）：
-    判定指标能不能匹配上、能力支不支持、统计对象在不在授权范围内。
-    数值一律留到试运行时由预览链路产生。
+    这里**只做能力核对，不取数**：判定指标能不能匹配上、能力支不支持、
+    统计对象在不在授权范围内，并把方案声明的**定稿栏目**原样透传下来。
+
+    定义层面不产生任何业务数值 —— 数值由草稿阶段的模拟业务数据渲染产生
+    （ADR 0004）。这一层给的是**绑定描述符**与**定稿栏目**。
     """
     section = dict(section or {})
     section_id = str(section.get("id") or f"section_{index + 1}")
@@ -287,8 +395,16 @@ def _build_region(
             f"必须声明至少一条指标意图（metricIntents）。",
             section_id=section_id, section_title=title, section_index=index,
         )
+    # 方案声明的定稿栏目：顺序与 id/label/fieldRef 原样带下来，
+    # 转换层不按标题猜列、不替换列顺序。
+    columns = _normalize_columns(section, section_id=section_id)
 
-    def placeholder(reason: str, metric_refs: list[str] | None = None) -> TemplateRegion:
+    def placeholder(
+        reason: str,
+        metric_refs: list[str] | None = None,
+        *,
+        capability_pending: bool = False,
+    ) -> TemplateRegion:
         return TemplateRegion(
             id=f"region_{index + 1}",
             sectionId=section_id,
@@ -296,8 +412,12 @@ def _build_region(
             componentType=component_type,
             metricIntents=intents,
             metricRefs=metric_refs or [],
+            columns=columns,
             dataStatus=RegionDataStatus.PLACEHOLDER.value,
             placeholderReason=reason,
+            # 能力待接通与「授权范围」「绑定三态」相互独立：
+            # 指标口径算不出来 → True；统计对象越权 → False。
+            capabilityPending=capability_pending,
         )
 
     if component_type == "text":
@@ -313,20 +433,31 @@ def _build_region(
 
     metric_ref, metric, intent_reason = _match_metric(intents)
     if metric_ref is None or metric is None:
-        return placeholder(intent_reason or "数据待连接：当前已接通的能力里没有对应指标。")
+        # 目录里没有这个指标 —— 身份认得出来就标「能力待接通」，
+        # 认不出来给 generic（照实标，不编口径）。
+        return placeholder(
+            intent_reason or "数据待连接：当前已接通的能力里没有对应指标。",
+            capability_pending=True,
+        )
 
     backed, reason = _metric_is_backed(metric)
     if not backed:
-        return placeholder(reason or "数据待连接。", [metric_ref])
+        # 指标登记在册但底层字段没有 —— 系统还算不出这个数（能力待接通）。
+        return placeholder(reason or "数据待连接。", [metric_ref], capability_pending=True)
 
     if room_id is None:
-        return placeholder(room_reason or "数据待连接：统计对象不在授权范围内。", [metric_ref])
+        # 统计对象越权 —— 这是**授权范围**问题，不是能力缺失。
+        return placeholder(
+            room_reason or "数据待连接：统计对象不在授权范围内。",
+            [metric_ref],
+            capability_pending=False,
+        )
 
     # 到这里说明：指标匹配上了、能力支持、统计对象也在授权范围内。
     #
-    # 但这里**不取数**（工单 04 / GitHub #38）：模板阶段只核对「能力是否
-    # 可用、指标是否绑定」，数值一律留到试运行时产生。区域带的是
-    # **绑定描述符** —— 指标绑定 + 时间窗，不含任何业务数值。
+    # 但这里**不取真实数**：模板阶段只核对「能力是否可用、指标是否绑定」。
+    # 区域带的是**绑定描述符** —— 指标绑定 + 时间窗 + 定稿栏目，
+    # 不含任何业务数值。
     metric_label = str((metric or {}).get("label") or title)
     metric_unit = str((metric or {}).get("unit") or "")
     return TemplateRegion(
@@ -336,17 +467,18 @@ def _build_region(
         componentType=component_type,
         metricIntents=intents,
         metricRefs=[metric_ref],
-        # bound = 指标已绑定、能力可用；**不代表已经取到数**。
+        columns=columns,
+        # bound = 指标已绑定、能力可用；**不代表已经取到真实数**。
         dataStatus=RegionDataStatus.BOUND.value,
         data={
-            # 取数状态标记：还没取数，等试运行。
+            # 取数状态标记：还没取真实数。
             "bindingStatus": "pending_execution",
             # 指标绑定（与 metricRefs 一致，便于转换层直接取用）
             "metricRef": metric_ref,
             # 展示用标签与单位（不含任何数值）
             "label": metric_label,
             "unit": metric_unit,
-            # 时间窗：方案时间参数的协议形状，供试运行取数用
+            # 时间窗：方案时间参数的协议形状，供取数用
             "timeWindow": {
                 "type": "CALENDAR",
                 "timezone": window.timezone,
@@ -355,10 +487,11 @@ def _build_region(
                 "offset": window.offset,
             },
             "windowLabel": window.label,
-            # 还没取数的原因（转换层据此在草稿空壳上说明）
-            "pendingReason": "数值待试运行产生，本区域尚未取数。",
+            # 这个区域的数值**是模拟的**（ADR 0004）：草稿阶段不接真实数，
+            # 屏上那一屏由模拟业务数据渲染，接入真实数据后自动替换。
+            "pendingReason": "本区域数值为模拟业务数据，接入真实数据后自动替换。",
         },
-        # 取数来源与数据性质披露保留：试运行取到的就是这个源
+        # 取数来源与数据性质披露保留：数值就来自这个模拟源
         dataSource=DATA_SOURCE,
         dataSourceLabel=DATA_SOURCE_LABEL,
     )
@@ -379,8 +512,8 @@ def build_template_design(
       错误信息点名是哪个板块。这不是「缺数据」，是**方案本身不合法**，
       猜一个类型补上去只会让草稿长成另一个样子（#39）。
 
-    这一步**不取数、不算数值**（工单 04 / GitHub #38）：区域带的是
-    指标绑定与时间窗，数值由试运行时产生。
+    这一步**不取真实数、不算数值**：区域带的是指标绑定与时间窗与**定稿栏目**，
+    数值由草稿阶段的模拟业务数据渲染产生（ADR 0004）。
     """
     plan = dict(plan or {})
     requirements = dict(plan.get("requirements") or {})
