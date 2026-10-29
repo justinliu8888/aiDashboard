@@ -377,9 +377,21 @@ class SessionService:
         if not previous:
             return snapshot
         result = dict(snapshot or {})
-        for key in ("definition", "policy", "lastReportRun", "previewPayload"):
+        for key in ("definition", "policy", "lastReportRun"):
             if not isinstance(result.get(key), dict) and isinstance(previous.get(key), dict):
                 result[key] = previous[key]
+        # ``previewPayload``（试运行结果）**只在非模板态**沿用：
+        # 模板态的试运行跑的是模拟业务数据，结果只留内存（ADR 0004），
+        # 不能因为沿用库里那份**历史遗留**的模拟结果又把它写回持久化存储
+        # ——「已有历史数据不删改」不等于「继续写」。
+        definition = result.get("definition") or previous.get("definition")
+        if not _definition_is_template_mode(definition):
+            if not isinstance(result.get("previewPayload"), dict) and isinstance(
+                previous.get("previewPayload"), dict
+            ):
+                result["previewPayload"] = previous["previewPayload"]
+        else:
+            result.pop("previewPayload", None)
         # 设计阶段与方案是**原样带过**，不是「缺了才补」：
         # 本轮响应没带设计状态时，库里那份就是权威。
         for key in ("designPhase", "reportPlan", "templateDesign"):
