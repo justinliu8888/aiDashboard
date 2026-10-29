@@ -1,0 +1,231 @@
+{
+  "baseDir": "..",
+  "serve": "..",
+  "outDir": "../.selfcheck/tmpl-08b-page-accept",
+  "waitMs": 1500,
+  "timeout": 10000,
+  "ignore": ["modao.cc", "/health", "/api/sessions"],
+  "flows": [
+    {
+      "name": "08b-01 待确认阶段：文字方案在左侧对话区展开并带确认动作，右侧面板无方案",
+      "path": "/frontend/tests/page_accept_harness.html?scene=waiting",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#chat-scroll [data-plan-bubble] .plan-module" },
+        { "wait": 400 },
+
+        { "assertVisible": "#chat-scroll [data-plan-bubble] .plan-module" },
+        { "assertVisible": "#chat-scroll [data-plan-bubble] #plan-root" },
+        { "eval": "(() => { const kids = Array.from(document.querySelector('#chat-scroll').children); const iPlan = kids.findIndex(el => el.hasAttribute('data-plan-bubble')); const iText = kids.findIndex(el => el.textContent.includes('我拟了这份方案')); return iPlan >= 0 && iText >= 0 && iPlan > iText; })()" },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] .plan-module').getAttribute('data-plan-phase') === 'PLAN_WAITING_CONFIRM'" },
+
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] details.confirmed-plan-details') === null" },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] .plan-body').children.length >= 4" },
+        { "assertVisible": "#chat-scroll [data-plan-bubble] .plan-confirm" },
+        { "assertAttr": "#chat-scroll [data-plan-bubble] .plan-confirm", "name": "data-plan-can-confirm", "op": "==", "value": "true" },
+        { "assertText": "确认方案" },
+
+        { "assertCount": "#preview-root #plan-root", "count": 0, "op": "===" },
+        { "assertCount": "#preview-root .plan-module", "count": 0, "op": "===" },
+        { "assertCount": "#preview-root [data-plan-bubble]", "count": 0, "op": "===" },
+        { "assertCount": "#preview-root details", "count": 0, "op": "===" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root').textContent; return !t.includes('选型理由') && !t.includes('板块与图表建议') && !t.includes('未接受的额外建议') && !t.includes('确认方案'); })()" },
+
+        { "assertCount": "#chat-scroll [data-plan-bubble] .plan-component-type", "count": 4, "op": "===" },
+        { "assertText": "指标卡" },
+        { "assertText": "折线图" },
+        { "assertText": "表格" },
+        { "assertCount": "#chat-scroll [data-plan-bubble] .plan-selection-reason", "count": 4, "op": "===" },
+        { "assertText": "看总量，指标卡最直观" },
+        { "assertText": "看具体记录与属性，用表格" },
+        { "assertCount": "#chat-scroll [data-plan-bubble] .plan-column", "count": 3, "op": "===" },
+        { "assertText": "设备名称" },
+        { "assertText": "采集时间" },
+
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] .plan-module img') === null" },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] .plan-module script') === null" },
+        { "eval": "window.__pageAcceptXss === undefined" },
+        { "eval": "Array.from(document.querySelectorAll('#chat-scroll [data-plan-bubble] .plan-section-title')).some(el => el.textContent.includes('<img src=x onerror='))" },
+
+        { "eval": "window.__setChatWidth(340)" },
+        { "wait": 300 },
+        { "eval": "(() => { const root = document.querySelector('#chat-scroll [data-plan-bubble] #plan-root'); const col = document.querySelector('#chat-scroll'); const cb = col.getBoundingClientRect(); const rb = root.getBoundingClientRect(); const wide = Array.from(root.querySelectorAll('*')).filter(el => el.getBoundingClientRect().right > cb.right + 1); return root.scrollWidth <= root.clientWidth + 1 && wide.length === 0 && rb.right <= cb.right + 1; })()" },
+        { "eval": "Array.from(document.querySelectorAll('#chat-scroll [data-plan-bubble] .plan-column')).every(el => el.getBoundingClientRect().height < 24)" },
+        { "screenshot": "08b-01-待确认阶段左侧方案展开340px" },
+
+        { "eval": "window.__setChatWidth(560)" },
+        { "wait": 300 },
+        { "eval": "(() => { const root = document.querySelector('#chat-scroll [data-plan-bubble] #plan-root'); const col = document.querySelector('#chat-scroll'); const cb = col.getBoundingClientRect(); const wide = Array.from(root.querySelectorAll('*')).filter(el => el.getBoundingClientRect().right > cb.right + 1); return root.scrollWidth <= root.clientWidth + 1 && wide.length === 0; })()" },
+        { "eval": "Array.from(document.querySelectorAll('#chat-scroll [data-plan-bubble] .plan-column')).every(el => el.getBoundingClientRect().height < 24)" },
+        { "screenshot": "08b-02-待确认阶段左侧方案展开560px" }
+      ]
+    },
+    {
+      "name": "08b-02 草稿阶段：左侧方案收起可展开，右侧直接出图出表 + 弱标注 + 「示意」徽标",
+      "path": "/frontend/tests/page_accept_harness.html?scene=draft",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#preview-root [data-region-badge]" },
+        { "wait": 400 },
+
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] details.confirmed-plan-details') !== null" },
+        { "eval": "!document.querySelector('#chat-scroll [data-plan-bubble] details').hasAttribute('open')" },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] details summary').textContent.includes('查看已确认的文字方案')" },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] .plan-confirm') === null" },
+        { "click": "#chat-scroll [data-plan-bubble] details summary" },
+        { "wait": 300 },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] details').hasAttribute('open') === true" },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] details').textContent.includes('设备名称')" },
+        { "screenshot": "08b-03-草稿阶段左侧方案手动展开" },
+        { "click": "#chat-scroll [data-plan-bubble] details summary" },
+        { "wait": 200 },
+        { "eval": "!document.querySelector('#chat-scroll [data-plan-bubble] details').hasAttribute('open')" },
+
+        { "assertCount": "#preview-root #plan-root", "count": 0, "op": "===" },
+        { "assertCount": "#preview-root .plan-module", "count": 0, "op": "===" },
+        { "assertCount": "#preview-root [data-plan-bubble]", "count": 0, "op": "===" },
+        { "assertCount": "#preview-root details", "count": 0, "op": "===" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root').textContent; return !t.includes('选型理由') && !t.includes('板块与图表建议') && !t.includes('未接受的额外建议') && !t.includes('确认方案'); })()" },
+
+        { "assertText": "总耗电" },
+        { "assertText": "37357.8" },
+        { "assertText": "kWh" },
+        { "assertText": "总电费" },
+        { "assertText": "26150.46" },
+        { "assertText": "242.4" },
+        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_1\"] .text-3xl'); return v ? /\\d/.test(v.textContent) && !v.textContent.includes('—') : false; })()" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root').textContent; return !t.includes('暂无数值') && !t.includes('图表占位') && !t.includes('表格样例占位') && !t.includes('暂无数据'); })()" },
+        { "assertCount": "#preview-root [data-region-id=\"region_7\"] table tbody tr", "count": 10, "op": "===" },
+        { "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id=\"region_7\"] table tbody tr')).every(tr => tr.querySelectorAll('td').length >= 3 && Array.from(tr.querySelectorAll('td')).every(td => td.textContent.trim() !== ''))" },
+        { "assertVisible": "#preview-root svg" },
+        { "eval": "(() => { const p = document.querySelector('#preview-root [data-region-id=\"region_2\"] svg polyline'); return !!p && p.getAttribute('points').trim().split(/\\s+/).length >= 2; })()" },
+        { "eval": "(() => { const fills = Array.from(document.querySelectorAll('#preview-root [data-region-id=\"region_5\"] .template-chart-fill')); return fills.length === 7 && fills.every(el => el.getBoundingClientRect().width > 0); })()" },
+
+        { "assertVisible": "#preview-root [data-simulated-note]" },
+        { "assertText": "模拟业务数据" },
+        { "assertText": "接入真实数据后会自动替换" },
+        { "assertCount": "#preview-root [data-region-badge]", "count": 12, "op": "===" },
+        { "assertCount": "#preview-root [data-region-capability]", "count": 5, "op": "===" },
+        { "assertText": "能力待接通" },
+        { "assertText": "PUE" },
+        { "assertText": "实时功率" },
+
+        { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "simulated" },
+        { "assertText": "示意" },
+        { "assertNotText": "已校验 / 待接真数" },
+
+        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_2\"]').textContent; return t.includes('单位：kWh'); })()" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_10\"]').textContent; return t.includes('单位：元') && !t.includes('kWh'); })()" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_12\"]').textContent; return t.includes('单位：kW') && !t.includes('kWh'); })()" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_11\"]').textContent; return t.includes('kW') && !t.includes('kWh'); })()" },
+        { "assertText": "单位：kWh" },
+
+        { "eval": "(() => { const texts = Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(c => c.textContent); return texts.some(t => t.includes('role: SUMMARY')) && texts.some(t => t.includes('role: DETAIL')) && texts.some(t => t.includes('role: DESCRIPTION')); })()" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; return p.regions.every(r => Object.keys(r).sort().join(',') === 'componentType,name,payload,regionId,role'); })()" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; const t = p.regions.find(r => r.componentType === 'TABLE'); return !!t && t.payload.columns.every(c => c.format === null); })()" },
+
+        { "assertNotText": "仅显示前" },
+
+        { "eval": "(() => { const root = document.querySelector('#preview-root'); return root.scrollWidth <= root.clientWidth + 1; })()" },
+        { "screenshot": "08b-04-草稿阶段右侧出图出表" }
+      ]
+    },
+    {
+      "name": "08b-03 徽标状态机：校验中/校验失败不显示成功徽标，过了校验显示「已校验 / 待接真数」且数字不变",
+      "path": "/frontend/tests/page_accept_harness.html?scene=draft",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#preview-root [data-region-badge]" },
+        { "wait": 300 },
+
+        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_1\"] .text-3xl'); return v ? v.textContent : ''; })()", "save": "paTotalBefore" },
+        { "eval": "(() => { const rows = Array.from(document.querySelectorAll('#preview-root table tbody tr')).map(tr => tr.textContent.trim()); return rows.join('|'); })()", "save": "paRowsBefore" },
+
+        { "eval": "window.__pageAcceptScene('pending')" },
+        { "wait": 400 },
+        { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "simulated" },
+        { "assertText": "示意" },
+        { "assertNotText": "已校验 / 待接真数" },
+        { "assertText": "37357.8" },
+        { "screenshot": "08b-05-校验中仍是示意" },
+
+        { "eval": "window.__pageAcceptScene('failed')" },
+        { "wait": 400 },
+        { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "simulated" },
+        { "assertText": "示意" },
+        { "assertNotText": "已校验 / 待接真数" },
+        { "assertText": "37357.8" },
+        { "screenshot": "08b-06-校验失败仍是示意" },
+
+        { "eval": "window.__pageAcceptScene('validated')" },
+        { "wait": 400 },
+        { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "validated" },
+        { "assertText": "已校验 / 待接真数" },
+        { "assertText": "37357.8" },
+
+        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_1\"] .text-3xl'); return v ? v.textContent : ''; })()", "save": "paTotalAfter" },
+        { "eval": "(() => { const rows = Array.from(document.querySelectorAll('#preview-root table tbody tr')).map(tr => tr.textContent.trim()); return rows.join('|'); })()", "save": "paRowsAfter" },
+        { "eval": "paTotalBefore === paTotalAfter" },
+        { "eval": "paRowsBefore === paRowsAfter" },
+        { "screenshot": "08b-07-已校验徽标且数字不变" }
+      ]
+    },
+    {
+      "name": "08b-04 表格只留 2 行：真实形状下判不出截断（后端没给 truncated / totalRows，也没给列单位 format）",
+      "path": "/frontend/tests/page_accept_harness.html?scene=truncated",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#preview-root [data-region-id=\"region_7\"] table tbody tr" },
+        { "wait": 300 },
+        { "assertVisible": "#preview-root [data-region-id=\"region_7\"] table tbody tr" },
+        { "assertCount": "#preview-root [data-region-id=\"region_7\"] table tbody tr", "count": 2, "op": "===" },
+        { "assertText": "设备耗电明细" },
+        { "assertText": "UPS-01 不间断" },
+
+        { "assertHidden": "#preview-root [data-table-truncated]" },
+        { "assertNotText": "仅显示前" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; const t = p.regions.find(r => r.regionId === 'region_7'); if (!t) return false; return t.payload.truncated === undefined && t.payload.totalRows === undefined && t.payload.columns.every(c => c.format === null); })()" },
+        { "screenshot": "08b-08-表格只留2行真实形状判不出截断" }
+      ]
+    },
+    {
+      "name": "08b-05 真实产品页：方案挂在左侧对话区、右侧面板无方案容器、340~560px 不溢出",
+      "path": "/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "wait": 1200 },
+        { "eval": "(() => { planState.designPhase = 'PLAN_WAITING_CONFIRM'; planState.reportPlan = { id: 'plan_page_accept_real', revision: 1, topic: '机房 A 能耗日报', requirements: { metrics: ['总耗电'], subject: '机房 A', timeRange: '最近 7 天', exclusions: [] }, sections: [ { id: 's_total', title: '总耗电概览', metricIntents: ['总耗电'], componentType: 'metric_card', displayIntent: 'total', selectionReason: '看总量，指标卡最直观' }, { id: 's_rank', title: '设备耗电排名', metricIntents: ['总耗电'], componentType: 'table', displayIntent: 'records', selectionReason: '看具体记录与属性，用表格', columns: [ { id: 'c_device', label: '设备名称', fieldRef: 's_rank.device_name' }, { id: 'c_energy', label: '耗电', fieldRef: 's_rank.energy' } ] } ], assumptions: ['示意数据由系统生成，非真实业务数据'], suggestions: [], referenceTemplates: [] }; planState.busy = false; planState.error = null; appendAiText('按你的需求，我拟了这份方案：'); renderPlanModule(); return true; })()" },
+        { "wait": 500 },
+
+        { "assertVisible": "#chat-scroll [data-plan-bubble] .plan-module" },
+        { "assertVisible": "#chat-scroll [data-plan-bubble] .plan-confirm" },
+        { "assertText": "看总量，指标卡最直观" },
+        { "assertCount": "#chat-scroll [data-plan-bubble] .plan-column", "count": 2, "op": "===" },
+
+        { "assertCount": "#preview-root #plan-root", "count": 0, "op": "===" },
+        { "assertCount": "#preview-root .plan-module", "count": 0, "op": "===" },
+        { "assertCount": "#preview-root [data-plan-bubble]", "count": 0, "op": "===" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root').textContent; return !t.includes('选型理由') && !t.includes('板块与图表建议') && !t.includes('确认方案'); })()" },
+
+        { "eval": "(() => { const sec = document.querySelector('#chat-scroll').closest('section'); sec.style.width = '340px'; sec.style.minWidth = '340px'; sec.style.maxWidth = '340px'; sec.style.flex = '0 0 340px'; return true; })()" },
+        { "wait": 400 },
+        { "eval": "(() => { const root = document.querySelector('#chat-scroll [data-plan-bubble] #plan-root'); const sec = document.querySelector('#chat-scroll').closest('section'); const sb = sec.getBoundingClientRect(); const rb = root.getBoundingClientRect(); const wide = Array.from(root.querySelectorAll('*')).filter(el => el.getBoundingClientRect().right > sb.right + 1); return root.scrollWidth <= root.clientWidth + 1 && wide.length === 0 && rb.right <= sb.right + 1; })()" },
+        { "eval": "Array.from(document.querySelectorAll('#chat-scroll [data-plan-bubble] .plan-column')).every(el => el.getBoundingClientRect().height < 24)" },
+        { "screenshot": "08b-09-真实产品页左侧方案340px" },
+
+        { "eval": "(() => { const sec = document.querySelector('#chat-scroll').closest('section'); sec.style.width = '560px'; sec.style.minWidth = '560px'; sec.style.maxWidth = '560px'; sec.style.flex = '0 0 560px'; return true; })()" },
+        { "wait": 400 },
+        { "eval": "(() => { const root = document.querySelector('#chat-scroll [data-plan-bubble] #plan-root'); const sec = document.querySelector('#chat-scroll').closest('section'); const sb = sec.getBoundingClientRect(); const wide = Array.from(root.querySelectorAll('*')).filter(el => el.getBoundingClientRect().right > sb.right + 1); return root.scrollWidth <= root.clientWidth + 1 && wide.length === 0; })()" },
+        { "screenshot": "08b-10-真实产品页左侧方案560px" },
+
+        { "eval": "(() => { planState.designPhase = 'DRAFT_READY'; renderPlanModule(); return true; })()" },
+        { "wait": 400 },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] details.confirmed-plan-details') !== null" },
+        { "eval": "!document.querySelector('#chat-scroll [data-plan-bubble] details').hasAttribute('open')" },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] .plan-confirm') === null" },
+        { "eval": "document.querySelector('#preview-root').querySelector('#plan-root') === null" },
+        { "screenshot": "08b-11-真实产品页草稿阶段方案收起" }
+      ]
+    }
+  ]
+}
