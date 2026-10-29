@@ -69,7 +69,7 @@ class TemplateRegion(BaseModel):
     #: 方案声明的**定稿栏目**（表格板块）。顺序与方案一致，转换层不按标题猜列。
     columns: list[TemplateColumn] = Field(default_factory=list)
     dataStatus: str
-    #: 占位原因，例如「口径待核实」「数据待连接」。
+    #: 占位原因，例如「能力待接通」「口径待核实」「统计对象不在授权范围内」。
     placeholderReason: str | None = None
     #: 这个区域是不是因为**系统能力尚未接通**而拿不到数。
     #:

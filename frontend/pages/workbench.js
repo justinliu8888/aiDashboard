@@ -2290,8 +2290,8 @@ function readPayloadUnit(region, payload, defRegion) {
  *
  * 契约（**两个来源都支持**）：
  *   - 区域级：region.capabilityPending（布尔）—— 区域整体待接通。
- *     真实后端目前还没产出这个字段（标记落在 payload.metrics[] 里），
- *     但规格要求区域级也带能力标记，所以两个来源都要认。
+ *     后端在响应区域上带这个字段（规格 #46：区域额外带来源与能力标记）；
+ *     载荷里另有逐项标记，两个来源都认。
  *   - 逐项级：payload.metrics[] 与定义 previewSpec.metrics[] 里的
  *     capabilityPending / pendingReason —— 哪几项待接通、为什么。
  * 两处**合并**（不是二选一）：逐项说明永远保留；区域级标记在没有逐项说明时
