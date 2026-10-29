@@ -12,9 +12,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RegionDataStatus(str, Enum):
@@ -73,57 +73,3 @@ class TemplateDesign(BaseModel):
     dataStatus: str
     #: 没有接上的区域，界面要说明为什么。
     pendingNotes: list[str] = Field(default_factory=list)
-
-
-class GridPlacement(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["GRID"]
-    column: int = Field(strict=True, ge=1, le=12)
-    row: int = Field(strict=True, ge=1)
-    columnSpan: int = Field(strict=True, ge=1, le=12)
-    rowSpan: int = Field(strict=True, ge=1)
-
-    @model_validator(mode="after")
-    def check_column_boundary(self) -> GridPlacement:
-        if self.column + self.columnSpan - 1 > 12:
-            raise ValueError("布局不能超出 12 列")
-        return self
-
-
-class TemplateLayoutItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    regionId: str = Field(min_length=1)
-    placement: GridPlacement
-
-
-class UpdateTemplateLayoutRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    templateId: str = Field(min_length=1)
-    baseRevision: int = Field(strict=True, ge=1)
-    items: list[TemplateLayoutItem] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def check_unique_non_overlapping_regions(self) -> UpdateTemplateLayoutRequest:
-        region_ids = [item.regionId for item in self.items]
-        if len(region_ids) != len(set(region_ids)):
-            raise ValueError("布局区域不能重复")
-        for index, item in enumerate(self.items):
-            a = item.placement
-            for other in self.items[:index]:
-                b = other.placement
-                # Half-open rectangles allow shared edges without overlap.
-                if (
-                    a.column < b.column + b.columnSpan
-                    and b.column < a.column + a.columnSpan
-                    and a.row < b.row + b.rowSpan
-                    and b.row < a.row + a.rowSpan
-                ):
-                    raise ValueError("布局区域不能重叠")
-        return self
-
-
-class UpdateTemplateLayoutResponse(BaseModel):
-    templateDesign: TemplateDesign

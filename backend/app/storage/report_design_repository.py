@@ -284,13 +284,3 @@ class ReportDesignRepository(Protocol):
         definition: Mapping[str, Any], write_turn: WriteTurn, *, operation_id: str,
     ) -> dict[str, Any]:
         """Check the current template and atomically persist draft, phase and turn."""
-
-    def update_template_layout(
-        self,
-        session_id: str,
-        template_id: str,
-        expected_revision: int,
-        items: list[dict[str, Any]],
-        write_turn: WriteTurn | None = None,
-    ) -> dict[str, Any]:
-        """同事务检查模板版本、保存布局并执行快照写入；保留区域数据。"""

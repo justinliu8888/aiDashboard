@@ -24,7 +24,6 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, NamedTuple
 
-from app.schemas.template_design import UpdateTemplateLayoutRequest
 from app.storage.report_design_repository import (
     CLAIM_KIND_CLAIMED,
     CLAIM_KIND_CONFLICT,
@@ -1143,49 +1142,6 @@ class SqliteReportDesignRepository:
             "definitionDraft": draft_data,
             "alreadyCommitted": False,
         }
-
-    def update_template_layout(
-        self,
-        session_id: str,
-        template_id: str,
-        expected_revision: int,
-        items: list[dict[str, Any]],
-        write_turn: WriteTurn | None = None,
-    ) -> dict[str, Any]:
-        payload = UpdateTemplateLayoutRequest(
-            templateId=template_id, baseRevision=expected_revision, items=items
-        )
-        with self._lock:
-            conn = self._conn
-            self._begin(conn)
-            try:
-                current = self._fetch_template(conn, session_id)
-                if current is None:
-                    raise DesignTemplateNotFoundError("当前会话没有模板")
-                if current["id"] != template_id or current["revision"] != expected_revision:
-                    raise DesignTemplateConflictError("模板 ID 或基础版本已变化，请刷新后重试")
-                region_ids = {region["id"] for region in current["regions"]}
-                requested_ids = [item.regionId for item in payload.items]
-                if len(requested_ids) != len(region_ids) or set(requested_ids) != region_ids:
-                    raise DesignPlanInvalidError("布局必须恰好覆盖全部区域，不能重复或包含未知区域")
-                current["layout"] = {"columns": 12, "items": payload.model_dump()["items"]}
-                current["revision"] = expected_revision + 1
-                cursor = conn.execute(
-                    "UPDATE report_design_templates"
-                    " SET template_revision = ?, template_json = ?, updated_at = ?"
-                    " WHERE session_id = ? AND template_id = ? AND template_revision = ?",
-                    (current["revision"], json.dumps(current, ensure_ascii=False), _now(),
-                     session_id, template_id, expected_revision),
-                )
-                if cursor.rowcount != 1:
-                    raise DesignTemplateConflictError("模板基础版本已变化")
-                if write_turn is not None:
-                    write_turn(conn)
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-        return current
 
     # ---------- 失败 ----------
 
