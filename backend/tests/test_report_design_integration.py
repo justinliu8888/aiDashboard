@@ -594,21 +594,28 @@ def test_confirm_plan_does_not_trigger_save_or_data(client, monkeypatch):
     # #38 起模板阶段不取数 → 回复**不能**说「已接上数据」（那是不存在的事实）。
     assert "已接上" not in payload["reply"]
     assert "已接数据" not in payload["reply"]
+    # ADR 0004 口径反转：草稿阶段就用模拟业务数据渲染 —— 旧口径
+    # 「数值待试运行产生」「保留占位」都已作废。
+    assert "待试运行" not in payload["reply"]
+    assert "保留占位" not in payload["reply"]
+    assert "模拟业务数据" in payload["reply"]
     # 回复里的区域计数必须跟模板的实际状态一致，且用词不撒谎。
     bound = [r for r in template["regions"] if r.get("dataStatus") == "bound"]
     placeholders = [r for r in template["regions"] if r.get("dataStatus") == "placeholder"]
     if bound:
         assert f"{len(bound)} 个区域已绑定指标" in payload["reply"]
-        assert "待试运行" in payload["reply"]
+        assert "示意数值" in payload["reply"]
     if placeholders:
-        assert f"{len(placeholders)} 个区域保留占位" in payload["reply"]
+        assert f"{len(placeholders)} 个区域的能力尚未接通" in payload["reply"]
+        assert "能力待接通" in payload["reply"]
 
 
 def test_confirm_plan_reply_says_bound_regions_are_not_fetched_yet(client, monkeypatch):
-    """有 bound 区域时，回复要说「已绑定指标、数值待试运行产生」，不能说已取到数据。
+    """有 bound 区域时，回复要说「已绑定指标、出了示意数值」，不能说已取到数据。
 
-    工单 #38 起模板阶段只做能力核对、**不取数**：``dataStatus="bound"`` 的含义是
-    「指标已绑定、能力可用」，数值一律等试运行产生。回复文案不能声称数据已经接上。
+    ADR 0004 之后口径反转：草稿阶段就用**模拟业务数据**渲染，
+    ``dataStatus="bound"`` 的含义是「指标已绑定、能力可用」。回复文案既不能
+    声称数据已经接上（不存在的事实），也不能再说「数值待试运行产生」（旧口径）。
     """
     install_model(monkeypatch, RecordingModel(_candidate(
         topic="能耗日报",
@@ -640,7 +647,8 @@ def test_confirm_plan_reply_says_bound_regions_are_not_fetched_yet(client, monke
     assert bound, "这条用例要有一个 bound 区域才有意义"
     reply = payload["reply"]
     assert f"{len(bound)} 个区域已绑定指标" in reply
-    assert "待试运行" in reply
+    assert "示意数值" in reply
+    assert "待试运行" not in reply
     assert "已接上" not in reply
     assert "已接数据" not in reply
 
