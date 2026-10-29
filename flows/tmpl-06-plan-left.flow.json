@@ -66,6 +66,10 @@
         { "eval": "(() => { const root = document.querySelector('[data-plan-bubble] #plan-root'); const col = document.querySelector('.chat-col'); const cb = col.getBoundingClientRect(); const rb = root.getBoundingClientRect(); const wide = Array.from(root.querySelectorAll('*')).filter(el => el.getBoundingClientRect().right > cb.right + 1); return root.scrollWidth <= root.clientWidth + 1 && wide.length === 0 && rb.right <= cb.right + 1; })()" },
         { "screenshot": "06-04-harness窄栏方案卡片" },
 
+        { "eval": "(() => { const s = document.querySelector('.chat-scroll'); if (s) s.scrollTop = s.scrollHeight; window.scrollTo(0, document.body.scrollHeight); return true; })()" },
+        { "wait": 200 },
+        { "eval": "(() => { const b = document.querySelector('[data-plan-bubble] #plan-root .plan-confirm'); const r = b.getBoundingClientRect(); return document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) === b; })()" },
+
         { "click": "[data-plan-bubble] #plan-root .plan-confirm" },
         { "wait": 200 },
         { "eval": "document.querySelectorAll('#action-log .log-line[data-plan-action]').length === 1" },
