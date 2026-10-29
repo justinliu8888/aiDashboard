@@ -8,7 +8,8 @@
 
     1. 把方案的每个板块变成一个可视区域；
     2. 逐区域核对**当前已接通的能力**（目录 + 指标 + 授权范围）；
-    3. 接得到的区域填数据，并标明数据来源性质；
+    3. 接得到的区域写明**绑定了哪个指标**、**用哪个时间窗**，
+       并标明数据来源性质；
     4. 接不到的区域保留占位，写明原因（数据待连接 / 口径待核实）。
 
 同时守住两条边界：
@@ -17,17 +18,22 @@
       有没有数据被拦截了」）—— 没有数据也要出模板，只是那一块是占位；
     - **绝不编造数值**（Q11）—— 接不到就是占位，不是假数。
 
-数据来源说明：当前这条链路上唯一可取数的是能耗 Mock 源
-（``mock_data_service``），不是生产能耗事实表。所以每个接上数据的区域
-都会带上 ``dataSourceLabel``，界面必须把它显示出来 ——
-把演示数值当成生产数据，是比缺数据更严重的问题。
+**取数不在这一层发生**（工单 04 / GitHub #38）：模板阶段只做能力核对，
+**不读业务数据、不算出任何数值**。页面上那一屏「看起来像真的」的数值
+一律留到**试运行**时产生 —— 那一层读的是草稿里的执行绑定，与模板里
+的展示数值无关。所以 ``dataStatus="bound"`` 现在意味着
+**「指标已绑定、能力可用」**，不代表「已经取到数」。
+
+数据来源说明：试运行取到的数据来自能耗 Mock 源
+（``mock_data_service``），不是生产能耗事实表。所以每个绑定到区域的
+数据来源仍然标明性质 —— 把演示数值当成生产数据，是比缺数据更严重的
+问题。
 """
 from __future__ import annotations
 
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import date, timedelta
 from typing import Any, Mapping
 
 from app.schemas.template_design import (
@@ -43,7 +49,7 @@ from app.data.machine_room_energy import (
     METRIC_TOTAL_ENERGY,
 )
 from app.services.metric_mock_service import get_metric, match_metric_by_alias
-from app.services.mock_data_service import build_snapshot, resolve_room_name
+from app.services.mock_data_service import resolve_room_name
 from app.services.scope_service import authorized_subject_ids, is_subject_authorized
 
 
@@ -63,9 +69,6 @@ DATA_SOURCE_LABEL = "模拟数据（能耗 Mock 源，非生产事实表）"
 #: 就说明当前能力算不出这个数 —— 只能占位，不能编。
 _SOURCE = get_catalog(DEFAULT_SOURCE_REF) or {}
 _SOURCE_FIELDS = _SOURCE.get("fields") or {}
-
-#: 时间粒度没对齐时的最大展示行数。
-_MAX_TABLE_ROWS = 10
 
 #: 指标意图的常见措辞 → 指标口径。
 #:
@@ -149,17 +152,6 @@ def _resolve_window(time_range: Any) -> _Window:
         offset = -count
     timezone = str(resolved.get("timezone") or _default_window().timezone)
     return _Window(unit=unit, count=max(1, count), offset=int(offset), timezone=timezone)
-
-
-def _period_dates(logical_date: str, count: int, offset: int) -> list[str]:
-    """时间窗覆盖的自然日列表。
-
-    口径与预览层一致：``logical_date`` 代表「昨天」，窗口从
-    ``D + offset`` 开始、覆盖 ``count`` 天。
-    """
-    base = date.fromisoformat(logical_date)
-    start = base + timedelta(days=1 + offset)
-    return [(start + timedelta(days=index)).isoformat() for index in range(count)]
 
 
 def _resolve_room(subject_text: Any, subject_id: Any = None) -> tuple[str | None, str | None]:
@@ -248,170 +240,6 @@ def _metric_is_backed(metric: Mapping[str, Any]) -> tuple[bool, str | None]:
     return False, f"「{label}」口径待核实：当前数据源没有登记这个字段，算不出数值。"
 
 
-def _snapshot(room_id: str, logical_date: str, timezone: str):
-    return build_snapshot(
-        room_id=room_id,
-        room_name=resolve_room_name(room_id),
-        logical_date=logical_date,
-        timezone=timezone,
-    )
-
-
-def _daily_totals(room_id: str, days: list[str], timezone: str) -> list[float]:
-    return [
-        _snapshot(room_id, day, timezone).totalEnergyKwh for day in days
-    ]
-
-
-def _device_rows(snapshot: Any) -> list[dict[str, Any]]:
-    return [
-        {
-            "deviceId": device.deviceId,
-            "deviceName": device.deviceName,
-            "deviceType": device.deviceType,
-            "energyKwh": device.energyKwh,
-        }
-        for device in snapshot.deviceRanking
-    ]
-
-
-def _window_label(days: list[str]) -> str:
-    if not days:
-        return ""
-    if len(days) == 1:
-        return f"{days[0]} 全天"
-    return f"{days[0]} ~ {days[-1]}（{len(days)} 天）"
-
-
-def _metric_card_payload(
-    metric_ref: str,
-    room_id: str,
-    window: _Window,
-    logical_date: str,
-) -> dict[str, Any] | None:
-    """指标卡：总量 + 环比。"""
-    days = _period_dates(logical_date, window.count, window.offset)
-    previous_days = _period_dates(logical_date, window.count, window.offset - window.count)
-
-    if "device_energy" in metric_ref:
-        # 设备耗电合计：取窗口最后一天的设备明细之和。
-        snapshot = _snapshot(room_id, days[-1], window.timezone)
-        value = round(
-            sum(row["energyKwh"] for row in _device_rows(snapshot)), 1
-        )
-        previous = _snapshot(room_id, previous_days[-1], window.timezone)
-        previous_value = round(
-            sum(row["energyKwh"] for row in _device_rows(previous)), 1
-        )
-    else:
-        totals = _daily_totals(room_id, days, window.timezone)
-        value = round(sum(totals), 1)
-        previous_totals = _daily_totals(room_id, previous_days, window.timezone)
-        previous_value = round(sum(previous_totals), 1)
-
-    percent: float | None = None
-    if previous_value > 0:
-        percent = round((value - previous_value) / previous_value * 100, 1)
-
-    return {
-        "label": "设备耗电" if "device_energy" in metric_ref else "总耗电",
-        "value": value,
-        "unit": "kWh",
-        "precision": 1,
-        "yoyPercent": percent,
-        "comparisonAvailable": percent is not None,
-        "windowLabel": _window_label(days),
-    }
-
-
-def _table_payload(
-    metric_ref: str,
-    room_id: str,
-    window: _Window,
-    logical_date: str,
-) -> dict[str, Any] | None:
-    """表格：设备明细行，或按天的耗电汇总行。"""
-    days = _period_dates(logical_date, window.count, window.offset)
-
-    if "device_energy" in metric_ref:
-        snapshot = _snapshot(room_id, days[-1], window.timezone)
-        rows = sorted(
-            _device_rows(snapshot), key=lambda row: row["energyKwh"], reverse=True
-        )[:_MAX_TABLE_ROWS]
-        return {
-            "columns": [
-                {"id": "deviceName", "label": "设备", "fieldRef": "deviceName"},
-                {"id": "deviceType", "label": "类型", "fieldRef": "deviceType"},
-                {
-                    "id": "energyKwh",
-                    "label": "耗电（kWh）",
-                    "fieldRef": "energyKwh",
-                },
-            ],
-            "rows": rows,
-            "rowNumber": True,
-        }
-
-    totals = _daily_totals(room_id, days, window.timezone)
-    rows = [
-        {"logicalDate": day, "energyKwh": total}
-        for day, total in zip(days, totals)
-    ]
-    return {
-        "columns": [
-            {"id": "logicalDate", "label": "日期", "fieldRef": "logicalDate"},
-            {
-                "id": "energyKwh",
-                "label": "总耗电（kWh）",
-                "fieldRef": "energyKwh",
-            },
-        ],
-        "rows": rows,
-        "rowNumber": False,
-    }
-
-
-def _chart_payload(
-    component_type: str,
-    metric_ref: str,
-    room_id: str,
-    window: _Window,
-    logical_date: str,
-) -> dict[str, Any] | None:
-    """折线 / 柱状 / 饼图。"""
-    days = _period_dates(logical_date, window.count, window.offset)
-    snapshot = _snapshot(room_id, days[-1], window.timezone)
-
-    if "device_energy" in metric_ref:
-        rows = sorted(
-            _device_rows(snapshot), key=lambda row: row["energyKwh"], reverse=True
-        )[:_MAX_TABLE_ROWS]
-        x_labels = [str(row["deviceName"]) for row in rows]
-        y_values = [row["energyKwh"] for row in rows]
-    elif window.count > 1:
-        totals = _daily_totals(room_id, days, window.timezone)
-        x_labels = list(days)
-        y_values = totals
-    else:
-        points = snapshot.hourlyTrend
-        x_labels = [str(point.timestamp)[11:16] for point in points]
-        y_values = [point.energyKwh for point in points]
-
-    chart_kind = {
-        "line_chart": "LINE",
-        "bar_chart": "BAR",
-        "pie_chart": "PIE",
-    }.get(component_type, "LINE")
-
-    return {
-        "chartKind": chart_kind,
-        "xLabels": x_labels,
-        "yValues": y_values,
-        "points": [{"label": label, "value": value} for label, value in zip(x_labels, y_values)],
-        "unit": "kWh",
-    }
-
-
 def _text_payload(section: Mapping[str, Any], room_name: str) -> dict[str, Any]:
     """文字块：本来就是说明文字，没有数值。"""
     content = str(section.get("description") or section.get("title") or "")
@@ -425,9 +253,13 @@ def _build_region(
     room_id: str | None,
     room_reason: str | None,
     window: _Window,
-    logical_date: str,
 ) -> TemplateRegion:
-    """把方案里的一个板块变成一个模板区域。"""
+    """把方案里的一个板块变成一个模板区域。
+
+    这里**只做能力核对，不取数**（工单 04 / GitHub #38）：
+    判定指标能不能匹配上、能力支不支持、统计对象在不在授权范围内。
+    数值一律留到试运行时由预览链路产生。
+    """
     section = dict(section or {})
     section_id = str(section.get("id") or f"section_{index + 1}")
     title = str(section.get("title") or f"板块 {index + 1}")
@@ -472,22 +304,13 @@ def _build_region(
     if room_id is None:
         return placeholder(room_reason or "数据待连接：统计对象不在授权范围内。", [metric_ref])
 
-    try:
-        if component_type == "metric_card":
-            data = _metric_card_payload(metric_ref, room_id, window, logical_date)
-        elif component_type == "table":
-            data = _table_payload(metric_ref, room_id, window, logical_date)
-        else:
-            data = _chart_payload(
-                component_type, metric_ref, room_id, window, logical_date
-            )
-    except Exception:  # noqa: BLE001
-        logger.exception("[report_template] 区域取数失败 region=%s", title)
-        return placeholder("数据待连接：取数过程中出现异常。", [metric_ref])
-
-    if not data:
-        return placeholder("数据待连接：当前能力没有返回这个区域的数据。", [metric_ref])
-
+    # 到这里说明：指标匹配上了、能力支持、统计对象也在授权范围内。
+    #
+    # 但这里**不取数**（工单 04 / GitHub #38）：模板阶段只核对「能力是否
+    # 可用、指标是否绑定」，数值一律留到试运行时产生。区域带的是
+    # **绑定描述符** —— 指标绑定 + 时间窗，不含任何业务数值。
+    metric_label = str((metric or {}).get("label") or title)
+    metric_unit = str((metric or {}).get("unit") or "")
     return TemplateRegion(
         id=f"region_{index + 1}",
         sectionId=section_id,
@@ -495,8 +318,29 @@ def _build_region(
         componentType=component_type,
         metricIntents=intents,
         metricRefs=[metric_ref],
+        # bound = 指标已绑定、能力可用；**不代表已经取到数**。
         dataStatus=RegionDataStatus.BOUND.value,
-        data=data,
+        data={
+            # 取数状态标记：还没取数，等试运行。
+            "bindingStatus": "pending_execution",
+            # 指标绑定（与 metricRefs 一致，便于转换层直接取用）
+            "metricRef": metric_ref,
+            # 展示用标签与单位（不含任何数值）
+            "label": metric_label,
+            "unit": metric_unit,
+            # 时间窗：方案时间参数的协议形状，供试运行取数用
+            "timeWindow": {
+                "type": "CALENDAR",
+                "timezone": window.timezone,
+                "unit": window.unit,
+                "count": window.count,
+                "offset": window.offset,
+            },
+            "windowLabel": window.label,
+            # 还没取数的原因（转换层据此在草稿空壳上说明）
+            "pendingReason": "数值待试运行产生，本区域尚未取数。",
+        },
+        # 取数来源与数据性质披露保留：试运行取到的就是这个源
         dataSource=DATA_SOURCE,
         dataSourceLabel=DATA_SOURCE_LABEL,
     )
@@ -511,6 +355,9 @@ def build_template_design(
 
     **不抛异常**：能力不足不该让整份模板消失 —— 缺数据的区域转成占位，
     方案与板块一个都不丢。
+
+    这一步**不取数、不算数值**（工单 04 / GitHub #38）：区域带的是
+    指标绑定与时间窗，数值由试运行时产生。
     """
     plan = dict(plan or {})
     requirements = dict(plan.get("requirements") or {})
@@ -523,11 +370,6 @@ def build_template_design(
     room_id, room_reason = _resolve_room(requirements.get("subject"), subject_id)
     window = _resolve_window(requirements.get("timeRange"))
 
-    from app.services.mock_data_service import _default_logical_date
-    from zoneinfo import ZoneInfo
-
-    logical_date = _default_logical_date(ZoneInfo(window.timezone))
-
     regions: list[TemplateRegion] = []
     for index, section in enumerate(sections):
         regions.append(
@@ -537,7 +379,6 @@ def build_template_design(
                 room_id=room_id,
                 room_reason=room_reason,
                 window=window,
-                logical_date=logical_date,
             )
         )
 
@@ -553,6 +394,9 @@ def build_template_design(
             )
         ]
 
+    # 整体状态 = **指标绑定情况**的分布，不再代表「已经取到几个区域的数据」。
+    # bound = 所有区域都绑上了指标；partial = 一部分绑上、一部分占位；
+    # placeholder = 全占位。
     bound = [r for r in regions if r.dataStatus == RegionDataStatus.BOUND.value]
     placeholders = [
         r for r in regions if r.dataStatus == RegionDataStatus.PLACEHOLDER.value
