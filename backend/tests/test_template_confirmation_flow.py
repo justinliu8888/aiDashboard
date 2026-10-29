@@ -85,6 +85,56 @@ def test_confirm_plan_carries_the_confirmed_plan_for_the_collapsed_view(client, 
     assert confirmed["topic"] == plan["topic"]
 
 
+def test_draft_regions_follow_the_confirmed_plan_end_to_end(client, monkeypatch):
+    """断言 2：草稿板块与**已确认**的方案逐项一致（数量 / 标题 / 顺序）。
+
+    需求稿 §2.5：草稿的数量、标题和顺序与已确认板块一致，**不增删、不替换
+    成固定默认日报**。
+
+    这里走的是**公开入口的完整链路**（生成方案 → 确认方案 → 草稿），断言的是
+    落库后可再取回的对象：草稿区域的标题与顺序必须逐项等于用户确认的那一版
+    方案的板块标题 —— 既不多出默认日报的数据质量段 / 分析段，也不会退化成那
+    套固定区域。
+    """
+    candidate = _candidate(
+        topic="A 机房能耗专题",
+        metrics=["总耗电", "设备耗电"],
+        sections=[
+            {"id": "section_total", "title": "总耗电概览",
+             "metricIntents": ["总耗电"], "componentType": "metric_card"},
+            {"id": "section_rank", "title": "设备能耗排名",
+             "metricIntents": ["设备耗电"], "componentType": "table"},
+            {"id": "section_trend", "title": "能耗趋势分析",
+             "metricIntents": ["总耗电"], "componentType": "line_chart"},
+        ],
+    )
+    install_model(monkeypatch, RecordingModel(candidate))
+    plan = _post(client, "生成 A 机房能耗专题报表").json()["domainObjects"]["reportPlan"]
+
+    payload = _confirm_plan(client, plan, "confirm_plan")
+
+    draft = payload["domainObjects"]["reportDefinitionDraft"]
+    assert len(plan["sections"]) == 3
+    assert len(draft["regions"]) == 3
+    # 标题与顺序逐项等于已确认方案的板块标题。
+    assert [region["name"] for region in draft["regions"]] == [
+        section["title"] for section in plan["sections"]
+    ]
+    # 板块 id 也跟着方案走（靠 sectionId 认人，不是只对标题）。
+    assert [region["templateBinding"]["sectionId"] for region in draft["regions"]] == [
+        section["id"] for section in plan["sections"]
+    ]
+    # 草稿绑定的正是**已确认**的那一版方案。
+    assert draft["metadata"]["templateBinding"]["planId"] == plan["id"]
+    assert draft["metadata"]["templateBinding"]["planRevision"] == plan["revision"]
+    # 没有混进固定默认日报的其它区域。
+    assert not [region for region in draft["regions"]
+                if region["name"] not in {s["title"] for s in plan["sections"]}]
+    # 刷新后拿回来的还是同一份草稿。
+    stored = client.get("/api/sessions/sess_tpl_1").json()["snapshot"]["definition"]
+    assert stored["regions"] == draft["regions"]
+
+
 def test_confirm_plan_reply_states_actual_title_and_plan_revision(client, monkeypatch):
     """回复文案带**实际已确认的标题与方案版本号**，不写死示例文本。"""
     install_model(monkeypatch, RecordingModel(_candidate(topic="B 机房周报")))
@@ -362,6 +412,51 @@ def test_invalid_component_type_in_plan_fails_with_the_real_reason(client, monke
     # 方案没有落库，阶段也没推进。
     assert payload["domainObjects"]["reportPlan"] is None
     assert payload["designPhase"] != "PLAN_WAITING_CONFIRM"
+
+
+def test_invalid_component_type_from_model_keeps_the_previous_successful_plan(
+    client, monkeypatch
+):
+    """断言 9①：模型适配层直接判非法 ``componentType`` → 生成期失败，方案不被覆盖。
+
+    需求稿 §2.6 / §7：组件类型非法必须**明确失败**并**点名是哪个板块**；
+    失败之后**方案没有被覆盖** —— 库里仍然是上一版成功方案，用户可以直接改，
+    不是「确认完才炸」的死路。
+
+    与 ``test_invalid_component_type_fails_the_turn_and_keeps_the_plan`` 互补：
+    那条走的是**领域层**（放开了适配层枚举）；这条走的是**适配层**（模型输出
+    直接被模型适配层判非法），两条是不同的代码路径，都要守住。
+    """
+    illegal = _candidate(
+        topic="PUE 专题报表",
+        metrics=["PUE"],
+        sections=[
+            {"id": "section_pue", "title": "PUE 总览",
+             "metricIntents": ["PUE"], "componentType": "radar"},
+        ],
+    )
+    model, plan = _plan(client, monkeypatch, _candidate(), illegal)
+
+    payload = _post(client, "再加一个 PUE 板块", message_id="modify").json()
+
+    # 生成期就失败，错误码与文案都带板块名。
+    assert payload["error"] is not None
+    assert payload["error"]["code"] == "MODEL_OUTPUT_INVALID"
+    assert "板块 1「PUE 总览」" in payload["error"]["message"]
+    assert "radar" in payload["error"]["message"]
+    # 原因没有被概括成「请重试」这类通用文案。
+    assert "请重试" not in payload["error"]["message"]
+    # 方案**没有被覆盖**：仍然是上一版成功方案。
+    stored = report_design_service.repository.load("sess_tpl_1")
+    assert stored["reportPlan"]["id"] == plan["id"]
+    assert stored["reportPlan"]["revision"] == plan["revision"]
+    assert stored["reportPlan"]["topic"] == "A 机房能耗日报"
+    assert stored["reportPlan"]["sections"][0]["componentType"] == "metric_card"
+    # 也没有半截的模板或草稿。
+    assert stored["templateDesign"] is None
+    assert stored["definitionDraft"] is None
+    assert stored["designPhase"] == "PLAN_WAITING_CONFIRM"
+    assert len(model.calls) == 2
 
 
 def test_invalid_component_type_at_confirmation_fails_and_names_the_section(client, monkeypatch):

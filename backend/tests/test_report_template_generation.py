@@ -402,6 +402,17 @@ def _numbers_in(obj: Any) -> list[float]:
     return []
 
 
+def _texts_in(obj: Any) -> list[str]:
+    """递归收集所有字符串（只看值，不看键名）。"""
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        return [t for v in obj.values() for t in _texts_in(v)]
+    if isinstance(obj, list):
+        return [t for v in obj for t in _texts_in(v)]
+    return []
+
+
 def test_bound_region_carries_binding_and_window_but_no_business_value(
     client, monkeypatch
 ):
@@ -870,6 +881,83 @@ def test_draft_device_region_uses_the_plan_window_and_grain():
     assert draft.regions[0]["context"]["grain"]["value"]["unit"] == "DAY"
 
 
+def test_device_region_preview_value_is_the_seven_day_total(client, monkeypatch):
+    """断言 8：设备类区域的预览数值 == 7 天合计，**不是**最后一天。
+
+    需求稿 §2.7：方案写「最近 7 天」，设备耗电排名与设备类指标卡就按最近七
+    天算，**不再单独收窄到最后一天**。
+
+    #39 删掉了那个收窄（实测设备指标卡从 5551.0 kWh 变成 37357.3 kWh，差
+    6.7 倍）—— 这是需求要的行为，不是回归。但 #39 同时把断言从「等于某个值」
+    降级成了「是个数字」，于是这个数**没有任何断言钉住**：将来有人把收窄
+    加回来，没有测试会红。
+
+    这里**独立**按 7 天算一遍（直接用 mock 取数源
+    ``mock_data_service.build_snapshot``），再和预览值比对：等于 7 天合计，
+    且**不等于**最后一天。
+
+    ⚠️ 期望值按**方案**的 7 天窗口算，不按区域自己声明的窗口算 —— 否则实现
+    一旦把区域收窄成 1 天，期望值会跟着收窄，这条用例就白写了。
+    """
+    from datetime import date, timedelta
+
+    from app.services.mock_data_service import build_snapshot
+
+    candidate = _candidate(
+        topic="A 机房最近 7 天设备耗电",
+        time_range="最近 7 天",
+        metrics=["设备耗电"],
+        sections=[
+            {
+                "id": "section_device", "title": "设备耗电",
+                "metricIntents": ["设备耗电"], "componentType": "metric_card",
+            }
+        ],
+    )
+    install_model(monkeypatch, RecordingModel(candidate))
+    plan = _post(client, "生成 A 机房最近 7 天设备耗电报表").json()["domainObjects"]["reportPlan"]
+    assert plan["requirements"]["timeRange"] == "最近 7 天"
+
+    _confirm(client, plan, "msg_confirm_device")
+    _post(client, "同意", message_id="msg_agree_device")
+    for state in ("VALIDATING", "PREVIEWING", "PREVIEW_READY"):
+        advanced = _post(client, "__advance__", message_id="advance_" + state).json()
+        assert advanced["error"] is None
+        assert advanced["state"] == state
+
+    payload = client.get("/api/sessions/sess_tpl_1").json()["snapshot"]["previewPayload"]
+    region = payload["regions"][0]
+    assert region["componentType"] == "METRIC_CARD"
+
+    logical_date = date.fromisoformat(payload["logicalDate"])
+    room_id = payload["snapshot"]["roomId"]
+    room_name = payload["snapshot"]["roomName"]
+
+    def _device_total(days: list[str]) -> float:
+        return round(sum(
+            device.energyKwh
+            for day in days
+            for device in build_snapshot(
+                room_id=room_id,
+                room_name=room_name,
+                logical_date=day,
+                timezone="Asia/Shanghai",
+            ).deviceRanking
+        ), 1)
+
+    # 方案写的是最近 7 天 → 窗口是 logicalDate 往前 6 天直到 logicalDate。
+    seven_days = [
+        (logical_date - timedelta(days=6 - index)).isoformat() for index in range(7)
+    ]
+    expected_total = _device_total(seven_days)
+    last_day_only = _device_total([logical_date.isoformat()])
+
+    # 7 天合计，不是最后一天。
+    assert region["payload"]["value"] == expected_total
+    assert region["payload"]["value"] != last_day_only
+    assert "7 天" in region["payload"]["windowLabel"]
+
+
 def test_draft_ignores_historical_twelve_column_placement():
     """转换过程不读历史 12 列网格 placement（#39 硬要求）。"""
     from app.services.template_definition_service import build_template_definition
@@ -918,6 +1006,55 @@ def test_draft_regions_match_the_confirmed_plan_one_to_one():
     assert [r["component"]["type"] for r in draft.regions] == \
            ["METRIC_CARD", "TABLE", "CHART"]
     assert draft.regions[2]["component"]["chartKind"] == "LINE"
+
+
+@pytest.mark.parametrize(
+    ("plan_type", "expected_type", "expected_chart_kind"),
+    [
+        ("metric_card", "METRIC_CARD", None),
+        ("line_chart", "CHART", "LINE"),
+        ("bar_chart", "CHART", "BAR"),
+        ("pie_chart", "CHART", "PIE"),
+        ("table", "TABLE", None),
+        ("text", "TEXT", None),
+    ],
+)
+def test_draft_component_type_follows_the_plan_declaration(
+    client, monkeypatch, plan_type, expected_type, expected_chart_kind
+):
+    """断言 3：六种方案组件类型 → 草稿组件类型的完整映射。
+
+    需求稿 §2.5：指标卡、柱状图、折线图、表格、文本按确认结果映射；
+    **展示为占位不等于改掉组件类型**。
+
+    已有用例只覆盖了其中一部分（``metric_card`` / ``line_chart`` / ``table``，
+    以及**占位**路径下的 ``bar_chart``）。这里把六种映射**逐条**钉死，补上
+    bound 路径下的 ``bar_chart`` / ``pie_chart`` 与 ``text``。
+    """
+    is_text = plan_type == "text"
+    candidate = _candidate(
+        topic=f"A 机房 {plan_type} 报表",
+        metrics=[] if is_text else ["总耗电"],
+        sections=[
+            {
+                "id": "section_one", "title": "单一板块",
+                "metricIntents": [] if is_text else ["总耗电"],
+                "componentType": plan_type,
+            }
+        ],
+    )
+    install_model(monkeypatch, RecordingModel(candidate))
+    plan = _post(client, f"生成 A 机房 {plan_type} 报表").json()["domainObjects"]["reportPlan"]
+    assert plan["sections"][0]["componentType"] == plan_type
+
+    draft = _confirm(client, plan, "msg_confirm_type")["domainObjects"]["reportDefinitionDraft"]
+
+    region = draft["regions"][0]
+    assert region["component"]["type"] == expected_type
+    if expected_chart_kind is None:
+        assert "chartKind" not in region["component"]
+    else:
+        assert region["component"]["chartKind"] == expected_chart_kind
 
 
 def test_draft_metrics_are_not_swapped_with_another_metric():
@@ -987,3 +1124,144 @@ def test_draft_binding_passes_the_pending_reason_through():
     assert binding["sectionId"] == "section_1"
     assert binding["dataSourceLabel"] is None
     assert binding["metricRefs"] == ["metric.machine_room.total_energy"]
+
+
+def test_draft_stage_has_no_business_values_and_the_metric_slot_is_empty(
+    client, monkeypatch
+):
+    """断言 5：草稿阶段没有业务数值；指标值位是空的（面板渲染成「—」）。
+
+    需求稿 §2.1：生成草稿时不执行业务取数。指标值用 ``—``，图表和表格保持
+    占位；**不得编造数值，也不提前展示 Mock 数值**。
+
+    口径提醒：「无 ``kWh``」**只能对占位卡断**。占位卡的 ``unitLabel`` 是
+    空串（``template_definition_service._empty_shell``），整张卡里没有
+    ``kWh``；而 **bound 区的 ``kWh`` 是单位标签**，本来就应该显示，不能拿它
+    当成「编造数值」。所以这里分两路断：
+
+      - 占位卡：没有 ``kWh``、没有小数、没有 ``%``、没有数据块；
+      - bound 指标卡：有 ``kWh``（单位），但**没有带单位的数值**，值位是空的。
+    """
+    candidate = _candidate(
+        topic="A 机房能耗与 PUE 专题",
+        metrics=["总耗电", "PUE"],
+        sections=[
+            {
+                "id": "section_total", "title": "总耗电概览",
+                "metricIntents": ["总耗电"], "componentType": "metric_card",
+            },
+            {
+                "id": "section_pue", "title": "PUE 总览",
+                "metricIntents": ["PUE"], "componentType": "metric_card",
+            },
+        ],
+    )
+    install_model(monkeypatch, RecordingModel(candidate))
+    plan = _post(client, "生成 A 机房能耗与 PUE 报表").json()["domainObjects"]["reportPlan"]
+    draft = _confirm(client, plan, "msg_confirm_no_values")["domainObjects"]["reportDefinitionDraft"]
+    by_name = {region["name"]: region for region in draft["regions"]}
+
+    bound = by_name["总耗电概览"]
+    placeholder = by_name["PUE 总览"]
+
+    # ① 指标值位是空的 —— 面板据此渲染成「—」（bound 卡与占位卡都是）。
+    for region in (bound, placeholder):
+        assert "value" not in region["component"]["metric"], region["name"]
+        assert "values" not in region["component"]["metric"], region["name"]
+        assert "value" not in (region.get("data") or {}), region["name"]
+
+    # ② 占位卡：没有 kWh、没有小数、没有百分比、没有数据块。
+    placeholder_text = json.dumps(placeholder, ensure_ascii=False)
+    assert "kWh" not in placeholder_text
+    assert "%" not in placeholder_text
+    assert "data" not in placeholder
+    assert [n for n in _numbers_in(placeholder) if isinstance(n, float)] == []
+
+    # ③ bound 指标卡：kWh 是**单位标签**，允许出现；但不能出现「数值 + kWh」。
+    assert bound["component"]["metric"]["format"]["unitLabel"] == "kWh"
+    assert not [
+        text for text in _texts_in(bound)
+        if "kWh" in text and any(char.isdigit() for char in text)
+    ]
+    assert "%" not in json.dumps(bound, ensure_ascii=False)
+    assert [n for n in _numbers_in(bound) if isinstance(n, float)] == []
+
+
+def test_placeholder_region_binding_carries_the_four_fields(client, monkeypatch):
+    """断言 7：占位区域的 ``templateBinding`` 四个字段齐全。
+
+    需求稿 §2.5 + #39 §0.4.1：``dataStatus`` / ``placeholderReason`` /
+    ``pendingReason`` / ``dataSourceLabel`` 都要在。bound 区域
+    ``pendingReason`` 有值、``placeholderReason`` 是 ``None``；占位区域反过来
+    —— ``placeholderReason`` 有值、``pendingReason`` 是 ``None``，
+    ``dataSourceLabel`` 也是 ``None``（没有数据源可标）。
+    """
+    candidate = _candidate(
+        topic="A 机房能耗与 PUE 专题",
+        metrics=["总耗电", "PUE"],
+        sections=[
+            {
+                "id": "section_total", "title": "总耗电概览",
+                "metricIntents": ["总耗电"], "componentType": "metric_card",
+            },
+            {
+                "id": "section_pue", "title": "PUE 总览",
+                "metricIntents": ["PUE"], "componentType": "metric_card",
+            },
+        ],
+    )
+    install_model(monkeypatch, RecordingModel(candidate))
+    plan = _post(client, "生成 A 机房能耗与 PUE 报表").json()["domainObjects"]["reportPlan"]
+    draft = _confirm(client, plan, "msg_confirm_binding")["domainObjects"]["reportDefinitionDraft"]
+    by_name = {region["name"]: region for region in draft["regions"]}
+
+    placeholder = by_name["PUE 总览"]["templateBinding"]
+    for field in ("dataStatus", "placeholderReason", "pendingReason", "dataSourceLabel"):
+        assert field in placeholder, field
+    assert placeholder["dataStatus"] == "placeholder"
+    assert placeholder["placeholderReason"]
+    # pendingReason 只对 bound 区域有意义（那里是「还没取数」）。
+    assert placeholder["pendingReason"] is None
+    assert placeholder["dataSourceLabel"] is None
+
+    bound = by_name["总耗电概览"]["templateBinding"]
+    for field in ("dataStatus", "placeholderReason", "pendingReason", "dataSourceLabel"):
+        assert field in bound, field
+    assert bound["dataStatus"] == "bound"
+    assert bound["pendingReason"]
+    assert bound["placeholderReason"] is None
+    assert bound["dataSourceLabel"]
+    assert len(bound["metricRefs"]) == 1
+
+
+def test_unaccepted_suggestions_do_not_enter_the_draft(client, monkeypatch):
+    """断言 12：方案里的可选建议**不自动进入草稿**。
+
+    需求稿 §2.5：方案中的可选建议、未接受修改不自动进入草稿。建议只是建议
+    —— 用户没接受，它就不该变成一个板块，也不该出现在草稿的任何地方。
+    """
+    candidate = _candidate(
+        topic="A 机房能耗日报",
+        metrics=["总耗电"],
+        sections=[
+            {
+                "id": "section_total", "title": "总耗电概览",
+                "metricIntents": ["总耗电"], "componentType": "metric_card",
+            }
+        ],
+    )
+    candidate["candidate"]["suggestions"] = ["建议追加 PUE 板块", "建议改成柱状图"]
+    install_model(monkeypatch, RecordingModel(candidate))
+    plan = _post(client, "生成 A 机房能耗日报").json()["domainObjects"]["reportPlan"]
+    assert plan["suggestions"] == ["建议追加 PUE 板块", "建议改成柱状图"]
+
+    draft = _confirm(client, plan, "msg_confirm_suggestions")["domainObjects"]["reportDefinitionDraft"]
+
+    # 建议没有变成板块。
+    assert len(draft["regions"]) == len(plan["sections"]) == 1
+    assert [region["name"] for region in draft["regions"]] == ["总耗电概览"]
+    # 建议的文字也没有出现在草稿的任何地方。
+    draft_text = json.dumps(draft, ensure_ascii=False)
+    assert "建议追加 PUE 板块" not in draft_text
+    assert "建议改成柱状图" not in draft_text
+    assert "PUE" not in draft_text
