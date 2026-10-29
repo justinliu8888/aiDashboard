@@ -36,6 +36,10 @@ const session = {
   // 语义不同、互不覆盖、互不替代（规格 #46「跨工单契约」）。
   // 它只活在内存里：不写 localStorage、不写任何持久化位置。
   reportPreviewPayload: null,
+  // 恢复会话时「示意数据没生成出来」的原因（后端放在 snapshot.error 上）。
+  // 有它就说明这一轮**没出数**：右侧要写明原因，不伪造载荷、不给空壳卡片。
+  // 载荷真的到了（聊天响应或恢复响应带来 reportPreviewPayload）就清掉。
+  reportPreviewError: null,
   pendingResume: null, // 停止后等待重新执行的原请求
   workspaceId: null, // 归属项目
 };
@@ -1703,7 +1707,8 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
   syncPlanFromResponse(data);
   if (fromChoice) clearChoiceLock();
   if (data.error) {
-    appendAiText(`[${data.error.code}] ${data.error.message}`);
+    // 失败原因要看得见：对话区一条 AI 回复（与恢复会话那处同一套写法）。
+    appendAgentError(data.error);
     return;
   }
 
@@ -1771,6 +1776,7 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
         session.lastReportRun = null;
         session.previewPayload = null;
         session.reportPreviewPayload = null;
+        session.reportPreviewError = null;
         destroyCharts();
         previewRoot.innerHTML = "";
         previewRoot.appendChild(previewEmpty);
@@ -2176,7 +2182,77 @@ function applyReportPreviewPayload(payload) {
     return false;
   }
   session.reportPreviewPayload = payload;
+  // 载荷到了，之前那条「没生成出来」的理由就不成立了（恢复失败 → 又出数了）。
+  session.reportPreviewError = null;
   return true;
+}
+
+// --------------------------------------------------------------------------
+// 结构化失败的显示口径（#53）
+//
+// 后端有两处把「这一轮没成」结构化地带回来：
+//   - 聊天响应顶层 `error`（AgentResponse.error）；
+//   - 会话恢复响应 `snapshot.error`（恢复时模拟载荷生成不出来）。
+//
+// 两处用**同一套口径**显示：[错误码] 人话原因。
+// 聊天响应那处本来就有（对话区一条 AI 回复）；恢复会话那处原来没有，
+// 于是用户刷新一下页面，之前那句「按周不支持」就没了，只剩一片空白的
+// 右侧面板 —— 用户不知道发生了什么。
+//
+// 显示沿用页面**已有**的机制，不另造一套：
+//   - 对话区：沿用 appendAiText（与聊天响应的失败写法逐字一致）；
+//   - 右侧面板：一条失败提示，用页面既有的 rose 色板（与状态徽标
+//     VALIDATION_FAILED / BLOCKED_OR_UNSUPPORTED 同一套），不另造配色。
+//
+// 失败时**不画载荷、不画空壳卡片**：只说清楚为什么没出来。
+// --------------------------------------------------------------------------
+
+/** 结构化失败 → 一句人话（[错误码] 原因）。 */
+function formatAgentError(error) {
+  if (!error || typeof error !== "object") return "";
+  const code = error.code ? String(error.code) : "";
+  const message = error.message ? String(error.message) : "";
+  if (!code) return message;
+  if (!message) return `[${code}]`;
+  return `[${code}] ${message}`;
+}
+
+/** 把结构化失败显示成对话区的一条 AI 回复（聊天响应与恢复会话共用同一套）。 */
+function appendAgentError(error) {
+  const text = formatAgentError(error);
+  if (!text) return;
+  appendAiText(text);
+}
+
+/**
+ * 读会话恢复响应里的失败原因。
+ *
+ * 后端在模拟载荷生成不出来时（典型：方案要「按周统计」，示意数据只能按
+ * 分钟 / 小时 / 天生成）把原因挂在 `snapshot.error` 上（code + 人话 message），
+ * 而不是静默返回空快照。没有这个键 = 正常会话（带 reportPreviewPayload）。
+ */
+function readSessionRestoreError(detail) {
+  const error = detail?.snapshot?.error;
+  if (!error || typeof error !== "object") return null;
+  const code = error.code ? String(error.code).trim() : "";
+  const message = error.message ? String(error.message).trim() : "";
+  if (!code && !message) return null;
+  return { code, message: message || code };
+}
+
+/** 右侧面板顶部的失败提示条（样式沿用页面既有的失败色板）。 */
+function renderPreviewErrorNotice(error) {
+  const text = formatAgentError(error);
+  if (!text) return null;
+  const box = document.createElement("div");
+  box.className = "rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700";
+  box.setAttribute("data-preview-error", "");
+  box.setAttribute("role", "alert");
+  const line = document.createElement("div");
+  line.className = "leading-relaxed";
+  line.textContent = text;
+  box.appendChild(line);
+  return box;
 }
 
 /** 定义里的区域（按 id 找）：载荷只带 regionId，编辑入口与 topN 都要回定义里取。 */
@@ -2425,6 +2501,14 @@ function renderReportPanel(highlightRegionIds = []) {
   destroyCharts();
   previewRoot.innerHTML = "";
 
+  // 恢复会话失败（模拟载荷没生成出来）：先把原因摆在面板顶部，
+  // 别让用户对着空白面板猜。下面仍然是空态，不画载荷、不画空壳卡片。
+  const previewError = session.reportPreviewError;
+  if (previewError) {
+    const notice = renderPreviewErrorNotice(previewError);
+    if (notice) previewRoot.appendChild(notice);
+  }
+
   const payload = session.reportPreviewPayload;
   const regions = Array.isArray(payload?.regions) ? payload.regions : [];
   // 标题区（role == REPORT_TITLE）不出数，也不占一块。
@@ -2432,6 +2516,11 @@ function renderReportPanel(highlightRegionIds = []) {
   const definition = session.definition;
 
   if (!bodyRegions.length) {
+    if (previewError) {
+      // 失败就说失败：上面已经是原因条了，不再摆「示意数据还没生成」的
+      // 空态（失败时那句话是错的），也不画空壳卡片。
+      return;
+    }
     // 没有载荷就没有数可画：回到空态，不画空壳卡片。
     setPreviewEmptyHint(definition ? "draft" : "none");
     previewRoot.appendChild(previewEmpty);
@@ -3062,6 +3151,11 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   session.previewPayload = detail.snapshot?.previewPayload ?? null;
   session.baseDefinitionRevision = session.definition?.metadata?.revision ?? null;
   applyReportPreviewPayload(detail.snapshot?.reportPreviewPayload ?? null);
+  // 恢复失败的原因（#53）：模拟载荷生成不出来时，后端把原因放在
+  // snapshot.error 上（code + 人话 message），而不是静默返回空快照。
+  // 记下来，由 renderReportPanel 摆在右侧面板顶部，对话区也说一遍 ——
+  // 刷新后原因不能只剩一片空白。
+  session.reportPreviewError = readSessionRestoreError(detail);
   writeLastSessionId(detail.sessionId);
 
   // 恢复文字方案（#19）：方案与阶段存在服务端快照里，
@@ -3090,6 +3184,10 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
       appendAiText(message.content);
     }
   }
+
+  // 恢复失败：在对话区说清楚原因（与聊天响应的失败写法一致）。
+  // 放在回放之后：这条不是历史消息，是**这一次恢复**的结果。
+  if (session.reportPreviewError) appendAgentError(session.reportPreviewError);
 
   // 恢复右侧报表面板：只有一条渲染入口，数据只来自示意载荷。
   try {
@@ -3240,6 +3338,7 @@ function startNewSession() {
   session.lastReportRun = null;
   session.previewPayload = null;
   session.reportPreviewPayload = null;
+  session.reportPreviewError = null;
   session.pendingResume = null;
   session.workspaceId = null;
   // 新对话还没有自己的 sessionId（要等第一条消息才向后端要），
