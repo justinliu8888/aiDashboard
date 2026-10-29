@@ -117,6 +117,8 @@ class CommitResult(TypedDict, total=False):
     template: dict[str, Any] | None
     templateId: str | None
     templateRevision: int | None
+    # 草稿提交（工单 02 新落点）时才有。
+    definitionDraft: dict[str, Any] | None
 
 
 class ConfirmationResult(TypedDict, total=False):
@@ -244,6 +246,26 @@ class ReportDesignRepository(Protocol):
                plan_revision)`` 建在确认关系表上，跨进程也成立。
             2. **确认操作不在操作表上记方案版本**。操作表那组键留给方案提交，
                确认操作只记「这次操作成功了」，方案版本记在确认关系表里。
+        """
+
+    def commit_template_and_definition(
+        self,
+        operation_id: str,
+        expected_revision: int | None,
+        template: Mapping[str, Any],
+        definition: Mapping[str, Any],
+        write_turn: WriteTurn | None = None,
+    ) -> CommitResult:
+        """一次提交「模板 + 草稿 + 下一步菜单」（工单 02 的新落点）。
+
+        「确认方案」是**一次**操作，所以确认关系、模板、草稿、阶段
+        （``DRAFT_READY``）、操作结果与 write_turn 回调（会话行、快照、
+        本轮消息、待确认菜单）必须在**同一笔事务**里写全。中途失败整体
+        回滚，上一成功方案与阶段原样保留 —— 不留下「已确认成功但没有
+        草稿」的半截状态。
+
+        幂等键是**方案版本**（``plan_id`` + ``plan_revision``）：同一版
+        方案重复确认复用同一份草稿，既不产生第二份，也不推高模板版本号。
         """
 
     def find_confirmation(

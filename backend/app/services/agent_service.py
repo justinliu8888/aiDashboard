@@ -26,6 +26,7 @@ from app.schemas.agent import (
     ADVANCE_MESSAGE,
     ALLOWED_TRANSITIONS,
     AGENT_PROTOCOL_VERSION,
+    DESIGN_ACTION_CONFIRM_PLAN,
     DESIGN_ACTION_CONFIRM_TEMPLATE,
     AgentBlock,
     AgentError,
@@ -478,6 +479,16 @@ class AgentService:
                 request.context.baseDefinitionRevision = (
                     (snapshot.get("definition") or {}).get("metadata", {}).get("revision")
                 )
+                if (request.context.designAction or "").strip().upper() == DESIGN_ACTION_CONFIRM_PLAN:
+                    # 重复点「确认方案」：仍然从**「确认方案」入口**发起，
+                    # 走既有确认路径复用同一份草稿（幂等），不产生第二份。
+                    #
+                    # 只有带 designAction 的请求能走到这里；自由输入没有
+                    # designAction，仍由下面的待确认菜单挡住。
+                    if request.message.strip() and not is_pure_confirmation(request.message):
+                        return self._protocol_error(request, code="PLAN_ALREADY_CONFIRMED",
+                                                    message="方案已经确认成草稿，请从当前草稿的下一步操作继续。")
+                    return report_design_service.confirm_plan(request, state=design_state)
                 if (request.context.designAction or "").strip().upper() == DESIGN_ACTION_CONFIRM_TEMPLATE:
                     if request.message.strip() and not is_pure_confirmation(request.message):
                         return self._protocol_error(request, code="TEMPLATE_ALREADY_CONFIRMED",
