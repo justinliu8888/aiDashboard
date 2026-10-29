@@ -12,6 +12,8 @@
 //     applyReportPreviewPayload）
 //   - 单位读取（readPayloadUnit）
 //   - 能力待接通标注（readCapabilityNotes）
+//   - 指标卡主量判定（readPrimaryMetric / readBoundMetricKey）
+//   - 卡片渲染（renderRegionCard / renderRegionPayloadBody，带假 DOM）
 //   - 表格截断判定（readTableTruncation）
 //   - 徽标状态机（draftBadgeView）
 //
@@ -29,7 +31,12 @@ const WORKBENCH_HTML = readFileSync(new URL("../pages/workbench.html", import.me
 
 // ---------------------------------------------------------------- 抽取工具
 
-/** 从源码里原样抽出一个函数定义（按大括号配平，含模板字面量里的 ${}）。 */
+/**
+ * 抽出一个函数定义（按大括号配平，含模板字面量里的 ${}）。
+ * 注意：参数表里有**默认值 {}** 时不能直接配平大括号
+ * （renderRegionPayloadBody 的 `ctx = {}` 会被截断），那种函数用
+ * extractFunctionDeep。
+ */
 function extractFunction(name) {
   const marker = `function ${name}(`;
   const start = WORKBENCH_JS.indexOf(marker);
@@ -44,6 +51,37 @@ function extractFunction(name) {
     } else if (ch === "}") {
       depth -= 1;
       if (opened && depth === 0) return WORKBENCH_JS.slice(start, i + 1);
+    }
+  }
+  throw new Error(`函数 ${name} 的大括号没有配平`);
+}
+
+/** 抽出一个函数定义：先跳过参数表（可能有默认值 {}），再对函数体配平大括号。 */
+function extractFunctionDeep(name) {
+  const marker = `function ${name}(`;
+  const start = WORKBENCH_JS.indexOf(marker);
+  assert.ok(start >= 0, `源码里找不到函数 ${name}`);
+  let parens = 0;
+  let i = start + marker.length - 1;
+  for (; i < WORKBENCH_JS.length; i += 1) {
+    const ch = WORKBENCH_JS[i];
+    if (ch === "(") parens += 1;
+    else if (ch === ")") {
+      parens -= 1;
+      if (parens === 0) break;
+    }
+  }
+  assert.ok(i < WORKBENCH_JS.length, `函数 ${name} 的参数表没有收口`);
+  let braces = 0;
+  let opened = false;
+  for (let j = i + 1; j < WORKBENCH_JS.length; j += 1) {
+    const ch = WORKBENCH_JS[j];
+    if (ch === "{") {
+      braces += 1;
+      opened = true;
+    } else if (ch === "}") {
+      braces -= 1;
+      if (opened && braces === 0) return WORKBENCH_JS.slice(start, j + 1);
     }
   }
   throw new Error(`函数 ${name} 的大括号没有配平`);
@@ -80,8 +118,11 @@ function extractConstBlock(name) {
 }
 
 /** 把选中的片段放进沙箱跑一遍，返回它们组成的 API。 */
-function loadApi(names, extraStatements = []) {
-  const snippets = [...extraStatements, ...names.map(extractFunction)].join("\n\n");
+function loadApi(names, extraStatements = [], extractors = {}) {
+  const snippets = [
+    ...extraStatements,
+    ...names.map((name) => (extractors[name] || extractFunction)(name)),
+  ].join("\n\n");
   const sandbox = {
     console: { warn() {}, error() {}, log() {} },
     session: null, // 每个用例自己填
@@ -377,6 +418,330 @@ test("未接通的指标额外写明「能力待接通」，并说明具体项",
   // 都接通了：没有这条标注。
   const ok = SAMPLE_PAYLOAD.regions[0];
   assert.equal(api.__api.readCapabilityNotes(ok, ok.payload, null).length, 0);
+});
+
+// ---------------------------------------------------------------- 指标卡主量与角标文案
+//
+// 真实形状来自 frontend/tests/page_accept_harness.html（**后端真实产出**，冻结在那里）：
+//   payload.label           = **区域名**（「总电费概览」）
+//   payload.metrics[].label = **目录里的指标名**（「能耗成本」）
+// 两者不同名 —— 「label 相等」判不出主量，主量会在「其它指标」清单里再出现一次
+//（同一个数字在卡片上出现两次）。
+//
+// 这里把真实载荷**抄**进测试（那个文件是别人的成果，不改），并用一条用例守住
+// 「抄的形状与真实形状一致」，免得抄着抄着抄成一套与真实形状不一致的假数据。
+
+const HARNESS_HTML = readFileSync(new URL("./page_accept_harness.html", import.meta.url), "utf8");
+
+/** 从 harness 里原样取出某个 var 的 JSON 文本（大括号配平）。 */
+function extractHarnessVar(name) {
+  const at = HARNESS_HTML.indexOf(`var ${name} =`);
+  assert.ok(at >= 0, `harness 里找不到 ${name}`);
+  const start = HARNESS_HTML.indexOf("{", at);
+  let depth = 0;
+  for (let i = start; i < HARNESS_HTML.length; i += 1) {
+    const ch = HARNESS_HTML[i];
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return HARNESS_HTML.slice(start, i + 1);
+    }
+  }
+  throw new Error(`${name} 的大括号没有配平`);
+}
+
+/** harness 里真实产出的 region_3 载荷与定义（抄形状用的原件）。 */
+function harnessRealMetricCard() {
+  const payload = JSON.parse(extractHarnessVar("REAL_PAYLOAD"));
+  const definition = JSON.parse(extractHarnessVar("DEFINITION"));
+  return {
+    region: payload.regions.find((r) => r.regionId === "region_3"),
+    defRegion: definition.regions.find((r) => r.id === "region_3"),
+  };
+}
+
+/** 真实载荷（抄自 harness 的 region_3）。 */
+const REAL_METRIC_CARD_PAYLOAD = {
+  label: "总电费概览",
+  value: 26150.46,
+  unit: "元",
+  precision: 2,
+  yoyPercent: -4.1,
+  comparisonAvailable: true,
+  windowLabel: "2026-10-22 ~ 2026-10-28（7 天）",
+  dataSource: "simulated",
+  metrics: [
+    {
+      metricKey: "metric.machine_room.energy_cost",
+      label: "能耗成本",
+      kind: "cost",
+      unit: "元",
+      value: 26150.46,
+      precision: 2,
+      capabilityPending: true,
+      pendingReason: "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+    },
+  ],
+};
+
+const REAL_METRIC_CARD_REGION = {
+  regionId: "region_3",
+  name: "总电费概览",
+  role: "SUMMARY",
+  componentType: "METRIC_CARD",
+  payload: REAL_METRIC_CARD_PAYLOAD,
+};
+
+/** 真实定义里 region_3 那一块（绑定 + 纯结构描述）。 */
+const REAL_METRIC_CARD_DEF_REGION = {
+  id: "region_3",
+  name: "总电费概览",
+  role: "SUMMARY",
+  component: {
+    type: "METRIC_CARD",
+    metric: { id: "", label: "总电费概览", fieldRef: "", format: { kind: "NUMBER", precision: 1, unitLabel: "" } },
+  },
+  templateBinding: {
+    sectionId: "section_3",
+    dataStatus: "placeholder",
+    placeholderReason: "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+    dataSourceLabel: null,
+    metricRefs: ["metric.machine_room.energy_cost"],
+    pendingReason: null,
+    previewSpec: {
+      role: "SUMMARY",
+      kind: "cost",
+      unit: "元",
+      capabilityPending: true,
+      columns: [],
+      metrics: [
+        {
+          metricKey: "metric.machine_room.energy_cost",
+          label: "能耗成本",
+          kind: "cost",
+          unit: "元",
+          capabilityPending: true,
+          pendingReason: "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+        },
+      ],
+    },
+  },
+};
+
+/** 假 DOM 元素：够 renderRegionCard 用（建元素、写 innerHTML、挂子节点、记住 querySelector 的结果）。 */
+function makeFakeCardElement(tagName = "div") {
+  const el = {
+    tagName: String(tagName).toUpperCase(),
+    className: "",
+    style: {},
+    dataset: {},
+    innerHTML: "",
+    textContent: "",
+    children: [],
+    appendChild(child) {
+      this.children.push(child);
+      return child;
+    },
+    addEventListener() {},
+    setAttribute(name, value) {
+      this[name] = value;
+    },
+    getAttribute(name) {
+      return this[name] ?? null;
+    },
+  };
+  el.querySelector = (selector) => {
+    if (!el._selected) el._selected = {};
+    if (!el._selected[selector]) el._selected[selector] = makeFakeCardElement("div");
+    return el._selected[selector];
+  };
+  return el;
+}
+
+/** 渲染一块板（走真实的 renderRegionCard），返回正文 HTML 与角标文案。 */
+function renderCard(api, region, defRegion) {
+  api.document = { createElement: (tagName) => makeFakeCardElement(tagName) };
+  const definition = { regions: defRegion ? [defRegion] : [] };
+  const card = api.__api.renderRegionCard(region, definition, region.payload, null);
+  const body = card.querySelector(".region-body");
+  const badge = card.children.find((child) => child.dataset && child.dataset.regionCapability);
+  return { card, html: body.innerHTML, badge: badge ? badge.textContent : "" };
+}
+
+/** 渲染用到的源码片段（全部来自工作台主脚本的原文）。 */
+function loadCardApi() {
+  return loadApi(
+    [
+      "renderRegionCard",
+      "renderRegionPayloadBody",
+      "readCapabilityNotes",
+      "readPrimaryMetric",
+      "readBoundMetricKey",
+      "readPayloadUnit",
+      "formatMetricValue",
+      "findDefinitionRegion",
+    ],
+    [extractConst("esc")],
+    { renderRegionPayloadBody: extractFunctionDeep }
+  );
+}
+
+test("抄进测试的载荷与 harness 的真实形状一致（不写死一套假数据）", () => {
+  const real = harnessRealMetricCard();
+  assert.ok(real.region && real.defRegion, "harness 里没有 region_3");
+
+  // 抄的每个字段都与真实载荷一致，且没凭空多出字段。
+  for (const [key, value] of Object.entries(REAL_METRIC_CARD_PAYLOAD)) {
+    assert.ok(key in real.region.payload, `真实载荷里没有 ${key}，抄的形状已经过时了`);
+    assert.deepEqual(value, real.region.payload[key], `抄的 ${key} 与真实载荷不一致`);
+  }
+  for (const [key, value] of Object.entries(REAL_METRIC_CARD_PAYLOAD.metrics[0])) {
+    assert.ok(key in real.region.payload.metrics[0], `真实指标里没有 ${key}`);
+    assert.deepEqual(value, real.region.payload.metrics[0][key], `抄的指标 ${key} 与真实载荷不一致`);
+  }
+  for (const [key, value] of Object.entries(REAL_METRIC_CARD_DEF_REGION.templateBinding)) {
+    assert.ok(key in real.defRegion.templateBinding, `真实定义里没有 ${key}`);
+    assert.deepEqual(value, real.defRegion.templateBinding[key], `抄的 templateBinding.${key} 与真实定义不一致`);
+  }
+
+  // 这个缺陷依赖的两条真实关系：两处 label 不同名、主量的值与单位在顶层。
+  assert.equal(real.region.payload.label, "总电费概览");
+  assert.notEqual(real.region.payload.label, real.region.payload.metrics[0].label, "真实形状里两处 label 本来就不同名");
+  assert.equal(real.region.payload.metrics[0].value, real.region.payload.value);
+  assert.equal(real.region.payload.metrics[0].unit, real.region.payload.unit);
+});
+
+test("指标卡主量只渲染一次（真实形状：payload.label 是区域名、metrics[].label 是指标名）", () => {
+  const api = loadCardApi();
+  const { html } = renderCard(api, REAL_METRIC_CARD_REGION, REAL_METRIC_CARD_DEF_REGION);
+
+  // 主量 26150.46 在卡片正文里只出现一次（不再在「其它指标」清单里再来一遍）。
+  assert.equal((html.match(/26150\.46/g) || []).length, 1, "主量渲染了多次");
+  assert.ok(!html.includes('data-region-metric="metric.machine_room.energy_cost"'), "主量还在「其它指标」清单里");
+
+  // 大数字上方写的是**指标名**（卡片标题已经是区域名，不必再写一遍）。
+  assert.ok(html.includes("能耗成本"), "大数字上方要写明这是哪个量");
+});
+
+test("多指标卡片：主量只画一次，真正的「其它指标」留在清单里", () => {
+  const api = loadCardApi();
+  const region = {
+    ...REAL_METRIC_CARD_REGION,
+    payload: {
+      ...REAL_METRIC_CARD_PAYLOAD,
+      metrics: [
+        REAL_METRIC_CARD_PAYLOAD.metrics[0],
+        {
+          metricKey: "metric.machine_room.total_energy",
+          label: "总耗电",
+          kind: "energy",
+          unit: "kWh",
+          value: 37357.8,
+          precision: 1,
+          capabilityPending: false,
+          pendingReason: null,
+        },
+      ],
+    },
+  };
+  const { html } = renderCard(api, region, REAL_METRIC_CARD_DEF_REGION);
+
+  assert.equal((html.match(/26150\.46/g) || []).length, 1, "主量渲染了多次");
+  assert.equal((html.match(/37357\.8/g) || []).length, 1, "其它指标应出现一次");
+  assert.ok(!html.includes('data-region-metric="metric.machine_room.energy_cost"'), "主量不该在「其它指标」清单里");
+  assert.ok(html.includes('data-region-metric="metric.machine_room.total_energy"'), "其它指标应留在清单里");
+});
+
+test("主量判定不靠位置：主量排在清单后面也认得出来（按值+单位，不按 label）", () => {
+  const api = loadCardApi();
+  const region = {
+    ...REAL_METRIC_CARD_REGION,
+    payload: {
+      ...REAL_METRIC_CARD_PAYLOAD,
+      metrics: [
+        {
+          metricKey: "metric.machine_room.total_energy",
+          label: "总耗电",
+          kind: "energy",
+          unit: "kWh",
+          value: 37357.8,
+          precision: 1,
+          capabilityPending: false,
+          pendingReason: null,
+        },
+        REAL_METRIC_CARD_PAYLOAD.metrics[0],
+      ],
+    },
+  };
+  const { html } = renderCard(api, region, null);
+
+  // 值+单位对得上的是主量（能耗成本 26150.46 元），不是清单第一条。
+  assert.equal((html.match(/26150\.46/g) || []).length, 1, "主量渲染了多次");
+  assert.ok(!html.includes('data-region-metric="metric.machine_room.energy_cost"'), "主量不该在「其它指标」清单里");
+  assert.ok(html.includes('data-region-metric="metric.machine_room.total_energy"'), "其它指标应留在清单里");
+});
+
+test("授权类原因不标成「能力待接通」：角标按原因分文案", () => {
+  const api = loadCardApi();
+  const withReason = (pendingReason) => ({
+    ...REAL_METRIC_CARD_REGION,
+    payload: {
+      ...REAL_METRIC_CARD_PAYLOAD,
+      metrics: [{ ...REAL_METRIC_CARD_PAYLOAD.metrics[0], pendingReason }],
+    },
+  });
+
+  // 统计对象不在授权范围内 → 这是授权问题，不是能力缺失。
+  const scope = renderCard(api, withReason("统计对象不在本次授权范围内，暂不纳入统计。"), null);
+  assert.ok(scope.badge.includes("不在授权范围"), `授权类角标文案不对：${scope.badge}`);
+  assert.ok(!scope.badge.includes("能力待接通"), `授权类不该标成能力待接通：${scope.badge}`);
+
+  // 能力没接通 → 还是「能力待接通」。
+  const capability = renderCard(api, withReason("「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。"), null);
+  assert.ok(capability.badge.includes("能力待接通"), `能力类角标文案不对：${capability.badge}`);
+  assert.ok(!capability.badge.includes("不在授权范围"), `能力类不该标成授权范围：${capability.badge}`);
+
+  // 原因为空 → 按「能力待接通」兜底（没写原因就分不出是不是授权问题）。
+  const blank = renderCard(api, withReason(""), null);
+  assert.ok(blank.badge.includes("能力待接通"), `空原因应兜底成能力待接通：${blank.badge}`);
+  assert.ok(!blank.badge.includes("不在授权范围"), `空原因不该标成授权范围：${blank.badge}`);
+});
+
+test("区域级 capabilityPending 缺失时仍能从 payload.metrics[] 聚合出标记", () => {
+  const api = loadCardApi();
+  // 真实后端目前不产出区域级 capabilityPending（标记在 payload.metrics[] 里）。
+  assert.equal(REAL_METRIC_CARD_REGION.capabilityPending, undefined, "真实载荷没有区域级标记");
+
+  const { badge } = renderCard(api, REAL_METRIC_CARD_REGION, null);
+  assert.ok(badge.includes("能力待接通"), `未接通的区域不能被当成已接通：${badge}`);
+  assert.ok(badge.includes("能耗成本"), "要说明是哪个指标：");
+});
+
+test("区域级 capabilityPending 存在时被采用（逐项没标也要标出来）", () => {
+  const api = loadCardApi();
+  const region = {
+    ...REAL_METRIC_CARD_REGION,
+    capabilityPending: true,
+    payload: {
+      ...REAL_METRIC_CARD_PAYLOAD,
+      metrics: [{ ...REAL_METRIC_CARD_PAYLOAD.metrics[0], capabilityPending: false, pendingReason: null }],
+    },
+  };
+  const { badge } = renderCard(api, region, null);
+  assert.ok(badge.includes("能力待接通"), `区域级标记必须被采用：${badge}`);
+});
+
+test("区域级与逐项都没有：不标成未接通", () => {
+  const api = loadCardApi();
+  const region = {
+    ...REAL_METRIC_CARD_REGION,
+    payload: {
+      ...REAL_METRIC_CARD_PAYLOAD,
+      metrics: [{ ...REAL_METRIC_CARD_PAYLOAD.metrics[0], capabilityPending: false, pendingReason: null }],
+    },
+  };
+  const { badge } = renderCard(api, region, null);
+  assert.equal(badge, "", "都接通了就不该有角标");
 });
 
 // ---------------------------------------------------------------- 表格截断
