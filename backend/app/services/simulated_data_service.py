@@ -97,6 +97,23 @@ _ALARM_ISSUES = (
 #: 设备运行状态取值池。
 _CABINET_STATUSES = ("运行中", "运行中", "运行中", "运行中", "运行中", "告警", "维护中")
 
+#: 图表纵轴字段：按量身份映射（前端按这个字段名取数）。
+_CHART_Y_FIELDS = {
+    KIND_ENERGY: "energyKwh",
+    KIND_COST: "costYuan",
+    KIND_POWER: "powerKw",
+    KIND_PUE: "pueValue",
+}
+
+#: 图表纵轴单位：按纵轴字段反推。量身份认不出来、但定义里声明了
+#: 纵轴字段时用它兜底（``pueValue`` 无量纲，用空串）。
+_CHART_Y_FIELD_UNITS = {
+    "energyKwh": "kWh",
+    "costYuan": "元",
+    "powerKw": "kW",
+    "pueValue": "",
+}
+
 
 class SimulatedDataError(RuntimeError):
     """模拟数据生成失败。
@@ -755,6 +772,42 @@ def _unit_for(kind: str, spec: dict[str, Any], fallback: str = "") -> str:
     return defaults.get(kind, fallback or "")
 
 
+def _chart_units(
+    spec: dict[str, Any], kind: str, metrics: list[dict[str, Any]]
+) -> list[str]:
+    """图表里每个系列各自的单位（顺序与 ``metrics`` 一致）。
+
+    单位来源优先级（规格：数值型组件带 ``unit``，前端从载荷读，不得硬编码）：
+    1. 该指标自己声明的单位（``previewSpec.metrics[].unit``）；
+    2. 区域声明的单位（``previewSpec.unit``）——**只对区域主量**套用：
+       多指标时把主量的单位盖到别的指标上会显示错误单位；
+    3. 按量身份（``kind``）的默认单位（``energy``→``kWh``、``cost``→``元``…）；
+    4. 按纵轴字段反推（``energyKwh``→``kWh``…）——由调用方兜底。
+
+    ``previewSpec.unit`` 还没落地（03 号票）时自动落到 3 级——
+    **代码容忍它缺失**，不因此留空或瞎猜。
+    """
+    declared: dict[str, str] = {}
+    for raw in spec.get("metrics") or []:
+        if isinstance(raw, dict):
+            key = str(raw.get("metricKey") or "").strip()
+            if key:
+                declared[key] = str(raw.get("unit") or "").strip()
+
+    units: list[str] = []
+    for item in metrics:
+        key = str(item.get("metricKey") or "").strip()
+        metric_kind = str(item.get("kind") or kind or "").strip().lower()
+        unit = declared.get(key, "")
+        if not unit and metric_kind == kind:
+            # 区域主量：区域声明的单位就是它的单位（单指标区域同样适用）。
+            unit = str(item.get("unit") or "").strip()
+        if not unit:
+            unit = _unit_for(metric_kind, {}, "")
+        units.append(unit)
+    return units
+
+
 # ---------------------------------------------------------------- 列分类
 
 
@@ -1178,13 +1231,7 @@ def _chart_payload(
     multi_day = len({b.start.date() for b in buckets}) > 1
 
     def _y_field_for(metric_kind: str) -> str:
-        mapping = {
-            KIND_ENERGY: "energyKwh",
-            KIND_COST: "costYuan",
-            KIND_POWER: "powerKw",
-            KIND_PUE: "pueValue",
-        }
-        return mapping.get(metric_kind, "value")
+        return _CHART_Y_FIELDS.get(metric_kind, "value")
 
     def _series_for(
         metric_kind: str
@@ -1262,11 +1309,19 @@ def _chart_payload(
         for x_value, value in zip(x_values, y_values)
     ]
 
+    # 单位：规格要求数值型组件自带单位，前端从载荷读，不硬编码。
+    units = _chart_units(spec, kind, metrics)
+    unit = units[0] if units else ""
+    if not unit:
+        # 量身份认不出来时，按纵轴字段反推（energyKwh→kWh …）。
+        unit = _CHART_Y_FIELD_UNITS.get(y_field, "")
+
     payload: dict[str, Any] = {
         "chartKind": str(component.get("chartKind") or "LINE"),
         "grain": grain,
         "xField": x_field,
         "yField": y_field,
+        "unit": unit,
         "xLabels": x_labels,
         "yValues": y_values,
         "points": points,
@@ -1274,14 +1329,17 @@ def _chart_payload(
     }
     if len(metrics) > 1:
         series = []
-        for item in metrics:
+        for index, item in enumerate(metrics):
             labels, values, field, x_values = _series_for(item["kind"])
+            series_unit = units[index] if index < len(units) else ""
+            if not series_unit:
+                series_unit = _CHART_Y_FIELD_UNITS.get(field, "")
             series.append(
                 {
                     "metricKey": item["metricKey"],
                     "label": item["label"],
                     "kind": item["kind"],
-                    "unit": item.get("unit") or "",
+                    "unit": series_unit,
                     "yField": field,
                     "yValues": values,
                     "points": [
@@ -1374,7 +1432,7 @@ def generate_simulated_data(
     - ``METRIC_CARD`` → ``{label, value, unit, precision, yoyPercent,
       comparisonAvailable, windowLabel, dataSource, metrics[]}``
     - ``TABLE`` → ``{columns[], rowNumber, rows[], dataSource}``
-    - ``CHART`` → ``{chartKind, grain, xField, yField, xLabels[], yValues[],
+    - ``CHART`` → ``{chartKind, grain, xField, yField, unit, xLabels[], yValues[],
       points[], series[]?, dataSource}``
     - ``DATA_QUALITY`` → ``{coverage, missing, duplicates, freshnessSeconds}``
     - ``ANALYSIS`` → ``{goal, analysis, evidenceRefs[]}``
