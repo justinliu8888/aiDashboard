@@ -1,0 +1,43 @@
+{
+  "baseDir": "../..",
+  "serve": "../..",
+  "outDir": "../../.selfcheck/tmpl-seam-render",
+  "waitMs": 2000,
+  "ignore": ["modao.cc", "/health", "/api/sessions"],
+  "pages": [
+    {
+      "name": "前后端接缝-harness-真实后端载荷",
+      "path": "/frontend/tests/seam_harness.html",
+      "title": "前后端接缝 harness",
+      "waitMs": 2000,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#preview-root",
+        "#preview-root [data-region-badge]",
+        "#preview-root [data-region-capability]",
+        "#preview-root table",
+        "#preview-root table tbody tr",
+        "#preview-root svg",
+        "#draft-badge"
+      ],
+      "texts": [
+        "模拟业务数据",
+        "接入真实数据后会自动替换",
+        "示意",
+        "能力待接通",
+        "PUE",
+        "总电费",
+        "元",
+        "单位：kWh",
+        "设备名称",
+        "耗电量"
+      ],
+      "counts": [
+        "#preview-root [data-region-badge]>=4",
+        "#preview-root [data-region-capability]>=2",
+        "#preview-root table tbody tr>=10",
+        "#preview-root svg>=1"
+      ]
+    }
+  ]
+}
