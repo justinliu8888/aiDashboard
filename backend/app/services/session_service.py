@@ -132,6 +132,8 @@ def _payload_is_simulated(payload: Any) -> bool:
     for region in regions:
         if not isinstance(region, dict):
             continue
+        if region.get("dataSource") == "simulated":
+            return True
         region_payload = region.get("payload")
         if (
             isinstance(region_payload, dict)
