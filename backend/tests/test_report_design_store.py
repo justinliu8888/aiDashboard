@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +32,7 @@ from app.storage.report_design_repository import (
     OPERATION_PROCESSING,
     OPERATION_SUCCEEDED,
     DesignPlanInvalidError,
+    ReportDesignRepository,
 )
 from app.storage.report_design_sqlite import SqliteReportDesignRepository
 from app.storage.sqlite_store import SqliteSessionRepository
@@ -569,3 +571,38 @@ def test_successful_operation_is_unique_per_plan_revision(conn):
         plan_id="plan_x",
         plan_revision=1,
     )
+
+
+# --------------------------------------------------------------------------
+# 死代码守卫：只提交模板的写入路径已删除
+# --------------------------------------------------------------------------
+
+
+def test_legacy_commit_template_path_is_gone(store):
+    """「只提交模板」的写入路径**整条不存在**了。
+
+    #36 起「确认方案」一次提交模板 + 草稿（``commit_template_and_definition``）。
+    旧的 ``commit_template`` 没有调用方，却仍会把阶段写成 ``TEMPLATE_READY``
+    —— 那是**已下线的模板中间页**。留着它，就等于给「模板中间页复活」留了
+    一条路：将来有人误调用，阶段就退回去了，而且没有任何用例会拦住。
+
+    所以断三件事（从弱到强）：
+
+        1. 具体仓储的**实例**上没有这个方法（不是「没调用」，是「不存在」）；
+        2. **协议**上也没有这个声明 —— 否则调用方还能照契约去调；
+        3. 源码里**没有** ``def commit_template`` —— 换个模块复活也拦住。
+
+    为什么第 3 条要用源码扫描而不是只看 ``hasattr``：前两条只看住这两个
+    文件，人把方法挪到另一个仓储类里就漏掉了。
+    """
+    assert not hasattr(store, "commit_template")
+    assert not hasattr(SqliteReportDesignRepository, "commit_template")
+    assert not hasattr(ReportDesignRepository, "commit_template")
+
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    revived = [
+        path.relative_to(app_dir).as_posix()
+        for path in sorted(app_dir.rglob("*.py"))
+        if "def commit_template(" in path.read_text(encoding="utf-8")
+    ]
+    assert revived == [], f"「只提交模板」的写入路径复活了：{revived}"

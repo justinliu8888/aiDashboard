@@ -225,29 +225,6 @@ class ReportDesignRepository(Protocol):
     ) -> None:
         """把操作标记为失败，保留上一成功方案。"""
 
-    def commit_template(
-        self,
-        operation_id: str,
-        expected_revision: int | None,
-        template: Mapping[str, Any],
-        write_turn: WriteTurn | None = None,
-    ) -> CommitResult:
-        """提交由已确认方案生成的模板（工单 02）。
-
-        模板、确认关系、阶段（``TEMPLATE_READY``）、操作结果与 write_turn
-        回调同事务提交。
-
-        两处刻意的设计：
-
-            1. **确认关系单独建唯一键**。操作表上的
-               ``(session_id, plan_id, plan_revision)`` 唯一索引已经被
-               「提交方案」那次操作占用了 —— 确认动作不能再往同一组键上写，
-               否则第二次确认会撞库。确认按 ``(session_id, plan_id,
-               plan_revision)`` 建在确认关系表上，跨进程也成立。
-            2. **确认操作不在操作表上记方案版本**。操作表那组键留给方案提交，
-               确认操作只记「这次操作成功了」，方案版本记在确认关系表里。
-        """
-
     def commit_template_and_definition(
         self,
         operation_id: str,

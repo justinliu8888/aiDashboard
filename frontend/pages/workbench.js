@@ -2142,8 +2142,9 @@ function renderRegionBody(region) {
   if (type === "METRIC_CARD") return { html: renderMetricCard(region), node: null };
   if (type === "TABLE") return { html: renderTable(region), node: null };
   if (type === "CHART") {
-    // 草稿阶段还没有数据点 → 继续走原来的空壳卡片（不编造数值）。
-    // 试运行出数之后 → 用真实点画折线 / 柱条。
+    // 事实：草稿路径的 region.data 是**执行绑定描述符**（{inputs, pipeline, outputs}），
+    // 不含 xLabels / yValues，所以这里拿不到数据点、始终回落到空壳卡片（不编造数值）。
+    // 该渲染器按需求稿 §3.3 保留；草稿路径真的拿到数据点时才会被用到（当前无此数据源）。
     const chartNode = renderRealChart(region);
     if (chartNode) return { html: "", node: chartNode };
     return { html: renderChartPlaceholder(region), node: null };
@@ -2213,13 +2214,17 @@ const CHART_KIND_TO_COMPONENT_TYPE = {
 };
 
 /**
- * 图表区域：真的拿到数据点时画真实图表。
+ * 图表区域：区域里真的带数据点时画真实图表。
  *
- * - 草稿阶段还没有数据点 → 返回 null，继续显示空壳卡片（需求稿 §2.6：不编造数值）。
- * - 试运行出数之后，区域里带 xLabels / yValues 时，才调用
- *   globalThis.WorkbenchPlan.renderChart 画折线 / 柱条。
+ * 事实（下线拖拽后）：
+ *   - 草稿路径的 `region.data` 是**执行绑定描述符**（{inputs, pipeline, outputs}），
+ *     **不含** xLabels / yValues —— 所以这里**始终**返回 null，继续显示空壳卡片
+ *     （需求稿 §2.6：不编造数值）；
+ *   - 真正带 xLabels / yValues 的是**预览 payload**，走的是 ECharts 那条路
+ *     （renderFinalRegion），不走这里。
  *
- * 需求稿 §3.3 点名保护那段图表渲染代码，所以这里是**复用**而不是重写。
+ * 本函数按需求稿 §3.3「严禁删除折线图 SVG 渲染」保留：草稿路径哪天真的拿到
+ * 数据点就能直接用上（当前没有这样的数据源）。
  * 调用前必须判空、调用失败必须吞掉：绝不允许因为接图表把草稿面板渲染搞崩。
  */
 function renderRealChart(region) {

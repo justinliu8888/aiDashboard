@@ -55,7 +55,12 @@ from app.schemas.agent import (
     AgentResponseDomainObjects,
     AgentState,
 )
-from app.schemas.report_plan import ComponentType, ReportPlan, ReportPlanError
+from app.schemas.report_plan import (
+    PlanContractError,
+    ReportPlan,
+    ReportPlanError,
+    validate_section_contract,
+)
 from app.schemas.session import (
     CLARIFICATION_COUNT_KEY,
     CLARIFICATION_KEY_KEY,
@@ -194,10 +199,10 @@ _VERSION_PATTERN = re.compile(r"第\d+版")
 
 
 # --------------------------------------------------------------------------
-# 方案契约校验（组件类型）
+# 方案契约校验
 #
-# 组件类型的权威枚举在 ``app.schemas.report_plan``（冻结契约）。这里只取
-# 一份**取值集合**用于校验，不另造一套定义。
+# 判据本身**只有一份**：``app.schemas.report_plan.validate_section_contract``
+# （那个模块里写明「唯一权威判据」）。编排层**不抄第二份**。
 #
 # 为什么编排层要再查一遍：方案校验与模板生成之间的任何一条路径，
 # 都可能带着一个没声明组件类型、或声明了非法类型的板块进来。组件类型
@@ -207,12 +212,13 @@ _VERSION_PATTERN = re.compile(r"第\d+版")
 #   - 不能当成「已接上数据的成功区域」（那是把非法输入当成成功）。
 #
 # 失败原因要**点名是哪个板块**：只说「componentType 不合法」，
-# 用户根本不知道要改哪一块。
+# 用户根本不知道要改哪一块。权威判据已经把板块标识写进异常消息里，
+# 这里**原样**透传。
+#
+# 为什么不再抄一份弱判据：抄的那份只查组件类型、不查取数板块的指标意图。
+# 两份一旦漂移，编排层就会放过非法板块，把本该在这里拦下的错误推迟到
+# 模板层才炸，错误文案也随之改变。
 # --------------------------------------------------------------------------
-
-#: 合法的组件类型取值（按枚举声明顺序，与方案契约层的文案一致）。
-_COMPONENT_TYPES: frozenset[str] = frozenset(item.value for item in ComponentType)
-_COMPONENT_TYPE_LIST: str = " / ".join(item.value for item in ComponentType)
 
 
 def _reason_text(exc: Exception) -> str:
@@ -227,32 +233,24 @@ def _reason_text(exc: Exception) -> str:
 
 
 def _plan_contract_error(sections: Any) -> str | None:
-    """检查方案板块的组件类型契约。
+    """检查方案板块的契约（组件类型 + 取数板块的指标意图）。
 
     返回可读原因（点名板块）；合法时返回 ``None``。
 
     这是**确认前的最后一道关**，也是「方案落库前」的兜底：模型适配层与
     领域层已经各有一道校验，这里再挡一次，是为了拦住绕过那两层的路径
     （历史数据、手工改库、将来新增的调用方）。
+
+    判据直接调用方案契约层的 ``validate_section_contract`` —— 编排层
+    **不保留第二份实现**，否则两份判据会漂移。
     """
     if not isinstance(sections, list):
         return None
     for index, section in enumerate(sections):
-        if not isinstance(section, dict):
-            continue
-        title = str(section.get("title") or "").strip()
-        label = f"板块 {index + 1}"
-        if title:
-            label += f"「{title}」"
-        raw = section.get("componentType")
-        if raw is None or not str(raw).strip():
-            return f"{label}没有声明组件类型；合法取值为 {_COMPONENT_TYPE_LIST}。"
-        value = str(raw).strip()
-        if value not in _COMPONENT_TYPES:
-            return (
-                f"{label}的组件类型非法：'{value}'；"
-                f"合法取值为 {_COMPONENT_TYPE_LIST}。"
-            )
+        try:
+            validate_section_contract(section, index=index)
+        except PlanContractError as exc:
+            return _reason_text(exc)
     return None
 
 
@@ -531,7 +529,10 @@ class ReportDesignService:
                 response = self._template_response(
                     request, plan=current_plan, template=(state or {}).get("templateDesign")
                 )
-                response.reply = "请说明要修改方案的哪些内容。当前模板保持原样，修改后的方案需要重新确认才能生成新模板。"
+                response.reply = (
+                    "请说明要修改方案的哪些内容。当前方案保持原样，"
+                    "修改后的方案重新确认后直接生成草稿。"
+                )
                 response.uiActions = ["modify_plan", "plan_edit_requested"]
                 return response
             if is_vague_approval(request.message):
@@ -717,7 +718,10 @@ class ReportDesignService:
         current_revision = current_plan.get("revision")
         if (state or {}).get("designPhase") == DESIGN_PHASE_TEMPLATE_READY:
             response = self._template_response(request, plan=current_plan, template=(state or {}).get("templateDesign"))
-            response.reply = "当前模板保持原样。请明确确认模板，或告诉我要修改方案的哪一处。"
+            response.reply = (
+                "当前方案保持原样。发送「确认」即可按当前方案直接生成草稿；"
+                "要调整请说明要修改方案的哪一处。"
+            )
             return response
         message = (
             "我理解你对这份方案大致认可，但还不能确定是不是要按它生成，"
@@ -1559,10 +1563,16 @@ class ReportDesignService:
         template: dict[str, Any] | None,
         duplicate: bool = False,
     ) -> AgentResponse:
-        """模板已就绪的响应。
+        """历史会话（``TEMPLATE_READY``）的响应。
 
-        正文由前端模板模块渲染；这里给一句可读的摘要 ——
-        接上数据的区域报数、占位的区域报原因，不让用户自己猜。
+        ``TEMPLATE_READY`` 现在是**纯历史态**：新流程的落点只有
+        ``DRAFT_READY``（#36 起「确认方案」一次提交模板 + 草稿），
+        只有改造前创建的会话才可能停在这个阶段。
+
+        所以这里的文案与 ``ui_actions`` 都按**草稿就绪**的语义说 ——
+        需求稿 §2.4 明令「要求用户输入『确认模板』的提示」要下线：
+        既不再要求用户去「确认模板」，也不把模板中间页当成一个要停留
+        的落点。下一步只有一条：按这版方案直接生成草稿。
         """
         template = template or {}
         regions = template.get("regions") or []
@@ -1571,7 +1581,7 @@ class ReportDesignService:
         title = template.get("title") or (plan or {}).get("topic") or "报表"
         plan_revision = template.get("planRevision") or (plan or {}).get("revision")
 
-        reply = f"已按第 {plan_revision} 版方案生成模板：{title}。"
+        reply = f"已确认第 {plan_revision} 版方案「{title}」。"
         if bound:
             # 同 _draft_response：#38 起模板阶段不取数，不能说「已接上数据」。
             reply += f"{len(bound)} 个区域已绑定指标，数值待试运行产生"
@@ -1589,12 +1599,16 @@ class ReportDesignService:
             if cleaned:
                 reply += "占位原因：" + "；".join(cleaned) + "。"
         if duplicate:
-            reply += "（这一版方案之前已经确认过，直接沿用已生成的模板，没有重复生成。）"
+            reply += "（这一版方案之前已经确认过，直接沿用已生成的草稿，没有重复生成。）"
         else:
-            reply += "模板已经保存，刷新后仍然在。"
-        reply += "请确认模板以生成报表草稿，或选择修改方案继续调整。"
+            reply += "方案已经确认，刷新后仍然在。"
+        reply += (
+            "发送「确认」即可按这版方案直接生成草稿，"
+            "然后在右侧草稿继续修改、校验与试运行。"
+        )
 
-        ui_actions = [UI_ACTION_TEMPLATE_READY, "confirm_template", "modify_plan"]
+        # 不再给「确认模板」这个动作：模板中间页已下线，下一步是草稿。
+        ui_actions = [UI_ACTION_TEMPLATE_READY, "draft_ready", "modify_plan"]
         if duplicate:
             ui_actions.append("template_duplicate")
         return AgentResponse(
