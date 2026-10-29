@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -244,6 +245,39 @@ def test_table_columns_field_ref_matches_row_keys(client, monkeypatch):
         assert column["id"] and column["label"] and column["fieldRef"]
         for row in table["rows"]:
             assert column["fieldRef"] in row
+
+
+def test_chart_unit_falls_back_to_preview_spec_when_the_generator_omits_it(
+    client, monkeypatch
+):
+    """图表载荷缺 ``unit`` 时，组装层兜底从 ``previewSpec.unit`` 补。
+
+    图表的 ``unit`` 由并行的 04b 补丁提供；组装层**容忍它缺失**，
+    并保证数值型组件一定有单位（前端也就多个回退，少个坑）。
+    """
+    from app.services import preview_service as preview_module
+
+    _, plan = _plan(client, monkeypatch)
+    draft = _confirm_plan(client, plan)["domainObjects"]["reportDefinitionDraft"]
+    definition = draft
+    context = build_preview_context(definition)
+
+    original = preview_module.generate_simulated_data
+
+    def without_unit(defn, ctx):
+        payloads = original(defn, ctx)
+        for payload in payloads.values():
+            payload.pop("unit", None)
+        return payloads
+
+    monkeypatch.setattr(preview_module, "generate_simulated_data", without_unit)
+
+    payload = build_report_preview_payload(definition, context)
+
+    region = payload["regions"][0]
+    assert region["componentType"] == "METRIC_CARD"
+    assert "unit" in region["payload"]
+    assert region["payload"]["unit"] == "kWh"
 
 
 def test_regions_have_no_placeholder_numbers(client, monkeypatch):
@@ -558,6 +592,96 @@ def test_confirm_template_legacy_path_carries_the_preview_payload(client, monkey
     }).json()
 
     _assert_carries_payload(payload, "确认模板（TEMPLATE_READY）")
+
+
+def test_preview_context_identity_matches_the_definition_binding(client, monkeypatch):
+    """previewContext 的标识/版本 = 定义上登记的那一套（票 03 定稿）。
+
+    前端拿定义里的标识/版本与载荷里的比对：两边必须是**同一套值**，
+    否则前端会把载荷当过期版本丢掉。
+    """
+    _, plan = _plan(client, monkeypatch)
+    confirmed = _confirm_plan(client, plan)
+    context = confirmed["reportPreviewPayload"]["previewContext"]
+    binding = confirmed["domainObjects"]["reportDefinitionDraft"]["metadata"][
+        "templateBinding"
+    ]
+
+    assert context["definitionId"] == binding["definitionId"]
+    assert context["definitionVersion"] == binding["definitionVersion"]
+    assert isinstance(context["definitionVersion"], int)
+
+
+def test_generator_version_is_persisted_and_reused(client, monkeypatch):
+    """``generatorVersion`` 要落库并复用 —— 生成器升级不得无声改变旧示意。
+
+    造数器的种子材料里有生成器版本：版本一变种子就变、数字就变。
+    所以冻结下来的上下文必须**带着**当时的版本号，恢复时原样复用，
+    不能拿当前代码常量覆盖。
+    """
+    from app.services import preview_service as preview_module
+    from app.services import simulated_data_service as generator_module
+
+    _, plan = _plan(client, monkeypatch)
+    confirmed = _confirm_plan(client, plan)
+    context = confirmed["reportPreviewPayload"]["previewContext"]
+
+    # 版本号取造数器导出的常量，不自己另写一个字符串。
+    assert context["generatorVersion"] == generator_module.GENERATOR_VERSION
+
+    # 落库的是同一份。
+    record = session_service.repository.get_session("sess_tpl_1")
+    assert record.snapshot["previewContext"]["generatorVersion"] == (
+        generator_module.GENERATOR_VERSION
+    )
+
+    # 生成器「升级」了：代码常量变了，但**持久化的上下文**不能被覆盖。
+    monkeypatch.setattr(generator_module, "GENERATOR_VERSION", "simulated-data/2")
+    monkeypatch.setattr(preview_module, "GENERATOR_VERSION", "simulated-data/2")
+
+    detail = client.get("/api/sessions/sess_tpl_1").json()
+    regenerated = detail["snapshot"]["reportPreviewPayload"]
+    # 复用**持久化的那个**版本号，不被当前代码常量覆盖。
+    assert regenerated["previewContext"]["generatorVersion"] == "simulated-data/1"
+    assert generator_module.GENERATOR_VERSION == "simulated-data/2"
+    # 数字完全一致：还是原来那份（版本号没被覆盖 → 种子没变）。
+    assert regenerated["regions"][0]["payload"]["value"] == (
+        confirmed["reportPreviewPayload"]["regions"][0]["payload"]["value"]
+    )
+
+
+def test_new_context_picks_up_the_current_generator_version(client, monkeypatch):
+    """新建上下文用**当前**生成器版本；旧上下文仍旧用旧版本（不混）。"""
+    from app.services import preview_service as preview_module
+    from app.services import simulated_data_service as generator_module
+
+    # 用一个**没登记**的指标：它的数值由种子派生，生成器版本一变数字就变。
+    candidate = _candidate(metrics=["某个没登记的指标"], sections=[{
+        "id": "section_unknown", "title": "未知指标概览",
+        "metricIntents": ["某个没登记的指标"], "componentType": "metric_card",
+    }])
+    _, plan = _plan(client, monkeypatch, candidate)
+    confirmed = _confirm_plan(client, plan)
+    first = confirmed["reportPreviewPayload"]["previewContext"]
+    old_value = confirmed["reportPreviewPayload"]["regions"][0]["payload"]["value"]
+
+    monkeypatch.setattr(generator_module, "GENERATOR_VERSION", "simulated-data/2")
+    monkeypatch.setattr(preview_module, "GENERATOR_VERSION", "simulated-data/2")
+
+    definition = confirmed["domainObjects"]["reportDefinitionDraft"]
+    # 锚点固定成原来那个：只让生成器版本变，窗口不动。
+    fresh = build_preview_context(
+        definition, anchor_time=datetime.fromisoformat(first["anchorTime"])
+    )
+    assert fresh["generatorVersion"] == "simulated-data/2"
+
+    # 旧上下文重新生成 → 还是旧数字（种子里的版本没变）。
+    again = build_report_preview_payload(definition, first)
+    assert again["regions"][0]["payload"]["value"] == old_value
+    # 新上下文 → 种子变了，数字跟着变（版本一变，界面上的数字跟着变，
+    # 不会拿旧版本的数字冒充新版本的示意）。
+    renewed = build_report_preview_payload(definition, fresh)
+    assert renewed["regions"][0]["payload"]["value"] != old_value
 
 
 # --------------------------------------------------------------------------
