@@ -1,0 +1,149 @@
+{
+  "baseDir": "../..",
+  "serve": "../..",
+  "outDir": "../../.selfcheck/tmpl-08b-page-accept-selfcheck",
+  "waitMs": 1500,
+  "ignore": ["modao.cc"],
+  "pages": [
+    {
+      "name": "page-accept-01-waiting-plan-left",
+      "path": "/frontend/tests/page_accept_harness.html?scene=waiting",
+      "title": "工单 08b 页面层验收 harness",
+      "waitMs": 2000,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#chat-scroll [data-plan-bubble] .plan-module",
+        "#chat-scroll [data-plan-bubble] #plan-root",
+        "#chat-scroll [data-plan-bubble] .plan-confirm",
+        "#chat-scroll [data-plan-bubble] .plan-component-type",
+        "#chat-scroll [data-plan-bubble] .plan-selection-reason",
+        "#chat-scroll [data-plan-bubble] .plan-column",
+        "#preview-root"
+      ],
+      "texts": [
+        "确认方案",
+        "指标卡",
+        "折线图",
+        "表格",
+        "看总量，指标卡最直观",
+        "看具体记录与属性，用表格",
+        "设备名称",
+        "采集时间"
+      ],
+      "counts": [
+        "#chat-scroll [data-plan-bubble] .plan-component-type>=4",
+        "#chat-scroll [data-plan-bubble] .plan-selection-reason>=4",
+        "#chat-scroll [data-plan-bubble] .plan-column>=3",
+        "#preview-root #plan-root==0",
+        "#preview-root .plan-module==0",
+        "#preview-root [data-plan-bubble]==0"
+      ]
+    },
+    {
+      "name": "page-accept-02-draft-report-right",
+      "path": "/frontend/tests/page_accept_harness.html?scene=draft",
+      "title": "工单 08b 页面层验收 harness",
+      "waitMs": 2000,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#chat-scroll [data-plan-bubble] details.confirmed-plan-details",
+        "#preview-root [data-simulated-note]",
+        "#preview-root [data-region-badge]",
+        "#preview-root [data-region-capability]",
+        "#preview-root table",
+        "#preview-root table tbody tr",
+        "#preview-root svg",
+        "#draft-badge"
+      ],
+      "texts": [
+        "查看已确认的文字方案",
+        "模拟业务数据",
+        "接入真实数据后会自动替换",
+        "总耗电",
+        "306.1",
+        "kWh",
+        "总电费",
+        "244.88",
+        "元",
+        "能力待接通",
+        "PUE",
+        "实时功率",
+        "示意",
+        "单位：kWh",
+        "单位：元",
+        "单位：kW",
+        "设备耗电排名",
+        "A-1 机架"
+      ],
+      "counts": [
+        "#preview-root [data-region-badge]>=8",
+        "#preview-root [data-region-capability]>=2",
+        "#preview-root table tbody tr>=3",
+        "#preview-root svg>=3",
+        "#preview-root #plan-root==0",
+        "#preview-root .plan-module==0",
+        "#preview-root [data-plan-bubble]==0"
+      ]
+    },
+    {
+      "name": "page-accept-03-validated-badge",
+      "path": "/frontend/tests/page_accept_harness.html?scene=validated",
+      "title": "工单 08b 页面层验收 harness",
+      "waitMs": 2000,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#draft-badge",
+        "#preview-root [data-region-badge]",
+        "#preview-root [data-simulated-note]"
+      ],
+      "texts": [
+        "已校验 / 待接真数",
+        "306.1",
+        "示意"
+      ],
+      "counts": [
+        "#preview-root [data-region-badge]>=8"
+      ]
+    },
+    {
+      "name": "page-accept-04-table-truncated",
+      "path": "/frontend/tests/page_accept_harness.html?scene=truncated",
+      "title": "工单 08b 页面层验收 harness",
+      "waitMs": 2000,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#preview-root [data-table-truncated]",
+        "#preview-root table tbody tr"
+      ],
+      "texts": [
+        "仅显示前 2 行",
+        "各行之和小于报表总量"
+      ],
+      "counts": [
+        "#preview-root table tbody tr>=2"
+      ]
+    },
+    {
+      "name": "page-accept-05-workbench-load",
+      "path": "/frontend/pages/workbench.html",
+      "title": "AI 报表生成工作台",
+      "waitMs": 2500,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#chat-scroll",
+        "#preview-root",
+        "#preview-root [data-preview-empty-hint]",
+        "#draft-badge"
+      ],
+      "texts": [
+        "AI 报表助理",
+        "还没有草稿"
+      ],
+      "counts": [
+        "#chat-scroll>=1",
+        "#preview-root>=1",
+        "#preview-root #plan-root==0"
+      ]
+    }
+  ]
+}
