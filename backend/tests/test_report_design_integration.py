@@ -557,9 +557,10 @@ def test_clarification_keeps_phase_and_is_not_a_failure(client, monkeypatch):
 
 
 def test_confirm_plan_does_not_trigger_save_or_data(client, monkeypatch):
-    """确认方案要出模板，但**不**接旧的保存 / 出数链路。
+    """确认方案要出草稿，但**不**接旧的保存 / 出数链路。
 
-    工单 02 起：确认方案 → 生成模板（逐区域接数，接不到的保留占位）。
+    工单 #36 起：确认方案在**一次操作**内生成模板结构、转换成报表草稿，
+    对外落点是「草稿就绪 + 等待用户确认」。
     仍然明确**不**接旧的「确认报表」链路：不保存草稿、不预览、不推进运行。
     """
     install_model(monkeypatch, RecordingModel(_candidate()))
@@ -579,15 +580,17 @@ def test_confirm_plan_does_not_trigger_save_or_data(client, monkeypatch):
     ).json()
 
     assert payload["toolRequests"] == []
-    assert payload["domainObjects"].get("reportDefinitionDraft") is None
+    # 确认方案后草稿已经落库（#36：确认一次到位，不再等第二次「确认模板」）。
+    assert payload["domainObjects"].get("reportDefinitionDraft") is not None
     assert payload["domainObjects"].get("reportRunPreview") is None
-    assert payload["designPhase"] == "TEMPLATE_READY"
+    assert payload["designPhase"] == "DRAFT_READY"
+    assert payload["state"] == "WAITING_USER_CONFIRM"
     # 模板绑定的就是确认的那一版方案
     template = payload["domainObjects"]["templateDesign"]
     assert template["planId"] == plan["id"]
     assert template["planRevision"] == plan["revision"]
     assert template["regions"]
-    assert "模板" in payload["reply"]
+    assert "草稿" in payload["reply"]
 
 
 def test_confirm_plan_with_stale_revision_is_rejected(client, monkeypatch):
@@ -653,7 +656,7 @@ def test_natural_language_confirm_binds_current_plan_version(client, monkeypatch
     服务端认得这句是在认可当前方案，所以：
       - 不再跑一次模型（模型调用次数不变）；
       - 绑定的方案 id 与版本不变；
-      - 行为与按钮确认一致：出模板。
+      - 行为与按钮确认一致：直接出草稿（#36：确认一次到位）。
     """
     model = install_model(monkeypatch, RecordingModel(_candidate()))
     built = _post(client, "生成 PUE 报表", message_id="msg_1").json()
@@ -663,13 +666,13 @@ def test_natural_language_confirm_binds_current_plan_version(client, monkeypatch
     payload = _post(client, "确认", message_id="msg_2").json()
 
     assert len(model.calls) == calls_before
-    assert payload["designPhase"] == "TEMPLATE_READY"
+    assert payload["designPhase"] == "DRAFT_READY"
     confirmed = payload["domainObjects"]["reportPlan"]
     assert confirmed["revision"] == plan["revision"]
     assert confirmed["id"] == plan["id"]
     assert payload["toolRequests"] == []
     assert payload["domainObjects"]["templateDesign"]["planId"] == plan["id"]
-    assert "模板" in payload["reply"]
+    assert "草稿" in payload["reply"]
 
 
 def test_vague_approval_does_not_advance_design_version(client, monkeypatch):
@@ -996,10 +999,10 @@ def test_confirmation_turn_does_not_run_the_old_router(client, monkeypatch):
     payload = _post(client, "确认", message_id="msg_2").json()
 
     assert calls == []
-    assert payload["designPhase"] == "TEMPLATE_READY"
+    assert payload["designPhase"] == "DRAFT_READY"
     assert payload["domainObjects"]["reportPlan"]["revision"] == 1
     assert payload["domainObjects"]["templateDesign"]["regions"]
-    assert "模板" in payload["reply"]
+    assert "草稿" in payload["reply"]
 
 
 def test_design_turn_does_not_persist_router_defaults_into_the_snapshot(
