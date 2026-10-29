@@ -337,11 +337,15 @@ _ORDINAL_VALUES = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "
 #: 表格栏目的补齐模板（按板块标题与指标意图判断）。
 #: 第一条来自需求稿 4.1：「告警列表」建议设备名称、时间、告警级别；
 #: 第二条来自 ADR 0004 §3：「机柜运行状态」对应成套机柜、状态、负载率。
+#:
+#: 补出来的列必须是**能被渲染出合理内容**的列（规格 US47）。「机房」曾经
+#: 在能耗与设备两类预设里，但造数器没有机房列的值类型，它会落进兜底的
+#: 「示例值 69」—— 占位观感的列不算合理的列，所以拿掉。
 _TABLE_COLUMN_PRESETS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("告警", "alarm"), ("设备名称", "时间", "告警级别")),
     (("机柜", "cabinet"), ("机柜名称", "状态", "负载率")),
-    (("能耗", "耗电", "用电", "energy"), ("设备名称", "机房", "耗电量")),
-    (("设备", "device"), ("设备名称", "机房", "状态")),
+    (("能耗", "耗电", "用电", "energy"), ("设备名称", "耗电量")),
+    (("设备", "device"), ("设备名称", "状态")),
 )
 
 #: 用户在需求里点名栏目的说法。
@@ -380,6 +384,8 @@ class ColumnSpec:
     label: str
     id: str | None = None
     fieldRef: str | None = None
+    #: 列的展示格式（精度、单位标注）。模型没声明就是 None。
+    format: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -763,6 +769,27 @@ def _infer_columns(
     return _column_hints_from_request(request_text)
 
 
+def normalize_column_format(raw: Any) -> dict[str, Any] | None:
+    """栏目声明的**展示格式**：只认已知键，认不出的丢掉。
+
+    未知键不报错 —— 格式是可选的装饰，认不出就不给单位标注，不因为一个
+    多写的键把整轮方案作废。
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    out: dict[str, Any] = {}
+    kind = raw.get("kind")
+    if isinstance(kind, str) and kind.strip():
+        out["kind"] = kind.strip()
+    precision = raw.get("precision")
+    if isinstance(precision, int) and not isinstance(precision, bool) and precision >= 0:
+        out["precision"] = precision
+    unit = raw.get("unitLabel")
+    if isinstance(unit, str) and unit.strip():
+        out["unitLabel"] = unit.strip()
+    return out or None
+
+
 def resolve_table_columns(
     section: Mapping[str, Any], *, request_text: str = ""
 ) -> ColumnResolution:
@@ -800,10 +827,22 @@ def resolve_table_columns(
                     if isinstance(item.get("fieldRef"), str)
                     else None
                 ),
+                format=normalize_column_format(item.get("format")),
             )
         )
     if specs:
         return ColumnResolution(kind="model", specs=tuple(specs))
+
+    if malformed:
+        # 模型写了栏目但结构是坏的：这是技术错误，不能变成「请你设计这张表」，
+        # 更不能**悄悄换成系统补齐的栏目** —— 用户以为模型给的就是他看到的。
+        # 判定放在「系统补齐」之前：模型给的栏目结构坏了就该明确报失败，
+        # 让用户重试。
+        return ColumnResolution(
+            kind="failure",
+            code="PLAN_COLUMNS_UNRESOLVED",
+            message=f"板块「{title}」的栏目无法解析，方案生成失败，请重试。",
+        )
 
     inferred = _infer_columns(section, request_text=request_text)
     if inferred:
@@ -812,14 +851,6 @@ def resolve_table_columns(
             kind="inferred",
             specs=tuple(ColumnSpec(label=label) for label in inferred),
             note=note,
-        )
-
-    if malformed:
-        # 模型写了栏目但结构是坏的：这是技术错误，不能变成「请你设计这张表」。
-        return ColumnResolution(
-            kind="failure",
-            code="PLAN_COLUMNS_UNRESOLVED",
-            message=f"板块「{title}」的栏目无法解析，方案生成失败，请重试。",
         )
 
     return ColumnResolution(
@@ -1007,7 +1038,18 @@ def finalize_columns(
             field_ref = _make_field_ref(section_id, column_id, used_refs)
         used_ids.add(column_id)
         used_refs.add(field_ref)
-        columns.append(PlanColumn(id=column_id, label=label, fieldRef=field_ref))
+        # 格式跟着栏目走：模型这次声明了就用这次的；没声明就沿用上一版的
+        # （改列名不换身份，单位标注也不该跟着改）。
+        column_format = spec.format
+        if column_format is None and matched is not None:
+            column_format = (
+                matched.format.model_dump(mode="json") if matched.format else None
+            )
+        columns.append(
+            PlanColumn(
+                id=column_id, label=label, fieldRef=field_ref, format=column_format
+            )
+        )
 
     return columns
 

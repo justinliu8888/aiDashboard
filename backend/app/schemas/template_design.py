@@ -39,11 +39,12 @@ class TemplateColumn(BaseModel):
     ``fieldRef`` 是**行对象的稳定取值键**，不是数据源绑定 —— 造数器按它造行、
     前端按它读单元格。改列名不改栏目身份（``id`` 与 ``fieldRef`` 都不变）。
 
-    多余字段（列宽等）保留原样透传：方案侧以后加字段时，转换层不该把
-    它们悄悄吃掉。
+    **字段白名单**（``extra="forbid"``）：只认 ``id`` / ``label`` /
+    ``fieldRef`` / ``format``。模型多写的键（列宽等）不进模板设计，
+    也就不会跟着落进草稿定义 —— 未声明的键不进契约。
     """
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     id: str
     label: str
