@@ -12,14 +12,25 @@
   才能在同一屏里验「方案在左边、报表在右边」这条缝 2 的核心结论。
 
   本页是**测试 harness，不是产品页面**：
-    - 载荷是**静态样例**：字段形状照开发规格 #46「跨工单契约」写死，
-      **不是**生产数据、不是模板库资产、也不是模型回复。
-    - **载荷形状待工单 05 核对**（票 05 的后端示意载荷与响应尚未落地，
-      真实响应字段名/层级还可能变）。本页只断言**界面形态**，
-      不因为字段名变化而判产品有错。
+    - 载荷与定义是**后端真实产出的形状**（票 05 / #51 落地后核对过，见下方「真实形状」）：
+      字段名、层级、类型、取值集合都照后端实际吐出来的写，不是按规格猜的。
+    - 数值是**一次真实运行**的产物：真实编排 + 真实服务 + 独立临时 SQLite 库，
+      只替换了外部模型调用（RecordingModel）。不是生产数据、不是模板库资产。
     - 不接后端、不调模型：fetch 被桩掉，产品脚本（workbench.js / workbench_plan.js）
       **原样加载**，左侧方案走产品自己的 renderPlanModule()，右侧报表走产品自己的
       renderReportPanel()，不是本页手搓的渲染。
+
+  【真实形状】后端当前实际吐出来的 reportPreviewPayload（核对结论）：
+    - 顶层只有 ``previewContext`` 与 ``regions``；
+    - ``regions[]`` 每项**只有** regionId / name / role / componentType / payload；
+    - ``role`` 的取值集合是 SUMMARY / TREND / DETAIL / DESCRIPTION
+      （指标卡是 **SUMMARY**，不是 TOTAL）；
+    - 「能力待接通」挂在 ``payload.metrics[].capabilityPending`` / ``pendingReason``，
+      **区域级没有** capabilityPending；
+    - ``dataSource`` 挂在 ``payload`` 里，**区域级没有** dataSource；
+    - ``previewContext`` 固定八字段，generatorVersion = "simulated-data/1"；
+    - 表格列的 ``format`` 是 **null**（后端当前不产出列单位），表格载荷里
+      也没有 truncated / totalRows —— 所以真实形状下**判不出**表格行被截断。
 
   场景切换（给交互流程与静态自检用）：
     window.__pageAcceptScene('waiting' | 'draft' | 'validated' | 'pending' | 'failed' | 'truncated')
@@ -64,11 +75,16 @@
 
 <div class="banner">
   <strong>这是测试 harness，不是产品页面。</strong>
-  载荷是<strong>静态样例</strong>（照开发规格 #46「跨工单契约」的字段形状写死），
-  <strong>载荷形状待工单 05 核对</strong>。
+  载荷与定义是<strong>后端真实产出的形状</strong>（票 05 / #51 落地后核对过），
+  数值取自一次真实运行（真实编排 + 真实服务 + 独立临时 SQLite，只替换外部模型调用）。
   本页<strong>不接后端、不调模型</strong>：fetch 被桩掉，工作台脚本原样加载，
   左侧文字方案走产品自己的 <code>renderPlanModule()</code>，
   右侧报表走产品自己的 <code>renderReportPanel()</code>。
+  <br />
+  <strong>与真实形状有关的三点</strong>：区域级<strong>没有</strong> <code>dataSource</code> /
+  <code>capabilityPending</code>（能力标记在 <code>payload.metrics[]</code> 里）；
+  <code>role</code> 的取值是 <code>SUMMARY</code> / <code>TREND</code> / <code>DETAIL</code> /
+  <code>DESCRIPTION</code>；表格列的 <code>format</code> 是空值。
   <br />
   场景切换：<code>window.__pageAcceptScene('waiting' | 'draft' | 'validated' | 'pending' | 'failed' | 'truncated')</code>
   或直接开 <code>?scene=draft</code>。
@@ -134,291 +150,2128 @@
 <script src="../pages/workbench.js" defer></script>
 
 <script>
-  // ── 静态载荷样例 ────────────────────────────────────────────────
-  // 字段形状照开发规格 #46「跨工单契约」：
-  //   顶层 previewContext + regions[]；
-  //   区域带 regionId / name / componentType / role / payload / dataSource / capabilityPending。
-  //
-  // 【载荷形状待工单 05 核对】票 05 的后端示意载荷与响应尚未落地，
-  // 这里的字段名/层级以规格写死的形状为准，后端落地后要回头核对一遍。
+  // ── 真实形状的报表定义 ──────────────────────────────────────────
+  // 照抄后端真实产出的报表定义（一次真实运行的落库定义）。
+  // 关键点：metadata.templateBinding 里才有定义身份与版本（definitionId /
+  // definitionVersion），页面靠它判断载荷是不是过期版本。
   var DEFINITION = {
-    schemaVersion: "1.0",
-    metadata: { id: "def_page_accept_001", revision: 3, name: "机房 A 能耗日报", status: "DRAFT" },
-    regions: [
-      { id: "region_total", name: "总耗电概览", role: "TOTAL", component: { type: "METRIC_CARD" }, binding: {} },
-      { id: "region_pue", name: "PUE 总览", role: "TOTAL", component: { type: "METRIC_CARD" }, binding: {} },
-      { id: "region_trend", name: "耗电趋势", role: "TREND", component: { type: "CHART" }, binding: {} },
-      // 故意让定义里的单位与载荷里的单位打架：
-      // 定义写 kWh、载荷写「元」。若页面显示的是 kWh，说明单位是写死/取错来源的。
-      { id: "region_cost_chart", name: "电费趋势", role: "TREND", component: { type: "CHART" }, binding: {}, templateBinding: { previewSpec: { unit: "kWh" } } },
-      { id: "region_power", name: "实时功率", role: "TOTAL", component: { type: "METRIC_CARD" }, binding: {} },
-      { id: "region_power_chart", name: "功率趋势", role: "TREND", component: { type: "CHART" }, binding: {} },
-      { id: "region_rank_chart", name: "设备耗电对比", role: "DETAIL", component: { type: "CHART" }, binding: {} },
-      { id: "region_ranking", name: "设备耗电排名", role: "DETAIL", component: { type: "TABLE" }, binding: { topN: 10 } }
+  "schemaVersion": "1.0",
+  "metadata": {
+    "name": "A 机房能耗日报",
+    "description": "A 机房能耗日报 由 AI 生成的首版草稿",
+    "revision": 0,
+    "status": "DRAFT",
+    "tags": [
+      "machine_room",
+      "energy",
+      "daily"
+    ],
+    "templateBinding": {
+      "templateId": "rtpl_ca53febf746c",
+      "templateRevision": 1,
+      "planId": "rplan_cd501c467310",
+      "planRevision": 1,
+      "definitionId": "rplan_cd501c467310",
+      "definitionVersion": 1
+    },
+    "pendingNotes": [
+      "「总电费概览」「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+      "「PUE 总览」「PUE」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+      "「电费趋势」「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+      "「实时功率」数据待连接：当前已接通的能力里没有对应指标。",
+      "「功率趋势」数据待连接：当前已接通的能力里没有对应指标。"
     ]
-  };
-
-  // 截断场景用：这张表只声明前 2 行，行和（218.7）小于总量（306.1）。
-  var DEFINITION_TRUNCATED = JSON.parse(JSON.stringify(DEFINITION));
-  DEFINITION_TRUNCATED.regions.forEach(function (r) {
-    if (r.id === "region_ranking") r.binding.topN = 2;
-  });
-
-  function basePayload() {
-    return {
-      previewContext: {
-        definitionId: "def_page_accept_001",
-        definitionVersion: 3,
-        timezone: "Asia/Shanghai",
-        anchorTime: "2026-10-28T00:00:00+08:00",
-        windowStart: "2026-10-27T00:00:00+08:00",
-        windowEnd: "2026-10-28T00:00:00+08:00",
-        grainUnit: "HOUR",
-        generatorVersion: "sim-1"
+  },
+  "parameters": {},
+  "policyBinding": {
+    "policyRef": "policy_pending",
+    "allowedOverrides": [
+      "TIME_WINDOW",
+      "GRAIN"
+    ],
+    "executionMode": "MANUAL_ONLY"
+  },
+  "defaults": {
+    "locale": "zh-CN",
+    "scope": {
+      "subjectRef": "machine_room",
+      "selectors": {
+        "machineRoomId": [
+          "room_a"
+        ]
+      }
+    },
+    "source": {
+      "sourceRef": "catalog.machine_room.energy",
+      "sourceVersion": "1.0",
+      "subjectRef": "machine_room"
+    },
+    "timeWindow": {
+      "type": "CALENDAR",
+      "timezone": "Asia/Shanghai",
+      "anchor": {
+        "type": "CONTEXT",
+        "path": "runtime.logicalTime"
       },
-      regions: [
-        {
-          regionId: "region_title",
-          name: "机房 A 能耗日报",
-          componentType: "TEXT",
-          role: "REPORT_TITLE",
-          dataSource: "simulated",
-          capabilityPending: false,
-          payload: { rendered: "机房 A 能耗日报", template: "{{roomName}} 能耗日报" }
+      "unit": "DAY",
+      "offset": -7,
+      "count": 7
+    },
+    "grain": {
+      "unit": "DAY"
+    },
+    "preFilters": []
+  },
+  "page": {
+    "arrangement": {
+      "mode": "GRID",
+      "columns": 12,
+      "gap": {
+        "value": 12,
+        "unit": "PX"
+      }
+    },
+    "margins": {
+      "top": {
+        "value": 10,
+        "unit": "MM"
+      },
+      "right": {
+        "value": 10,
+        "unit": "MM"
+      },
+      "bottom": {
+        "value": 10,
+        "unit": "MM"
+      },
+      "left": {
+        "value": 10,
+        "unit": "MM"
+      }
+    }
+  },
+  "theme": {
+    "themeRef": "theme_default",
+    "version": "1.0"
+  },
+  "datasets": {
+    "ds_room_energy": {
+      "sourceRef": "catalog.machine_room.energy",
+      "sourceVersion": "1.0",
+      "subjectRef": "machine_room",
+      "fields": {
+        "deviceId": {
+          "sourceFieldRef": "deviceId",
+          "dataType": "STRING",
+          "semanticType": "IDENTIFIER"
         },
-        {
-          regionId: "region_total",
-          name: "总耗电概览",
-          componentType: "METRIC_CARD",
-          role: "TOTAL",
-          dataSource: "simulated",
-          capabilityPending: false,
-          payload: {
-            label: "总耗电",
-            value: 306.1,
-            unit: "kWh",
-            precision: 1,
-            yoyPercent: 6.2,
-            comparisonAvailable: true,
-            windowLabel: "2026-10-27 全天",
-            dataSource: "simulated",
-            metrics: [
-              { metricKey: "total_energy", label: "总耗电", kind: "energy", unit: "kWh", value: 306.1, precision: 1, capabilityPending: false },
-              { metricKey: "total_cost", label: "总电费", kind: "cost", unit: "元", value: 244.88, precision: 2, capabilityPending: false }
-            ]
+        "deviceName": {
+          "sourceFieldRef": "deviceName",
+          "dataType": "STRING"
+        },
+        "deviceType": {
+          "sourceFieldRef": "deviceType",
+          "dataType": "STRING",
+          "semanticType": "CATEGORY"
+        },
+        "timestamp": {
+          "sourceFieldRef": "timestamp",
+          "dataType": "DATETIME",
+          "semanticType": "TIMESTAMP"
+        },
+        "energyKwh": {
+          "sourceFieldRef": "energyKwh",
+          "dataType": "DECIMAL",
+          "semanticType": "INTERVAL_ENERGY",
+          "unit": "kWh"
+        }
+      }
+    }
+  },
+  "pipelines": {},
+  "regions": [
+    {
+      "id": "region_1",
+      "name": "总耗电概览",
+      "role": "SUMMARY",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 1,
+          "columnSpan": 4,
+          "rowSpan": 1
+        }
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
           }
         },
-        {
-          regionId: "region_pue",
-          name: "PUE 总览",
-          componentType: "METRIC_CARD",
-          role: "TOTAL",
-          dataSource: "simulated",
-          capabilityPending: true,
-          payload: {
-            label: "PUE",
-            value: 1.42,
-            unit: "",
-            precision: 2,
-            yoyPercent: -1.1,
-            comparisonAvailable: true,
-            windowLabel: "2026-10-27 全天",
-            dataSource: "simulated",
-            metrics: [
-              {
-                metricKey: "pue",
-                label: "PUE",
-                kind: "pue",
-                unit: "",
-                value: 1.42,
-                precision: 2,
-                capabilityPending: true,
-                pendingReason: "PUE 口径待核实，当前数据源没有登记这个字段"
-              }
-            ]
-          }
-        },
-        {
-          regionId: "region_trend",
-          name: "耗电趋势",
-          componentType: "CHART",
-          role: "TREND",
-          dataSource: "simulated",
-          capabilityPending: false,
-          payload: {
-            chartKind: "LINE",
-            grain: "HOUR",
-            xField: "timestamp",
-            yField: "energyKwh",
-            xLabels: ["09:00", "10:00", "11:00", "12:00"],
-            yValues: [210.5, 233.1, 198.7, 221.4],
-            points: [],
-            unit: "kWh",
-            dataSource: "simulated"
-          }
-        },
-        {
-          regionId: "region_cost_chart",
-          name: "电费趋势",
-          componentType: "CHART",
-          role: "TREND",
-          dataSource: "simulated",
-          capabilityPending: false,
-          payload: {
-            chartKind: "LINE",
-            grain: "HOUR",
-            xField: "timestamp",
-            yField: "cost",
-            xLabels: ["09:00", "10:00", "11:00", "12:00"],
-            yValues: [168.4, 186.5, 158.9, 177.1],
-            points: [],
-            unit: "元",
-            dataSource: "simulated"
-          }
-        },
-        {
-          regionId: "region_power",
-          name: "实时功率",
-          componentType: "METRIC_CARD",
-          role: "TOTAL",
-          dataSource: "simulated",
-          capabilityPending: true,
-          payload: {
-            label: "实时功率",
-            value: 42.6,
-            unit: "kW",
-            precision: 1,
-            comparisonAvailable: false,
-            windowLabel: "2026-10-27 12:00",
-            dataSource: "simulated",
-            metrics: [
-              {
-                metricKey: "realtime_power",
-                label: "实时功率",
-                kind: "power",
-                unit: "kW",
-                value: 42.6,
-                precision: 1,
-                capabilityPending: true,
-                pendingReason: "实时功率需要接入实时数据源"
-              }
-            ]
-          }
-        },
-        {
-          regionId: "region_power_chart",
-          name: "功率趋势",
-          componentType: "CHART",
-          role: "TREND",
-          dataSource: "simulated",
-          capabilityPending: false,
-          payload: {
-            chartKind: "LINE",
-            grain: "HOUR",
-            xField: "timestamp",
-            yField: "power",
-            xLabels: ["09:00", "10:00", "11:00", "12:00"],
-            yValues: [38.2, 44.7, 40.1, 42.6],
-            points: [],
-            unit: "kW",
-            dataSource: "simulated"
-          }
-        },
-        {
-          regionId: "region_rank_chart",
-          name: "设备耗电对比",
-          componentType: "CHART",
-          role: "DETAIL",
-          dataSource: "simulated",
-          capabilityPending: false,
-          payload: {
-            chartKind: "BAR",
-            grain: "",
-            xField: "deviceName",
-            yField: "energyKwh",
-            xLabels: ["A-1 机架", "A-2 机架", "A-3 机架"],
-            yValues: [120.5, 98.2, 87.4],
-            points: [],
-            unit: "kWh",
-            dataSource: "simulated"
-          }
-        },
-        {
-          regionId: "region_ranking",
-          name: "设备耗电排名",
-          componentType: "TABLE",
-          role: "DETAIL",
-          dataSource: "simulated",
-          capabilityPending: false,
-          payload: {
-            columns: [
-              { id: "col_device", label: "设备名称", fieldRef: "ranking.device_name", format: { kind: "TEXT" } },
-              { id: "col_energy", label: "耗电", fieldRef: "ranking.energy", format: { kind: "NUMBER", precision: 1, unitLabel: "kWh" } },
-              { id: "col_time", label: "采集时间", fieldRef: "ranking.collected_at", format: { kind: "TEXT" } }
-            ],
-            rowNumber: true,
-            rows: [
-              { "ranking.device_name": "A-1 机架", "ranking.energy": 120.5, "ranking.collected_at": "2026-10-27 09:00" },
-              { "ranking.device_name": "A-2 机架", "ranking.energy": 98.2, "ranking.collected_at": "2026-10-27 09:00" },
-              { "ranking.device_name": "A-3 机架", "ranking.energy": 87.4, "ranking.collected_at": "2026-10-27 09:00" }
-            ],
-            dataSource: "simulated"
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
           }
         }
-      ]
-    };
+      },
+      "data": {
+        "inputs": {
+          "main": {
+            "type": "DATASET",
+            "datasetRef": "ds_room_energy",
+            "periodRef": "CURRENT"
+          }
+        },
+        "pipeline": {
+          "nodes": [
+            {
+              "id": "n_total",
+              "type": "METRIC",
+              "inputs": [
+                "input:main"
+              ],
+              "metricRef": "metric.machine_room.total_energy",
+              "metricVersion": "1.0"
+            }
+          ],
+          "outputs": {
+            "main": {
+              "nodeRef": "node:n_total",
+              "expectedFields": {
+                "energyKwh": {
+                  "dataType": "DECIMAL",
+                  "unit": "kWh"
+                }
+              }
+            }
+          }
+        }
+      },
+      "binding": {
+        "outputRef": "output:main"
+      },
+      "component": {
+        "type": "METRIC_CARD",
+        "metric": {
+          "id": "m_total",
+          "label": "总耗电概览",
+          "fieldRef": "energyKwh",
+          "format": {
+            "kind": "NUMBER",
+            "precision": 1,
+            "unitLabel": "kWh"
+          }
+        }
+      },
+      "templateBinding": {
+        "sectionId": "section_1",
+        "dataStatus": "bound",
+        "placeholderReason": null,
+        "dataSourceLabel": "模拟数据（能耗 Mock 源，非生产事实表）",
+        "metricRefs": [
+          "metric.machine_room.total_energy"
+        ],
+        "pendingReason": "本区域数值为模拟业务数据，接入真实数据后自动替换。",
+        "previewSpec": {
+          "role": "SUMMARY",
+          "kind": "energy",
+          "unit": "kWh",
+          "capabilityPending": false,
+          "columns": [],
+          "metrics": [
+            {
+              "metricKey": "metric.machine_room.total_energy",
+              "label": "总耗电",
+              "kind": "energy",
+              "unit": "kWh",
+              "capabilityPending": false,
+              "pendingReason": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "region_2",
+      "name": "耗电趋势",
+      "role": "TREND",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 2,
+          "columnSpan": 12,
+          "rowSpan": 1
+        }
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "data": {
+        "inputs": {
+          "main": {
+            "type": "DATASET",
+            "datasetRef": "ds_room_energy",
+            "periodRef": "CURRENT"
+          }
+        },
+        "pipeline": {
+          "nodes": [
+            {
+              "id": "n_resample",
+              "type": "RESAMPLE",
+              "inputs": [
+                "input:main"
+              ],
+              "timeFieldRef": "timestamp",
+              "grain": {
+                "unit": "DAY"
+              },
+              "measures": [
+                {
+                  "asField": "energyKwh",
+                  "aggregation": "SUM",
+                  "fieldRef": "energyKwh"
+                }
+              ]
+            }
+          ],
+          "outputs": {
+            "main": {
+              "nodeRef": "node:n_resample",
+              "expectedFields": {
+                "timestamp": {
+                  "dataType": "DATETIME"
+                },
+                "energyKwh": {
+                  "dataType": "DECIMAL",
+                  "unit": "kWh"
+                }
+              }
+            }
+          }
+        }
+      },
+      "binding": {
+        "outputRef": "output:main"
+      },
+      "component": {
+        "type": "CHART",
+        "chartKind": "LINE",
+        "encodings": [
+          {
+            "channel": "X",
+            "fieldRef": "timestamp"
+          },
+          {
+            "channel": "Y",
+            "fieldRef": "energyKwh"
+          }
+        ]
+      },
+      "templateBinding": {
+        "sectionId": "section_2",
+        "dataStatus": "bound",
+        "placeholderReason": null,
+        "dataSourceLabel": "模拟数据（能耗 Mock 源，非生产事实表）",
+        "metricRefs": [
+          "metric.machine_room.total_energy"
+        ],
+        "pendingReason": "本区域数值为模拟业务数据，接入真实数据后自动替换。",
+        "previewSpec": {
+          "role": "TREND",
+          "kind": "energy",
+          "unit": "kWh",
+          "capabilityPending": false,
+          "columns": [],
+          "metrics": [
+            {
+              "metricKey": "metric.machine_room.total_energy",
+              "label": "总耗电",
+              "kind": "energy",
+              "unit": "kWh",
+              "capabilityPending": false,
+              "pendingReason": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "role": "SUMMARY",
+      "component": {
+        "type": "METRIC_CARD",
+        "metric": {
+          "id": "",
+          "label": "总电费概览",
+          "fieldRef": "",
+          "format": {
+            "kind": "NUMBER",
+            "precision": 1,
+            "unitLabel": ""
+          }
+        }
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "id": "region_3",
+      "name": "总电费概览",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 3,
+          "columnSpan": 4,
+          "rowSpan": 1
+        }
+      },
+      "templateBinding": {
+        "sectionId": "section_3",
+        "dataStatus": "placeholder",
+        "placeholderReason": "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+        "dataSourceLabel": null,
+        "metricRefs": [
+          "metric.machine_room.energy_cost"
+        ],
+        "pendingReason": null,
+        "previewSpec": {
+          "role": "SUMMARY",
+          "kind": "cost",
+          "unit": "元",
+          "capabilityPending": true,
+          "columns": [],
+          "metrics": [
+            {
+              "metricKey": "metric.machine_room.energy_cost",
+              "label": "能耗成本",
+              "kind": "cost",
+              "unit": "元",
+              "capabilityPending": true,
+              "pendingReason": "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "role": "SUMMARY",
+      "component": {
+        "type": "METRIC_CARD",
+        "metric": {
+          "id": "",
+          "label": "PUE 总览",
+          "fieldRef": "",
+          "format": {
+            "kind": "NUMBER",
+            "precision": 1,
+            "unitLabel": ""
+          }
+        }
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "id": "region_4",
+      "name": "PUE 总览",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 4,
+          "columnSpan": 4,
+          "rowSpan": 1
+        }
+      },
+      "templateBinding": {
+        "sectionId": "section_4",
+        "dataStatus": "placeholder",
+        "placeholderReason": "「PUE」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+        "dataSourceLabel": null,
+        "metricRefs": [
+          "metric.machine_room.pue"
+        ],
+        "pendingReason": null,
+        "previewSpec": {
+          "role": "SUMMARY",
+          "kind": "pue",
+          "unit": "",
+          "capabilityPending": true,
+          "columns": [],
+          "metrics": [
+            {
+              "metricKey": "metric.machine_room.pue",
+              "label": "PUE",
+              "kind": "pue",
+              "unit": "",
+              "capabilityPending": true,
+              "pendingReason": "「PUE」口径待核实：当前数据源没有登记这个字段，算不出数值。"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "region_5",
+      "name": "设备耗电对比",
+      "role": "TREND",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 5,
+          "columnSpan": 12,
+          "rowSpan": 1
+        }
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "data": {
+        "inputs": {
+          "main": {
+            "type": "DATASET",
+            "datasetRef": "ds_room_energy",
+            "periodRef": "CURRENT"
+          }
+        },
+        "pipeline": {
+          "nodes": [
+            {
+              "id": "n_resample",
+              "type": "RESAMPLE",
+              "inputs": [
+                "input:main"
+              ],
+              "timeFieldRef": "timestamp",
+              "grain": {
+                "unit": "DAY"
+              },
+              "measures": [
+                {
+                  "asField": "energyKwh",
+                  "aggregation": "SUM",
+                  "fieldRef": "energyKwh"
+                }
+              ]
+            }
+          ],
+          "outputs": {
+            "main": {
+              "nodeRef": "node:n_resample",
+              "expectedFields": {
+                "timestamp": {
+                  "dataType": "DATETIME"
+                },
+                "energyKwh": {
+                  "dataType": "DECIMAL",
+                  "unit": "kWh"
+                }
+              }
+            }
+          }
+        }
+      },
+      "binding": {
+        "outputRef": "output:main"
+      },
+      "component": {
+        "type": "CHART",
+        "chartKind": "BAR",
+        "encodings": [
+          {
+            "channel": "X",
+            "fieldRef": "timestamp"
+          },
+          {
+            "channel": "Y",
+            "fieldRef": "energyKwh"
+          }
+        ]
+      },
+      "templateBinding": {
+        "sectionId": "section_5",
+        "dataStatus": "bound",
+        "placeholderReason": null,
+        "dataSourceLabel": "模拟数据（能耗 Mock 源，非生产事实表）",
+        "metricRefs": [
+          "metric.machine_room.total_energy"
+        ],
+        "pendingReason": "本区域数值为模拟业务数据，接入真实数据后自动替换。",
+        "previewSpec": {
+          "role": "TREND",
+          "kind": "energy",
+          "unit": "kWh",
+          "capabilityPending": false,
+          "columns": [],
+          "metrics": [
+            {
+              "metricKey": "metric.machine_room.total_energy",
+              "label": "总耗电",
+              "kind": "energy",
+              "unit": "kWh",
+              "capabilityPending": false,
+              "pendingReason": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "region_6",
+      "name": "设备耗电排名",
+      "role": "TREND",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 6,
+          "columnSpan": 12,
+          "rowSpan": 1
+        }
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "data": {
+        "inputs": {
+          "main": {
+            "type": "DATASET",
+            "datasetRef": "ds_room_energy",
+            "periodRef": "CURRENT"
+          }
+        },
+        "pipeline": {
+          "nodes": [
+            {
+              "id": "n_resample",
+              "type": "RESAMPLE",
+              "inputs": [
+                "input:main"
+              ],
+              "timeFieldRef": "timestamp",
+              "grain": {
+                "unit": "DAY"
+              },
+              "measures": [
+                {
+                  "asField": "energyKwh",
+                  "aggregation": "SUM",
+                  "fieldRef": "energyKwh"
+                }
+              ]
+            }
+          ],
+          "outputs": {
+            "main": {
+              "nodeRef": "node:n_resample",
+              "expectedFields": {
+                "timestamp": {
+                  "dataType": "DATETIME"
+                },
+                "energyKwh": {
+                  "dataType": "DECIMAL",
+                  "unit": "kWh"
+                }
+              }
+            }
+          }
+        }
+      },
+      "binding": {
+        "outputRef": "output:main"
+      },
+      "component": {
+        "type": "TABLE",
+        "columns": [
+          {
+            "id": "c_device",
+            "label": "设备名称",
+            "fieldRef": "ranking.device_name"
+          },
+          {
+            "id": "c_energy",
+            "label": "耗电",
+            "fieldRef": "ranking.energy"
+          },
+          {
+            "id": "c_time",
+            "label": "采集时间",
+            "fieldRef": "ranking.collected_at"
+          }
+        ]
+      },
+      "templateBinding": {
+        "sectionId": "section_6",
+        "dataStatus": "bound",
+        "placeholderReason": null,
+        "dataSourceLabel": "模拟数据（能耗 Mock 源，非生产事实表）",
+        "metricRefs": [
+          "metric.machine_room.total_energy"
+        ],
+        "pendingReason": "本区域数值为模拟业务数据，接入真实数据后自动替换。",
+        "previewSpec": {
+          "role": "TREND",
+          "kind": "energy",
+          "unit": "kWh",
+          "capabilityPending": false,
+          "columns": [
+            {
+              "id": "c_device",
+              "label": "设备名称",
+              "fieldRef": "ranking.device_name"
+            },
+            {
+              "id": "c_energy",
+              "label": "耗电",
+              "fieldRef": "ranking.energy"
+            },
+            {
+              "id": "c_time",
+              "label": "采集时间",
+              "fieldRef": "ranking.collected_at"
+            }
+          ],
+          "metrics": [
+            {
+              "metricKey": "metric.machine_room.total_energy",
+              "label": "总耗电",
+              "kind": "energy",
+              "unit": "kWh",
+              "capabilityPending": false,
+              "pendingReason": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "region_7",
+      "name": "设备耗电明细",
+      "role": "DETAIL",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 7,
+          "columnSpan": 12,
+          "rowSpan": 1
+        }
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "data": {
+        "inputs": {
+          "main": {
+            "type": "DATASET",
+            "datasetRef": "ds_room_energy",
+            "periodRef": "CURRENT"
+          }
+        },
+        "pipeline": {
+          "nodes": [
+            {
+              "id": "n_device",
+              "type": "GROUP_AGGREGATE",
+              "inputs": [
+                "input:main"
+              ],
+              "groupBy": [
+                "deviceId",
+                "deviceName"
+              ],
+              "measures": [
+                {
+                  "asField": "energyKwh",
+                  "aggregation": "SUM",
+                  "fieldRef": "energyKwh"
+                }
+              ]
+            },
+            {
+              "id": "n_sort",
+              "type": "SORT",
+              "inputs": [
+                "node:n_device"
+              ],
+              "orderBy": [
+                {
+                  "fieldRef": "energyKwh",
+                  "direction": "DESC"
+                }
+              ]
+            },
+            {
+              "id": "n_limit",
+              "type": "LIMIT",
+              "inputs": [
+                "node:n_sort"
+              ],
+              "count": 10
+            }
+          ],
+          "outputs": {
+            "main": {
+              "nodeRef": "node:n_limit",
+              "expectedFields": {
+                "deviceId": {
+                  "dataType": "STRING"
+                },
+                "deviceName": {
+                  "dataType": "STRING"
+                },
+                "energyKwh": {
+                  "dataType": "DECIMAL",
+                  "unit": "kWh"
+                }
+              }
+            }
+          }
+        }
+      },
+      "binding": {
+        "outputRef": "output:main",
+        "topN": 10,
+        "sort": [
+          {
+            "fieldRef": "energyKwh",
+            "direction": "DESC"
+          }
+        ]
+      },
+      "component": {
+        "type": "TABLE",
+        "columns": [
+          {
+            "id": "c_device",
+            "label": "设备名称",
+            "fieldRef": "ranking.device_name"
+          },
+          {
+            "id": "c_energy",
+            "label": "耗电",
+            "fieldRef": "ranking.energy"
+          }
+        ],
+        "rowNumber": true
+      },
+      "templateBinding": {
+        "sectionId": "section_7",
+        "dataStatus": "bound",
+        "placeholderReason": null,
+        "dataSourceLabel": "模拟数据（能耗 Mock 源，非生产事实表）",
+        "metricRefs": [
+          "metric.machine_room.device_energy"
+        ],
+        "pendingReason": "本区域数值为模拟业务数据，接入真实数据后自动替换。",
+        "previewSpec": {
+          "role": "DETAIL",
+          "kind": "energy",
+          "unit": "kWh",
+          "capabilityPending": false,
+          "columns": [
+            {
+              "id": "c_device",
+              "label": "设备名称",
+              "fieldRef": "ranking.device_name"
+            },
+            {
+              "id": "c_energy",
+              "label": "耗电",
+              "fieldRef": "ranking.energy"
+            }
+          ],
+          "metrics": [
+            {
+              "metricKey": "metric.machine_room.device_energy",
+              "label": "设备耗电",
+              "kind": "energy",
+              "unit": "kWh",
+              "capabilityPending": false,
+              "pendingReason": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "region_8",
+      "name": "设备耗电对比",
+      "role": "DETAIL",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 8,
+          "columnSpan": 12,
+          "rowSpan": 1
+        }
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "data": {
+        "inputs": {
+          "main": {
+            "type": "DATASET",
+            "datasetRef": "ds_room_energy",
+            "periodRef": "CURRENT"
+          }
+        },
+        "pipeline": {
+          "nodes": [
+            {
+              "id": "n_device",
+              "type": "GROUP_AGGREGATE",
+              "inputs": [
+                "input:main"
+              ],
+              "groupBy": [
+                "deviceId",
+                "deviceName"
+              ],
+              "measures": [
+                {
+                  "asField": "energyKwh",
+                  "aggregation": "SUM",
+                  "fieldRef": "energyKwh"
+                }
+              ]
+            },
+            {
+              "id": "n_sort",
+              "type": "SORT",
+              "inputs": [
+                "node:n_device"
+              ],
+              "orderBy": [
+                {
+                  "fieldRef": "energyKwh",
+                  "direction": "DESC"
+                }
+              ]
+            },
+            {
+              "id": "n_limit",
+              "type": "LIMIT",
+              "inputs": [
+                "node:n_sort"
+              ],
+              "count": 10
+            }
+          ],
+          "outputs": {
+            "main": {
+              "nodeRef": "node:n_limit",
+              "expectedFields": {
+                "deviceId": {
+                  "dataType": "STRING"
+                },
+                "deviceName": {
+                  "dataType": "STRING"
+                },
+                "energyKwh": {
+                  "dataType": "DECIMAL",
+                  "unit": "kWh"
+                }
+              }
+            }
+          }
+        }
+      },
+      "binding": {
+        "outputRef": "output:main",
+        "topN": 10,
+        "sort": [
+          {
+            "fieldRef": "energyKwh",
+            "direction": "DESC"
+          }
+        ]
+      },
+      "component": {
+        "type": "CHART",
+        "chartKind": "BAR",
+        "encodings": [
+          {
+            "channel": "X",
+            "fieldRef": "deviceName"
+          },
+          {
+            "channel": "Y",
+            "fieldRef": "energyKwh"
+          }
+        ]
+      },
+      "templateBinding": {
+        "sectionId": "section_8",
+        "dataStatus": "bound",
+        "placeholderReason": null,
+        "dataSourceLabel": "模拟数据（能耗 Mock 源，非生产事实表）",
+        "metricRefs": [
+          "metric.machine_room.device_energy"
+        ],
+        "pendingReason": "本区域数值为模拟业务数据，接入真实数据后自动替换。",
+        "previewSpec": {
+          "role": "DETAIL",
+          "kind": "energy",
+          "unit": "kWh",
+          "capabilityPending": false,
+          "columns": [],
+          "metrics": [
+            {
+              "metricKey": "metric.machine_room.device_energy",
+              "label": "设备耗电",
+              "kind": "energy",
+              "unit": "kWh",
+              "capabilityPending": false,
+              "pendingReason": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "role": "DESCRIPTION",
+      "component": {
+        "type": "TEXT",
+        "content": {
+          "format": "PLAIN",
+          "template": "口径说明"
+        }
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "id": "region_9",
+      "name": "口径说明",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 9,
+          "columnSpan": 12,
+          "rowSpan": 1
+        }
+      },
+      "templateBinding": {
+        "sectionId": "section_9",
+        "dataStatus": "text",
+        "placeholderReason": null,
+        "dataSourceLabel": null,
+        "metricRefs": [],
+        "pendingReason": null,
+        "previewSpec": {
+          "role": "DESCRIPTION",
+          "kind": "generic",
+          "unit": null,
+          "capabilityPending": false,
+          "columns": [],
+          "metrics": []
+        }
+      }
+    },
+    {
+      "role": "TREND",
+      "component": {
+        "type": "CHART",
+        "chartKind": "LINE",
+        "encodings": []
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "id": "region_10",
+      "name": "电费趋势",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 10,
+          "columnSpan": 12,
+          "rowSpan": 1
+        }
+      },
+      "templateBinding": {
+        "sectionId": "section_10",
+        "dataStatus": "placeholder",
+        "placeholderReason": "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+        "dataSourceLabel": null,
+        "metricRefs": [
+          "metric.machine_room.energy_cost"
+        ],
+        "pendingReason": null,
+        "previewSpec": {
+          "role": "TREND",
+          "kind": "cost",
+          "unit": "元",
+          "capabilityPending": true,
+          "columns": [],
+          "metrics": [
+            {
+              "metricKey": "metric.machine_room.energy_cost",
+              "label": "能耗成本",
+              "kind": "cost",
+              "unit": "元",
+              "capabilityPending": true,
+              "pendingReason": "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "role": "SUMMARY",
+      "component": {
+        "type": "METRIC_CARD",
+        "metric": {
+          "id": "",
+          "label": "实时功率",
+          "fieldRef": "",
+          "format": {
+            "kind": "NUMBER",
+            "precision": 1,
+            "unitLabel": ""
+          }
+        }
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "id": "region_11",
+      "name": "实时功率",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 11,
+          "columnSpan": 4,
+          "rowSpan": 1
+        }
+      },
+      "templateBinding": {
+        "sectionId": "section_11",
+        "dataStatus": "placeholder",
+        "placeholderReason": "数据待连接：当前已接通的能力里没有对应指标。",
+        "dataSourceLabel": null,
+        "metricRefs": [],
+        "pendingReason": null,
+        "previewSpec": {
+          "role": "SUMMARY",
+          "kind": "power",
+          "unit": "kW",
+          "capabilityPending": true,
+          "columns": [],
+          "metrics": [
+            {
+              "metricKey": "metric.power.section_11_1",
+              "label": "实时功率",
+              "kind": "power",
+              "unit": "kW",
+              "capabilityPending": true,
+              "pendingReason": "数据待连接：当前已接通的能力里没有对应指标。"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "role": "TREND",
+      "component": {
+        "type": "CHART",
+        "chartKind": "LINE",
+        "encodings": []
+      },
+      "context": {
+        "timeWindow": {
+          "mode": "REPLACE",
+          "value": {
+            "type": "CALENDAR",
+            "timezone": "Asia/Shanghai",
+            "anchor": {
+              "type": "CONTEXT",
+              "path": "runtime.logicalTime"
+            },
+            "unit": "DAY",
+            "offset": -7,
+            "count": 7
+          }
+        },
+        "grain": {
+          "mode": "REPLACE",
+          "value": {
+            "unit": "DAY"
+          }
+        }
+      },
+      "id": "region_12",
+      "name": "功率趋势",
+      "layout": {
+        "placement": {
+          "type": "GRID",
+          "column": 1,
+          "row": 12,
+          "columnSpan": 12,
+          "rowSpan": 1
+        }
+      },
+      "templateBinding": {
+        "sectionId": "section_12",
+        "dataStatus": "placeholder",
+        "placeholderReason": "数据待连接：当前已接通的能力里没有对应指标。",
+        "dataSourceLabel": null,
+        "metricRefs": [],
+        "pendingReason": null,
+        "previewSpec": {
+          "role": "TREND",
+          "kind": "power",
+          "unit": "kW",
+          "capabilityPending": true,
+          "columns": [],
+          "metrics": [
+            {
+              "metricKey": "metric.power.section_12_1",
+              "label": "实时功率",
+              "kind": "power",
+              "unit": "kW",
+              "capabilityPending": true,
+              "pendingReason": "数据待连接：当前已接通的能力里没有对应指标。"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "html": {
+      "format": "HTML",
+      "fileNameTemplate": "machine_room_energy_{{logicalDate}}.html"
+    }
+  },
+  "intentBindings": [],
+  "dependencies": {
+    "dataCatalogVersion": "1.0",
+    "componentRegistryVersion": "1.0",
+    "operatorRegistryVersion": "1.0",
+    "functionRegistryVersion": "1.0",
+    "metricRefs": [
+      {
+        "ref": "metric.machine_room.total_energy",
+        "version": "1.0"
+      },
+      {
+        "ref": "metric.machine_room.device_energy",
+        "version": "1.0"
+      }
+    ],
+    "sourceRef": "catalog.machine_room.energy",
+    "capabilityEvidence": {
+      "sourceRef": "catalog.machine_room.energy",
+      "grainUnit": "DAY",
+      "supportedGrains": [
+        "HOUR",
+        "DAY"
+      ],
+      "timeWindow": {
+        "type": "CALENDAR",
+        "unit": "DAY",
+        "count": 7,
+        "offset": -7
+      }
+    }
+  }
+};
+
+  // 截断场景用：把设备明细表的前 topN 行留着（真实形状下后端**没有**给
+  // truncated / totalRows，也没给列单位，所以页面判不出「行被截断」——
+  // 这一点由流程 08b-04 如实断言，不编字段）。
+  var DEFINITION_TRUNCATED = JSON.parse(JSON.stringify(DEFINITION));
+  DEFINITION_TRUNCATED.regions.forEach(function (r) {
+    if (r.id === "region_7" && r.binding) r.binding.topN = 2;
+  });
+
+  // ── 真实形状的报表示意载荷 ──────────────────────────────────────
+  // 照抄后端真实产出的 reportPreviewPayload（一次真实运行）。
+  // 字段名 / 层级 / 类型 / role 取值集合都以后端实际吐出来的为准。
+  var REAL_PAYLOAD = {
+  "previewContext": {
+    "definitionId": "rplan_cd501c467310",
+    "definitionVersion": 1,
+    "timezone": "Asia/Shanghai",
+    "anchorTime": "2026-10-29T21:19:57.473559+08:00",
+    "windowStart": "2026-10-22T00:00:00+08:00",
+    "windowEnd": "2026-10-29T00:00:00+08:00",
+    "grainUnit": "DAY",
+    "generatorVersion": "simulated-data/1"
+  },
+  "regions": [
+    {
+      "regionId": "region_1",
+      "name": "总耗电概览",
+      "role": "SUMMARY",
+      "componentType": "METRIC_CARD",
+      "payload": {
+        "label": "总耗电概览",
+        "value": 37357.8,
+        "unit": "kWh",
+        "precision": 1,
+        "yoyPercent": -4.1,
+        "comparisonAvailable": true,
+        "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
+        "dataSource": "simulated",
+        "metrics": [
+          {
+            "metricKey": "metric.machine_room.total_energy",
+            "label": "总耗电",
+            "kind": "energy",
+            "unit": "kWh",
+            "value": 37357.8,
+            "precision": 1,
+            "capabilityPending": false,
+            "pendingReason": null
+          }
+        ]
+      }
+    },
+    {
+      "regionId": "region_2",
+      "name": "耗电趋势",
+      "role": "TREND",
+      "componentType": "CHART",
+      "payload": {
+        "chartKind": "LINE",
+        "grain": "DAY",
+        "xField": "timestamp",
+        "yField": "energyKwh",
+        "unit": "kWh",
+        "xLabels": [
+          "10-22",
+          "10-23",
+          "10-24",
+          "10-25",
+          "10-26",
+          "10-27",
+          "10-28"
+        ],
+        "yValues": [
+          5489.6,
+          5418.2,
+          4984.4,
+          5460.4,
+          5521.1,
+          4932.9,
+          5551.2
+        ],
+        "points": [
+          {
+            "timestamp": "2026-10-22T00:00:00+08:00",
+            "energyKwh": 5489.6
+          },
+          {
+            "timestamp": "2026-10-23T00:00:00+08:00",
+            "energyKwh": 5418.2
+          },
+          {
+            "timestamp": "2026-10-24T00:00:00+08:00",
+            "energyKwh": 4984.4
+          },
+          {
+            "timestamp": "2026-10-25T00:00:00+08:00",
+            "energyKwh": 5460.4
+          },
+          {
+            "timestamp": "2026-10-26T00:00:00+08:00",
+            "energyKwh": 5521.1
+          },
+          {
+            "timestamp": "2026-10-27T00:00:00+08:00",
+            "energyKwh": 4932.9
+          },
+          {
+            "timestamp": "2026-10-28T00:00:00+08:00",
+            "energyKwh": 5551.2
+          }
+        ],
+        "dataSource": "simulated"
+      }
+    },
+    {
+      "regionId": "region_3",
+      "name": "总电费概览",
+      "role": "SUMMARY",
+      "componentType": "METRIC_CARD",
+      "payload": {
+        "label": "总电费概览",
+        "value": 26150.46,
+        "unit": "元",
+        "precision": 2,
+        "yoyPercent": -4.1,
+        "comparisonAvailable": true,
+        "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
+        "dataSource": "simulated",
+        "metrics": [
+          {
+            "metricKey": "metric.machine_room.energy_cost",
+            "label": "能耗成本",
+            "kind": "cost",
+            "unit": "元",
+            "value": 26150.46,
+            "precision": 2,
+            "capabilityPending": true,
+            "pendingReason": "「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。"
+          }
+        ]
+      }
+    },
+    {
+      "regionId": "region_4",
+      "name": "PUE 总览",
+      "role": "SUMMARY",
+      "componentType": "METRIC_CARD",
+      "payload": {
+        "label": "PUE 总览",
+        "value": 1.6,
+        "unit": "",
+        "precision": 1,
+        "yoyPercent": -4.1,
+        "comparisonAvailable": true,
+        "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
+        "dataSource": "simulated",
+        "metrics": [
+          {
+            "metricKey": "metric.machine_room.pue",
+            "label": "PUE",
+            "kind": "pue",
+            "unit": "",
+            "value": 1.6,
+            "precision": 1,
+            "capabilityPending": true,
+            "pendingReason": "「PUE」口径待核实：当前数据源没有登记这个字段，算不出数值。"
+          }
+        ]
+      }
+    },
+    {
+      "regionId": "region_5",
+      "name": "设备耗电对比",
+      "role": "TREND",
+      "componentType": "CHART",
+      "payload": {
+        "chartKind": "BAR",
+        "grain": "DAY",
+        "xField": "timestamp",
+        "yField": "energyKwh",
+        "unit": "kWh",
+        "xLabels": [
+          "10-22",
+          "10-23",
+          "10-24",
+          "10-25",
+          "10-26",
+          "10-27",
+          "10-28"
+        ],
+        "yValues": [
+          5489.6,
+          5418.2,
+          4984.4,
+          5460.4,
+          5521.1,
+          4932.9,
+          5551.2
+        ],
+        "points": [
+          {
+            "timestamp": "2026-10-22T00:00:00+08:00",
+            "energyKwh": 5489.6
+          },
+          {
+            "timestamp": "2026-10-23T00:00:00+08:00",
+            "energyKwh": 5418.2
+          },
+          {
+            "timestamp": "2026-10-24T00:00:00+08:00",
+            "energyKwh": 4984.4
+          },
+          {
+            "timestamp": "2026-10-25T00:00:00+08:00",
+            "energyKwh": 5460.4
+          },
+          {
+            "timestamp": "2026-10-26T00:00:00+08:00",
+            "energyKwh": 5521.1
+          },
+          {
+            "timestamp": "2026-10-27T00:00:00+08:00",
+            "energyKwh": 4932.9
+          },
+          {
+            "timestamp": "2026-10-28T00:00:00+08:00",
+            "energyKwh": 5551.2
+          }
+        ],
+        "dataSource": "simulated"
+      }
+    },
+    {
+      "regionId": "region_6",
+      "name": "设备耗电排名",
+      "role": "TREND",
+      "componentType": "TABLE",
+      "payload": {
+        "columns": [
+          {
+            "id": "c_device",
+            "label": "设备名称",
+            "fieldRef": "ranking.device_name",
+            "format": null
+          },
+          {
+            "id": "c_energy",
+            "label": "耗电",
+            "fieldRef": "ranking.energy",
+            "format": null
+          },
+          {
+            "id": "c_time",
+            "label": "采集时间",
+            "fieldRef": "ranking.collected_at",
+            "format": null
+          }
+        ],
+        "rowNumber": true,
+        "rows": [
+          {
+            "ranking.device_name": "UPS-01 不间断",
+            "ranking.energy": 5177.6,
+            "ranking.collected_at": ""
+          },
+          {
+            "ranking.device_name": "A-4 机架",
+            "ranking.energy": 4113.2,
+            "ranking.collected_at": ""
+          },
+          {
+            "ranking.device_name": "PDU-02 配电",
+            "ranking.energy": 4042.6,
+            "ranking.collected_at": ""
+          },
+          {
+            "ranking.device_name": "CRAC-02 空调",
+            "ranking.energy": 3929.2,
+            "ranking.collected_at": ""
+          },
+          {
+            "ranking.device_name": "A-5 机架",
+            "ranking.energy": 3851.5,
+            "ranking.collected_at": ""
+          },
+          {
+            "ranking.device_name": "A-1 机架",
+            "ranking.energy": 3801.0,
+            "ranking.collected_at": ""
+          },
+          {
+            "ranking.device_name": "A-3 机架",
+            "ranking.energy": 3684.9,
+            "ranking.collected_at": ""
+          },
+          {
+            "ranking.device_name": "CRAC-01 空调",
+            "ranking.energy": 3063.6,
+            "ranking.collected_at": ""
+          },
+          {
+            "ranking.device_name": "PDU-01 配电",
+            "ranking.energy": 2949.5,
+            "ranking.collected_at": ""
+          },
+          {
+            "ranking.device_name": "A-2 机架",
+            "ranking.energy": 2744.7,
+            "ranking.collected_at": ""
+          }
+        ],
+        "dataSource": "simulated"
+      }
+    },
+    {
+      "regionId": "region_7",
+      "name": "设备耗电明细",
+      "role": "DETAIL",
+      "componentType": "TABLE",
+      "payload": {
+        "columns": [
+          {
+            "id": "c_device",
+            "label": "设备名称",
+            "fieldRef": "ranking.device_name",
+            "format": null
+          },
+          {
+            "id": "c_energy",
+            "label": "耗电",
+            "fieldRef": "ranking.energy",
+            "format": null
+          }
+        ],
+        "rowNumber": true,
+        "rows": [
+          {
+            "ranking.device_name": "UPS-01 不间断",
+            "ranking.energy": 5177.6
+          },
+          {
+            "ranking.device_name": "A-4 机架",
+            "ranking.energy": 4113.2
+          },
+          {
+            "ranking.device_name": "PDU-02 配电",
+            "ranking.energy": 4042.6
+          },
+          {
+            "ranking.device_name": "CRAC-02 空调",
+            "ranking.energy": 3929.2
+          },
+          {
+            "ranking.device_name": "A-5 机架",
+            "ranking.energy": 3851.5
+          },
+          {
+            "ranking.device_name": "A-1 机架",
+            "ranking.energy": 3801.0
+          },
+          {
+            "ranking.device_name": "A-3 机架",
+            "ranking.energy": 3684.9
+          },
+          {
+            "ranking.device_name": "CRAC-01 空调",
+            "ranking.energy": 3063.6
+          },
+          {
+            "ranking.device_name": "PDU-01 配电",
+            "ranking.energy": 2949.5
+          },
+          {
+            "ranking.device_name": "A-2 机架",
+            "ranking.energy": 2744.7
+          }
+        ],
+        "dataSource": "simulated"
+      }
+    },
+    {
+      "regionId": "region_8",
+      "name": "设备耗电对比",
+      "role": "DETAIL",
+      "componentType": "CHART",
+      "payload": {
+        "chartKind": "BAR",
+        "grain": "DAY",
+        "xField": "deviceName",
+        "yField": "energyKwh",
+        "unit": "kWh",
+        "xLabels": [
+          "UPS-01 不间断",
+          "A-4 机架",
+          "PDU-02 配电",
+          "CRAC-02 空调",
+          "A-5 机架",
+          "A-1 机架",
+          "A-3 机架",
+          "CRAC-01 空调",
+          "PDU-01 配电",
+          "A-2 机架"
+        ],
+        "yValues": [
+          5177.6,
+          4113.2,
+          4042.6,
+          3929.2,
+          3851.5,
+          3801.0,
+          3684.9,
+          3063.6,
+          2949.5,
+          2744.7
+        ],
+        "points": [
+          {
+            "deviceName": "UPS-01 不间断",
+            "energyKwh": 5177.6
+          },
+          {
+            "deviceName": "A-4 机架",
+            "energyKwh": 4113.2
+          },
+          {
+            "deviceName": "PDU-02 配电",
+            "energyKwh": 4042.6
+          },
+          {
+            "deviceName": "CRAC-02 空调",
+            "energyKwh": 3929.2
+          },
+          {
+            "deviceName": "A-5 机架",
+            "energyKwh": 3851.5
+          },
+          {
+            "deviceName": "A-1 机架",
+            "energyKwh": 3801.0
+          },
+          {
+            "deviceName": "A-3 机架",
+            "energyKwh": 3684.9
+          },
+          {
+            "deviceName": "CRAC-01 空调",
+            "energyKwh": 3063.6
+          },
+          {
+            "deviceName": "PDU-01 配电",
+            "energyKwh": 2949.5
+          },
+          {
+            "deviceName": "A-2 机架",
+            "energyKwh": 2744.7
+          }
+        ],
+        "dataSource": "simulated"
+      }
+    },
+    {
+      "regionId": "region_9",
+      "name": "口径说明",
+      "role": "DESCRIPTION",
+      "componentType": "TEXT",
+      "payload": {
+        "rendered": "口径说明",
+        "template": "口径说明",
+        "dataSource": "simulated"
+      }
+    },
+    {
+      "regionId": "region_10",
+      "name": "电费趋势",
+      "role": "TREND",
+      "componentType": "CHART",
+      "payload": {
+        "chartKind": "LINE",
+        "grain": "DAY",
+        "xField": "timestamp",
+        "yField": "costYuan",
+        "unit": "元",
+        "xLabels": [
+          "10-22",
+          "10-23",
+          "10-24",
+          "10-25",
+          "10-26",
+          "10-27",
+          "10-28"
+        ],
+        "yValues": [
+          3842.72,
+          3792.74,
+          3489.08,
+          3822.28,
+          3864.77,
+          3453.03,
+          3885.84
+        ],
+        "points": [
+          {
+            "timestamp": "2026-10-22T00:00:00+08:00",
+            "costYuan": 3842.72
+          },
+          {
+            "timestamp": "2026-10-23T00:00:00+08:00",
+            "costYuan": 3792.74
+          },
+          {
+            "timestamp": "2026-10-24T00:00:00+08:00",
+            "costYuan": 3489.08
+          },
+          {
+            "timestamp": "2026-10-25T00:00:00+08:00",
+            "costYuan": 3822.28
+          },
+          {
+            "timestamp": "2026-10-26T00:00:00+08:00",
+            "costYuan": 3864.77
+          },
+          {
+            "timestamp": "2026-10-27T00:00:00+08:00",
+            "costYuan": 3453.03
+          },
+          {
+            "timestamp": "2026-10-28T00:00:00+08:00",
+            "costYuan": 3885.84
+          }
+        ],
+        "dataSource": "simulated"
+      }
+    },
+    {
+      "regionId": "region_11",
+      "name": "实时功率",
+      "role": "SUMMARY",
+      "componentType": "METRIC_CARD",
+      "payload": {
+        "label": "实时功率",
+        "value": 242.4,
+        "unit": "kW",
+        "precision": 1,
+        "yoyPercent": -4.1,
+        "comparisonAvailable": true,
+        "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
+        "dataSource": "simulated",
+        "metrics": [
+          {
+            "metricKey": "metric.power.section_11_1",
+            "label": "实时功率",
+            "kind": "power",
+            "unit": "kW",
+            "value": 242.4,
+            "precision": 1,
+            "capabilityPending": true,
+            "pendingReason": "数据待连接：当前已接通的能力里没有对应指标。"
+          }
+        ]
+      }
+    },
+    {
+      "regionId": "region_12",
+      "name": "功率趋势",
+      "role": "TREND",
+      "componentType": "CHART",
+      "payload": {
+        "chartKind": "LINE",
+        "grain": "DAY",
+        "xField": "timestamp",
+        "yField": "powerKw",
+        "unit": "kW",
+        "xLabels": [
+          "10-22",
+          "10-23",
+          "10-24",
+          "10-25",
+          "10-26",
+          "10-27",
+          "10-28"
+        ],
+        "yValues": [
+          214.892,
+          230.287,
+          193.922,
+          218.155,
+          227.686,
+          229.278,
+          242.355
+        ],
+        "points": [
+          {
+            "timestamp": "2026-10-22T00:00:00+08:00",
+            "powerKw": 214.892
+          },
+          {
+            "timestamp": "2026-10-23T00:00:00+08:00",
+            "powerKw": 230.287
+          },
+          {
+            "timestamp": "2026-10-24T00:00:00+08:00",
+            "powerKw": 193.922
+          },
+          {
+            "timestamp": "2026-10-25T00:00:00+08:00",
+            "powerKw": 218.155
+          },
+          {
+            "timestamp": "2026-10-26T00:00:00+08:00",
+            "powerKw": 227.686
+          },
+          {
+            "timestamp": "2026-10-27T00:00:00+08:00",
+            "powerKw": 229.278
+          },
+          {
+            "timestamp": "2026-10-28T00:00:00+08:00",
+            "powerKw": 242.355
+          }
+        ],
+        "dataSource": "simulated"
+      }
+    }
+  ]
+};
+
+  function basePayload() {
+    return JSON.parse(JSON.stringify(REAL_PAYLOAD));
   }
 
   // ── 文字方案样例 ────────────────────────────────────────────────
-  // 形状照规格 #46「方案输入与选型 / 栏目与取值键」。
+  // 形状照后端真实产出的 reportPlan（requirements 带 grainUnit、
+  // 板块带 explicitComponentType 与 columns[]）。
   // 其中一个板块标题里塞了模型可能吐出来的 HTML：
   // 用来验「方案文字按纯文本渲染，模型的 HTML 不在浏览器里执行」。
   var PLAN = {
-    id: "plan_page_accept_001",
+    id: "rplan_page_accept_001",
     revision: 1,
     topic: "机房 A 能耗日报",
     requirements: {
       metrics: ["总耗电", "总电费", "实时功率"],
       subject: "机房 A",
       timeRange: "最近 7 天",
-      exclusions: []
+      exclusions: [],
+      grainUnit: "DAY"
     },
     sections: [
       {
-        id: "s_total",
+        id: "section_1",
         title: "总耗电概览",
         metricIntents: ["总耗电"],
         componentType: "metric_card",
         displayIntent: "total",
-        selectionReason: "看总量，指标卡最直观"
+        explicitComponentType: null,
+        selectionReason: "看总量，指标卡最直观",
+        columns: []
       },
       {
-        id: "s_trend",
+        id: "section_2",
         title: "耗电趋势",
         metricIntents: ["总耗电"],
         componentType: "line_chart",
         displayIntent: "trend",
-        selectionReason: "看随时间的变化，用趋势图"
+        explicitComponentType: null,
+        selectionReason: "看随时间的变化，用趋势图",
+        columns: []
       },
       {
-        id: "s_cost",
+        id: "section_3",
         title: "总电费概览",
         metricIntents: ["总电费"],
         componentType: "metric_card",
         displayIntent: "total",
-        selectionReason: "电费是金额，单列一张指标卡更清楚"
+        explicitComponentType: null,
+        selectionReason: "电费是金额，单列一张指标卡更清楚",
+        columns: []
       },
       {
-        id: "s_rank",
+        id: "section_4",
         title: '设备耗电排名 <img src=x onerror="window.__pageAcceptXss = 1">',
         metricIntents: ["总耗电"],
         componentType: "table",
         displayIntent: "records",
+        explicitComponentType: null,
         selectionReason: "看具体记录与属性，用表格",
         columns: [
-          { id: "c_device", label: "设备名称", fieldRef: "s_rank.device_name" },
-          { id: "c_energy", label: "耗电", fieldRef: "s_rank.energy" },
-          { id: "c_time", label: "采集时间", fieldRef: "s_rank.collected_at" }
+          { id: "c_device", label: "设备名称", fieldRef: "ranking.device_name", format: null },
+          { id: "c_energy", label: "耗电", fieldRef: "ranking.energy", format: null },
+          { id: "c_time", label: "采集时间", fieldRef: "ranking.collected_at", format: null }
         ]
       }
     ],
@@ -496,10 +2349,12 @@
     }
 
     if (scene === "truncated") {
+      // 设备明细表只留前 2 行（真实形状：后端没给 truncated / totalRows，
+      // 也没给列单位 format，页面**判不出**行被截断 —— 不编字段，如实断言）。
       mountPlan("DRAFT_READY");
       var payload = basePayload();
-      var ranking = payload.regions.filter(function (r) { return r.regionId === "region_ranking"; })[0];
-      ranking.payload.rows = ranking.payload.rows.slice(0, 2);
+      var detail = payload.regions.filter(function (r) { return r.regionId === "region_7"; })[0];
+      detail.payload.rows = detail.payload.rows.slice(0, 2);
       mountDraft(DEFINITION_TRUNCATED, payload, "DEFINITION_DRAFT_READY");
       return scene;
     }

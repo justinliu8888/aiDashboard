@@ -51,7 +51,7 @@
         "#preview-root [data-region-badge]",
         "#preview-root [data-region-capability]",
         "#preview-root table",
-        "#preview-root table tbody tr",
+        "#preview-root [data-region-id=\"region_7\"] table tbody tr",
         "#preview-root svg",
         "#draft-badge"
       ],
@@ -60,10 +60,10 @@
         "模拟业务数据",
         "接入真实数据后会自动替换",
         "总耗电",
-        "306.1",
+        "37357.8",
         "kWh",
         "总电费",
-        "244.88",
+        "26150.46",
         "元",
         "能力待接通",
         "PUE",
@@ -76,9 +76,9 @@
         "A-1 机架"
       ],
       "counts": [
-        "#preview-root [data-region-badge]>=8",
-        "#preview-root [data-region-capability]>=2",
-        "#preview-root table tbody tr>=3",
+        "#preview-root [data-region-badge]>=12",
+        "#preview-root [data-region-capability]>=5",
+        "#preview-root [data-region-id=\"region_7\"] table tbody tr>=10",
         "#preview-root svg>=3",
         "#preview-root #plan-root==0",
         "#preview-root .plan-module==0",
@@ -98,29 +98,28 @@
       ],
       "texts": [
         "已校验 / 待接真数",
-        "306.1",
+        "37357.8",
         "示意"
       ],
       "counts": [
-        "#preview-root [data-region-badge]>=8"
+        "#preview-root [data-region-badge]>=12"
       ]
     },
     {
-      "name": "page-accept-04-table-truncated",
+      "name": "page-accept-04-table-rows-2-no-truncated-badge",
       "path": "/frontend/tests/page_accept_harness.html?scene=truncated",
       "title": "工单 08b 页面层验收 harness",
       "waitMs": 2000,
       "ignore": ["/health", "/api/sessions"],
       "selectors": [
-        "#preview-root [data-table-truncated]",
-        "#preview-root table tbody tr"
+        "#preview-root [data-region-id=\"region_7\"] table tbody tr"
       ],
       "texts": [
-        "仅显示前 2 行",
-        "各行之和小于报表总量"
+        "设备耗电明细",
+        "UPS-01 不间断"
       ],
       "counts": [
-        "#preview-root table tbody tr>=2"
+        "#preview-root [data-region-id=\"region_7\"] table tbody tr==2"
       ]
     },
     {

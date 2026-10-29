@@ -88,24 +88,24 @@
         { "eval": "(() => { const t = document.querySelector('#preview-root').textContent; return !t.includes('选型理由') && !t.includes('板块与图表建议') && !t.includes('未接受的额外建议') && !t.includes('确认方案'); })()" },
 
         { "assertText": "总耗电" },
-        { "assertText": "306.1" },
+        { "assertText": "37357.8" },
         { "assertText": "kWh" },
         { "assertText": "总电费" },
-        { "assertText": "244.88" },
-        { "assertText": "42.6" },
-        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_total\"] .text-3xl'); return v ? /\\d/.test(v.textContent) && !v.textContent.includes('—') : false; })()" },
-        { "eval": "(() => { const t = document.querySelector('#preview-root').textContent; return !t.includes('暂无数值') && !t.includes('数据待连接') && !t.includes('图表占位') && !t.includes('表格样例占位') && !t.includes('暂无数据'); })()" },
-        { "assertCount": "#preview-root table tbody tr", "count": 3, "op": "===" },
-        { "eval": "Array.from(document.querySelectorAll('#preview-root table tbody tr')).every(tr => tr.querySelectorAll('td').length >= 3 && Array.from(tr.querySelectorAll('td')).every(td => td.textContent.trim() !== ''))" },
+        { "assertText": "26150.46" },
+        { "assertText": "242.4" },
+        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_1\"] .text-3xl'); return v ? /\\d/.test(v.textContent) && !v.textContent.includes('—') : false; })()" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root').textContent; return !t.includes('暂无数值') && !t.includes('图表占位') && !t.includes('表格样例占位') && !t.includes('暂无数据'); })()" },
+        { "assertCount": "#preview-root [data-region-id=\"region_7\"] table tbody tr", "count": 10, "op": "===" },
+        { "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id=\"region_7\"] table tbody tr')).every(tr => tr.querySelectorAll('td').length >= 3 && Array.from(tr.querySelectorAll('td')).every(td => td.textContent.trim() !== ''))" },
         { "assertVisible": "#preview-root svg" },
-        { "eval": "(() => { const p = document.querySelector('#preview-root [data-region-id=\"region_trend\"] svg polyline'); return !!p && p.getAttribute('points').trim().split(/\\s+/).length >= 2; })()" },
-        { "eval": "(() => { const fills = Array.from(document.querySelectorAll('#preview-root .template-chart-fill')); return fills.length === 3 && fills.every(el => el.getBoundingClientRect().width > 0); })()" },
+        { "eval": "(() => { const p = document.querySelector('#preview-root [data-region-id=\"region_2\"] svg polyline'); return !!p && p.getAttribute('points').trim().split(/\\s+/).length >= 2; })()" },
+        { "eval": "(() => { const fills = Array.from(document.querySelectorAll('#preview-root [data-region-id=\"region_5\"] .template-chart-fill')); return fills.length === 7 && fills.every(el => el.getBoundingClientRect().width > 0); })()" },
 
         { "assertVisible": "#preview-root [data-simulated-note]" },
         { "assertText": "模拟业务数据" },
         { "assertText": "接入真实数据后会自动替换" },
-        { "assertCount": "#preview-root [data-region-badge]", "count": 8, "op": "===" },
-        { "assertCount": "#preview-root [data-region-capability]", "count": 2, "op": "===" },
+        { "assertCount": "#preview-root [data-region-badge]", "count": 12, "op": "===" },
+        { "assertCount": "#preview-root [data-region-capability]", "count": 5, "op": "===" },
         { "assertText": "能力待接通" },
         { "assertText": "PUE" },
         { "assertText": "实时功率" },
@@ -114,11 +114,15 @@
         { "assertText": "示意" },
         { "assertNotText": "已校验 / 待接真数" },
 
-        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_trend\"]').textContent; return t.includes('单位：kWh'); })()" },
-        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_cost_chart\"]').textContent; return t.includes('单位：元') && !t.includes('kWh'); })()" },
-        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_power_chart\"]').textContent; return t.includes('单位：kW') && !t.includes('kWh'); })()" },
-        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_power\"]').textContent; return t.includes('kW') && !t.includes('kWh'); })()" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_2\"]').textContent; return t.includes('单位：kWh'); })()" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_10\"]').textContent; return t.includes('单位：元') && !t.includes('kWh'); })()" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_12\"]').textContent; return t.includes('单位：kW') && !t.includes('kWh'); })()" },
+        { "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_11\"]').textContent; return t.includes('kW') && !t.includes('kWh'); })()" },
         { "assertText": "单位：kWh" },
+
+        { "eval": "(() => { const texts = Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(c => c.textContent); return texts.some(t => t.includes('role: SUMMARY')) && texts.some(t => t.includes('role: DETAIL')) && texts.some(t => t.includes('role: DESCRIPTION')); })()" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; return p.regions.every(r => Object.keys(r).sort().join(',') === 'componentType,name,payload,regionId,role'); })()" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; const t = p.regions.find(r => r.componentType === 'TABLE'); return !!t && t.payload.columns.every(c => c.format === null); })()" },
 
         { "assertNotText": "仅显示前" },
 
@@ -134,7 +138,7 @@
         { "waitFor": "#preview-root [data-region-badge]" },
         { "wait": 300 },
 
-        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_total\"] .text-3xl'); return v ? v.textContent : ''; })()", "save": "paTotalBefore" },
+        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_1\"] .text-3xl'); return v ? v.textContent : ''; })()", "save": "paTotalBefore" },
         { "eval": "(() => { const rows = Array.from(document.querySelectorAll('#preview-root table tbody tr')).map(tr => tr.textContent.trim()); return rows.join('|'); })()", "save": "paRowsBefore" },
 
         { "eval": "window.__pageAcceptScene('pending')" },
@@ -142,7 +146,7 @@
         { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "simulated" },
         { "assertText": "示意" },
         { "assertNotText": "已校验 / 待接真数" },
-        { "assertText": "306.1" },
+        { "assertText": "37357.8" },
         { "screenshot": "08b-05-校验中仍是示意" },
 
         { "eval": "window.__pageAcceptScene('failed')" },
@@ -150,16 +154,16 @@
         { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "simulated" },
         { "assertText": "示意" },
         { "assertNotText": "已校验 / 待接真数" },
-        { "assertText": "306.1" },
+        { "assertText": "37357.8" },
         { "screenshot": "08b-06-校验失败仍是示意" },
 
         { "eval": "window.__pageAcceptScene('validated')" },
         { "wait": 400 },
         { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "validated" },
         { "assertText": "已校验 / 待接真数" },
-        { "assertText": "306.1" },
+        { "assertText": "37357.8" },
 
-        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_total\"] .text-3xl'); return v ? v.textContent : ''; })()", "save": "paTotalAfter" },
+        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_1\"] .text-3xl'); return v ? v.textContent : ''; })()", "save": "paTotalAfter" },
         { "eval": "(() => { const rows = Array.from(document.querySelectorAll('#preview-root table tbody tr')).map(tr => tr.textContent.trim()); return rows.join('|'); })()", "save": "paRowsAfter" },
         { "eval": "paTotalBefore === paTotalAfter" },
         { "eval": "paRowsBefore === paRowsAfter" },
@@ -167,17 +171,21 @@
       ]
     },
     {
-      "name": "08b-04 表格行被截断：标注「仅显示前 N 行」",
+      "name": "08b-04 表格只留 2 行：真实形状下判不出截断（后端没给 truncated / totalRows，也没给列单位 format）",
       "path": "/frontend/tests/page_accept_harness.html?scene=truncated",
       "continueOnError": false,
       "steps": [
-        { "waitFor": "#preview-root [data-table-truncated]" },
+        { "waitFor": "#preview-root [data-region-id=\"region_7\"] table tbody tr" },
         { "wait": 300 },
-        { "assertVisible": "#preview-root [data-table-truncated]" },
-        { "assertText": "仅显示前 2 行" },
-        { "assertText": "各行之和小于报表总量" },
-        { "assertCount": "#preview-root table tbody tr", "count": 2, "op": "===" },
-        { "screenshot": "08b-08-表格截断标注" }
+        { "assertVisible": "#preview-root [data-region-id=\"region_7\"] table tbody tr" },
+        { "assertCount": "#preview-root [data-region-id=\"region_7\"] table tbody tr", "count": 2, "op": "===" },
+        { "assertText": "设备耗电明细" },
+        { "assertText": "UPS-01 不间断" },
+
+        { "assertHidden": "#preview-root [data-table-truncated]" },
+        { "assertNotText": "仅显示前" },
+        { "eval": "(() => { const p = typeof session !== 'undefined' ? session.reportPreviewPayload : null; if (!p) return false; const t = p.regions.find(r => r.regionId === 'region_7'); if (!t) return false; return t.payload.truncated === undefined && t.payload.totalRows === undefined && t.payload.columns.every(c => c.format === null); })()" },
+        { "screenshot": "08b-08-表格只留2行真实形状判不出截断" }
       ]
     },
     {
