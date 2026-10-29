@@ -41,7 +41,12 @@
   /** 草稿阶段：方案已确认，右侧直接出报表草稿面板。 */
   const PHASE_DRAFT_READY = "DRAFT_READY";
 
-  /** 图表类型 → 中文标签。未知类型原样显示（安全文本）。 */
+  /**
+   * 图表类型 → 中文标签。
+   *
+   * 未知类型走 COMPONENT_TYPE_UNKNOWN_LABEL 中文兜底，**不**回落英文 key
+   * （见 componentTypeLabel）。
+   */
   const COMPONENT_TYPE_LABELS = {
     metric_card: "指标卡",
     line_chart: "折线图",
@@ -50,6 +55,43 @@
     table: "表格",
     text: "文字块",
   };
+
+  /**
+   * 未知组件类型的中文兜底标签。
+   *
+   * 与展示目的的兜底**分开**（DISPLAY_INTENT_UNKNOWN_LABEL）：
+   * 两个标签并排出现在同一个板块头里，各说各的维度 —— 用户不悬停就知道
+   * 是哪一个不认识；共用一句「未知项」的话，两个都未知时就分不出谁是谁。
+   * 原始 key 由调用方放进 title / data-* 属性，保留可追溯性。
+   */
+  const COMPONENT_TYPE_UNKNOWN_LABEL = "未知组件类型";
+
+  /**
+   * 展示目的 → 中文标签。
+   *
+   * 字段来自开发规格「跨工单契约」：每个板块定稿携带 displayIntent，
+   * 取值是 total / trend / comparison / composition / records。
+   *
+   * 取值域已封闭为这 5 个（方案侧工单 02）。后端将来加新枚举时，
+   * 走 DISPLAY_INTENT_UNKNOWN_LABEL 兜底，**不**回落英文 key（见 displayIntentLabel）。
+   * 空值（null / 缺字段）不显示。
+   */
+  const DISPLAY_INTENT_LABELS = {
+    total: "总量",
+    trend: "趋势",
+    comparison: "对比",
+    composition: "构成",
+    records: "明细",
+  };
+
+  /**
+   * 未知展示目的的中文兜底标签。
+   *
+   * 后端将来加了新枚举时用它：用户看到的是中文，不是裸英文 key；
+   * 原始 key 由调用方放进 title / data-* 属性，保留可追溯性。
+   * 它**不**代表任何已知语义 —— 未知就是未知，不猜。
+   */
+  const DISPLAY_INTENT_UNKNOWN_LABEL = "未知展示目的";
 
   /** 设计阶段 → 中文标签。 */
   const PHASE_LABELS = {
@@ -66,7 +108,9 @@
   // 用内联样式而不是外部 CSS：本模块不引入样式表、不改宿主页面，
   // 协调者接入时可以直接覆盖这些类名。
   const STYLE = {
-    module: "font-family:inherit;color:#1e293b;",
+    // overflow-wrap / word-break 是继承属性：写在容器上，方案卡片里所有长文本
+    // 都会换行。左侧对话区最窄只有 340px，没有换行就会横向溢出。
+    module: "font-family:inherit;color:#1e293b;max-width:100%;overflow-wrap:anywhere;word-break:break-word;",
     status: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#64748b;margin-bottom:10px;",
     badge: "display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;background:#e2e8f0;color:#475569;font-size:11px;",
     badgeBusy: "display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;background:#fef3c7;color:#b45309;font-size:11px;",
@@ -81,6 +125,12 @@
     sectionHead: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;",
     sectionTitle: "font-size:13px;font-weight:600;color:#0f172a;",
     sectionMetrics: "font-size:12px;color:#64748b;",
+    reason: "font-size:12px;color:#475569;margin:4px 0 0;",
+    columnBlock: "margin-top:8px;",
+    columnTitle: "font-size:12px;font-weight:600;color:#64748b;margin:0 0 4px;",
+    columnList: "display:flex;flex-wrap:wrap;gap:4px;",
+    column: "display:inline-flex;align-items:baseline;max-width:100%;padding:1px 8px;border-radius:999px;border:1px solid #cbd5e1;background:#ffffff;color:#475569;font-size:11px;",
+    columnLabel: "flex:0 1 auto;min-width:0;",
     note: "font-size:12px;color:#b45309;margin:0 0 6px;",
     actions: "margin-top:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;",
     button: "padding:7px 16px;border-radius:8px;border:1px solid #1d4ed8;background:#1d4ed8;color:#ffffff;font-size:13px;font-weight:500;cursor:pointer;",
@@ -164,6 +214,49 @@
   // ---------------------------------------------------------------- 视图归一
 
   /**
+   * 归一一个板块（section）。
+   *
+   * 只取契约里有的字段，缺的就是缺：
+   *   - displayIntent / explicitComponentType / selectionReason（选型契约）
+   *   - columns[]：定稿栏目，每项有 id / label / fieldRef（栏目契约）
+   * 字段不存在就当没有 —— 不按标题猜、不自造默认值。
+   */
+  function normalizeSection(section) {
+    const item = isPlainObject(section) ? section : {};
+    return {
+      id: safeText(item.id),
+      title: safeText(item.title),
+      metricIntents: stringList(item.metricIntents),
+      componentType: safeText(item.componentType),
+      displayIntent: safeText(item.displayIntent),
+      explicitComponentType: safeText(item.explicitComponentType),
+      selectionReason: safeText(item.selectionReason),
+      columns: normalizeColumns(item.columns),
+    };
+  }
+
+  /**
+   * 归一栏目声明。
+   * 没有显示名（label）的栏目整项跳过：显示名是给人看的，id / fieldRef 是技术键，
+   * 拿它们当栏目名就是「自造默认值」。
+   */
+  function normalizeColumns(value) {
+    if (!Array.isArray(value)) return [];
+    const out = [];
+    for (const column of value) {
+      if (!isPlainObject(column)) continue;
+      const label = safeText(column.label);
+      if (!label) continue;
+      out.push({
+        id: safeText(column.id),
+        label,
+        fieldRef: safeText(column.fieldRef),
+      });
+    }
+    return out;
+  }
+
+  /**
    * 把上层传进来的 view 归一成一份安全、好用的视图对象。
    * 字段缺失 / 类型不对都不抛错，只按「空」处理。
    */
@@ -171,6 +264,7 @@
     const source = isPlainObject(view) ? view : {};
     const plan = isPlainObject(source.reportPlan) ? source.reportPlan : null;
     const requirements = plan && isPlainObject(plan.requirements) ? plan.requirements : {};
+    const sections = plan && Array.isArray(plan.sections) ? plan.sections : [];
 
     return {
       designPhase: ownString(source.designPhase),
@@ -182,7 +276,7 @@
       subject: safeText(requirements.subject),
       timeRange: safeText(requirements.timeRange),
       exclusions: stringList(requirements.exclusions),
-      sections: Array.isArray(plan && plan.sections) ? plan.sections : [],
+      sections: sections.map(normalizeSection),
       assumptions: stringList(plan && plan.assumptions),
       suggestions: stringList(plan && plan.suggestions),
       referenceTemplates: Array.isArray(plan && plan.referenceTemplates) ? plan.referenceTemplates : [],
@@ -236,12 +330,58 @@
     };
   }
 
+  /**
+   * 组件类型 → 中文标签。
+   *
+   * 三种情况：
+   *   - 空值（null / 缺字段）→ 空串：不渲染这个标签；
+   *   - 已知类型 → 对应中文（译法不动，票07 / 票08b 的资产依赖它）；
+   *   - **未知类型 → 中文兜底**（COMPONENT_TYPE_UNKNOWN_LABEL）。
+   *
+   * 未知类型**不回落英文 key**（用户看不懂），也**不映射到任何已知类型**
+   * （那是猜，会显示错误语义）。原始 key 由调用方放进 title / data-* 属性。
+   *
+   * ⚠️ 本函数只管**显示标签**。componentType 在别处还当判断用
+   * （renderChart 用原始值决定画 SVG 折线还是柱条），那些判断一律读原始值，
+   * **不经过本函数** —— 显示兜底不许改到渲染逻辑。
+   */
   function componentTypeLabel(type) {
     const key = safeText(type);
     if (!key) return "";
-    return Object.prototype.hasOwnProperty.call(COMPONENT_TYPE_LABELS, key)
-      ? COMPONENT_TYPE_LABELS[key]
-      : key;
+    return isKnownComponentType(key) ? COMPONENT_TYPE_LABELS[key] : COMPONENT_TYPE_UNKNOWN_LABEL;
+  }
+
+  /** 这个组件类型是否是已知取值。空值也算「不是已知取值」。 */
+  function isKnownComponentType(type) {
+    const key = safeText(type);
+    if (!key) return false;
+    return Object.prototype.hasOwnProperty.call(COMPONENT_TYPE_LABELS, key);
+  }
+
+  /**
+   * 展示目的 → 中文标签。
+   *
+   * 三种情况：
+   *   - 空值（null / 缺字段）→ 空串：不渲染这一行；
+   *   - 5 个已知取值 → 对应中文；
+   *   - **未知取值 → 中文兜底**（DISPLAY_INTENT_UNKNOWN_LABEL）。
+   *
+   * 未知取值**不回落英文 key**：用户看不懂英文，而且裸英文正说明
+   * 「后端枚举与前端映射没同步」—— 那是要暴露的问题，不是要洗成中文的样子。
+   * 未知取值也**不映射到任何已知取值**：那是猜，会显示错误语义。
+   * 原始 key 由调用方放进 title / data-* 属性，保留可追溯性。
+   */
+  function displayIntentLabel(intent) {
+    const key = safeText(intent);
+    if (!key) return "";
+    return isKnownDisplayIntent(key) ? DISPLAY_INTENT_LABELS[key] : DISPLAY_INTENT_UNKNOWN_LABEL;
+  }
+
+  /** 这个展示目的是否是已知取值。空值也算「不是已知取值」。 */
+  function isKnownDisplayIntent(intent) {
+    const key = safeText(intent);
+    if (!key) return false;
+    return Object.prototype.hasOwnProperty.call(DISPLAY_INTENT_LABELS, key);
   }
 
   /**
@@ -250,6 +390,10 @@
    * **未知阶段返回空串**（而不是原始 key）：历史会话里可能还留着
    * 「模板阶段」的旧枚举，直接把 key 渲染出去会露出英文徽标。
    * 空串意味着「不渲染这个徽标」。
+   *
+   * 注意：这里的策略与展示目的 / 组件类型**故意不同** ——
+   * 那两个是后端将来会**新增**的枚举，要让人看见落差（回落中文兜底）；
+   * 阶段是历史会话残留的**旧**枚举，要藏起来。两者别互相「统一」。
    */
   function designPhaseLabel(phase) {
     const key = safeText(phase);
@@ -343,6 +487,40 @@
         const tag = makeText(doc, "span", STYLE.tag, typeLabel);
         tag.setAttribute("class", "plan-component-type");
         tag.setAttribute("data-plan-component-type", safeText(item.componentType));
+        // 未知类型：标签上是中文兜底，原始 key 放进 title（悬停可见）——
+        // 既不把英文外露到界面上，又不把「后端加了新类型」这件事藏起来。
+        if (!isKnownComponentType(item.componentType)) {
+          tag.setAttribute("title", safeText(item.componentType));
+        }
+        head.appendChild(tag);
+      }
+
+      // 展示目的：用户想看什么（总量 / 趋势 / 对比 / 构成 / 明细）。
+      const intentLabel = displayIntentLabel(item.displayIntent);
+      if (intentLabel) {
+        const tag = makeText(doc, "span", STYLE.tag, intentLabel);
+        tag.setAttribute("class", "plan-display-intent");
+        tag.setAttribute("data-plan-display-intent", safeText(item.displayIntent));
+        // 未知取值：标签上是中文兜底，原始 key 放进 title（悬停可见）——
+        // 既不把英文外露到界面上，又不把「后端加了新枚举」这件事藏起来。
+        // 已知取值不加 title：它的中文已经是人话，原文在 data-* 里就够追溯了。
+        if (!isKnownDisplayIntent(item.displayIntent)) {
+          tag.setAttribute("title", safeText(item.displayIntent));
+        }
+        head.appendChild(tag);
+      }
+
+      // 用户明确指定的展示类型：与系统按意图选出的类型分开标，
+      // 免得把「用户指定」看成「系统自己决定的」。
+      const explicitLabel = componentTypeLabel(item.explicitComponentType);
+      if (explicitLabel) {
+        const tag = makeText(doc, "span", STYLE.tag, "用户指定：" + explicitLabel);
+        tag.setAttribute("class", "plan-explicit-type");
+        tag.setAttribute("data-plan-explicit-type", safeText(item.explicitComponentType));
+        // 同上：用户指定的类型不认识时，标签是中文兜底，原始 key 留在 title 里。
+        if (!isKnownComponentType(item.explicitComponentType)) {
+          tag.setAttribute("title", safeText(item.explicitComponentType));
+        }
         head.appendChild(tag);
       }
       card.appendChild(head);
@@ -356,6 +534,36 @@
       );
       metrics.setAttribute("class", "plan-section-metrics");
       card.appendChild(metrics);
+
+      // 选型理由：系统为什么这么画。没有这一项就不显示，不自造。
+      const reason = safeText(item.selectionReason);
+      if (reason) {
+        const reasonBox = makeText(doc, "div", STYLE.reason, "选型理由：" + reason);
+        reasonBox.setAttribute("class", "plan-selection-reason");
+        reasonBox.setAttribute("data-plan-selection-reason", reason);
+        card.appendChild(reasonBox);
+      }
+
+      // 表格板块声明的栏目：方案里写清楚这张表要展示哪些列。
+      const columns = Array.isArray(item.columns) ? item.columns : [];
+      if (columns.length) {
+        const columnBox = makeBlock(doc, "div", STYLE.columnBlock, "plan-columns");
+        columnBox.appendChild(makeText(doc, "div", STYLE.columnTitle, "栏目"));
+        const list = makeBlock(doc, "div", STYLE.columnList, "plan-column-list");
+        for (const column of columns) {
+          const chip = makeBlock(doc, "span", STYLE.column, "plan-column");
+          chip.setAttribute("data-plan-column-id", safeText(column.id));
+          chip.setAttribute("data-plan-column-field-ref", safeText(column.fieldRef));
+          // 给人看的是栏目名；取值键（fieldRef）是技术键，
+          // 放 title 里（悬停可见），不跟名字挤在一行 —— 窄栏里挤在一起会被拦腰截断。
+          if (safeText(column.fieldRef)) chip.setAttribute("title", safeText(column.fieldRef));
+          chip.appendChild(makeText(doc, "span", STYLE.columnLabel, safeText(column.label)));
+          list.appendChild(chip);
+        }
+        columnBox.appendChild(list);
+        card.appendChild(columnBox);
+      }
+
       box.appendChild(card);
     }
     return box;
@@ -368,10 +576,11 @@
   // 它**不随模板中间页下线而删除**：需求稿 §3.3 点名保护这段代码
   // （「严禁删除折线图 SVG 渲染与 chartFill 样式」）—— 它是独立的图表改进，
   // 与网格、与业务链路都无关。模板中间页下线只是**换了调用方**：
-  //   - 模板中间页下线后，本模块不再调用它；
-  //   - 草稿路径（workbench.js）在区域真的拿到数据点时调用它。
+  //   - 模板中间页下线后，本模块自己不再调用它；
+  //   - 草稿路径（workbench.js）在 ECharts 不可用时调用它画 SVG。
   //
-  // 草稿阶段还没有数据点，此时草稿面板继续显示空壳卡片，不调用它。
+  // 草稿阶段**不再画空壳**：按 ADR 0004，模版阶段一律用模拟业务数据渲染，
+  // 图表区域带 xLabels / yValues —— 这条路径是**真的会被调用**的。
 
   function renderChart(doc, region) {
     const data = isPlainObject(region.data) ? region.data : {};
@@ -694,6 +903,9 @@
     PHASE_PLAN_WAITING_CONFIRM,
     PHASE_DRAFT_READY,
     COMPONENT_TYPE_LABELS,
+    COMPONENT_TYPE_UNKNOWN_LABEL,
+    DISPLAY_INTENT_LABELS,
+    DISPLAY_INTENT_UNKNOWN_LABEL,
     PHASE_LABELS,
     MODULE_ATTR,
     MODULE_NAME,
@@ -702,10 +914,13 @@
     canConfirmNow,
     confirmPayload,
     componentTypeLabel,
+    isKnownComponentType,
+    displayIntentLabel,
+    isKnownDisplayIntent,
     designPhaseLabel,
     // 图表渲染器：模板中间页下线后**改由草稿路径复用**
-    // （事实：草稿路径的 region.data 是执行绑定描述符，不含 xLabels / yValues，
-    //  所以草稿面板当前不会真的调到这里；带数据点的预览走 ECharts 那条路）。
+    // （事实：草稿路径按 ADR 0004 用模拟业务数据渲染，图表区域带 xLabels / yValues；
+    //  ECharts 可用时走 ECharts，ECharts 不可用时才落到这里画 SVG）。
     // 需求稿 §3.3 点名保护这段代码，不得因为「没有调用方」而删掉。
     renderChart,
     render,

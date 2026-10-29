@@ -37,7 +37,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any
+from typing import Any, Mapping
 
 from app.agents.report_plan_agent import (
     KIND_CLARIFICATION,
@@ -56,6 +56,8 @@ from app.schemas.agent import (
     AgentState,
 )
 from app.schemas.report_plan import (
+    PlanClarificationRequired,
+    PlanColumnsUnresolvedError,
     PlanContractError,
     ReportPlan,
     ReportPlanError,
@@ -67,8 +69,17 @@ from app.schemas.session import (
     CLARIFICATION_QUESTION_KEY,
 )
 from app.services.report_plan_service import apply_candidate
-from app.services.report_template_service import build_template_design
+from app.services.report_template_service import (
+    build_template_design,
+    split_placeholder_regions,
+)
 from app.services.report_draft_service import build_policy_draft
+from app.services.preview_service import (
+    PreviewContextError,
+    build_report_preview_payload,
+    resolve_preview_context,
+)
+from app.services.simulated_data_service import SimulatedDataError
 from app.services.template_definition_service import build_template_definition
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.services.session_context import current_session_key
@@ -232,6 +243,21 @@ def _reason_text(exc: Exception) -> str:
     return message or exc.__class__.__name__
 
 
+def _definition_dict(
+    definition: ReportDefinitionDraft | dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """草稿 → 造数用的定义字典（拿不到就 None）。
+
+    载荷生成只吃**纯字典**：领域模型与原始字典两条路径都要能出数，
+    造数器不该关心调用方手里拿的是哪一种。
+    """
+    if isinstance(definition, ReportDefinitionDraft):
+        return definition.model_dump(mode="json")
+    if isinstance(definition, dict):
+        return definition
+    return None
+
+
 def _plan_contract_error(sections: Any) -> str | None:
     """检查方案板块的契约（组件类型 + 取数板块的指标意图）。
 
@@ -304,6 +330,87 @@ def is_vague_approval(message: str) -> bool:
     rest = _strip_markers(text, _VAGUE_APPROVAL_MARKERS)
     rest = _strip_markers(rest, _CONFIRM_FILLERS)
     return not rest
+
+
+# --------------------------------------------------------------------------
+# 占位区域在回复正文里的说法
+# --------------------------------------------------------------------------
+#
+# 规格 #46 第 246 行：「能力待接通与范围授权、既有绑定三态相互独立；
+# 不把所有占位原因都标为能力缺失」。
+#
+# 所以**占位 ≠ 能力缺失**：
+#   - 能力待接通 —— 这个指标当前还算不出来 → 说「能力尚未接通」；
+#   - 范围授权   —— 指标能力是通的，缺的是这个统计对象的授权 → **不能**
+#     说成「能力尚未接通」，要说授权范围的事。
+#
+# 两类**分别计数**，不混算。判据在 ``report_template_service``（模板 /
+# 定义两层结构的同一份语义），这里只负责把它说成人话。
+
+#: 能力待接通类占位的说法。
+CAPABILITY_PENDING_REPLY = "{count} 个区域的能力尚未接通，已标注「能力待接通」"
+
+#: 范围授权类占位的说法 —— 与上面**明确区分**。
+#:
+#: 括注里说的是**事实**：指标能力已接通，缺的是这个统计对象的授权
+#: （与 ``report_template_service.SCOPE_PLACEHOLDER_REASON`` 同一套说法）。
+#: **不说**「能力尚未接通」，也不说旧口径「数据待连接」。
+SCOPE_PENDING_REPLY = (
+    "{count} 个区域不在授权范围"
+    "（该指标能力已接通，当前账号没有这个统计对象的授权）"
+)
+
+#: 占位原因清单的引导语。两类都在时用中性的这一句 ——
+#: 授权类的原因**不是**「尚未接通的原因」。
+_NOTES_LEAD_CAPABILITY = "尚未接通的原因："
+_NOTES_LEAD_SCOPE = "不在授权范围的原因："
+_NOTES_LEAD_MIXED = "各区域的具体原因："
+
+
+def _placeholder_fragment(
+    capability: list[Any], scope: list[Any]
+) -> str:
+    """按两类占位的数量拼出说明（两类分别计数，不混算）。"""
+    parts: list[str] = []
+    if capability:
+        parts.append(CAPABILITY_PENDING_REPLY.format(count=len(capability)))
+    if scope:
+        parts.append(SCOPE_PENDING_REPLY.format(count=len(scope)))
+    return "；".join(parts)
+
+
+def placeholder_reply(regions: Any) -> str:
+    """占位区域在回复正文里的说明（两类分别计数，不混算）。
+
+    没有占位区域时返回空串。判据来自 ``report_template_service``：
+    能力类看 ``capabilityPending``，授权类是「能力通、只是没授权」。
+    """
+    capability, scope = split_placeholder_regions(regions)
+    return _placeholder_fragment(capability, scope)
+
+
+def pending_notes_reply(template: Mapping[str, Any]) -> str:
+    """占位原因清单的正文（引导语按占位类别选，不混说）。
+
+    只有能力类时沿用「尚未接通的原因：」；只有授权类时说
+    「不在授权范围的原因：」（授权类**不是**「尚未接通」）；
+    两类都在时用中性的「各区域的具体原因：」。
+    """
+    notes = template.get("pendingNotes") or []
+    # 原因本身已经带句号了，直接拼会变成「。。」。
+    cleaned = [
+        str(note).rstrip("。；;，,") for note in notes[:4] if str(note).strip()
+    ]
+    if not cleaned:
+        return ""
+    capability, scope = split_placeholder_regions(template.get("regions") or [])
+    if capability and not scope:
+        lead = _NOTES_LEAD_CAPABILITY
+    elif scope and not capability:
+        lead = _NOTES_LEAD_SCOPE
+    else:
+        lead = _NOTES_LEAD_MIXED
+    return lead + "；".join(cleaned) + "。"
 
 
 class ReportDesignService:
@@ -650,8 +757,9 @@ class ReportDesignService:
                 designPhase=DESIGN_PHASE_DRAFT_READY,
                 reply=(
                     f"已按第 {plan_revision} 版方案「{title}」生成报表草稿。"
-                    "草稿已生成，请在右侧选择下一步。"
-                    "请确认草稿后继续校验、试运行；占位区域仍保留原因，不会编造数值。"
+                    "右侧这份报表用系统生成的**模拟业务数据**渲染，是用来核对版式的"
+                    "示意，接入真实数据后会自动替换。"
+                    "请确认草稿后继续校验、试运行；尚未接通的指标会标注「能力待接通」。"
                 ),
                 domainObjects=AgentResponseDomainObjects(
                     reportDefinitionDraft=draft, reportPolicyDraft=build_policy_draft(template["title"]),
@@ -662,6 +770,11 @@ class ReportDesignService:
                     selectionOnly=True, options=[{"value": v, "label": v} for v in ("同意", "修改", "重新开始")],
                 )],
                 uiActions=["confirm_framework", "draft_ready"],
+            )
+            # 与 _draft_response 同一个挂载点：这条路径（历史「确认模板」
+            # 入口）也要有示意载荷，不能只有另一条路径有。
+            response = self._attach_report_preview_payload(
+                request, response, definition=draft, plan=plan,
             )
             write_turn = self._make_write_turn(request, response)
 
@@ -823,8 +936,11 @@ class ReportDesignService:
             - 校验动作确实指向当前这一版方案（版本过期要可辨识地拒绝）；
             - **生成模板**：按已确认的方案逐板块出可视区域，
               区域与方案板块一一对应；
-            - **逐区域接数**：当前已接通能力算得出来的区域填数据，
-              算不出来的保留占位并写明原因（数据待连接 / 口径待核实）；
+            - **逐区域标注能力**：按方案声明的组件类型逐板块标注量身份、
+              单位与列；当前能力算不出来的板块标成「能力待接通」并写明
+              原因（能力待接通 / 口径待核实 / 统计对象不在授权范围内）——
+              草稿阶段一律用**模拟业务
+              数据**渲染，不留空壳、也不编造口径；
             - **转换成报表草稿**：模板转成可确认的报表草稿；
             - **一次事务落库**：模板、草稿、确认关系、阶段
               （``DRAFT_READY``）、下一步菜单与本轮消息同生共死。
@@ -1273,6 +1389,41 @@ class ReportDesignService:
                     else f"{PLAN_ID_PREFIX}{uuid.uuid4().hex[:12]}"
                 ),
                 expected_revision=expected_revision,
+                # 方案服务要靠这三样输入做逐板块选型：用户**最初**的原话、
+                # 本轮**当前**的修改、已有方案。少了前两样，用户明确指定的
+                # 展示类型（"用柱状图"）与展示目的就都判不出来。
+                original_request=self._original_request(session_key),
+                current_request=request.message,
+            )
+        except PlanClarificationRequired as exc:
+            # 缺栏目且推不出来 —— 这**不是**技术失败，是要请用户拍板。
+            # 走澄清通道：问题出现在左侧对话区，用户答完再完善方案。
+            question = str(exc.question or exc.message or "").strip()
+            logger.info("[report_design] 方案需要澄清 code=%s", exc.code)
+            return await self._commit_clarification(
+                request,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+                question=question,
+                state=state,
+            )
+        except PlanColumnsUnresolvedError as exc:
+            # 栏目修不了：明确报失败、允许重试，**绝不**给一张空表还宣称成功。
+            code = getattr(exc, "code", "PLAN_COLUMNS_UNRESOLVED")
+            reason = str(exc).strip()
+            logger.info("[report_design] 方案栏目无法确定 code=%s", code)
+            self._fail_operation(operation_id, code, reason or "表格栏目无法确定")
+            message = (
+                f"这次没能确定表格要展示哪些栏目：{reason}方案保持原样，请重试。"
+                if reason
+                else "这次没能确定表格要展示哪些栏目，方案保持原样，请重试。"
+            )
+            return self._failure_response(
+                request,
+                state,
+                code=code,
+                message=message,
+                retryable=True,
             )
         except ReportPlanError as exc:
             code = getattr(exc, "code", "PLAN_INVALID_STRUCTURE")
@@ -1642,27 +1793,24 @@ class ReportDesignService:
         template = template or {}
         regions = template.get("regions") or []
         bound = [r for r in regions if r.get("dataStatus") == "bound"]
-        placeholders = [r for r in regions if r.get("dataStatus") == "placeholder"]
+        # 占位区域**分两类**说：能力待接通 vs 范围授权（规格 #46 第 246 行）。
+        # 授权类不是能力缺失 —— 不能混算成「能力尚未接通」。
+        capability_regions, scope_regions = split_placeholder_regions(regions)
+        placeholder_note = _placeholder_fragment(capability_regions, scope_regions)
         title = template.get("title") or (plan or {}).get("topic") or "报表"
         plan_revision = template.get("planRevision") or (plan or {}).get("revision")
 
         reply = f"已确认第 {plan_revision} 版方案「{title}」。"
         if bound:
-            # 同 _draft_response：#38 起模板阶段不取数，不能说「已接上数据」。
-            reply += f"{len(bound)} 个区域已绑定指标，数值待试运行产生"
-            if placeholders:
-                reply += f"，{len(placeholders)} 个区域保留占位"
+            # 同 _draft_response：ADR 0004 起草稿阶段就用模拟业务数据渲染，
+            # 既不说「已接上数据」，也不说「数值待试运行产生」。
+            reply += f"{len(bound)} 个区域已绑定指标并出了示意数值"
+            if placeholder_note:
+                reply += f"，{placeholder_note}"
             reply += "。"
-        elif placeholders:
-            reply += f"{len(placeholders)} 个区域保留占位。"
-        notes = template.get("pendingNotes") or []
-        if notes:
-            # 原因本身已经带句号了，直接拼会变成「。。」。
-            cleaned = [
-                str(note).rstrip("。；;，,") for note in notes[:4] if str(note).strip()
-            ]
-            if cleaned:
-                reply += "占位原因：" + "；".join(cleaned) + "。"
+        elif placeholder_note:
+            reply += f"{placeholder_note}。"
+        reply += pending_notes_reply(template)
         if duplicate:
             reply += "（这一版方案之前已经确认过，直接沿用已生成的草稿，没有重复生成。）"
         else:
@@ -1695,7 +1843,10 @@ class ReportDesignService:
                 "planRevision": plan_revision,
                 "dataStatus": template.get("dataStatus"),
                 "boundRegions": len(bound),
-                "placeholderRegions": len(placeholders),
+                # 占位区域**分两类**记（能力待接通 / 范围授权），不混算。
+                "capabilityPendingRegions": len(capability_regions),
+                "scopePendingRegions": len(scope_regions),
+                "placeholderRegions": len(capability_regions) + len(scope_regions),
             },
         )
 
@@ -1715,36 +1866,37 @@ class ReportDesignService:
        对照展示）。
 
         回复文案带**实际已确认的标题与方案版本号**，不写死示例文本。
+
+        这一轮同时挂上**报表示意载荷**（``reportPreviewPayload``）：
+        草稿阶段就用模拟业务数据渲染，用户确认方案后右侧当场有数字，
+        不用再点一次什么才出数。
         """
         template = template or {}
         regions = template.get("regions") or []
         bound = [r for r in regions if r.get("dataStatus") == "bound"]
-        placeholders = [r for r in regions if r.get("dataStatus") == "placeholder"]
+        # 占位区域**分两类**说：能力待接通 vs 范围授权（规格 #46 第 246 行）。
+        # 授权类不是能力缺失 —— 不能混算成「能力尚未接通」。
+        capability_regions, scope_regions = split_placeholder_regions(regions)
+        placeholder_note = _placeholder_fragment(capability_regions, scope_regions)
         title = template.get("title") or (plan or {}).get("topic") or "报表"
         plan_revision = template.get("planRevision") or (plan or {}).get("revision")
 
         reply = (
             f"已按第 {plan_revision} 版方案「{title}」生成报表草稿。"
-            "草稿已生成，请在右侧选择下一步。"
+            "右侧这份报表用系统生成的**模拟业务数据**渲染，是用来核对版式的"
+            "示意，接入真实数据后会自动替换。"
         )
         if bound:
-            # #38 起，模板阶段只做能力核对、**不取数**：bound 的含义是
-            # 「指标已绑定、能力可用」，数值一律等试运行产生。
-            # 这里不能说「已接上数据」—— 那是不存在的事实。
-            reply += f"{len(bound)} 个区域已绑定指标，数值待试运行产生"
-            if placeholders:
-                reply += f"，{len(placeholders)} 个区域保留占位"
+            # ADR 0004：草稿阶段就用模拟业务数据渲染，**不再**说
+            # 「数值待试运行产生」—— 那是旧口径。反过来也不能说「已接上
+            # 真实数据」—— 那同样是不存在的事实。
+            reply += f"{len(bound)} 个区域已绑定指标并出了示意数值"
+            if placeholder_note:
+                reply += f"，{placeholder_note}"
             reply += "。"
-        elif placeholders:
-            reply += f"{len(placeholders)} 个区域保留占位。"
-        notes = template.get("pendingNotes") or []
-        if notes:
-            # 原因本身已经带句号了，直接拼会变成「。。」。
-            cleaned = [
-                str(note).rstrip("。；;，,") for note in notes[:4] if str(note).strip()
-            ]
-            if cleaned:
-                reply += "占位原因：" + "；".join(cleaned) + "。"
+        elif placeholder_note:
+            reply += f"{placeholder_note}。"
+        reply += pending_notes_reply(template)
         if duplicate:
             reply += "（这一版方案之前已经确认过，直接沿用已生成的草稿，没有重复生成。）"
 
@@ -1760,7 +1912,7 @@ class ReportDesignService:
         else:
             draft_obj = None
 
-        return AgentResponse(
+        response = AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.WAITING_USER_CONFIRM,
             designSessionId=request.context.designSessionId,
@@ -1789,9 +1941,92 @@ class ReportDesignService:
                 "planId": (plan or {}).get("id"),
                 "dataStatus": template.get("dataStatus"),
                 "boundRegions": len(bound),
-                "placeholderRegions": len(placeholders),
+                # 占位区域**分两类**记（能力待接通 / 范围授权），不混算。
+                "capabilityPendingRegions": len(capability_regions),
+                "scopePendingRegions": len(scope_regions),
+                "placeholderRegions": len(capability_regions) + len(scope_regions),
             },
         )
+        # 报表示意载荷在这里统一挂：5 条走到本函数的路径**自动**都带上，
+        # 不用在各调用点各自拼（漏一条 → 那条路径右侧仍是空壳）。
+        return self._attach_report_preview_payload(
+            request,
+            response,
+            definition=draft_obj if draft_obj is not None else draft,
+            plan=plan,
+        )
+
+    def _preview_context_from_session(self, request: AgentRequest) -> dict[str, Any] | None:
+        """会话快照里**已冻结**的示意上下文（没有就 None）。
+
+        冻结规则：同一定义版本（``definitionId + definitionVersion``）跨天、
+        刷新、重启都复用同一份 —— 数字不跳。这里读到的就是第一次确认
+        方案时落下的那一份。
+        """
+        try:
+            record = session_service.repository.get_session(self.session_key(request))
+        except Exception:  # noqa: BLE001
+            logger.exception("[report_design] 读示意上下文失败")
+            return None
+        snapshot = (record.snapshot if record else None) or {}
+        context = snapshot.get("previewContext")
+        return context if isinstance(context, dict) else None
+
+    def _attach_report_preview_payload(
+        self,
+        request: AgentRequest,
+        response: AgentResponse,
+        *,
+        definition: ReportDefinitionDraft | dict[str, Any] | None,
+        plan: dict[str, Any] | None,
+    ) -> AgentResponse:
+        """给响应挂上**报表示意载荷**（草稿阶段就带数字的那一份）。
+
+        载荷的生成入口只有一处（``preview_service.build_report_preview_payload``）
+        —— 将来接真实数据时复用同一处，前端读的还是同一个字段。
+
+        造数失败（定义非法 / 时间窗推不出来 / 粒度解析不了 / 表格没有列）
+        时**明确失败**：不退回空表、不给半份载荷，响应里带明确的错误码与
+        原因。草稿本身已经落库，所以这一轮如实说「示意数据没生成出来」，
+        而不是把整轮说成失败。
+        """
+        definition_dict = _definition_dict(definition)
+        if definition_dict is None:
+            return response
+        try:
+            context = resolve_preview_context(
+                definition_dict,
+                plan=plan,
+                existing=self._preview_context_from_session(request),
+            )
+            response.reportPreviewPayload = build_report_preview_payload(
+                definition_dict, context, plan=plan
+            )
+        except (SimulatedDataError, PreviewContextError) as exc:
+            code = str(getattr(exc, "code", "") or "REPORT_PREVIEW_PAYLOAD_FAILED")
+            # 日志只记**标识**与原因，不记任何模拟数值正文。
+            logger.warning(
+                "[report_design] 示意载荷生成失败 code=%s definitionId=%s",
+                code,
+                (definition_dict.get("metadata") or {})
+                .get("templateBinding", {})
+                .get("definitionId"),
+            )
+            response.reportPreviewPayload = None
+            response.error = AgentError(
+                code=code,
+                message=f"示意数据没有生成出来：{exc}",
+            )
+            # 失败时不能还留着「出了示意数值」—— 同一段正文里先说出了数、
+            # 后说没生成出来，是自相矛盾。把那句改成失败口径，原因单独说明。
+            response.reply = response.reply.replace(
+                "已绑定指标并出了示意数值",
+                "已绑定指标，但示意数据没有生成出来",
+            )
+            if "示意数据没有生成出来" not in response.reply:
+                response.reply += "示意数据没有生成出来"
+            response.reply += f"（原因：{exc}）"
+        return response
 
     @staticmethod
     def _plan_reply(plan: dict[str, Any] | None) -> str:
@@ -1801,7 +2036,7 @@ class ReportDesignService:
         读屏与「只看文本」的场景也不丢信息。
         """
         if not plan:
-            return "已准备好文字方案，请查看右侧方案卡片。"
+            return "已准备好文字方案，请查看左侧对话区里的方案卡片。"
         topic = plan.get("topic") or "报表"
         sections = plan.get("sections") or []
         titles = "、".join(
@@ -1811,7 +2046,10 @@ class ReportDesignService:
         head = f"已根据你的要求整理出文字方案（第 {revision} 版）：{topic}。"
         if titles:
             head += f"包含板块：{titles}。"
-        head += "请在右侧查看完整方案；确认前不会生成模板，也不会取数。"
+        head += (
+            "请在左侧对话区查看完整方案；确认后我会用系统生成的模拟业务数据"
+            "把这份报表渲染出来。"
+        )
         return head
 
     # ---------- 辅助 ----------
@@ -1836,6 +2074,29 @@ class ReportDesignService:
                 continue
             history.append({"role": record.role, "text": text})
         return history
+
+    @staticmethod
+    def _original_request(session_key: str) -> str | None:
+        """会话里用户**最初**的那句原话。
+
+        方案服务要靠它判断「用户明确指定的是哪一块」—— 只给本轮这一句
+        的话，跨轮的原始要求就丢了（比如先说"看最近7天"，后来说"改成
+        表格"，服务端得同时看得到两句）。
+
+        读不到就返回 None：服务端的兜底路径按当前请求推定，不因此失败。
+        """
+        try:
+            records = session_service.repository.list_messages(session_key)
+        except Exception:  # noqa: BLE001
+            logger.exception("[report_design] 读原始请求失败")
+            return None
+        for record in records:
+            if record.role != "user":
+                continue
+            text = (record.content or "").strip()
+            if text and text != "__advance__":
+                return text
+        return None
 
     @staticmethod
     def _plan_emit(emit: Any | None):

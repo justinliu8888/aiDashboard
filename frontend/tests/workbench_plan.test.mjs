@@ -21,6 +21,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 
 const require = createRequire(import.meta.url);
 const Plan = require("../pages/workbench_plan.js");
@@ -300,15 +301,23 @@ test("参考来源显示名称与版本", () => {
   assert.ok(text.includes("结构接近"));
 });
 
-test("未知图表类型原样显示为文本", () => {
-  const { root } = makeRoot();
+test("未知图表类型回落中文兜底，原始值仍按文本保留（不执行）", () => {
+  const { doc, root } = makeRoot();
   Plan.render(root, viewWith({
     reportPlan: {
       ...SAMPLE_PLAN,
       sections: [{ id: "s1", title: "自定义块", metricIntents: [], componentType: "custom_widget" }],
     },
   }), { onAction() {} });
-  assert.ok(textOf(root).includes("custom_widget"));
+
+  // 界面上是中文兜底，不是裸英文 key
+  const tag = oneClass(root, "plan-component-type");
+  assert.equal(tag.textContent, "未知组件类型");
+  assert.ok(!textOf(root).includes("custom_widget"), "界面文字里不该出现裸英文 key");
+  // 原始值仍在，但是**作为文本**存在属性里（不是 HTML，不会被执行）
+  assert.equal(tag.getAttribute("data-plan-component-type"), "custom_widget");
+  assert.equal(tag.getAttribute("title"), "custom_widget");
+  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应该使用 innerHTML");
 });
 
 // ---------------------------------------------------------------- 错误与忙碌
@@ -546,7 +555,8 @@ test("阶段与图表类型的标签映射", () => {
   assert.equal(Plan.componentTypeLabel("pie_chart"), "饼图");
   assert.equal(Plan.componentTypeLabel("table"), "表格");
   assert.equal(Plan.componentTypeLabel("text"), "文字块");
-  assert.equal(Plan.componentTypeLabel("unknown_type"), "unknown_type");
+  // 未知类型回落中文兜底，不再把裸英文 key 露出去（见下面「组件类型的未知值兜底」）。
+  assert.equal(Plan.componentTypeLabel("unknown_type"), "未知组件类型");
 });
 
 test("render 需要一个 DOM 容器，参数不对时明确报错", () => {
@@ -759,4 +769,515 @@ test("折线图区域把取到的点画出来（renderChart 已导出给草稿�
   const text = textOf(root);
   assert.ok(text.includes("2026-10-22"), "应显示横轴标签");
   assert.ok(text.includes("620"), "应显示纵轴数值");
+});
+
+// ---------------------------------------------------------------- 选型与栏目
+//
+// 工单 06（#46）：方案卡片要能显示**板块类型和它的选择理由**，
+// 以及表格板块声明的**栏目**。
+//
+// 字段来自开发规格「跨工单契约」：
+//   - 每个板块定稿携带 displayIntent / explicitComponentType（可空）/ selectionReason；
+//   - 定稿栏目每项有 id / label / fieldRef。
+//
+// 前端**不猜**后端字段：字段不存在就当没有，不按标题猜、不自造默认值。
+
+test("板块显示展示目的与选型理由", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_total",
+          title: "总耗电概览",
+          metricIntents: ["总耗电"],
+          componentType: "metric_card",
+          displayIntent: "total",
+          selectionReason: "看总量，指标卡最直观",
+        },
+      ],
+    },
+  }), {});
+
+  const section = oneClass(root, "plan-section");
+  assert.ok(section.textContent.includes("总量"), "应显示展示目的");
+  assert.ok(section.textContent.includes("看总量，指标卡最直观"), "应显示选型理由");
+  assert.equal(
+    oneClass(root, "plan-display-intent").getAttribute("data-plan-display-intent"),
+    "total"
+  );
+});
+
+test("没有选型字段时什么都不显示（不猜后端字段）", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith(), {});
+
+  assert.equal(byClass(root, "plan-display-intent").length, 0, "没有 displayIntent 就不显示展示目的");
+  assert.equal(byClass(root, "plan-selection-reason").length, 0, "没有 selectionReason 就不显示理由");
+  assert.equal(byClass(root, "plan-explicit-type").length, 0, "没有 explicitComponentType 就不显示指定类型");
+});
+
+test("用户指定的展示类型单独标出，不与系统选型混为一谈", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_rank",
+          title: "设备耗电排名",
+          metricIntents: ["总耗电"],
+          componentType: "bar_chart",
+          displayIntent: "comparison",
+          explicitComponentType: "bar_chart",
+          selectionReason: "用户明确要求用柱状图",
+        },
+      ],
+    },
+  }), {});
+
+  const explicit = oneClass(root, "plan-explicit-type");
+  assert.equal(explicit.getAttribute("data-plan-explicit-type"), "bar_chart");
+  assert.ok(explicit.textContent.includes("柱状图"), "应显示指定类型的中文名");
+  assert.ok(explicit.textContent.includes("用户指定"), "应标明这是用户指定的");
+});
+
+test("表格板块显示它声明的栏目", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_alarm",
+          title: "当前告警列表",
+          metricIntents: ["告警"],
+          componentType: "table",
+          displayIntent: "records",
+          columns: [
+            { id: "col_device", label: "设备名称", fieldRef: "section_alarm.device_name" },
+            { id: "col_level", label: "告警级别", fieldRef: "section_alarm.level" },
+          ],
+        },
+      ],
+    },
+  }), {});
+
+  const columns = byClass(root, "plan-column");
+  assert.equal(columns.length, 2, "应显示 2 个栏目");
+  assert.ok(columns[0].textContent.includes("设备名称"));
+  assert.ok(columns[1].textContent.includes("告警级别"));
+  assert.equal(columns[0].getAttribute("data-plan-column-id"), "col_device");
+  assert.equal(columns[0].getAttribute("data-plan-column-field-ref"), "section_alarm.device_name");
+  // 取值键是技术键：放在 title 里（悬停可见），不和栏目名挤在一行
+  assert.equal(columns[0].getAttribute("title"), "section_alarm.device_name");
+  assert.ok(!columns[0].textContent.includes("section_alarm.device_name"), "取值键不与栏目名挤在一行");
+});
+
+test("方案里没有栏目声明时不显示栏目（不按标题猜列）", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        { id: "section_alarm", title: "当前告警列表", metricIntents: ["告警"], componentType: "table" },
+      ],
+    },
+  }), {});
+
+  assert.equal(byClass(root, "plan-columns").length, 0, "没有声明就不显示栏目");
+});
+
+test("栏目没有显示名时整项跳过（不拿 id 当栏目名）", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_alarm",
+          title: "当前告警列表",
+          metricIntents: ["告警"],
+          componentType: "table",
+          columns: [
+            { id: "col_device", fieldRef: "section_alarm.device_name" },
+            { id: "col_level", label: "告警级别", fieldRef: "section_alarm.level" },
+          ],
+        },
+      ],
+    },
+  }), {});
+
+  const columns = byClass(root, "plan-column");
+  assert.equal(columns.length, 1, "只有有显示名的栏目才显示");
+  assert.ok(columns[0].textContent.includes("告警级别"));
+});
+
+test("选型与栏目里的 HTML 只作为文本显示", () => {
+  const { doc, root } = makeRoot();
+  const nasty = '<img src=x onerror="window.__pwned=9">';
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_alarm",
+          title: "当前告警列表",
+          metricIntents: ["告警"],
+          componentType: "table",
+          displayIntent: "records",
+          selectionReason: nasty,
+          columns: [{ id: "col_device", label: nasty, fieldRef: "section_alarm.device_name" }],
+        },
+      ],
+    },
+  }), {});
+
+  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应该使用 innerHTML");
+  const tags = walk(root).map((node) => node.tagName);
+  assert.ok(!tags.includes("IMG"), "不该由模型文本生成 img 元素");
+  assert.ok(textOf(root).includes(nasty), "模型文本应当原样以文本显示");
+});
+
+test("方案卡片允许换行（左侧 340px 窄栏不溢出）", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith(), {});
+  const style = oneClass(root, "plan-module").getAttribute("style") || "";
+  assert.ok(
+    style.includes("overflow-wrap:anywhere") && style.includes("word-break:break-word"),
+    "方案卡片必须允许长文本换行，否则窄栏会横向溢出"
+  );
+});
+
+test("展示目的的标签映射", () => {
+  assert.equal(Plan.displayIntentLabel("total"), "总量");
+  assert.equal(Plan.displayIntentLabel("trend"), "趋势");
+  assert.equal(Plan.displayIntentLabel("comparison"), "对比");
+  assert.equal(Plan.displayIntentLabel("composition"), "构成");
+  assert.equal(Plan.displayIntentLabel("records"), "明细");
+  assert.equal(Plan.displayIntentLabel(""), "");
+  assert.equal(Plan.displayIntentLabel(null), "");
+});
+
+// ---------------------------------------------------------------- 展示目的的取值域与兜底
+//
+// 工单 02 把 displayIntent 的取值域**封闭**为 5 个：
+//   total / trend / comparison / composition / records（纯说明板块为 null）。
+// 后端将来加新枚举时，前端不许回落英文 key（用户看不懂，而且裸英文正说明
+// 「后端枚举与前端映射没同步」），也不许猜成某个已知取值（那是错误语义）。
+// 兜底必须：显示中文 + 不丢信息 + 原始值可追溯。
+
+const INTENT_SECTIONS = {
+  total: "总量",
+  trend: "趋势",
+  comparison: "对比",
+  composition: "构成",
+  records: "明细",
+};
+
+test("展示目的的五个已知取值各自显示中文", () => {
+  for (const [intent, label] of Object.entries(INTENT_SECTIONS)) {
+    const { root } = makeRoot();
+    Plan.render(root, viewWith({
+      reportPlan: {
+        ...SAMPLE_PLAN,
+        sections: [
+          {
+            id: "section_intent",
+            title: "总耗电概览",
+            metricIntents: ["总耗电"],
+            componentType: "metric_card",
+            displayIntent: intent,
+          },
+        ],
+      },
+    }), {});
+
+    const tag = oneClass(root, "plan-display-intent");
+    assert.equal(tag.textContent, label, `displayIntent=${intent} 应显示「${label}」`);
+    assert.equal(tag.getAttribute("data-plan-display-intent"), intent, "原始取值要留在 data-* 里");
+    assert.equal(tag.getAttribute("title"), null, "已知取值是中文，不需要 title 兜底");
+    assert.ok(Plan.isKnownDisplayIntent(intent), `${intent} 算已知取值`);
+  }
+});
+
+test("展示目的为 null 时不渲染这一项（板块本身照常渲染）", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_note",
+          title: "口径说明",
+          metricIntents: ["总耗电"],
+          componentType: "text",
+          displayIntent: null,
+        },
+      ],
+    },
+  }), {});
+
+  assert.equal(byClass(root, "plan-display-intent").length, 0, "null 展示目的不渲染这一项");
+  assert.equal(byClass(root, "plan-section").length, 1, "板块卡片本身照常渲染");
+  assert.ok(textOf(root).includes("口径说明"), "板块标题照常显示");
+});
+
+test("未知展示目的回落中文兜底，原始取值可追溯", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_rank",
+          title: "设备耗电排名",
+          metricIntents: ["总耗电"],
+          componentType: "bar_chart",
+          displayIntent: "ranking",
+        },
+      ],
+    },
+  }), {});
+
+  const tag = oneClass(root, "plan-display-intent");
+  // 中文：用户看到的是人话，不是裸英文 key
+  assert.equal(tag.textContent, "未知展示目的", "未知取值要显示中文兜底");
+  assert.ok(!tag.textContent.includes("ranking"), "界面文字里不该出现裸英文 key");
+  assert.ok(!/[a-zA-Z]/.test(tag.textContent), "兜底文字里不该有英文字母");
+  // 不丢信息：这一项照常渲染出来（不是整行消失）
+  assert.equal(byClass(root, "plan-section").length, 1, "板块卡片照常渲染");
+  assert.ok(textOf(root).includes("设备耗电排名"), "板块标题照常显示");
+  // 可追溯：原始取值两处都留着
+  assert.equal(tag.getAttribute("data-plan-display-intent"), "ranking", "原始取值要留在 data-* 里");
+  assert.equal(tag.getAttribute("title"), "ranking", "原始取值要能从 title 里查到");
+});
+
+test("未知展示目的不猜成某个已知取值", () => {
+  const knownLabels = Object.values(Plan.DISPLAY_INTENT_LABELS);
+  for (const unknown of ["ranking", "distribution", "Total", "TOTAL", "records "]) {
+    assert.ok(!Plan.isKnownDisplayIntent(unknown), `${unknown} 不算已知取值`);
+    const label = Plan.displayIntentLabel(unknown);
+    assert.equal(label, "未知展示目的", `${unknown} 应走中文兜底`);
+    assert.ok(!knownLabels.includes(label), `${unknown} 不能被猜成某个已知语义`);
+  }
+});
+
+test("兜底标签本身是中文常量", () => {
+  assert.equal(Plan.DISPLAY_INTENT_UNKNOWN_LABEL, "未知展示目的");
+  assert.ok(!/[a-zA-Z]/.test(Plan.DISPLAY_INTENT_UNKNOWN_LABEL), "兜底标签不该含英文字母");
+});
+
+test("未知展示目的里的文本只作为文本显示（不执行模型 HTML）", () => {
+  const { doc, root } = makeRoot();
+  const nasty = '<img src=x onerror="window.__pwned=9">';
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_rank",
+          title: "设备耗电排名",
+          metricIntents: ["总耗电"],
+          componentType: "bar_chart",
+          displayIntent: nasty,
+          selectionReason: nasty,
+        },
+      ],
+    },
+  }), {});
+
+  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应该使用 innerHTML");
+  const tags = walk(root).map((node) => node.tagName);
+  assert.ok(!tags.includes("IMG"), "不该由模型文本生成 img 元素");
+  assert.ok(textOf(root).includes(nasty), "模型文本应当原样以文本显示");
+
+  const tag = oneClass(root, "plan-display-intent");
+  assert.equal(tag.textContent, "未知展示目的", "未知取值仍然显示中文兜底");
+  assert.equal(tag.getAttribute("title"), nasty, "原始取值原样留在 title 里");
+});
+
+// ---------------------------------------------------------------- 组件类型的未知值兜底
+//
+// 与展示目的同一类问题：组件类型也是封闭枚举，未知取值不该回落裸英文 key。
+// 兜底要求同样是四条：中文可见、不丢信息、不猜、原始值可追溯。
+//
+// ⚠️ 显示与逻辑必须分离：componentType 在别处还当判断用
+// （renderChart 用原始值决定画 SVG 折线还是柱条），显示兜底不许改到那条路。
+
+const COMPONENT_TYPE_LABELS_EXPECTED = {
+  metric_card: "指标卡",
+  line_chart: "折线图",
+  bar_chart: "柱状图",
+  pie_chart: "饼图",
+  table: "表格",
+  text: "文字块",
+};
+
+test("组件类型的已知取值译法不变（锁死）", () => {
+  for (const [type, label] of Object.entries(COMPONENT_TYPE_LABELS_EXPECTED)) {
+    const { root } = makeRoot();
+    Plan.render(root, viewWith({
+      reportPlan: {
+        ...SAMPLE_PLAN,
+        sections: [
+          { id: "section_type", title: "板块", metricIntents: ["总耗电"], componentType: type },
+        ],
+      },
+    }), {});
+
+    const tag = oneClass(root, "plan-component-type");
+    assert.equal(tag.textContent, label, `componentType=${type} 应显示「${label}」`);
+    assert.equal(tag.getAttribute("data-plan-component-type"), type, "原始取值要留在 data-* 里");
+    assert.equal(tag.getAttribute("title"), null, "已知取值是中文，不需要 title 兜底");
+    assert.ok(Plan.isKnownComponentType(type), `${type} 算已知取值`);
+  }
+});
+
+test("未知组件类型回落中文兜底，原始取值可追溯", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        { id: "section_type", title: "热力分布", metricIntents: ["总耗电"], componentType: "heatmap" },
+      ],
+    },
+  }), {});
+
+  const tag = oneClass(root, "plan-component-type");
+  // 中文：用户看到的是人话，不是裸英文 key
+  assert.equal(tag.textContent, "未知组件类型", "未知类型要显示中文兜底");
+  assert.ok(!tag.textContent.includes("heatmap"), "界面文字里不该出现裸英文 key");
+  assert.ok(!/[a-zA-Z]/.test(tag.textContent), "兜底文字里不该有英文字母");
+  // 不丢信息：标签照常渲染出来（不是整行不渲染）
+  assert.equal(byClass(root, "plan-section").length, 1, "板块卡片照常渲染");
+  assert.ok(textOf(root).includes("热力分布"), "板块标题照常显示");
+  // 可追溯：原始取值两处都留着
+  assert.equal(tag.getAttribute("data-plan-component-type"), "heatmap", "原始取值要留在 data-* 里");
+  assert.equal(tag.getAttribute("title"), "heatmap", "原始取值要能从 title 里查到");
+});
+
+test("未知组件类型不猜成某个已知类型", () => {
+  const knownLabels = Object.values(Plan.COMPONENT_TYPE_LABELS);
+  for (const unknown of ["heatmap", "gauge", "Metric_Card", "METRIC_CARD", "table "]) {
+    assert.ok(!Plan.isKnownComponentType(unknown), `${unknown} 不算已知取值`);
+    const label = Plan.componentTypeLabel(unknown);
+    assert.equal(label, "未知组件类型", `${unknown} 应走中文兜底`);
+    assert.ok(!knownLabels.includes(label), `${unknown} 不能被猜成某个已知语义`);
+  }
+});
+
+test("组件类型的兜底标签本身是中文常量", () => {
+  assert.equal(Plan.COMPONENT_TYPE_UNKNOWN_LABEL, "未知组件类型");
+  assert.ok(!/[a-zA-Z]/.test(Plan.COMPONENT_TYPE_UNKNOWN_LABEL), "兜底标签不该含英文字母");
+  // 与展示目的的兜底是两句不同的话：两个标签并排时各自说得清是哪个维度。
+  assert.notEqual(Plan.COMPONENT_TYPE_UNKNOWN_LABEL, Plan.DISPLAY_INTENT_UNKNOWN_LABEL);
+});
+
+test("用户指定的未知组件类型也走中文兜底，原始取值可追溯", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_type",
+          title: "热力分布",
+          metricIntents: ["总耗电"],
+          componentType: "metric_card",
+          explicitComponentType: "heatmap",
+        },
+      ],
+    },
+  }), {});
+
+  const tag = oneClass(root, "plan-explicit-type");
+  assert.ok(tag.textContent.includes("用户指定"), "仍要标明这是用户指定的");
+  assert.ok(tag.textContent.includes("未知组件类型"), "未知类型要显示中文兜底");
+  assert.ok(!tag.textContent.includes("heatmap"), "界面文字里不该出现裸英文 key");
+  assert.equal(tag.getAttribute("data-plan-explicit-type"), "heatmap", "原始取值要留在 data-* 里");
+  assert.equal(tag.getAttribute("title"), "heatmap", "原始取值要能从 title 里查到");
+});
+
+test("未知组件类型里的文本只作为文本显示（不执行模型 HTML）", () => {
+  const { doc, root } = makeRoot();
+  const nasty = '<img src=x onerror="window.__pwned=9">';
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        { id: "section_type", title: "热力分布", metricIntents: ["总耗电"], componentType: nasty },
+      ],
+    },
+  }), {});
+
+  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应该使用 innerHTML");
+  const tags = walk(root).map((node) => node.tagName);
+  assert.ok(!tags.includes("IMG"), "不该由模型文本生成 img 元素");
+
+  const tag = oneClass(root, "plan-component-type");
+  assert.equal(tag.textContent, "未知组件类型", "未知类型仍然显示中文兜底");
+  assert.equal(tag.getAttribute("title"), nasty, "原始取值原样留在 title 里");
+});
+
+test("renderChart 的类型判断读原始 componentType（显示兜底不改渲染逻辑）", () => {
+  // 文档桩补上 createElementNS：SVG 分支的另一个前提条件也满足，
+  // 于是「走哪个分支」完全由 componentType 的**原始值**决定。
+  const { doc, root } = makeRoot();
+  const svgNodes = [];
+  doc.createElementNS = (_ns, tagName) => {
+    const node = new FakeElement(tagName, doc);
+    svgNodes.push(node);
+    return node;
+  };
+  const data = { xLabels: ["2026-10-22"], yValues: [500], unit: "kWh" };
+
+  const lineNode = Plan.renderChart(doc, { title: "折线", componentType: "line_chart", data });
+  assert.ok(svgNodes.length > 0, "line_chart 应走 SVG 折线分支");
+
+  svgNodes.length = 0;
+  const unknownNode = Plan.renderChart(doc, { title: "未知类型", componentType: "heatmap", data });
+  assert.equal(svgNodes.length, 0, "未知 componentType 不该被当成 line_chart 落进 SVG 分支");
+
+  root.appendChild(lineNode);
+  root.appendChild(unknownNode);
+  const text = textOf(root);
+  // 兜底标签只出现在「显示标签」这一层，不许渗进渲染结果。
+  assert.ok(!text.includes("未知组件类型"), "渲染结果里不该混进显示标签");
+  assert.ok(!text.includes("heatmap"), "渲染结果里不该出现裸英文 key");
+  assert.ok(text.includes("2026-10-22"), "数据点照常画出来");
+});
+
+// ---------------------------------------------------------------- 工作台页面结构
+//
+// 工单 06（#46）：文字方案移到左侧对话区，右侧报表面板不再出现文字方案。
+//
+// 这一层是**静态存在性检查**：页面骨架与挂载点由 workbench.html / workbench.js 决定，
+// 没有浏览器就跑不了交互，这里守住「右侧不再声明方案容器」「方案挂进左侧对话流」两条。
+
+const WORKBENCH_HTML = readFileSync(new URL("../pages/workbench.html", import.meta.url), "utf8");
+const WORKBENCH_JS = readFileSync(new URL("../pages/workbench.js", import.meta.url), "utf8");
+
+test("右侧报表面板不再声明文字方案容器", () => {
+  const right = WORKBENCH_HTML.split("右：报表预览区")[1] || "";
+  assert.ok(right.length > 0, "应能在页面里定位到右侧报表面板");
+  assert.ok(!right.includes('id="plan-root"'), "右侧不再声明方案容器");
+  assert.ok(!right.includes('id="plan-bubble"'), "右侧不再声明方案气泡");
+});
+
+test("左侧对话区仍然存在（方案的落点）", () => {
+  assert.ok(WORKBENCH_HTML.includes('id="chat-scroll"'), "左侧对话区应当存在");
+});
+
+test("工作台把方案挂进左侧对话流，而不是页面里的静态容器", () => {
+  assert.ok(
+    !WORKBENCH_JS.includes('$("plan-root")'),
+    "方案容器不再由页面静态声明，主工作台自己建一条 AI 气泡承载它"
+  );
+  assert.ok(
+    /chatScroll\.appendChild\(planBubble\)/.test(WORKBENCH_JS),
+    "方案气泡应当挂到左侧对话流（#chat-scroll）里"
+  );
 });

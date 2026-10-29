@@ -1,0 +1,171 @@
+{
+  "baseDir": "..",
+  "serve": "..",
+  "outDir": "../.selfcheck/tmpl-07-render",
+  "waitMs": 1500,
+  "timeout": 10000,
+  "ignore": ["modao.cc", "/health", "/api/sessions"],
+  "flows": [
+    {
+      "name": "07-01 草稿阶段：右侧按载荷出图出表 + 角标 + 「示意」徽标",
+      "path": "/frontend/tests/render_harness.html",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#preview-root [data-region-badge]" },
+        { "wait": 300 },
+
+        { "assertVisible": "#preview-root [data-simulated-note]" },
+        { "assertText": "模拟业务数据" },
+        { "assertText": "接入真实数据后会自动替换" },
+
+        { "assertCount": "#preview-root [data-region-badge]", "count": 5, "op": "===" },
+        { "assertText": "示意" },
+
+        { "assertText": "总耗电" },
+        { "assertText": "306.1" },
+        { "assertText": "kWh" },
+        { "assertText": "总电费" },
+        { "assertText": "244.88" },
+        { "assertText": "元" },
+        { "assertText": "较上一周期" },
+
+        { "assertText": "能力待接通" },
+        { "assertText": "PUE" },
+        { "assertCount": "#preview-root [data-region-capability]", "count": 1, "op": "===" },
+
+        { "assertVisible": "#preview-root svg" },
+        { "assertText": "单位：kWh" },
+
+        { "assertText": "设备耗电对比" },
+        { "assertText": "A-2 机架" },
+        { "assertCount": "#preview-root [data-chart-unit]", "count": 1, "op": ">=" },
+        { "assertCount": "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit]", "count": 1, "op": "===" },
+        { "assertCount": "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit=\"kWh\"]", "count": 1, "op": "===" },
+
+        { "assertText": "设备名称" },
+        { "assertText": "A-1 机架" },
+        { "assertText": "A-3 机架" },
+        { "assertCount": "#preview-root table tbody tr", "count": 3, "op": "===" },
+
+        { "assertNotText": "暂无数值" },
+        { "assertNotText": "数据待连接" },
+        { "assertNotText": "图表占位" },
+        { "assertNotText": "表格样例占位" },
+        { "assertNotText": "仅显示前" },
+        { "assertNotText": "已校验 / 待接真数" },
+
+        { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "simulated" },
+        { "screenshot": "07-01-草稿阶段示意" },
+
+        { "eval": "(() => { const root = document.querySelector('#preview-root'); const wide = Array.from(root.querySelectorAll('*')).filter(el => el.getBoundingClientRect().right > root.getBoundingClientRect().right + 1); return root.scrollWidth <= root.clientWidth + 1 && wide.length === 0; })()" },
+
+        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_total\"] .text-3xl'); return v ? v.textContent : ''; })()", "save": "totalBefore" },
+        { "eval": "(() => { const rows = Array.from(document.querySelectorAll('#preview-root table tbody tr')).map(tr => tr.textContent.trim()); return rows.join('|'); })()", "save": "rowsBefore" }
+      ]
+    },
+    {
+      "name": "07-02 校验中 / 校验失败：不显示成功徽标，示意保持可见，数字不动",
+      "path": "/frontend/tests/render_harness.html",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#preview-root [data-region-badge]" },
+
+        { "eval": "window.__renderDemo('pending')" },
+        { "wait": 300 },
+        { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "simulated" },
+        { "assertText": "示意" },
+        { "assertNotText": "已校验 / 待接真数" },
+        { "assertText": "306.1" },
+        { "screenshot": "07-02-校验中仍是示意" },
+
+        { "eval": "(() => { session.state = 'VALIDATION_FAILED'; updateMeta(); return true; })()" },
+        { "wait": 200 },
+        { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "simulated" },
+        { "assertText": "示意" },
+        { "assertNotText": "已校验 / 待接真数" },
+        { "assertText": "306.1" },
+        { "screenshot": "07-03-校验失败仍是示意" }
+      ]
+    },
+    {
+      "name": "07-03 校验成功：徽标变「已校验 / 待接真数」，屏幕上的数字不动",
+      "path": "/frontend/tests/render_harness.html",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#preview-root [data-region-badge]" },
+
+        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_total\"] .text-3xl'); return v ? v.textContent : ''; })()", "save": "totalBefore" },
+        { "eval": "(() => { const rows = Array.from(document.querySelectorAll('#preview-root table tbody tr')).map(tr => tr.textContent.trim()); return rows.join('|'); })()", "save": "rowsBefore" },
+
+        { "eval": "window.__renderDemo('validated')" },
+        { "wait": 300 },
+        { "assertAttr": "#draft-badge", "name": "data-draft-badge", "op": "==", "value": "validated" },
+        { "assertText": "已校验 / 待接真数" },
+        { "assertText": "306.1" },
+
+        { "eval": "(() => { const v = document.querySelector('#preview-root [data-region-id=\"region_total\"] .text-3xl'); return v ? v.textContent : ''; })()", "save": "totalAfter" },
+        { "eval": "(() => { const rows = Array.from(document.querySelectorAll('#preview-root table tbody tr')).map(tr => tr.textContent.trim()); return rows.join('|'); })()", "save": "rowsAfter" },
+        { "eval": "totalBefore === totalAfter" },
+        { "eval": "rowsBefore === rowsAfter" },
+        { "screenshot": "07-04-已校验徽标且数字不变" }
+      ]
+    },
+    {
+      "name": "07-04 表格行被截断：标注「仅显示前 N 行」，行和与总量不等要说清楚",
+      "path": "/frontend/tests/render_harness.html",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#preview-root [data-region-badge]" },
+
+        { "eval": "window.__renderDemo('truncated')" },
+        { "wait": 300 },
+        { "assertVisible": "#preview-root [data-table-truncated]" },
+        { "assertText": "仅显示前 2 行" },
+        { "assertCount": "#preview-root table tbody tr", "count": 2, "op": "===" },
+        { "assertText": "各行之和小于报表总量" },
+        { "screenshot": "07-05-表格截断标注" }
+      ]
+    },
+    {
+      "name": "07-05 过期版本的载荷不覆盖新模板",
+      "path": "/frontend/tests/render_harness.html",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#preview-root [data-region-badge]" },
+
+        { "eval": "(() => { const stale = JSON.parse(JSON.stringify(session.reportPreviewPayload)); stale.previewContext.definitionId = 'def_other_999'; stale.regions[1].payload.value = 99999; const accepted = applyReportPreviewPayload(stale); return accepted === false && session.reportPreviewPayload.previewContext.definitionId === 'def_demo_001'; })()" },
+        { "eval": "document.querySelector('#preview-root').textContent.includes('99999') === false" },
+        { "assertText": "306.1" }
+      ]
+    },
+    {
+      "name": "07-06 ECharts 路径：单位标记与纵轴名都来自载荷（CDN 不可达时降级到 SVG 兜底，结构断言仍成立）",
+      "path": "/frontend/tests/render_harness.html?echarts=1",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#preview-root [data-region-badge]" },
+        { "wait": 300 },
+
+        { "eval": "window.__chartBackend()", "save": "chartBackend" },
+        { "eval": "chartBackend === 'echarts' || chartBackend === 'svg'" },
+        { "eval": "document.body.getAttribute('data-chart-backend') === chartBackend" },
+
+        { "assertText": "单位：kWh" },
+        { "assertCount": "#preview-root [data-chart-unit]", "count": 1, "op": ">=" },
+        { "assertCount": "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit]", "count": 1, "op": "===" },
+        { "assertCount": "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit=\"kWh\"]", "count": 1, "op": "===" },
+        { "assertCount": "#preview-root [data-region-badge]", "count": 5, "op": "===" },
+        { "assertCount": "#preview-root table tbody tr", "count": 3, "op": "===" },
+        { "assertText": "306.1" },
+        { "assertText": "244.88" },
+        { "assertText": "总耗电" },
+        { "assertText": "PUE" },
+
+        { "eval": "chartBackend !== 'echarts' || document.querySelectorAll('#preview-root canvas').length >= 1" },
+        { "eval": "chartBackend !== 'echarts' || document.querySelectorAll('#preview-root [data-chart-unit]').length === document.querySelectorAll('#preview-root canvas').length" },
+        { "eval": "chartBackend !== 'svg' || document.querySelectorAll('#preview-root svg').length >= 1" },
+        { "screenshot": "07-06-ECharts 路径" }
+      ]
+    }
+  ]
+}

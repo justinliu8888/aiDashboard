@@ -60,6 +60,7 @@ from app.services.preview_service import preview_service
 from app.services.report_design_service import (
     is_pure_confirmation,
     is_vague_approval,
+    placeholder_reply,
     report_design_service,
 )
 # 判定与兜底策略放在 query_answer_service（回答文本策略的家）。
@@ -2300,14 +2301,15 @@ class AgentService:
             f"{record.snapshot.totalEnergyKwh} kWh。"
         )
         if (definition_dict.get("metadata") or {}).get("templateBinding"):
-            placeholders = sum(
-                (region.get("templateBinding") or {}).get("dataStatus") == "placeholder"
-                for region in definition_dict.get("regions", [])
-            )
+            # 占位区域**分两类**说：能力待接通 vs 范围授权（规格 #46 第 246 行）。
+            # 授权类不是能力缺失 —— 不能混算成「能力尚未接通」。
+            placeholder_note = placeholder_reply(definition_dict.get("regions") or [])
             reply = f"预览已生成（{preview.reportRunId}），按已确认模板的各区域口径展示。"
-            if placeholders:
-                reply += f"{placeholders} 个区域仍保留占位与原因，没有替它们生成数值。"
-            reply += "已接数区域使用能耗 Mock 模拟数据，非生产事实表。"
+            if placeholder_note:
+                # ADR 0004 之后口径反转：草稿阶段就已经用模拟业务数据渲染，
+                # 这里不再说「保留占位、没有替它们生成数值」。
+                reply += f"{placeholder_note}。"
+            reply += "本次试运行同样使用能耗模拟数据，不是生产事实表。"
         return AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.PREVIEW_READY,

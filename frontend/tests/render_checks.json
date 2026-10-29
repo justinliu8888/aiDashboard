@@ -1,0 +1,101 @@
+{
+  "baseDir": "../..",
+  "serve": "../..",
+  "outDir": "../../.selfcheck/tmpl-07-render",
+  "waitMs": 1500,
+  "ignore": ["modao.cc"],
+  "pages": [
+    {
+      "name": "工单07-harness-草稿面板按载荷渲染",
+      "path": "/frontend/tests/render_harness.html",
+      "title": "工单 07 自检 harness",
+      "waitMs": 2000,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#preview-root",
+        "#preview-root [data-simulated-note]",
+        "#preview-root [data-region-badge]",
+        "#preview-root [data-region-capability]",
+        "#preview-root [data-chart-unit]",
+        "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit]",
+        "#preview-root table",
+        "#preview-root table tbody tr",
+        "#preview-root svg",
+        "#draft-badge"
+      ],
+      "texts": [
+        "模拟业务数据",
+        "总耗电",
+        "306.1",
+        "kWh",
+        "总电费",
+        "244.88",
+        "能力待接通",
+        "PUE",
+        "耗电趋势",
+        "设备耗电排名",
+        "A-1 机架",
+        "示意"
+      ],
+      "counts": [
+        "#preview-root [data-region-badge]>=5",
+        "#preview-root [data-region-capability]>=1",
+        "#preview-root [data-chart-unit]>=1",
+        "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit]==1",
+        "#preview-root table tbody tr>=3",
+        "#preview-root svg>=1"
+      ]
+    },
+    {
+      "name": "工单07-harness-ECharts 路径（CDN 可达时走真图表；不可达时退回 SVG 兜底，结构断言仍成立）",
+      "path": "/frontend/tests/render_harness.html?echarts=1",
+      "title": "工单 07 自检 harness · 草稿面板按载荷渲染",
+      "waitMs": 3000,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#preview-root",
+        "#preview-root [data-region-badge]",
+        "#preview-root [data-chart-unit]",
+        "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit]",
+        "#preview-root table",
+        "#preview-root table tbody tr",
+        "#draft-badge"
+      ],
+      "texts": [
+        "单位：kWh",
+        "总耗电",
+        "306.1",
+        "244.88",
+        "耗电趋势",
+        "设备耗电对比"
+      ],
+      "counts": [
+        "#preview-root [data-region-badge]>=5",
+        "#preview-root [data-chart-unit]>=1",
+        "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit]==1",
+        "#preview-root table tbody tr>=3"
+      ]
+    },
+    {
+      "name": "workbench-页面仍然正常加载",
+      "path": "/frontend/pages/workbench.html",
+      "title": "AI 报表生成工作台",
+      "waitMs": 2500,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#chat-scroll",
+        "#preview-root",
+        "#preview-root [data-preview-empty-hint]",
+        "#draft-badge"
+      ],
+      "texts": [
+        "AI 报表助理",
+        "还没有草稿"
+      ],
+      "counts": [
+        "#chat-scroll>=1",
+        "#preview-root>=1"
+      ]
+    }
+  ]
+}

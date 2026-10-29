@@ -1,0 +1,173 @@
+{
+  "baseDir": "..",
+  "serve": "..",
+  "outDir": "../.selfcheck/tmpl-seam-render",
+  "waitMs": 1500,
+  "timeout": 10000,
+  "ignore": [
+    "modao.cc",
+    "/health",
+    "/api/sessions"
+  ],
+  "flows": [
+    {
+      "name": "seam-01 真实后端载荷：前端收得下、渲染得出（指标卡、表格、图表、单位、能力标记）",
+      "path": "/frontend/tests/seam_harness.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "waitFor": "body[data-harness-ready=\"true\"]"
+        },
+        {
+          "wait": 300
+        },
+        {
+          "assertAttr": "body",
+          "name": "data-seam-accepted",
+          "op": "==",
+          "value": "true"
+        },
+        {
+          "assertCount": "#preview-root [data-region-badge]",
+          "count": 4,
+          "op": "==="
+        },
+        {
+          "assertText": "模拟业务数据"
+        },
+        {
+          "assertText": "接入真实数据后会自动替换"
+        },
+        {
+          "assertText": "示意"
+        },
+        {
+          "assertAttr": "#draft-badge",
+          "name": "data-draft-badge",
+          "op": "==",
+          "value": "simulated"
+        },
+        {
+          "eval": "(() => { const r = window.__seamRegion('METRIC_CARD', '元'); if (!r) return false; const t = window.__seamText(r.regionId); return t.includes(window.__seamExpected(r)) && t.includes('元'); })()"
+        },
+        {
+          "eval": "(() => { const r = window.__seamRegion('METRIC_CARD', ''); if (!r) return false; const t = window.__seamText(r.regionId); return t.includes(window.__seamExpected(r)) && !t.includes('kWh'); })()"
+        },
+        {
+          "eval": "(() => { const r = window.__seamRegion('METRIC_CARD', '元'); if (!r) return false; return !window.__seamText(r.regionId).includes('kWh'); })()"
+        },
+        {
+          "assertVisible": "#preview-root [data-region-capability]"
+        },
+        {
+          "assertText": "能力待接通"
+        },
+        {
+          "eval": "(() => { const notes = Array.from(document.querySelectorAll('#preview-root [data-region-capability]')).map(n => n.textContent).join(' | '); if (!notes) return false; const pending = (window.__seamFixture.payload.regions || []).flatMap(r => (r.payload.metrics || []).filter(m => m.capabilityPending === true)); if (!pending.length) return false; return pending.every(m => notes.includes(m.label) && notes.includes(m.pendingReason)); })()"
+        },
+        {
+          "assertVisible": "#preview-root svg"
+        },
+        {
+          "eval": "(() => { const r = window.__seamRegion('CHART'); if (!r) return false; const t = window.__seamText(r.regionId); return t.includes('单位：' + r.payload.unit) && t.includes(r.payload.yValues.length + ' 个数据点') && t.includes(r.payload.xLabels[0]); })()"
+        },
+        {
+          "eval": "(() => { const r = window.__seamRegion('TABLE'); if (!r) return false; const card = document.querySelector('#preview-root [data-region-id=\"' + r.regionId + '\"]'); const table = card.querySelector('table'); if (!table) return false; const offset = r.payload.rowNumber ? 1 : 0; const head = Array.from(table.querySelectorAll('thead th')).map(th => th.textContent.trim()); const colsOk = r.payload.columns.every((c, i) => (head[i + offset] || '').includes(c.label)); const trs = table.querySelectorAll('tbody tr'); const cells = trs[0] ? trs[0].querySelectorAll('td') : []; const first = r.payload.rows[0]; const cellOk = r.payload.columns.every((c, i) => (cells[i + offset] || {}).textContent === String(first[c.fieldRef])); return colsOk && cellOk && trs.length === r.payload.rows.length; })()"
+        },
+        {
+          "eval": "(() => { const r = window.__seamRegion('TABLE'); if (!r) return false; const card = document.querySelector('#preview-root [data-region-id=\"' + r.regionId + '\"]'); const cells = card.querySelectorAll('tbody tr td'); return cells.length === r.payload.rows.length * r.payload.columns.length + (r.payload.rowNumber ? r.payload.rows.length : 0); })()"
+        },
+        {
+          "screenshot": "seam-01-真实载荷渲染"
+        }
+      ]
+    },
+    {
+      "name": "seam-02 重新读取会话：重新生成的载荷数字与确认那轮完全一致",
+      "path": "/frontend/tests/seam_harness.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "waitFor": "body[data-harness-ready=\"true\"]"
+        },
+        {
+          "wait": 300
+        },
+        {
+          "eval": "(() => { const f = window.__seamFixture; const norm = p => (p.regions || []).map(r => r.regionId + ':' + JSON.stringify(r.payload)).join('|'); return norm(f.payload) === norm(f.stageRestorePayload); })()"
+        },
+        {
+          "eval": "(() => { const f = window.__seamFixture; const a = f.payload.previewContext; const b = f.stageRestorePayload.previewContext; return JSON.stringify(a) === JSON.stringify(b); })()"
+        },
+        {
+          "eval": "window.__seamDemo('restore')"
+        },
+        {
+          "wait": 300
+        },
+        {
+          "assertAttr": "body",
+          "name": "data-seam-accepted",
+          "op": "==",
+          "value": "true"
+        },
+        {
+          "assertCount": "#preview-root [data-region-badge]",
+          "count": 4,
+          "op": "==="
+        },
+        {
+          "eval": "(() => { const f = window.__seamFixture; return f.payload.regions.every(r => { const t = window.__seamText(r.regionId); if (!t) return false; if (r.componentType === 'METRIC_CARD') return t.includes(window.__seamExpected(r)); return true; }); })()"
+        },
+        {
+          "eval": "(() => { const r = window.__seamRegion('CHART'); if (!r) return false; const t = window.__seamText(r.regionId); return t.includes('单位：' + r.payload.unit) && t.includes(r.payload.yValues.length + ' 个数据点'); })()"
+        },
+        {
+          "screenshot": "seam-02-恢复会话数字一致"
+        }
+      ]
+    },
+    {
+      "name": "seam-03 接缝断掉时：载荷被丢弃、页面回到空态（harness 能验出回归）",
+      "path": "/frontend/tests/seam_harness.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "waitFor": "body[data-harness-ready=\"true\"]"
+        },
+        {
+          "wait": 300
+        },
+        {
+          "eval": "window.__seamDemo('dropped')"
+        },
+        {
+          "wait": 300
+        },
+        {
+          "assertAttr": "body",
+          "name": "data-seam-accepted",
+          "op": "==",
+          "value": "false"
+        },
+        {
+          "assertCount": "#preview-root [data-region-badge]",
+          "count": 0,
+          "op": "==="
+        },
+        {
+          "assertVisible": "#preview-root [data-preview-empty-hint]"
+        },
+        {
+          "assertText": "草稿已保存，示意数据还没生成"
+        },
+        {
+          "eval": "(() => { const r = window.__seamRegion('METRIC_CARD'); if (!r) return false; return !document.querySelector('#preview-root').textContent.includes(window.__seamExpected(r)); })()"
+        },
+        {
+          "screenshot": "seam-03-接缝断掉载荷被丢"
+        }
+      ]
+    }
+  ]
+}

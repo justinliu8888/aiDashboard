@@ -36,6 +36,51 @@ class ComponentType(str, Enum):
 #: 模型适配层、模板生成层、草稿转换层都从这里取，不要再各抄一份（#39）。
 COMPONENT_TYPE_VALUES: tuple[str, ...] = tuple(item.value for item in ComponentType)
 
+
+class DisplayIntent(str, Enum):
+    """板块的**展示目的**：用户想看什么，不是用哪种图看。
+
+    模型给的是语义候选，服务端据此定稿组件类型（20261029 规格「跨工单契约」）：
+    用户明确指定 > 按展示目的映射 > 模型原选。
+
+    取值与需求稿 3.3 的对应关系一一对应：
+
+    - ``total``       看总量或关键指标 → 指标卡
+    - ``trend``       看随时间的变化 → 趋势图
+    - ``comparison``  比较不同对象或排名 → 柱状图
+    - ``composition`` 看构成或占比 → 占比图
+    - ``records``     看具体记录和属性 → 表格
+    """
+
+    TOTAL = "total"
+    TREND = "trend"
+    COMPARISON = "comparison"
+    COMPOSITION = "composition"
+    RECORDS = "records"
+
+
+#: 展示目的的合法取值集合。唯一来源是上面的 ``DisplayIntent`` 枚举。
+DISPLAY_INTENT_VALUES: tuple[str, ...] = tuple(item.value for item in DisplayIntent)
+
+
+class GrainUnit(str, Enum):
+    """既有时间粒度枚举：MINUTE / HOUR / DAY / WEEK / MONTH。
+
+    与工具层（``check_capability_tool`` / ``build_definition_draft_tool``）
+    的取值一致，不另起一套。方案里的 ``requirements.grainUnit`` 与
+    **时间范围单位是两回事**：范围是「最近 7 天」，粒度是「按天」。
+    """
+
+    MINUTE = "MINUTE"
+    HOUR = "HOUR"
+    DAY = "DAY"
+    WEEK = "WEEK"
+    MONTH = "MONTH"
+
+
+#: 粒度的合法取值集合。唯一来源是上面的 ``GrainUnit`` 枚举。
+GRAIN_UNIT_VALUES: tuple[str, ...] = tuple(item.value for item in GrainUnit)
+
 #: 纯说明板块的组件类型：它不需要指标意图（#39 硬要求「纯说明板块明确声明为文本」）。
 TEXT_COMPONENT_TYPE = ComponentType.TEXT.value
 
@@ -167,6 +212,55 @@ class PlanRevisionConflictError(ReportPlanError):
         self.actual_revision = actual_revision
 
 
+class PlanClarificationRequired(ReportPlanError):
+    """方案里有一处必须由用户拍板，服务端不替用户猜。
+
+    ``question`` 就是要塞给用户的那句**具体**问题。编排层（05）据此走
+    **澄清追问通道**：问题出现在左侧对话区，用户回答后再完善方案、
+    再让用户确认。
+
+    出现这条错误的前提是「猜错会影响这张表 / 这块板块的用途」——
+    「没有真实数据」永远不是追问的理由。
+    """
+
+    code = "PLAN_CLARIFICATION_REQUIRED"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        question: str | None = None,
+        section_id: str | None = None,
+        code: str | None = None,
+    ) -> None:
+        super().__init__(message, code=code)
+        self.question = question or message
+        self.section_id = section_id
+
+
+class PlanColumnsUnresolvedError(ReportPlanError):
+    """表格栏目修不了：模型给的结构不合法，补齐也失败。
+
+    这条错误**不是**给用户的设计问题，是技术问题：不能把模型写坏的
+    JSON 结构变成「请你设计这张表」。编排层（05）据此明确报生成失败
+    并允许重试，绝不给一张空表还宣称成功。
+    """
+
+    code = "PLAN_COLUMNS_UNRESOLVED"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        section_id: str | None = None,
+        section_title: str | None = None,
+        code: str | None = None,
+    ) -> None:
+        super().__init__(message, code=code)
+        self.section_id = section_id
+        self.section_title = section_title
+
+
 def _format_validation_error(exc: ValidationError) -> str:
     """把 pydantic 的错误整理成一行可读信息。"""
     parts: list[str] = []
@@ -187,7 +281,18 @@ def _require_text(value: str) -> str:
     return text
 
 
+def _require_key(value: str) -> str:
+    """稳定键（栏目 id / 取值键）：非空、不带空白。"""
+    text = _require_text(value)
+    if not _KEY_PATTERN.match(text):
+        raise ValueError("不能包含空白字符")
+    return text
+
+
 # ---------- 危险执行内容 ----------
+
+#: 稳定键的合法形态：非空、不带空白。取值键要能当行对象的键用。
+_KEY_PATTERN = re.compile(r"^\S+$")
 
 # 方案里一旦出现这些字段名，说明模型把「执行绑定」塞进了设计稿：
 # 数据源、调度、SQL、脚本、凭证都不属于方案契约。
@@ -408,6 +513,10 @@ class PlanRequirements(_PlanModel):
     subject: str | None = None
     timeRange: str | None = None
     exclusions: list[str] = Field(default_factory=list)
+    #: 时间粒度（既有粒度枚举）。**与 timeRange 的单位不是一回事**：
+    #: ``timeRange`` 是范围（「最近 7 天」），``grainUnit`` 是粒度（「按天」）。
+    #: 用户没说时由服务端在确认前推定，并在假设里写明。
+    grainUnit: GrainUnit | None = None
 
     @field_validator("metrics", "exclusions")
     @classmethod
@@ -419,6 +528,97 @@ class PlanRequirements(_PlanModel):
     def _check_optional_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
+        return _require_text(value)
+
+
+class PlanColumnFormat(_PlanModel):
+    """列的**展示格式**：精度与单位标注。
+
+    - ``kind``：数值呈现方式（``NUMBER`` 等）。
+    - ``precision``：小数位数。
+    - ``unitLabel``：表头单位标注（例如 ``kWh``）。
+
+    字段封闭（``extra="forbid"``）：方案侧只认这三个键 —— 模型多写的键
+    在栏目归一时丢掉，不进契约。
+    """
+
+    kind: str = "NUMBER"
+    precision: int | None = None
+    unitLabel: str | None = None
+
+    @field_validator("kind")
+    @classmethod
+    def _check_kind(cls, value: str) -> str:
+        return _require_text(value)
+
+    @field_validator("precision")
+    @classmethod
+    def _check_precision(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if value < 0:
+            raise ValueError("不能是负数")
+        return value
+
+    @field_validator("unitLabel")
+    @classmethod
+    def _check_unit_label(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _require_text(value)
+
+
+class PlanColumnCandidate(_PlanModel):
+    """模型给出的栏目候选：**可以只有显示名**。
+
+    模型不负责分配稳定身份 —— ``id`` 与 ``fieldRef`` 由服务端定稿时补齐
+    （20261029 规格「栏目与取值键」）。模型带上 ``id`` 是为了在修改方案时
+    保住栏目身份（改列名不换身份）。
+    """
+
+    id: str | None = None
+    label: str
+    fieldRef: str | None = None
+    #: 列的展示格式（精度、单位标注）。模型不给就没有单位标注。
+    format: PlanColumnFormat | None = None
+
+    @field_validator("id", "fieldRef")
+    @classmethod
+    def _check_optional_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _require_key(value)
+
+    @field_validator("label")
+    @classmethod
+    def _check_label(cls, value: str) -> str:
+        return _require_text(value)
+
+
+class PlanColumn(_PlanModel):
+    """定稿栏目：稳定身份 + 显示名 + 行对象取值键。
+
+    - ``id``：栏目身份。改显示名、重排都不改它。
+    - ``label``：显示名，给人看的。
+    - ``fieldRef``：**行对象里的稳定取值键**，不是真实数据源绑定。
+      造数器按它造行，渲染层按它读单元格。
+    - ``format``：列的展示格式（精度、单位标注）。可空 —— 没声明就没有
+      单位标注，不写错的单位。
+    """
+
+    id: str
+    label: str
+    fieldRef: str
+    format: PlanColumnFormat | None = None
+
+    @field_validator("id", "fieldRef")
+    @classmethod
+    def _check_key(cls, value: str) -> str:
+        return _require_key(value)
+
+    @field_validator("label")
+    @classmethod
+    def _check_label(cls, value: str) -> str:
         return _require_text(value)
 
 
@@ -443,6 +643,10 @@ class PlanSectionCandidate(_PlanModel):
     title: str
     metricIntents: list[str] = Field(default_factory=list)
     componentType: ComponentType
+    #: 展示目的（语义候选）。模型给不给都行，服务端定稿时补齐。
+    displayIntent: DisplayIntent | None = None
+    #: 表格板块的栏目声明（仅表格板块使用）。模型可以只给 ``label``。
+    columns: list[PlanColumnCandidate] = Field(default_factory=list)
 
     @field_validator("id")
     @classmethod
@@ -463,12 +667,26 @@ class PlanSectionCandidate(_PlanModel):
 
 
 class PlanSection(_PlanModel):
-    """已定稿的方案板块：id 由领域服务分配。"""
+    """已定稿的方案板块：id 由领域服务分配。
+
+    定稿比候选多三样东西，都是**服务端**定的，模型说了不算：
+
+    - ``displayIntent``：这块要看什么（语义）。
+    - ``explicitComponentType``：用户明确指定的组件类型（没有指定就是 null）。
+    - ``selectionReason``：为什么选了这个组件类型。
+
+    另外 ``columns`` 是表格板块的定稿栏目：每项都有稳定 ``id``、显示名
+    ``label`` 与行对象取值键 ``fieldRef``。
+    """
 
     id: str
     title: str
     metricIntents: list[str] = Field(default_factory=list)
     componentType: ComponentType
+    displayIntent: DisplayIntent | None = None
+    explicitComponentType: ComponentType | None = None
+    selectionReason: str | None = None
+    columns: list[PlanColumn] = Field(default_factory=list)
 
     @field_validator("id", "title")
     @classmethod

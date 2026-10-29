@@ -104,6 +104,28 @@ def _dataset_fields(dataset: dict[str, Any] | None) -> set[str]:
     return set((dataset.get("fields") or {}).keys())
 
 
+def _is_template_row_key_column(region: dict[str, Any]) -> bool:
+    """这一区域的表格列是**模板态方案声明的行对象取值键**，不是数据源字段。
+
+    判据：区域挂了 ``templateBinding.previewSpec`` 且它声明了栏目。转换层把
+    同一份定稿列同时落进 ``component.columns`` 与 ``previewSpec.columns``
+    （工单 03 的三跳），所以两边都有栏目时，组件里的列就是方案声明的列。
+
+    这类列的 ``fieldRef`` 是取值键（工单 02 / 03 的 schema 契约：「不是真实
+    数据源绑定」），**不按数据源字段校验** —— 真实取数通道是后续独立决策
+    （ADR 0004 §5.9）。
+    """
+    if not isinstance(region, dict):
+        return False
+    binding = region.get("templateBinding")
+    if not isinstance(binding, dict):
+        return False
+    spec = binding.get("previewSpec")
+    if not isinstance(spec, dict):
+        return False
+    return bool(spec.get("columns"))
+
+
 def _grain_of(node: dict[str, Any]) -> str | None:
     """从一个**容器**节点里取它声明的粒度（node["grain"]）。"""
     if not isinstance(node, dict):
@@ -477,9 +499,20 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                     )
 
         # 组件列引用的字段必须拿得到
+        #
+        # 例外：**模板态**方案声明的栏目，它的 ``fieldRef`` 是**行对象取值键**
+        # （工单 02 / 03 的契约：``PlanColumn.fieldRef`` 与 ``TemplateColumn.fieldRef``
+        # 都写明「不是真实数据源绑定」，造数器按它造行、前端按它读单元格）。
+        # 真实取数通道是后续独立决策（ADR 0004 §5.9），所以模板态的列**不按
+        # 数据源字段校验**；数据源字段是真实取数那一步才落的绑定。
         for col_idx, column in enumerate(component.get("columns") or []):
             field_ref = column.get("fieldRef")
-            if field_ref and available_fields and field_ref not in available_fields:
+            if (
+                field_ref
+                and available_fields
+                and field_ref not in available_fields
+                and not _is_template_row_key_column(region)
+            ):
                 issues.append(
                     _issue(
                         "FIELD",

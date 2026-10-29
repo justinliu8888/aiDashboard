@@ -33,6 +33,26 @@ class RegionDataStatus(str, Enum):
     TEXT = "text"
 
 
+class TemplateColumn(BaseModel):
+    """方案声明的一列表格栏目。
+
+    ``fieldRef`` 是**行对象的稳定取值键**，不是数据源绑定 —— 造数器按它造行、
+    前端按它读单元格。改列名不改栏目身份（``id`` 与 ``fieldRef`` 都不变）。
+
+    **字段白名单**（``extra="forbid"``）：只认 ``id`` / ``label`` /
+    ``fieldRef`` / ``format``。模型多写的键（列宽等）不进模板设计，
+    也就不会跟着落进草稿定义 —— 未声明的键不进契约。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    label: str
+    fieldRef: str
+    #: 列的展示格式（精度、单位等），可空。
+    format: dict[str, Any] | None = None
+
+
 class TemplateRegion(BaseModel):
     """模板里的一个可视区域。"""
 
@@ -46,12 +66,20 @@ class TemplateRegion(BaseModel):
     metricIntents: list[str] = Field(default_factory=list)
     #: 这个区域实际落到哪些指标口径上（设计元数据，不是执行绑定）。
     metricRefs: list[str] = Field(default_factory=list)
+    #: 方案声明的**定稿栏目**（表格板块）。顺序与方案一致，转换层不按标题猜列。
+    columns: list[TemplateColumn] = Field(default_factory=list)
     dataStatus: str
-    #: 占位原因，例如「口径待核实」「数据待连接」。
+    #: 占位原因，例如「能力待接通」「口径待核实」「统计对象不在授权范围内」。
     placeholderReason: str | None = None
+    #: 这个区域是不是因为**系统能力尚未接通**而拿不到数。
+    #:
+    #: 它与「授权范围」「绑定三态」**相互独立**：统计对象越权不算能力缺失，
+    #: 指标口径算不出来才算。区域要标「能力待接通」时看它，不看占位原因。
+    capabilityPending: bool = False
     #: 区域数据。``dataStatus`` 为 bound 时才有值。
     data: dict[str, Any] | None = None
-    #: 数据来源标识（例如能耗 Mock 源）。界面据此标明数据性质。
+    #: 数据来源标识（例如 ``mock_energy``）。界面据此标明数据性质 ——
+    #: 草稿阶段显示的是**模拟业务数据**，接入真实数据后自动替换。
     dataSource: str | None = None
     dataSourceLabel: str | None = None
 

@@ -23,6 +23,15 @@ import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from app.schemas.report_plan import PlanValidationError
+from app.services.report_plan_service import (
+    COLUMNS_NOTE_PREFIX,
+    PlanResolution,
+    drop_unaccepted_suggestion_sections,
+    normalize_column_format,
+    resolve_plan,
+)
+
 logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "report_plan.md"
@@ -190,6 +199,57 @@ def _is_version_number(path: tuple[str, ...], value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _is_format_precision(path: tuple[str, ...], value: Any) -> bool:
+    """列格式里的**小数位数**是格式参数，不是业务数值。
+
+    ``columns[].format.precision`` 说明这一列保留几位小数 —— 它是**显示
+    格式**，不是实测值。方案侧能声明 ``format``，表头才有单位标注
+    （工单 03 的列格式契约）。
+    """
+    if len(path) < 2:
+        return False
+    if path[-1].lower() != "precision" or path[-2].lower() != "format":
+        return False
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+#: 标识位白名单：**容器键** -> 该容器项里哪些键是**标识位**。
+#:
+#: 标识位上的数值是「序号式标识」（模型把「第 1 列」写成 ``1``），不是业务
+#: 数值。模型给数字 id 很常见 —— 数值扫描器一刀切拒掉，等于让整轮方案作废、
+#: 用户被无端重问。那是误伤，不是防护。
+_IDENTIFIER_CONTAINERS: dict[str, frozenset[str]] = {
+    # 栏目项：``id``（栏目身份）与 ``fieldRef``（取值键）都是标识位
+    "columns": frozenset({"id", "fieldRef"}),
+    # 板块项：``id`` 是标识位
+    "sections": frozenset({"id"}),
+}
+
+
+def _normalize_identifiers(node: Any, container: str | None = None) -> None:
+    """把**标识位**上的整数归一成字符串（就地改）。
+
+    只动已知的标识位（栏目项的 ``id`` / ``fieldRef``、板块项的 ``id``）：
+
+    - 归一后扫描器照样扫得到这些位置（值已经是字符串，不再是数值）；
+    - 其它位置的数值照旧被拒 —— 真实业务数值仍然进不了方案。
+    """
+    if isinstance(node, dict):
+        allowed = _IDENTIFIER_CONTAINERS.get(container or "", frozenset())
+        for key, value in list(node.items()):
+            name = str(key)
+            if name in allowed and isinstance(value, int) and not isinstance(value, bool):
+                node[key] = str(value)
+            else:
+                _normalize_identifiers(
+                    value, name if name in _IDENTIFIER_CONTAINERS else None
+                )
+        return
+    if isinstance(node, list):
+        for item in node:
+            _normalize_identifiers(item, container)
+
+
 def _scan_node(node: Any, path: tuple[str, ...]) -> None:
     """递归检查模型输出：危险字段、真实数值、可执行内容。"""
     if isinstance(node, dict):
@@ -210,6 +270,8 @@ def _scan_node(node: Any, path: tuple[str, ...]) -> None:
 
     if isinstance(node, (int, float)):
         if _is_version_number(path, node):
+            return
+        if _is_format_precision(path, node):
             return
         raise _UnsafeContent("方案里出现了真实数值")
 
@@ -355,6 +417,21 @@ COMPONENT_TYPES: tuple[str, ...] = (
     "text",
 )
 
+#: 板块可用的展示目的：用户想看什么（语义候选，最终组件类型由服务端定）。
+DISPLAY_INTENTS: tuple[str, ...] = (
+    "total",
+    "trend",
+    "comparison",
+    "composition",
+    "records",
+)
+
+#: 时间粒度（既有粒度枚举）。
+GRAIN_UNITS: tuple[str, ...] = ("MINUTE", "HOUR", "DAY", "WEEK", "MONTH")
+
+#: 表格板块的组件类型：只有它用得上栏目声明。
+_TABLE_COMPONENT_TYPE = "table"
+
 #: 需求里必须出现的字段：指标和排除项被省略，就等于把用户明确的要求悄悄丢掉。
 _REQUIRED_REQUIREMENT_KEYS: tuple[str, ...] = ("metrics", "exclusions")
 #: 需求里可以为空的字段：用户没给就是 null，不算错。
@@ -410,7 +487,46 @@ def _validate_requirements(raw: Any) -> dict[str, Any]:
     validated["exclusions"] = _require_string_list(
         requirements["exclusions"], "requirements.exclusions"
     )
+    # 时间粒度：与时间范围单位不是一回事；用户没说就由服务端推定。
+    grain_unit = requirements.get("grainUnit")
+    if isinstance(grain_unit, str) and grain_unit.strip():
+        unit = grain_unit.strip().upper()
+        if unit in GRAIN_UNITS:
+            validated["grainUnit"] = unit
+        else:
+            logger.info("模型给的 grainUnit 非法，已忽略：%s", grain_unit)
     return validated
+
+
+def _validate_columns(raw: Any, label: str) -> list[dict[str, Any]]:
+    """表格栏目：模型可以只给显示名。
+
+    结构完全不可用时（不是数组）不在这里判死：交给服务端的栏目解析，
+    由它决定「补齐 → 追问 → 失败」哪条路。
+    """
+    if not isinstance(raw, list):
+        logger.info("%s的 columns 不是数组，交给服务端解析", label)
+        return []
+    columns: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            logger.info("%s的 columns 里有非对象项，已忽略", label)
+            continue
+        text = str(item.get("label") or "").strip()
+        if not text:
+            logger.info("%s的 columns 里有空显示名，已忽略", label)
+            continue
+        column: dict[str, Any] = {"label": text}
+        for key in ("id", "fieldRef"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                column[key] = value.strip()
+        # 列的展示格式（精度、单位标注）：模型给了就带着走，表头才有单位。
+        column_format = normalize_column_format(item.get("format"))
+        if column_format:
+            column["format"] = column_format
+        columns.append(column)
+    return columns
 
 
 def _validate_sections(raw: Any) -> list[dict[str, Any]]:
@@ -441,6 +557,16 @@ def _validate_sections(raw: Any) -> list[dict[str, Any]]:
         # 板块 id 只在引用已有板块时出现；新板块不编号，由领域层生成。
         if section.get("id") is not None:
             validated["id"] = _require_string(section["id"], "板块 id")
+        # 展示目的：模型的语义候选。非法就丢掉，由服务端按请求推定。
+        intent = section.get("displayIntent")
+        if isinstance(intent, str) and intent.strip():
+            if intent.strip() in DISPLAY_INTENTS:
+                validated["displayIntent"] = intent.strip()
+            else:
+                logger.info("%s的 displayIntent 非法，已忽略：%s", label, intent)
+        # 表格板块的栏目声明：只有表格板块用得上。
+        if component_type == _TABLE_COMPONENT_TYPE and section.get("columns") is not None:
+            validated["columns"] = _validate_columns(section["columns"], label)
         sections.append(validated)
     return sections
 
@@ -498,6 +624,38 @@ def _validate_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             candidate.get("referenceTemplates") or []
         ),
     }
+
+
+def _apply_resolution(candidate: dict[str, Any], resolution: PlanResolution) -> None:
+    """把服务端定稿的栏目写回候选，并把补齐说明记进假设。
+
+    系统补的栏目必须**出现在方案里**（用户看得见、能改），不能只在
+    渲染时按标题偷偷补列。
+    """
+    sections = candidate.get("sections") or []
+    assumptions = candidate.setdefault("assumptions", [])
+    for index, section in enumerate(sections):
+        if index not in resolution.columns:
+            continue
+        columns: list[dict[str, Any]] = []
+        for spec in resolution.columns[index]:
+            column: dict[str, Any] = {"label": spec.label}
+            if spec.id:
+                column["id"] = spec.id
+            if spec.fieldRef:
+                column["fieldRef"] = spec.fieldRef
+            # 列的展示格式（精度、单位标注）跟着栏目一起回写：模型声明了
+            # 「耗电量，单位 kWh」就不能在这里把 format 丢掉 —— 丢了表头就没有
+            # 单位标注（规格《契约缺口补充》A2：表格列的 format.unitLabel 同理）。
+            if spec.format:
+                column["format"] = dict(spec.format)
+            columns.append(column)
+        section["columns"] = columns
+        note = resolution.column_notes.get(index)
+        if note:
+            entry = f"{COLUMNS_NOTE_PREFIX}{note}"
+            if entry not in assumptions:
+                assumptions.append(entry)
 
 
 def _failure(code: str, message: str) -> dict[str, Any]:
@@ -579,6 +737,9 @@ async def generate_candidate(
         )
 
     try:
+        # 标识位上的整数先归一成字符串：模型给数字 id 很常见，那是序号式
+        # 标识，不是业务数值，不能让整轮方案因为它作废。
+        _normalize_identifiers(payload)
         _scan_unsafe_content(payload)
     except _UnsafeContent as exc:
         logger.info("方案设计输出含不安全内容：%s", exc)
@@ -604,6 +765,46 @@ async def generate_candidate(
                 FAILURE_MODEL_OUTPUT_INVALID,
                 f"模型输出的方案结构不合法（{exc}）",
             )
+
+        # ---- 选型与栏目：服务端定稿，模型说了不算 ----
+        # 模型只给语义候选；组件类型、栏目身份、取值键都由服务端按优先级定。
+        # 未接受的建议先剔掉：追问与补齐都只针对真正要做的板块。
+        try:
+            kept_sections = drop_unaccepted_suggestion_sections(
+                list(candidate.get("sections") or []),
+                list(candidate.get("suggestions") or []),
+            )
+            validated["sections"] = drop_unaccepted_suggestion_sections(
+                list(validated.get("sections") or []),
+                list(validated.get("suggestions") or []),
+            )
+        except PlanValidationError as exc:
+            logger.info("候选里的板块都只是未接受的建议：%s", exc)
+            return await _fail(
+                emit,
+                getattr(exc, "code", None) or FAILURE_MODEL_OUTPUT_INVALID,
+                f"模型输出的方案结构不合法（{exc}）",
+            )
+
+        resolution = resolve_plan(
+            kept_sections,
+            request_text=str(message or ""),
+            previous_sections=(current_plan or {}).get("sections") or [],
+        )
+        if resolution.question:
+            # 猜不出来、且猜错会影响这块的用途 → 走澄清追问通道，
+            # 问题出现在左侧对话区。「没有真实数据」不是追问的理由。
+            logger.info("方案需要澄清：%s", resolution.question)
+            return {"kind": KIND_CLARIFICATION, "question": resolution.question}
+        if resolution.failure_code:
+            # 修正仍失败：明确报失败并允许重试，不给空表。
+            return await _fail(
+                emit,
+                resolution.failure_code,
+                resolution.failure_message or "方案生成失败，请重试。",
+            )
+
+        _apply_resolution(validated, resolution)
         return {"kind": KIND_PLAN_CANDIDATE, "candidate": validated}
 
     if kind == KIND_CLARIFICATION:
