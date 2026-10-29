@@ -356,6 +356,8 @@ def test_invalid_component_type_in_plan_fails_with_the_real_reason(client, monke
     assert payload["error"]["code"] == "MODEL_OUTPUT_INVALID"
     # 原因没有被覆盖成「请重试」这类通用文案。
     assert "componentType" in payload["error"]["message"]
+    # #39：模型适配层的报错**带板块名** —— 用户要知道改哪一块。
+    assert "PUE 总览" in payload["error"]["message"]
     assert "请重试" not in payload["error"]["message"]
     # 方案没有落库，阶段也没推进。
     assert payload["domainObjects"]["reportPlan"] is None
@@ -413,22 +415,38 @@ def test_stale_template_confirmation_preserves_the_draft(client, monkeypatch, co
 
 
 def test_pue_placeholder_remains_text_without_metric_binding_in_preview(client, monkeypatch):
-    """占位区域不编造数值。"""
+    """占位区域不编造数值。
+
+    #39 之后占位板块**保留方案声明的组件类型**（这里是 ``METRIC_CARD``），
+    不再降级成纯文字区域 —— 但它**没有可执行绑定**，所以预览阶段仍然
+    只能回占位原因，绝不能给出一个数。
+
+    （用例名里的 "text" 是旧语义的历史留痕，改动前后指向同一个不变量：
+    占位区域在预览里没有数值。）
+    """
     _, plan = _plan(client, monkeypatch, _pue_candidate())
 
     draft = _confirm_plan(client, plan)["domainObjects"]["reportDefinitionDraft"]
 
     region = draft["regions"][0]
-    assert region["component"]["type"] == "TEXT"
-    assert "口径待核实" in region["component"]["content"]["template"]
+    # 组件类型按**方案声明**保留 —— 展示为占位 ≠ 改掉组件类型。
+    assert region["component"]["type"] == "METRIC_CARD"
+    # 占位原因在 templateBinding 里（#40 读它）。
+    assert "口径待核实" in region["templateBinding"]["placeholderReason"]
+    assert region["templateBinding"]["dataStatus"] == "placeholder"
+    # pendingReason 只对 bound 区域有意义（那里是「还没取数」）；
+    # 占位区域的原因是 placeholderReason，所以这里是 None。
+    assert region["templateBinding"]["pendingReason"] is None
     assert "data" not in region
     assert draft["dependencies"]["metricRefs"] == []
     _post(client, "同意", message_id="save")
     for expected in ["VALIDATING", "PREVIEWING", "PREVIEW_READY"]:
         assert _post(client, "__advance__", message_id="advance_" + expected).json()["state"] == expected
     preview = client.get("/api/sessions/sess_tpl_1").json()["snapshot"]["previewPayload"]["regions"][0]
-    assert preview["componentType"] == "TEXT"
-    assert "口径待核实" in preview["payload"]["rendered"]
+    assert preview["componentType"] == "METRIC_CARD"
+    # 预览里只有占位原因，**没有数值** —— 这条不许删。
+    assert preview["payload"]["placeholder"] is True
+    assert "口径待核实" in preview["payload"]["reason"]
     assert "value" not in preview["payload"]
 
 
@@ -487,7 +505,16 @@ def test_stale_confirm_after_save_keeps_saved_state(client, monkeypatch):
 
 @pytest.mark.parametrize("kind", ["metric_card", "table", "line_chart", "bar_chart", "pie_chart"])
 def test_device_regions_keep_device_metric_in_legacy_definition(client, monkeypatch, kind):
-    """设备指标在旧定义里保住。"""
+    """设备指标在旧定义里保住。
+
+    #38 让模板阶段**不取数**，模板侧只剩「绑定描述符」；#39 又把设备区的
+    时间窗从「收窄到最后一天」改回「按方案」。所以这条用例的语义变成：
+
+        模板侧 = 绑定描述符（**没有**业务数值）；
+        预览侧 = 试运行真的取到了数。
+
+    设备口径本身（device metricRef）依然是这条用例的核心，不许删。
+    """
     candidate = _candidate(metrics=["设备耗电"], sections=[{
         "id": "devices", "title": "设备耗电", "metricIntents": ["设备耗电"], "componentType": kind,
     }])
@@ -501,17 +528,28 @@ def test_device_regions_keep_device_metric_in_legacy_definition(client, monkeypa
     if kind == "metric_card":
         metric_nodes = [node for node in region["data"]["pipeline"]["nodes"] if node.get("metricRef")]
         assert metric_nodes[0]["metricRef"] == "metric.machine_room.device_energy"
+    # 模板侧：只有绑定描述符，没有业务数值（#38）。
+    original = template["regions"][0]["data"]
+    assert original.get("bindingStatus") == "pending_execution"
+    if kind == "metric_card":
+        assert "value" not in original
+    elif kind == "table":
+        assert "rows" not in original
+    else:
+        assert "yValues" not in original
+    # 草稿侧：时间窗按方案，不再收窄到最后一天（#39）。
+    assert region["context"]["timeWindow"]["value"]["count"] == 7
     _post(client, "同意", message_id="save_devices")
     for expected in ["VALIDATING", "PREVIEWING", "PREVIEW_READY"]:
         assert _post(client, "__advance__", message_id="device_" + expected).json()["state"] == expected
     preview = client.get("/api/sessions/sess_tpl_1").json()["snapshot"]["previewPayload"]["regions"][0]["payload"]
-    original = template["regions"][0]["data"]
+    # 预览侧：试运行真的出数了。
     if kind == "metric_card":
-        assert preview["value"] == original["value"]
+        assert isinstance(preview["value"], (int, float))
     elif kind == "table":
-        assert [row["energyKwh"] for row in preview["rows"]] == [row["energyKwh"] for row in original["rows"]]
+        assert preview["rows"]
     else:
-        assert preview["yValues"] == original["yValues"]
+        assert preview["yValues"]
 
 
 def test_modify_and_confirm_in_one_message_only_updates_plan(client, monkeypatch):

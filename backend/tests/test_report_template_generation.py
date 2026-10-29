@@ -627,3 +627,363 @@ def test_template_is_persisted_in_the_design_store(client, monkeypatch):
     assert stored is not None
     assert stored["id"] == template["id"]
     assert stored["planRevision"] == plan["revision"]
+
+
+# --------------------------------------------------------------------------
+# 7. #39 专有：组件类型合法性、空壳占位、时间窗与布局
+# --------------------------------------------------------------------------
+
+
+def _template_with(
+    plan_sections,
+    *,
+    metric_refs=None,
+    data_status="placeholder",
+    reason="「PUE」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+    component_type="metric_card",
+    region_data=None,
+):
+    """造一份模板对象：区域按方案板块顺序，数据状态可控。"""
+    return {
+        "id": "rtpl_test", "revision": 1, "planId": "plan_x", "planRevision": 1,
+        "title": "A 机房能耗日报",
+        "regions": [
+            {
+                "id": f"region_{index + 1}",
+                "sectionId": section["id"],
+                "title": section["title"],
+                "componentType": section.get("componentType", component_type),
+                "metricIntents": section.get("metricIntents", []),
+                "metricRefs": metric_refs or [],
+                "dataStatus": data_status,
+                "placeholderReason": reason if data_status == "placeholder" else None,
+                **({"data": region_data} if region_data is not None else {}),
+            }
+            for index, section in enumerate(plan_sections)
+        ],
+        # 历史 12 列网格坐标：转换层**必须不再读它**
+        "layout": {"columns": 12, "items": [
+            {"regionId": "region_1",
+             "placement": {"type": "GRID", "column": 2, "row": 3,
+                           "columnSpan": 10, "rowSpan": 4}},
+        ]},
+        "referenceTemplates": [],
+        "dataStatus": "placeholder",
+        "pendingNotes": [],
+    }
+
+
+def _plan_with(plan_sections, *, time_range="最近 7 天"):
+    return {
+        "id": "plan_x", "revision": 1, "topic": "A 机房能耗日报",
+        "requirements": {"metrics": [], "subject": "A 机房",
+                         "timeRange": time_range, "exclusions": []},
+        "sections": plan_sections,
+        "assumptions": [], "suggestions": [], "referenceTemplates": [],
+    }
+
+
+def test_illegal_component_type_error_names_the_section():
+    """模板层第二道闸：组件类型非法 → 硬失败，并指出是哪个板块。"""
+    from app.schemas.report_plan import PlanContractError
+    from app.services.report_template_service import build_template_design
+
+    plan = {
+        "id": "plan_x", "revision": 1, "topic": "A 机房能耗日报",
+        "requirements": {"metrics": ["总耗电"], "subject": "A 机房",
+                         "timeRange": "最近 7 天", "exclusions": []},
+        "sections": [
+            {"id": "section_1", "title": "总耗电概览",
+             "metricIntents": ["总耗电"], "componentType": "metric_card"},
+            {"id": "section_2", "title": "PUE 趋势",
+             "metricIntents": ["PUE"], "componentType": "radar"},
+        ],
+        "assumptions": [], "suggestions": [], "referenceTemplates": [],
+    }
+
+    with pytest.raises(PlanContractError) as excinfo:
+        build_template_design(plan, subject_id="room_a")
+
+    assert excinfo.value.code == "PLAN_CONTRACT_INVALID"
+    assert "板块 2" in excinfo.value.message
+    assert "PUE 趋势" in excinfo.value.message
+    assert excinfo.value.section_index == 1
+    assert excinfo.value.section_title == "PUE 趋势"
+
+
+def test_missing_component_type_error_names_the_section():
+    """组件类型缺失同样是硬失败，不静默补成 metric_card。"""
+    from app.schemas.report_plan import PlanContractError
+    from app.services.report_template_service import build_template_design
+
+    plan = {
+        "id": "plan_x", "revision": 1, "topic": "T",
+        "requirements": {"metrics": [], "subject": "A 机房",
+                         "timeRange": "最近 7 天", "exclusions": []},
+        "sections": [
+            {"id": "section_1", "title": "设备排名",
+             "metricIntents": ["设备耗电"]},          # 没有 componentType
+        ],
+        "assumptions": [], "suggestions": [], "referenceTemplates": [],
+    }
+
+    with pytest.raises(PlanContractError) as excinfo:
+        build_template_design(plan, subject_id="room_a")
+
+    assert "板块 1" in excinfo.value.message
+    assert "设备排名" in excinfo.value.message
+
+
+def test_plan_contract_rejects_non_text_section_without_metric_intents():
+    """落库前的领域校验：取数板块必须有指标意图；纯说明板块不强制。"""
+    from app.schemas.report_plan import PlanContractError
+    from app.services.report_plan_service import apply_candidate
+
+    base = {
+        "topic": "T",
+        "requirements": {"metrics": [], "subject": None, "timeRange": None, "exclusions": []},
+        "assumptions": [], "suggestions": [], "referenceTemplates": [],
+    }
+
+    with pytest.raises(PlanContractError) as excinfo:
+        apply_candidate(
+            {**base, "sections": [
+                {"title": "设备排名", "metricIntents": [], "componentType": "table"},
+            ]},
+            plan_id="plan_001",
+        )
+    assert "板块 1" in excinfo.value.message
+    assert "设备排名" in excinfo.value.message
+
+    # 纯说明板块：没有指标意图也合法
+    plan = apply_candidate(
+        {**base, "sections": [
+            {"title": "说明", "metricIntents": [], "componentType": "text"},
+        ]},
+        plan_id="plan_002",
+    )
+    assert plan.sections[0].componentType == "text"
+
+
+def test_illegal_component_type_fails_the_turn_and_keeps_the_plan(client, monkeypatch):
+    """走真实链路：非法组件类型 → 本轮失败，方案保持原样（不死路）。
+
+    只绕过**模型适配层**的枚举检查，让非法值落到**领域层**（带板块名的
+    判据在那儿）。领域层在**落库前**就拒绝 → 这一版方案根本没进库，
+    用户看到的仍然是上一版成功方案，可以直接改。
+    """
+    import app.agents.report_plan_agent as report_plan_agent
+
+    monkeypatch.setattr(
+        report_plan_agent, "COMPONENT_TYPES",
+        tuple(report_plan_agent.COMPONENT_TYPES) + ("radar",),
+    )
+
+    install_model(monkeypatch, RecordingModel(
+        _candidate(),
+        _candidate(sections=[{
+            "id": "section_pue", "title": "PUE 趋势",
+            "metricIntents": ["PUE"], "componentType": "radar",
+        }]),
+    ))
+    first = _post(client, "生成 A 机房能耗日报").json()["domainObjects"]["reportPlan"]
+
+    payload = _post(client, "再加一个 PUE 趋势板块", message_id="msg_bad").json()
+
+    # 领域层硬失败，错误码与文案都带板块名。
+    assert payload["error"]["code"] == "PLAN_CONTRACT_INVALID"
+    assert "板块 1" in payload["error"]["message"]
+    assert "PUE 趋势" in payload["error"]["message"]
+    # 方案**没有被覆盖**：仍然是上一版成功方案（不是「确认完才炸」的死路）。
+    stored = report_design_service.repository.load("sess_tpl_1")
+    assert stored["reportPlan"]["id"] == first["id"]
+    assert stored["reportPlan"]["revision"] == first["revision"]
+    assert stored["definitionDraft"] is None
+
+
+def test_draft_keeps_declared_component_type_for_unavailable_metric():
+    """方案要一个没有的指标 → 草稿保留声明的组件类型，出空壳 + 占位原因。"""
+    from app.services.template_definition_service import build_template_definition
+
+    sections = [
+        {"id": "section_1", "title": "总耗电概览", "metricIntents": ["总耗电"],
+         "componentType": "metric_card"},
+        {"id": "section_2", "title": "PUE 总览", "metricIntents": ["PUE"],
+         "componentType": "metric_card"},
+    ]
+    draft = build_template_definition(
+        _template_with(sections), _plan_with(sections), "room_a",
+    )
+
+    region = draft.regions[1]
+    assert region["component"]["type"] == "METRIC_CARD"     # 不是 TEXT
+    assert region["role"] == "SUMMARY"
+    assert region["component"]["metric"]["label"] == "PUE 总览"
+    # 占位原因仍在（#40 要读它）
+    assert "口径待核实" in region["templateBinding"]["placeholderReason"]
+    assert region["templateBinding"]["dataStatus"] == "placeholder"
+    # 空壳不编数值、也不可执行
+    assert "data" not in region
+    assert draft.dependencies["metricRefs"] == []
+
+
+def test_draft_placeholder_keeps_the_declared_chart_shape():
+    """占位的图表板块也保留方案声明的组件类型（BAR / LINE），不降级成文字。"""
+    from app.services.template_definition_service import build_template_definition
+
+    sections = [
+        {"id": "section_1", "title": "设备能耗排名", "metricIntents": ["PUE"],
+         "componentType": "bar_chart"},
+    ]
+    draft = build_template_definition(
+        _template_with(sections), _plan_with(sections), "room_a",
+    )
+
+    region = draft.regions[0]
+    assert region["component"]["type"] == "CHART"
+    assert region["component"]["chartKind"] == "BAR"
+    assert region["component"]["encodings"] == []
+    assert "data" not in region
+    # 占位区域同样带方案时间窗与粒度
+    assert region["context"]["timeWindow"]["value"]["count"] == 7
+    assert region["context"]["grain"]["value"]["unit"] == "DAY"
+
+
+def test_draft_device_region_uses_the_plan_window_and_grain():
+    """设备类区域的时间窗与粒度一律按方案，不再被收窄到最后一天。"""
+    from app.services.template_definition_service import build_template_definition
+
+    sections = [
+        {"id": "section_1", "title": "设备耗电排名", "metricIntents": ["设备耗电"],
+         "componentType": "table"},
+    ]
+    template = _template_with(
+        sections, metric_refs=["metric.machine_room.device_energy"],
+        data_status="bound", reason=None,
+    )
+    draft = build_template_definition(template, _plan_with(sections), "room_a")
+
+    window = draft.regions[0]["context"]["timeWindow"]["value"]
+    assert window["unit"] == "DAY"
+    assert window["count"] == 7          # 方案是 7 天，不是 1 天
+    assert window["offset"] == -7
+    assert draft.regions[0]["context"]["grain"]["value"]["unit"] == "DAY"
+
+
+def test_draft_ignores_historical_twelve_column_placement():
+    """转换过程不读历史 12 列网格 placement（#39 硬要求）。"""
+    from app.services.template_definition_service import build_template_definition
+
+    sections = [
+        {"id": "section_1", "title": "总耗电概览", "metricIntents": ["总耗电"],
+         "componentType": "metric_card"},
+    ]
+    template = _template_with(
+        sections, metric_refs=["metric.machine_room.total_energy"],
+        data_status="bound", reason=None,
+    )
+    draft = build_template_definition(template, _plan_with(sections), "room_a")
+
+    placement = draft.regions[0]["layout"]["placement"]
+    assert placement != {"type": "GRID", "column": 2, "row": 3,
+                         "columnSpan": 10, "rowSpan": 4}
+    assert placement["column"] == 1
+    assert placement["columnSpan"] == 4
+    # 12 列网格约束
+    assert placement["column"] + placement["columnSpan"] - 1 <= 12
+
+
+def test_draft_regions_match_the_confirmed_plan_one_to_one():
+    """草稿区域与已确认方案逐项一致：数量、顺序、标题、组件类型。"""
+    from app.services.template_definition_service import build_template_definition
+
+    sections = [
+        {"id": "section_1", "title": "总耗电概览", "metricIntents": ["总耗电"],
+         "componentType": "metric_card"},
+        {"id": "section_2", "title": "设备耗电排名", "metricIntents": ["设备耗电"],
+         "componentType": "table"},
+        {"id": "section_3", "title": "能耗趋势", "metricIntents": ["总耗电"],
+         "componentType": "line_chart"},
+    ]
+    template = _template_with(
+        sections, metric_refs=["metric.machine_room.total_energy"],
+        data_status="bound", reason=None,
+    )
+    draft = build_template_definition(template, _plan_with(sections), "room_a")
+
+    assert len(draft.regions) == len(sections)
+    assert [r["name"] for r in draft.regions] == [s["title"] for s in sections]
+    assert [r["templateBinding"]["sectionId"] for r in draft.regions] == \
+           [s["id"] for s in sections]
+    assert [r["component"]["type"] for r in draft.regions] == \
+           ["METRIC_CARD", "TABLE", "CHART"]
+    assert draft.regions[2]["component"]["chartKind"] == "LINE"
+
+
+def test_draft_metrics_are_not_swapped_with_another_metric():
+    """指标一致性：bound 区域的指标**没有被替换成另一个指标**（#39 §0.4.2）。
+
+    方案板块声明的 metricIntents → 模板层匹配到的 metricRef →
+    草稿的 ``templateBinding.metricRefs``，三者必须是同一个口径。
+    """
+    from app.services.report_template_service import build_template_design
+    from app.services.template_definition_service import build_template_definition
+
+    sections = [
+        {"id": "section_total", "title": "总耗电概览",
+         "metricIntents": ["总耗电"], "componentType": "metric_card"},
+        {"id": "section_device", "title": "设备耗电排名",
+         "metricIntents": ["设备耗电"], "componentType": "table"},
+    ]
+    plan = {
+        "id": "plan_x", "revision": 1, "topic": "A 机房能耗日报",
+        "requirements": {"metrics": ["总耗电", "设备耗电"], "subject": "A 机房",
+                         "timeRange": "最近 7 天", "exclusions": []},
+        "sections": sections,
+        "assumptions": [], "suggestions": [], "referenceTemplates": [],
+    }
+
+    template = build_template_design(plan, subject_id="room_a").model_dump(mode="json")
+    draft = build_template_definition(template, plan, "room_a")
+
+    by_section = {r["templateBinding"]["sectionId"]: r for r in draft.regions}
+    for section in sections:
+        region = by_section[section["id"]]
+        assert region["templateBinding"]["dataStatus"] == "bound"
+    # 方案意图 → 草稿指标口径，一一对应，**没有互换**。
+    assert by_section["section_total"]["templateBinding"]["metricRefs"] == \
+           ["metric.machine_room.total_energy"]
+    assert by_section["section_device"]["templateBinding"]["metricRefs"] == \
+           ["metric.machine_room.device_energy"]
+
+
+def test_draft_binding_passes_the_pending_reason_through():
+    """``pendingReason`` 是模板层 ``data.pendingReason`` 的**透传**（#39 §0.4.1）。
+
+    文案唯一来源是模板层（#38 产出）；草稿层不另写一句。
+    """
+    from app.services.template_definition_service import build_template_definition
+
+    sections = [
+        {"id": "section_1", "title": "总耗电概览", "metricIntents": ["总耗电"],
+         "componentType": "metric_card"},
+    ]
+    template = _template_with(
+        sections, metric_refs=["metric.machine_room.total_energy"],
+        data_status="bound", reason=None,
+        region_data={
+            "bindingStatus": "pending_execution",
+            "pendingReason": "数值待试运行产生，本区域尚未取数。",
+        },
+    )
+    draft = build_template_definition(template, _plan_with(sections), "room_a")
+
+    binding = draft.regions[0]["templateBinding"]
+    assert binding["pendingReason"] == "数值待试运行产生，本区域尚未取数。"
+    # bound 区域不是占位：placeholderReason 仍然是 None。
+    assert binding["placeholderReason"] is None
+    assert binding["dataStatus"] == "bound"
+    # #40 要读的字段一个都没少。
+    assert binding["sectionId"] == "section_1"
+    assert binding["dataSourceLabel"] is None
+    assert binding["metricRefs"] == ["metric.machine_room.total_energy"]
