@@ -2308,7 +2308,13 @@ function readPayloadUnit(region, payload, defRegion) {
  * 这里只如实说明**哪个指标还没接通、为什么**，不承诺计算口径或公式。
  */
 function readCapabilityNotes(region, payload, defRegion) {
-  const SCOPE_KEYWORDS = ["授权", "权限", "越权", "范围"];
+  // 判「是不是授权问题」的关键词 —— 与后端
+  // `report_template_service._SCOPE_KEYWORDS` **同一套词**：
+  // 授权 / 权限 / 越权。两边不一致时，同一段原因会被一方说成
+  // 「能力待接通」、另一方说成「不在授权范围」。
+  // 刻意**不含**「范围」：能力类原因里出现「范围」（例如
+  // 「不在支持的数据范围」）时，那仍然是能力问题，不是授权问题。
+  const SCOPE_KEYWORDS = ["授权", "权限", "越权"];
   const KIND_LABELS = { capability: "能力待接通", scope: "不在授权范围" };
 
   const groups = new Map(); // 类别 → 该类别的具体项
