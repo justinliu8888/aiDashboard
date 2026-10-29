@@ -28,6 +28,7 @@ from app.services.report_plan_service import (
     COLUMNS_NOTE_PREFIX,
     PlanResolution,
     drop_unaccepted_suggestion_sections,
+    normalize_column_format,
     resolve_plan,
 )
 
@@ -198,6 +199,57 @@ def _is_version_number(path: tuple[str, ...], value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _is_format_precision(path: tuple[str, ...], value: Any) -> bool:
+    """列格式里的**小数位数**是格式参数，不是业务数值。
+
+    ``columns[].format.precision`` 说明这一列保留几位小数 —— 它是**显示
+    格式**，不是实测值。方案侧能声明 ``format``，表头才有单位标注
+    （工单 03 的列格式契约）。
+    """
+    if len(path) < 2:
+        return False
+    if path[-1].lower() != "precision" or path[-2].lower() != "format":
+        return False
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+#: 标识位白名单：**容器键** -> 该容器项里哪些键是**标识位**。
+#:
+#: 标识位上的数值是「序号式标识」（模型把「第 1 列」写成 ``1``），不是业务
+#: 数值。模型给数字 id 很常见 —— 数值扫描器一刀切拒掉，等于让整轮方案作废、
+#: 用户被无端重问。那是误伤，不是防护。
+_IDENTIFIER_CONTAINERS: dict[str, frozenset[str]] = {
+    # 栏目项：``id``（栏目身份）与 ``fieldRef``（取值键）都是标识位
+    "columns": frozenset({"id", "fieldRef"}),
+    # 板块项：``id`` 是标识位
+    "sections": frozenset({"id"}),
+}
+
+
+def _normalize_identifiers(node: Any, container: str | None = None) -> None:
+    """把**标识位**上的整数归一成字符串（就地改）。
+
+    只动已知的标识位（栏目项的 ``id`` / ``fieldRef``、板块项的 ``id``）：
+
+    - 归一后扫描器照样扫得到这些位置（值已经是字符串，不再是数值）；
+    - 其它位置的数值照旧被拒 —— 真实业务数值仍然进不了方案。
+    """
+    if isinstance(node, dict):
+        allowed = _IDENTIFIER_CONTAINERS.get(container or "", frozenset())
+        for key, value in list(node.items()):
+            name = str(key)
+            if name in allowed and isinstance(value, int) and not isinstance(value, bool):
+                node[key] = str(value)
+            else:
+                _normalize_identifiers(
+                    value, name if name in _IDENTIFIER_CONTAINERS else None
+                )
+        return
+    if isinstance(node, list):
+        for item in node:
+            _normalize_identifiers(item, container)
+
+
 def _scan_node(node: Any, path: tuple[str, ...]) -> None:
     """递归检查模型输出：危险字段、真实数值、可执行内容。"""
     if isinstance(node, dict):
@@ -218,6 +270,8 @@ def _scan_node(node: Any, path: tuple[str, ...]) -> None:
 
     if isinstance(node, (int, float)):
         if _is_version_number(path, node):
+            return
+        if _is_format_precision(path, node):
             return
         raise _UnsafeContent("方案里出现了真实数值")
 
@@ -467,6 +521,10 @@ def _validate_columns(raw: Any, label: str) -> list[dict[str, Any]]:
             value = item.get(key)
             if isinstance(value, str) and value.strip():
                 column[key] = value.strip()
+        # 列的展示格式（精度、单位标注）：模型给了就带着走，表头才有单位。
+        column_format = normalize_column_format(item.get("format"))
+        if column_format:
+            column["format"] = column_format
         columns.append(column)
     return columns
 
@@ -674,6 +732,9 @@ async def generate_candidate(
         )
 
     try:
+        # 标识位上的整数先归一成字符串：模型给数字 id 很常见，那是序号式
+        # 标识，不是业务数值，不能让整轮方案因为它作废。
+        _normalize_identifiers(payload)
         _scan_unsafe_content(payload)
     except _UnsafeContent as exc:
         logger.info("方案设计输出含不安全内容：%s", exc)
