@@ -37,7 +37,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any
+from typing import Any, Mapping
 
 from app.agents.report_plan_agent import (
     KIND_CLARIFICATION,
@@ -69,7 +69,10 @@ from app.schemas.session import (
     CLARIFICATION_QUESTION_KEY,
 )
 from app.services.report_plan_service import apply_candidate
-from app.services.report_template_service import build_template_design
+from app.services.report_template_service import (
+    build_template_design,
+    split_placeholder_regions,
+)
 from app.services.report_draft_service import build_policy_draft
 from app.services.preview_service import (
     PreviewContextError,
@@ -327,6 +330,87 @@ def is_vague_approval(message: str) -> bool:
     rest = _strip_markers(text, _VAGUE_APPROVAL_MARKERS)
     rest = _strip_markers(rest, _CONFIRM_FILLERS)
     return not rest
+
+
+# --------------------------------------------------------------------------
+# 占位区域在回复正文里的说法
+# --------------------------------------------------------------------------
+#
+# 规格 #46 第 246 行：「能力待接通与范围授权、既有绑定三态相互独立；
+# 不把所有占位原因都标为能力缺失」。
+#
+# 所以**占位 ≠ 能力缺失**：
+#   - 能力待接通 —— 这个指标当前还算不出来 → 说「能力尚未接通」；
+#   - 范围授权   —— 指标能力是通的，缺的是这个统计对象的授权 → **不能**
+#     说成「能力尚未接通」，要说授权范围的事。
+#
+# 两类**分别计数**，不混算。判据在 ``report_template_service``（模板 /
+# 定义两层结构的同一份语义），这里只负责把它说成人话。
+
+#: 能力待接通类占位的说法。
+CAPABILITY_PENDING_REPLY = "{count} 个区域的能力尚未接通，已标注「能力待接通」"
+
+#: 范围授权类占位的说法 —— 与上面**明确区分**。
+#:
+#: 括注里说的是**事实**：指标能力已接通，缺的是这个统计对象的授权
+#: （与 ``report_template_service.SCOPE_PLACEHOLDER_REASON`` 同一套说法）。
+#: **不说**「能力尚未接通」，也不说旧口径「数据待连接」。
+SCOPE_PENDING_REPLY = (
+    "{count} 个区域不在授权范围"
+    "（该指标能力已接通，当前账号没有这个统计对象的授权）"
+)
+
+#: 占位原因清单的引导语。两类都在时用中性的这一句 ——
+#: 授权类的原因**不是**「尚未接通的原因」。
+_NOTES_LEAD_CAPABILITY = "尚未接通的原因："
+_NOTES_LEAD_SCOPE = "不在授权范围的原因："
+_NOTES_LEAD_MIXED = "各区域的具体原因："
+
+
+def _placeholder_fragment(
+    capability: list[Any], scope: list[Any]
+) -> str:
+    """按两类占位的数量拼出说明（两类分别计数，不混算）。"""
+    parts: list[str] = []
+    if capability:
+        parts.append(CAPABILITY_PENDING_REPLY.format(count=len(capability)))
+    if scope:
+        parts.append(SCOPE_PENDING_REPLY.format(count=len(scope)))
+    return "；".join(parts)
+
+
+def placeholder_reply(regions: Any) -> str:
+    """占位区域在回复正文里的说明（两类分别计数，不混算）。
+
+    没有占位区域时返回空串。判据来自 ``report_template_service``：
+    能力类看 ``capabilityPending``，授权类是「能力通、只是没授权」。
+    """
+    capability, scope = split_placeholder_regions(regions)
+    return _placeholder_fragment(capability, scope)
+
+
+def pending_notes_reply(template: Mapping[str, Any]) -> str:
+    """占位原因清单的正文（引导语按占位类别选，不混说）。
+
+    只有能力类时沿用「尚未接通的原因：」；只有授权类时说
+    「不在授权范围的原因：」（授权类**不是**「尚未接通」）；
+    两类都在时用中性的「各区域的具体原因：」。
+    """
+    notes = template.get("pendingNotes") or []
+    # 原因本身已经带句号了，直接拼会变成「。。」。
+    cleaned = [
+        str(note).rstrip("。；;，,") for note in notes[:4] if str(note).strip()
+    ]
+    if not cleaned:
+        return ""
+    capability, scope = split_placeholder_regions(template.get("regions") or [])
+    if capability and not scope:
+        lead = _NOTES_LEAD_CAPABILITY
+    elif scope and not capability:
+        lead = _NOTES_LEAD_SCOPE
+    else:
+        lead = _NOTES_LEAD_MIXED
+    return lead + "；".join(cleaned) + "。"
 
 
 class ReportDesignService:
@@ -1708,7 +1792,10 @@ class ReportDesignService:
         template = template or {}
         regions = template.get("regions") or []
         bound = [r for r in regions if r.get("dataStatus") == "bound"]
-        placeholders = [r for r in regions if r.get("dataStatus") == "placeholder"]
+        # 占位区域**分两类**说：能力待接通 vs 范围授权（规格 #46 第 246 行）。
+        # 授权类不是能力缺失 —— 不能混算成「能力尚未接通」。
+        capability_regions, scope_regions = split_placeholder_regions(regions)
+        placeholder_note = _placeholder_fragment(capability_regions, scope_regions)
         title = template.get("title") or (plan or {}).get("topic") or "报表"
         plan_revision = template.get("planRevision") or (plan or {}).get("revision")
 
@@ -1717,19 +1804,12 @@ class ReportDesignService:
             # 同 _draft_response：ADR 0004 起草稿阶段就用模拟业务数据渲染，
             # 既不说「已接上数据」，也不说「数值待试运行产生」。
             reply += f"{len(bound)} 个区域已绑定指标并出了示意数值"
-            if placeholders:
-                reply += f"，{len(placeholders)} 个区域的能力尚未接通，已标注「能力待接通」"
+            if placeholder_note:
+                reply += f"，{placeholder_note}"
             reply += "。"
-        elif placeholders:
-            reply += f"{len(placeholders)} 个区域的能力尚未接通，已标注「能力待接通」。"
-        notes = template.get("pendingNotes") or []
-        if notes:
-            # 原因本身已经带句号了，直接拼会变成「。。」。
-            cleaned = [
-                str(note).rstrip("。；;，,") for note in notes[:4] if str(note).strip()
-            ]
-            if cleaned:
-                reply += "尚未接通的原因：" + "；".join(cleaned) + "。"
+        elif placeholder_note:
+            reply += f"{placeholder_note}。"
+        reply += pending_notes_reply(template)
         if duplicate:
             reply += "（这一版方案之前已经确认过，直接沿用已生成的草稿，没有重复生成。）"
         else:
@@ -1762,7 +1842,10 @@ class ReportDesignService:
                 "planRevision": plan_revision,
                 "dataStatus": template.get("dataStatus"),
                 "boundRegions": len(bound),
-                "placeholderRegions": len(placeholders),
+                # 占位区域**分两类**记（能力待接通 / 范围授权），不混算。
+                "capabilityPendingRegions": len(capability_regions),
+                "scopePendingRegions": len(scope_regions),
+                "placeholderRegions": len(capability_regions) + len(scope_regions),
             },
         )
 
@@ -1790,7 +1873,10 @@ class ReportDesignService:
         template = template or {}
         regions = template.get("regions") or []
         bound = [r for r in regions if r.get("dataStatus") == "bound"]
-        placeholders = [r for r in regions if r.get("dataStatus") == "placeholder"]
+        # 占位区域**分两类**说：能力待接通 vs 范围授权（规格 #46 第 246 行）。
+        # 授权类不是能力缺失 —— 不能混算成「能力尚未接通」。
+        capability_regions, scope_regions = split_placeholder_regions(regions)
+        placeholder_note = _placeholder_fragment(capability_regions, scope_regions)
         title = template.get("title") or (plan or {}).get("topic") or "报表"
         plan_revision = template.get("planRevision") or (plan or {}).get("revision")
 
@@ -1804,19 +1890,12 @@ class ReportDesignService:
             # 「数值待试运行产生」—— 那是旧口径。反过来也不能说「已接上
             # 真实数据」—— 那同样是不存在的事实。
             reply += f"{len(bound)} 个区域已绑定指标并出了示意数值"
-            if placeholders:
-                reply += f"，{len(placeholders)} 个区域的能力尚未接通，已标注「能力待接通」"
+            if placeholder_note:
+                reply += f"，{placeholder_note}"
             reply += "。"
-        elif placeholders:
-            reply += f"{len(placeholders)} 个区域的能力尚未接通，已标注「能力待接通」。"
-        notes = template.get("pendingNotes") or []
-        if notes:
-            # 原因本身已经带句号了，直接拼会变成「。。」。
-            cleaned = [
-                str(note).rstrip("。；;，,") for note in notes[:4] if str(note).strip()
-            ]
-            if cleaned:
-                reply += "尚未接通的原因：" + "；".join(cleaned) + "。"
+        elif placeholder_note:
+            reply += f"{placeholder_note}。"
+        reply += pending_notes_reply(template)
         if duplicate:
             reply += "（这一版方案之前已经确认过，直接沿用已生成的草稿，没有重复生成。）"
 
@@ -1861,7 +1940,10 @@ class ReportDesignService:
                 "planId": (plan or {}).get("id"),
                 "dataStatus": template.get("dataStatus"),
                 "boundRegions": len(bound),
-                "placeholderRegions": len(placeholders),
+                # 占位区域**分两类**记（能力待接通 / 范围授权），不混算。
+                "capabilityPendingRegions": len(capability_regions),
+                "scopePendingRegions": len(scope_regions),
+                "placeholderRegions": len(capability_regions) + len(scope_regions),
             },
         )
         # 报表示意载荷在这里统一挂：5 条走到本函数的路径**自动**都带上，
