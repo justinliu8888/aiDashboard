@@ -1,0 +1,519 @@
+{
+  "_comment": "#42 交付票新增流程：补齐尚未验过的页面层断言。覆盖 A1~A7（负向，网格与模板中间页确实没了）、A10（折叠视图**真的用鼠标点开**后的内容）、需求稿 §4（历史会话可正常打开、且不恢复网格）。环境：真实后端 + 真实模型（VOLC_MODEL=doubao-seed-2-1-lite-260915）。waitFor 的 timeout ≥ 180000（真实模型出方案约 45 秒）。产物落 .selfcheck/downline-grid/real-model/。",
+  "baseDir": "..",
+  "outDir": "../.selfcheck/downline-grid/real-model",
+  "waitMs": 2500,
+  "timeout": 20000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "wb42-01 负向断言 A1~A7 + 草稿阶段正向断言（A8 A9 A12 A13 A15 A16 A17 A18）",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成A机房最近7天的能耗报表，四个板块：总耗电指标卡、每日耗电趋势图、设备耗电排名表、PUE指标卡。"
+        },
+        {
+          "click": "#btn-send"
+        },
+        {
+          "waitFor": "#plan-root .plan-module",
+          "timeout": 180000
+        },
+        {
+          "assertVisible": "#plan-root .plan-confirm"
+        },
+        {
+          "click": "#plan-root .plan-confirm"
+        },
+        {
+          "waitFor": "#preview-root [data-region-id]",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "assertVisible": "#preview-root .draft-status-badge"
+        },
+        {
+          "assertVisible": "#preview-root .draft-meta-row"
+        },
+        {
+          "assertCount": "#preview-root [data-region-id]",
+          "op": ">=",
+          "count": 1
+        },
+        {
+          "assertVisible": "#preview-root [data-region-placeholder-reason]"
+        },
+        {
+          "assertVisible": "#preview-root [data-region-source-note]"
+        },
+        {
+          "assertHidden": "#preview-empty"
+        },
+        {
+          "assertCount": "#plan-root .plan-confirm",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": "#plan-root details.confirmed-plan-details",
+          "op": "===",
+          "count": 1
+        },
+        {
+          "eval": "document.querySelector('#plan-root details.confirmed-plan-details').open === false"
+        },
+        {
+          "assertAttr": "#plan-root details.confirmed-plan-details",
+          "name": "data-plan-collapsed",
+          "op": "==",
+          "value": "true"
+        },
+
+        {
+          "eval": "document.querySelectorAll('#preview-root [data-region-id]').length",
+          "save": "draftRegionCount"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(c => c.innerText.replace(/\\s+/g, ' ').slice(0, 90)).join(' || ')",
+          "save": "draftCardTexts"
+        },
+
+        {
+          "assertCount": ".rg-root",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-region",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-grid",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-grid",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-grid-status",
+          "op": "===",
+          "count": 0
+        },
+
+        {
+          "assertCount": "[data-rg-handle]",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-handle",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-drop-ghost",
+          "op": "===",
+          "count": 0
+        },
+
+        {
+          "assertCount": ".template-design",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-region",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-title",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-region-head",
+          "op": "===",
+          "count": 0
+        },
+
+        {
+          "assertNotText": "模板已就绪"
+        },
+
+        {
+          "assertNotText": "个已接数据"
+        },
+        {
+          "assertNotText": "个占位"
+        },
+
+        {
+          "assertCount": ".template-confirm",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-modify",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertNotText": "确认报表，继续下一步"
+        },
+        {
+          "assertNotText": "修改报表"
+        },
+
+        {
+          "assertNotText": "拖动区域或蓝色手柄调整布局"
+        },
+        {
+          "assertNotText": "布局已保存"
+        },
+        {
+          "assertNotText": "未保存，已恢复原布局"
+        },
+        {
+          "screenshot": "wb42-01-草稿阶段负向断言A1-A7"
+        }
+      ]
+    },
+    {
+      "name": "wb42-02 A10 折叠视图用鼠标真的点开后的内容（刷新后仍可展开）",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "wait": 4000
+        },
+        {
+          "waitFor": "#preview-root [data-region-id]",
+          "timeout": 60000
+        },
+        {
+          "waitFor": "#plan-root details.confirmed-plan-details",
+          "timeout": 30000
+        },
+        {
+          "wait": 2000
+        },
+        {
+          "eval": "document.querySelector('#plan-root details.confirmed-plan-details').open === false"
+        },
+        {
+          "click": "#plan-root details.confirmed-plan-details > summary"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "eval": "document.querySelector('#plan-root details.confirmed-plan-details').open === true"
+        },
+        {
+          "eval": "(() => { const d = document.querySelector('#plan-root details.confirmed-plan-details'); const t = d && d.querySelector('.plan-topic'); return !!t && t.textContent.trim().length > 0 && t.textContent.trim() !== '（未命名方案）'; })()"
+        },
+        {
+          "eval": "(() => { const d = document.querySelector('#plan-root details.confirmed-plan-details'); const secs = d ? d.querySelectorAll('.plan-section').length : -1; const regions = document.querySelectorAll('#preview-root [data-region-id]').length; return secs > 0 && secs === regions; })()"
+        },
+        {
+          "eval": "(() => { const d = document.querySelector('#plan-root details.confirmed-plan-details'); return !!(d && d.querySelector('.plan-assumptions')); })()"
+        },
+        {
+          "eval": "(() => { const d = document.querySelector('#plan-root details.confirmed-plan-details'); return !!(d && d.querySelector('.plan-references')); })()"
+        },
+        {
+          "eval": "document.querySelectorAll('#plan-root details.confirmed-plan-details .plan-section').length",
+          "save": "planSectionCount"
+        },
+        {
+          "eval": "document.querySelectorAll('#preview-root [data-region-id]').length",
+          "save": "draftRegionCountAfterReload"
+        },
+        {
+          "eval": "document.querySelector('#plan-root details.confirmed-plan-details .plan-topic').textContent.trim()",
+          "save": "planTopic"
+        },
+        {
+          "eval": "document.querySelector('#plan-root details.confirmed-plan-details .plan-assumptions').innerText.replace(/\\s+/g, ' ').slice(0, 200)",
+          "save": "planAssumptionsText"
+        },
+        {
+          "eval": "document.querySelector('#plan-root details.confirmed-plan-details .plan-references').innerText.replace(/\\s+/g, ' ').slice(0, 200)",
+          "save": "planReferencesText"
+        },
+        {
+          "screenshot": "wb42-02-鼠标点开的已确认文字方案"
+        }
+      ]
+    },
+    {
+      "name": "wb42-03 选同意→校验→试运行→预览出数（A20 A21 复核 + 图表分支可达性）",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "wait": 4000
+        },
+        {
+          "waitFor": "#preview-root [data-region-id]",
+          "timeout": 60000
+        },
+        {
+          "waitFor": ".question-select",
+          "timeout": 60000
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('.question-select')).some(s => ['同意','修改','重新开始'].every(t => Array.from(s.options).some(o => o.textContent.trim() === t)))"
+        },
+        {
+          "eval": "(() => { const s = Array.from(document.querySelectorAll('.question-select')).filter(x => !x.disabled).pop(); const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitText": "报表已就绪",
+          "timeout": 240000
+        },
+        {
+          "eval": "document.getElementById('state-badge').textContent === 'READY'"
+        },
+        {
+          "screenshot": "wb42-03-选同意后预览出数"
+        },
+        {
+          "eval": "/\\d+\\.\\d+/.test(document.getElementById('preview-root').innerText)"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('#preview-root > div')); return cards.some(c => /\\d+\\.\\d+/.test(c.innerText)); })()"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('#preview-root > div')).map(c => c.innerText.replace(/\\s+/g, ' ').slice(0, 110)).join(' || ')",
+          "save": "finalCardTexts"
+        },
+        {
+          "eval": "(() => { const ph = Array.from(document.querySelectorAll('#preview-root > div')).filter(c => /暂无数值|口径待核实|数据待连接|暂不支持/.test(c.textContent)); return ph.length > 0 && ph.every(c => !/\\d+\\.\\d+/.test(c.textContent) && !c.textContent.includes('%') && !c.textContent.includes('kWh')); })()"
+        },
+        {
+          "eval": "(() => { const ph = Array.from(document.querySelectorAll('#preview-root > div')).filter(c => /暂无数值|口径待核实|数据待连接|暂不支持/.test(c.textContent)); return ph.length > 0 && ph.every(c => c.textContent.includes('暂无数值')); })()"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('#preview-root > div')).filter(c => /暂无数值|口径待核实|数据待连接|暂不支持/.test(c.textContent)).map(c => c.innerText.replace(/\\s+/g, ' ').slice(0, 120)).join(' || ')",
+          "save": "placeholderCardTexts"
+        },
+        {
+          "eval": "document.querySelectorAll('#preview-root svg').length",
+          "save": "previewChartSvgCount"
+        },
+        {
+          "eval": "document.querySelectorAll('#preview-root > div').length",
+          "save": "finalRegionCount"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.replace(/\\s+/g, ' ').slice(0, 900)",
+          "save": "previewRootText"
+        }
+      ]
+    },
+    {
+      "name": "wb42-04 §4 历史会话（网格时代 TEMPLATE_READY）能正常打开，且不恢复网格",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "wait": 3500
+        },
+        {
+          "eval": "(() => { localStorage.setItem('ai-report:last-session-id', 'sess_5ffc8d1ca35e'); return localStorage.getItem('ai-report:last-session-id') === 'sess_5ffc8d1ca35e'; })()"
+        },
+        {
+          "eval": "(async () => { const r = await restoreSession('sess_5ffc8d1ca35e'); return !!r && r.ok === true; })()"
+        },
+        {
+          "wait": 2500
+        },
+        {
+          "assertVisible": "#plan-root .plan-module"
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-topic') ? document.querySelector('#plan-root .plan-topic').textContent.trim() : ''",
+          "save": "historyTopic"
+        },
+        {
+          "eval": "document.querySelectorAll('#plan-root .plan-section').length",
+          "save": "historyPlanSectionCount"
+        },
+        {
+          "assertCount": ".rg-root",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-region",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-grid",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-grid",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": "[data-rg-handle]",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-handle",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-drop-ghost",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-design",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-region",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertNotText": "拖动区域或蓝色手柄调整布局"
+        },
+        {
+          "assertNotText": "模板已就绪"
+        },
+        {
+          "assertNotText": "确认报表，继续下一步"
+        },
+        {
+          "screenshot": "wb42-04-历史会话打开"
+        }
+      ]
+    },
+    {
+      "name": "wb42-05 其余两个网格时代会话也能打开",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "(async () => { const r = await restoreSession('sess_1ecb8874a288'); return !!r && r.ok === true; })()"
+        },
+        {
+          "wait": 2000
+        },
+        {
+          "assertVisible": "#plan-root .plan-module"
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-topic') ? document.querySelector('#plan-root .plan-topic').textContent.trim() : ''",
+          "save": "historyTopic2"
+        },
+        {
+          "assertCount": ".rg-root",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": "[data-rg-handle]",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "eval": "(async () => { const r = await restoreSession('sess_59200edb2621'); return !!r && r.ok === true; })()"
+        },
+        {
+          "wait": 2000
+        },
+        {
+          "assertVisible": "#plan-root .plan-module"
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-topic') ? document.querySelector('#plan-root .plan-topic').textContent.trim() : ''",
+          "save": "historyTopic3"
+        },
+        {
+          "assertCount": ".rg-root",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": "[data-rg-handle]",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "screenshot": "wb42-05-另外两个历史会话"
+        }
+      ]
+    },
+    {
+      "name": "wb42-06 硬刷新后历史会话仍然在（localStorage 落点自动恢复）",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "wait": 4000
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-module') !== null"
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-topic') ? document.querySelector('#plan-root .plan-topic').textContent.trim() : ''",
+          "save": "historyTopicAfterReload"
+        },
+        {
+          "assertCount": ".rg-root",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-grid",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": "[data-rg-handle]",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertNotText": "拖动区域或蓝色手柄调整布局"
+        },
+        {
+          "screenshot": "wb42-06-刷新后历史会话仍在"
+        }
+      ]
+    }
+  ]
+}
