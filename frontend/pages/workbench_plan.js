@@ -630,65 +630,6 @@
     return card;
   }
 
-  function templateGridItems(template) {
-    const layout = template.layout || {};
-    const placements = new Map((layout.items || []).map((item) => [item.regionId, item]));
-    return (template.regions || []).map((region, index) => {
-      const item = placements.get(region.id);
-      const legacyColumn = item && Number.isInteger(item.column) ? item.column : index % 2;
-      const legacyRow = item && Number.isInteger(item.row) ? item.row : Math.floor(index / 2);
-      return {
-        regionId: region.id,
-        label: region.title,
-        placement: item && item.placement ? { ...item.placement } : {
-          type: "GRID", column: legacyColumn * 6 + 1, row: legacyRow * 5 + 1,
-          columnSpan: 6, rowSpan: 5,
-        },
-      };
-    });
-  }
-
-  function mountTemplateGrid(state) {
-    const gridApi = typeof globalThis !== "undefined" && globalThis.WorkbenchGrid;
-    if (!state.gridRoot || !gridApi) return;
-    state.gridItems = templateGridItems(state.view.templateDesign);
-    const readonly = state.view.busy || !state.onLayoutChange;
-    state.grid = gridApi.mountReportGrid(state.gridRoot, {
-      items: state.gridItems,
-      readonly,
-      renderContent: ({ regionId }) => {
-        const index = state.view.templateRegions.findIndex((region) => region.id === regionId);
-        return renderRegion(docOf(state.gridRoot), state.view.templateRegions[index], index);
-      },
-      onIntent: async (intent) => {
-        if (state.disposed || state.gridSaving || !state.onLayoutChange) return;
-        const previous = state.gridItems;
-        const changed = new Map(intent.placements.map((item) => [item.regionId, item.placement]));
-        const next = previous.map((item) => ({ ...item, placement: changed.get(item.regionId) || item.placement }));
-        state.gridSaving = true;
-        state.gridNote.textContent = "正在保存布局…";
-        state.grid.update({ items: next, readonly: true });
-        try {
-          const template = await state.onLayoutChange(state.view.templateDesign,
-            next.map(({ regionId, placement }) => ({ regionId, placement })));
-          if (state.disposed) return;
-          state.view.templateDesign = template;
-          state.gridItems = templateGridItems(template);
-          state.gridNote.textContent = "布局已保存；可继续拖动区域或蓝色手柄调整。";
-        } catch (error) {
-          if (state.disposed) return;
-          state.gridItems = previous;
-          state.gridNote.textContent = "未保存，已恢复原布局：" + errorText(error);
-        } finally {
-          if (!state.disposed) {
-            state.gridSaving = false;
-            state.grid.update({ items: state.gridItems, readonly: false });
-          }
-        }
-      },
-    });
-  }
-
   function renderTemplate(doc, view, state) {
     if (!view.templateDesign) return null;
     const box = makeBlock(doc, "div", STYLE.templateWrap, "template-design");
@@ -711,18 +652,8 @@
     metaParts.push(view.templateRegions.length - bound + " 个占位");
     box.appendChild(makeText(doc, "p", STYLE.templateMeta, metaParts.join(" · ")));
 
-    const gridApi = typeof globalThis !== "undefined" && globalThis.WorkbenchGrid;
-    if (gridApi) {
-      state.gridNote = makeText(doc, "p", STYLE.templateMeta,
-        state.onLayoutChange ? "拖动区域或蓝色手柄调整布局，松开后自动保存。" : "模板网格预览");
-      state.gridNote.setAttribute("class", "template-grid-status");
-      box.appendChild(state.gridNote);
-      state.gridRoot = makeBlock(doc, "div", "margin-bottom:12px;", "template-grid");
-      box.appendChild(state.gridRoot);
-    } else {
-      for (let index = 0; index < view.templateRegions.length; index += 1) {
-        box.appendChild(renderRegion(doc, view.templateRegions[index], index));
-      }
+    for (let index = 0; index < view.templateRegions.length; index += 1) {
+      box.appendChild(renderRegion(doc, view.templateRegions[index], index));
     }
 
     if (view.templatePendingNotes.length) {
@@ -804,7 +735,7 @@
         button.setAttribute("type", "button");
         button.disabled = view.busy;
         const handler = () => {
-          if (state.view.busy || state.gridSaving || state.disposed) return;
+          if (state.view.busy || state.disposed) return;
           state.emit({ designAction: action, templateId: state.view.templateDesign.id,
             baseTemplateRevision: state.view.templateDesign.revision });
         };
@@ -918,8 +849,6 @@
       view: normalized,
       container: null,
       listeners: [],
-      onLayoutChange: typeof opts.onLayoutChange === "function" ? opts.onLayoutChange : null,
-      grid: null,
       disposed: false,
       confirmable: function () {
         return canConfirmNow(state.view);
@@ -947,7 +876,6 @@
 
     state.container = container;
     states.set(root, state);
-    mountTemplateGrid(state);
   }
 
   /**
@@ -959,7 +887,6 @@
     const state = states.get(root);
     if (!state) return;
     state.disposed = true;
-    if (state.grid) state.grid.destroy();
 
     for (const entry of state.listeners) {
       if (entry.node && typeof entry.node.removeEventListener === "function") {
@@ -989,7 +916,6 @@
     MODULE_ATTR,
     MODULE_NAME,
     normalizeView,
-    templateGridItems,
     errorText,
     canConfirmNow,
     confirmPayload,

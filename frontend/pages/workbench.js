@@ -179,26 +179,8 @@ function renderPlanModule() {
       error: planState.error,
       canConfirm: planCanConfirm(),
     },
-    { onAction: handlePlanAction, onLayoutChange: saveTemplateLayout }
+    { onAction: handlePlanAction }
   );
-}
-
-async function saveTemplateLayout(template, items) {
-  const sessionId = session.sessionId;
-  if (!sessionId) throw new Error("当前会话尚未保存，请先确认方案。");
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/template-layout`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ templateId: template.id, baseRevision: template.revision, items }),
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(typeof payload.detail === "string" ? payload.detail : "布局保存失败，请刷新后重试。");
-  }
-  if (session.sessionId === sessionId && planState.templateDesign?.id === template.id) {
-    planState.templateDesign = payload.templateDesign;
-  }
-  return payload.templateDesign;
 }
 
 /** 从一次响应里同步方案状态。 */
