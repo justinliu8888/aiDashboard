@@ -1,0 +1,148 @@
+/*
+ * G 独立网格模块 · 页面样式
+ *
+ * 约束：本文件所有规则都限定在 .rg-root 之下，不影响全局工作台样式。
+ * 宿主需要自行引入本文件：<link rel="stylesheet" href="../styles/report-grid.css">
+ *
+ * 定位方式（契约第 4 节）：
+ *   grid-column: var(--rg-column) / span var(--rg-column-span);
+ *   grid-row:    var(--rg-row)    / span var(--rg-row-span);
+ * 窗口变窄时 CSS Grid 自动重排，只重算渲染尺寸，不改坐标。
+ */
+
+.rg-root {
+  --rg-columns: 12;
+  --rg-row-unit: 48px;
+  --rg-gap: 12px;
+  --rg-col-width: 80px;
+  --rg-col-pitch: 92px;
+  --rg-row-pitch: 60px;
+  --rg-line-color: rgba(47, 111, 237, 0.26);
+  --rg-border-color: #d7dde8;
+  --rg-accent: #2f6fed;
+
+  position: relative;
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.rg-root *,
+.rg-root *::before,
+.rg-root *::after {
+  box-sizing: border-box;
+}
+
+/* ----------------------------------------------------------- 网格容器 */
+
+.rg-root .rg-grid {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(var(--rg-columns), minmax(0, 1fr));
+  grid-auto-rows: var(--rg-row-unit);
+  gap: var(--rg-gap);
+  width: 100%;
+  min-height: 100%;
+}
+
+/* 只读态不显示网格线 */
+.rg-root .rg-gridlines {
+  position: absolute;
+  inset: 0;
+  display: none;
+  pointer-events: none;
+  background-image:
+    repeating-linear-gradient(to right, var(--rg-line-color) 0px, var(--rg-line-color) 1px, transparent 1px, transparent var(--rg-col-pitch)),
+    repeating-linear-gradient(to bottom, var(--rg-line-color) 0px, var(--rg-line-color) 1px, transparent 1px, transparent var(--rg-row-pitch));
+}
+
+.rg-root[data-rg-editable="true"] .rg-gridlines {
+  display: block;
+}
+
+/* --------------------------------------------------------------- 区域 */
+
+.rg-root .rg-region {
+  position: relative;
+  grid-column: var(--rg-column) / span var(--rg-column-span);
+  grid-row: var(--rg-row) / span var(--rg-row-span);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--rg-border-color);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.rg-root .rg-region[data-rg-selected="true"] {
+  border-color: var(--rg-accent);
+  box-shadow: 0 0 0 2px rgba(47, 111, 237, 0.16);
+}
+
+.rg-root .rg-region[data-rg-dragging="true"] {
+  opacity: 0.5;
+  border-style: dashed;
+}
+
+.rg-root .rg-region-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px;
+}
+
+/* ------------------------------------------------------------- 手柄 */
+
+.rg-root .rg-handle {
+  position: absolute;
+  display: none;
+  width: 10px;
+  height: 10px;
+  border: 1px solid #fff;
+  border-radius: 2px;
+  background: var(--rg-accent);
+  z-index: 3;
+}
+
+.rg-root[data-rg-editable="true"] .rg-handle {
+  display: block;
+}
+
+.rg-root .rg-handle[data-rg-handle="e"] {
+  top: 50%;
+  right: 2px;
+  margin-top: -5px;
+  cursor: ew-resize;
+}
+
+.rg-root .rg-handle[data-rg-handle="s"] {
+  bottom: 2px;
+  left: 50%;
+  margin-left: -5px;
+  cursor: ns-resize;
+}
+
+.rg-root .rg-handle[data-rg-handle="se"] {
+  right: 2px;
+  bottom: 2px;
+  cursor: nwse-resize;
+}
+
+/* ------------------------------------------------------------- 落位示意 */
+
+.rg-root .rg-drop-ghost {
+  grid-column: var(--rg-column) / span var(--rg-column-span);
+  grid-row: var(--rg-row) / span var(--rg-row-span);
+  pointer-events: none;
+  z-index: 2;
+  padding: 6px 8px;
+  overflow: hidden;
+  border: 1px dashed #f59e0b;
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.14);
+  color: #92400e;
+  font-size: 12px;
+  line-height: 1.4;
+}
