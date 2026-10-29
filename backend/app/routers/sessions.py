@@ -122,6 +122,10 @@ def _with_report_preview_payload(
     - 历史会话没有上下文 → 用会话**已有的创建时间**只读推导一份，
       **不自动确认、不迁移、不写回**；
     - 没有有效定义 → 不返回无关的示意。
+    - 生成失败 → **不伪造载荷、不给空壳卡片**，但**原因要看得见**：
+      挂在这次响应的 ``snapshot.error`` 上（``code`` + ``message``，
+      与聊天响应的 ``error`` 同一套口径），否则刷新页面后右侧是空的，
+      用户只看到一片空白，不知道发生了什么。
     """
     if not isinstance(snapshot, dict):
         return snapshot
@@ -131,25 +135,39 @@ def _with_report_preview_payload(
         return snapshot
     plan = snapshot.get("reportPlan") if isinstance(snapshot.get("reportPlan"), dict) else None
     existing = snapshot.get("previewContext")
-    if isinstance(existing, dict):
-        context = resolve_preview_context(
-            definition, plan=plan, existing=existing
-        )
-    else:
-        # 历史会话没有上下文：按**已有的创建时间**只读推导。用创建时间
-        # 而不是「此刻」—— 它是稳定的，推导出的时间窗跨天、跨重启都一样，
-        # 数字不会因为刷新一次就跳。
-        context = resolve_preview_context(
-            definition,
-            plan=plan,
-            existing=None,
-            anchor_time=_session_anchor(record.createdAt),
-        )
     try:
+        if isinstance(existing, dict):
+            context = resolve_preview_context(
+                definition, plan=plan, existing=existing
+            )
+        else:
+            # 历史会话没有上下文：按**已有的创建时间**只读推导。用创建时间
+            # 而不是「此刻」—— 它是稳定的，推导出的时间窗跨天、跨重启都一样，
+            # 数字不会因为刷新一次就跳。
+            context = resolve_preview_context(
+                definition,
+                plan=plan,
+                existing=None,
+                anchor_time=_session_anchor(record.createdAt),
+            )
         payload = build_report_preview_payload(definition, context, plan=plan)
     except (SimulatedDataError, PreviewContextError) as exc:
-        logger.warning("[sessions] 恢复会话时示意载荷生成失败：%s", exc)
-        return snapshot
+        code = str(getattr(exc, "code", "") or "REPORT_PREVIEW_PAYLOAD_FAILED")
+        logger.warning(
+            "[sessions] 恢复会话时示意载荷生成失败 code=%s reason=%s", code, exc
+        )
+        # 失败原因随这次响应回去（响应级，不落库）：用户刷新后仍看得见
+        # 「为什么右侧是空的」，而不是只剩一片空白。
+        #
+        # 消息取**人话**（异常自带的 message，不带错误码前缀）：错误码单独
+        # 放在 ``code`` 里给机器看，消息是给人看的。
+        reason = str(getattr(exc, "message", "") or exc)
+        failed = dict(snapshot)
+        failed["error"] = {
+            "code": code,
+            "message": f"示意数据没有生成出来：{reason}",
+        }
+        return failed
     result = dict(snapshot)
     result["reportPreviewPayload"] = payload
     return result
