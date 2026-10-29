@@ -574,11 +574,13 @@ class AgentService:
                         if request.message == CONFIRM_BUTTON_VALUE:
                             return self._save_placeholder(request, RouteDecision())
                         if request.message == RESTART_BUTTON_VALUE:
-                            return AgentResponse(
-                                conversationId=request.conversationId,
-                                state=AgentState.ANALYZING,
-                                reply="好的，我们重新开始。请描述你想生成的新报表。",
-                                uiActions=["restart_from_template_editing"],
+                            # 「重新开始」要**落库**地把设计阶段复位回
+                            # 「需要生成方案」（工单 #44）：不复位的话这个
+                            # 会话会永远停在 DRAFT_READY，再也拿不到新的
+                            # 文字方案。复位由设计服务做，阶段与这一轮
+                            # 的消息同事务提交。
+                            return report_design_service.restart_design(
+                                request, state=design_state
                             )
                         return self._editing_prompt_response(
                             request,

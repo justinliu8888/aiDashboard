@@ -135,6 +135,21 @@ class ConfirmationResult(TypedDict, total=False):
     createdAt: str
 
 
+class PhaseResetResult(TypedDict, total=False):
+    """一次阶段复位的落库结果。
+
+    ``changed`` 说明这次是不是真的动了阶段：本来就已经是
+    ``PLAN_NEEDED`` 时复位是幂等的，``changed`` 为 False，
+    方案版本原样带回。
+    """
+
+    sessionId: str
+    designPhase: str
+    planId: str | None
+    planRevision: int | None
+    changed: bool
+
+
 # write_turn：协调者注入的同事务消息 / 会话写入回调。
 # 回调拿到的是本模块正在使用的那条连接，自己不 commit。
 WriteTurn = Callable[[sqlite3.Connection], Any]
@@ -224,6 +239,28 @@ class ReportDesignRepository(Protocol):
         self, operation_id: str, safe_error: str | Mapping[str, Any]
     ) -> None:
         """把操作标记为失败，保留上一成功方案。"""
+
+    def reset_design_phase(
+        self, session_id: str, write_turn: WriteTurn | None = None
+    ) -> PhaseResetResult:
+        """把设计阶段复位回 ``PLAN_NEEDED``（工单 #44）。
+
+        「重新开始」需要一次**落库**的阶段复位：草稿已就绪阶段点
+        「重新开始」之后，这个会话必须能重新回到「文字方案 → 确认方案」
+        链路，而不是永远停在 ``DRAFT_READY``。
+
+        复位**保留**当前成功方案（``plan_id`` / ``plan_revision`` /
+        ``plan_json``）：清空方案等于删历史，而且会把版本号压回 1，
+        与旧方案撞版本。保留之后新一轮的方案沿用同一 id、版本号 +1
+        （``apply_candidate`` 的 ``previous`` 机制），既保留血缘，
+        又与旧方案的版本标识不同。
+
+        幂等：本来就已经是 ``PLAN_NEEDED`` 时再复位一次，结果相同、
+        不报错、不动方案。
+
+        与 write_turn 回调同事务提交：阶段复位与「重新开始」这一轮
+        的消息、会话快照要么一起成功，要么一起回滚。
+        """
 
     def commit_template_and_definition(
         self,
