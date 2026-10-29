@@ -484,7 +484,9 @@ def test_capability_checks_survive_without_fetching_data(client, monkeypatch):
     )["domainObjects"]["templateDesign"]
     region2 = template2["regions"][0]
     assert region2["dataStatus"] == "placeholder"
-    assert "数据待连接" in region2["placeholderReason"]
+    # 旧口径「数据待连接」已删（规格《回复口径》/ US15）：陌生指标标「能力待接通」。
+    assert "数据待连接" not in region2["placeholderReason"]
+    assert "能力待接通" in region2["placeholderReason"]
     assert region2["data"] is None
     assert region2["metricRefs"] == []
 

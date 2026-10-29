@@ -399,7 +399,13 @@ def test_b5_plan_column_still_forbids_unknown_keys() -> None:
 
 
 def test_b5_a_declared_unit_reaches_the_definition() -> None:
-    """模型声明的单位标注一路落到草稿定义的列上（表头才有单位）。"""
+    """模型声明的单位标注一路落到草稿定义的列上（表头才有单位）。
+
+    方案从 ``generate_candidate()`` 的**输出**出发 —— 那才是线上链路：
+    候选要先经服务端定稿再回写，列的 ``format`` 必须在那一步活下来。
+    （早先这里直接拿原始模型候选做 ``apply_candidate``，绕过了出问题的那一层，
+    于是这条用例恒绿而线上是坏的。）
+    """
     candidate = _candidate(
         sections=[
             {
@@ -421,7 +427,8 @@ def test_b5_a_declared_unit_reaches_the_definition() -> None:
     result = _generate(candidate)
     assert result["kind"] == "plan_candidate", result
 
-    plan = _plan(candidate)
+    # 方案层：从**服务端定稿后的候选**建方案，单位标注不能在中途丢掉。
+    plan = _plan(result["candidate"])
     assert plan.sections[0].columns[0].format is not None
     assert plan.sections[0].columns[0].format.unitLabel == "kWh"
 
