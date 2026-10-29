@@ -2392,13 +2392,26 @@ async function renderFinalReport() {
 function renderFinalRegion(container, region, payload) {
   const t = region.componentType;
   const p = region.payload || {};
+  // #39 起，占位区域的预览 payload 是 {placeholder: true, reason, ...} ——
+  // **没有** value / label / unit / rows / yValues。
+  // 任何组件类型都要如实显示「暂无数值 + 原因」：
+  //   · 不显示原因 = 用户只看到一个空卡片，不知道为什么没有数；
+  //   · 直接插 ${p.value} = 页面上出现字面量 "undefined"。
+  if (p.placeholder) {
+    container.innerHTML = `
+      <div class="rounded-lg border border-dashed border-amber-200 bg-amber-50 px-4 py-3">
+        <div class="text-sm font-medium text-amber-900">暂无数值</div>
+        <div class="text-[11px] text-amber-800 mt-1">${esc(p.reason || "数据待连接：当前已接通的能力里没有对应指标。")}</div>
+      </div>`;
+    return;
+  }
   if (t === "TEXT") {
     container.innerHTML = `<div class="text-xl font-semibold text-slate-800">${esc(p.rendered || p.template || "")}</div>`;
   } else if (t === "METRIC_CARD") {
     container.innerHTML = `
       <div class="rounded-lg border border-slate-200 bg-slate-50 px-5 py-4 inline-block">
         <div class="text-[11px] text-slate-500">${esc(p.label)}</div>
-        <div class="text-3xl font-semibold text-slate-900 mt-1">${p.value}<span class="text-sm font-normal text-slate-400 ml-1">${esc(p.unit)}</span></div>
+        <div class="text-3xl font-semibold text-slate-900 mt-1">${esc(p.value ?? "—")}<span class="text-sm font-normal text-slate-400 ml-1">${esc(p.unit)}</span></div>
       </div>`;
   } else if (t === "TABLE") {
     const headCells = (p.columns || [])
