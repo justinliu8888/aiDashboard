@@ -2749,6 +2749,17 @@ function renderChartPayload(container, region, p, unit) {
         },
         series: seriesOption,
       });
+      // 单位标记：两条渲染后端产出**同一种**可断言标记（data-chart-unit）。
+      // ECharts 把单位画在纵轴名上（canvas 里），DOM 里抓不到 —— 这里补一个元素，
+      // 让「单位来自载荷」在 ECharts 路径下也能被同一条断言抓到。
+      // 单位取自载荷（readPayloadUnit 的回退链），绝不写死 kWh / 耗电。
+      if (unit) {
+        const unitNote = document.createElement("div");
+        unitNote.className = "text-[11px] text-slate-400 mt-1";
+        unitNote.dataset.chartUnit = unit;
+        unitNote.textContent = "单位：" + unit + "，共 " + labels.length + " 个数据点";
+        container.appendChild(unitNote);
+      }
       return;
     } catch (err) {
       console.error("[AI Report] 图表初始化失败", err);
@@ -2771,7 +2782,9 @@ function renderChartPayload(container, region, p, unit) {
       if (unit && !String(node.textContent || "").includes("单位：")) {
         const note = document.createElement("div");
         note.className = "text-[11px] text-slate-400 mt-1";
-        note.dataset.chartUnit = "true";
+        // 标记语义与 ECharts 分支一致：属性的值就是载荷里的单位，
+        // 两条渲染后端用同一套选择器断言（渲染内容不变）。
+        note.dataset.chartUnit = unit;
         note.textContent = "单位：" + unit + "，共 " + labels.length + " 个数据点";
         container.appendChild(note);
       }

@@ -45,6 +45,10 @@
   只把一份静态载荷塞进去，验证「右侧按载荷出图出表 + 角标 + 徽标」这条路径。
   <br />
   场景切换：<code>window.__renderDemo('default' | 'truncated' | 'validated' | 'pending')</code>
+  <br />
+  渲染后端：默认走 <strong>SVG 兜底</strong>（不依赖 CDN）；本页加 <code>?echarts=1</code> 则走
+  <strong>ECharts 真图表</strong>（真实 CDN）。CDN 不可达时自动退回 SVG 兜底，
+  两条后端的结构断言都成立。当前后端见 <code>document.body[data-chart-backend]</code>。
 </div>
 
 <div class="toolbar">
@@ -94,10 +98,22 @@
   };
   window.AI_REPORT_API_BASE = window.location.origin;
 
-  // 本机不接 CDN（图表库取不到）：强制走**不依赖 CDN** 的 SVG 渲染路径，
-  // 让本页的断言是确定的（曲线真的画出来了、单位真的写在图上）。
-  // ECharts 那条路要真实 CDN，在有网的环境里由工作台页承担。
-  try { delete window.echarts; } catch (e) { window.echarts = undefined; }
+  // ── 渲染后端选择 ───────────────────────────────────────────────
+  // 默认走**不依赖 CDN** 的 SVG 渲染路径，让本页的断言是确定的
+  // （曲线真的画出来了、单位真的写在图上）。
+  // 加 ?echarts=1 则**加载真实 ECharts CDN**，走真图表那条路 ——
+  // 这一条以前从来没被测过（票 07 的 harness 一直强制删掉 echarts）。
+  // CDN 不可达时，ECharts 那条路自己退回 SVG 兜底：结构断言仍然成立，
+  // 不能因为网络不通就让整条自检失败。
+  var WANT_ECHARTS = /[?&]echarts=1(?:&|$)/.test(window.location.search);
+  if (WANT_ECHARTS) {
+    var echartsScript = document.createElement("script");
+    echartsScript.src = "https://modao.cc/agent-py/static/source/js/echarts.min.js";
+    echartsScript.async = false;
+    document.head.appendChild(echartsScript);
+  } else {
+    try { delete window.echarts; } catch (e) { window.echarts = undefined; }
+  }
 </script>
 
 <script src="../pages/workbench_query.js"></script>
@@ -295,9 +311,17 @@
     return kind;
   };
 
+  // 当前走的是哪条渲染后端：流程与自检用它区分「ECharts 真图表」与
+  // 「CDN 不可达时的 SVG 兜底」，并据此决定哪些断言生效。
+  window.__chartBackend = function () {
+    var ok = typeof window.echarts !== "undefined" && window.echarts && typeof window.echarts.init === "function";
+    return ok ? "echarts" : "svg";
+  };
+
   window.addEventListener("load", function () {
     // 默认场景：草稿阶段的报表示意。
     window.__renderDemo("default");
+    document.body.setAttribute("data-chart-backend", window.__chartBackend());
     document.body.setAttribute("data-harness-ready", "true");
   });
 </script>
