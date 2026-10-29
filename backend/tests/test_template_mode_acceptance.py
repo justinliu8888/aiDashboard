@@ -469,8 +469,10 @@ def test_agreeing_the_draft_keeps_the_simulated_values_and_runs_the_trial():
     对应规格 #46 缝 1「点『同意』→ 校验与试运行照跑；示意数值不变」，
     以及 ADR 0004 §2.4「点同意之后右侧数字不动」。
 
-    同时验证存储隔离的另一半：``previewPayload`` 装的是**试运行结果**，
-    与 ``reportPreviewPayload``（模拟业务结果）并存、互不覆盖。
+    同时验证存储隔离的另一半：模板态的**试运行结果也不落库** ——
+    它跑的是模拟业务数据，按规格 #46「模拟业务数据只存在于响应与内存」
+    只留在内存与响应里；读会话时按内存里的运行结果挂回响应
+    （``previewPayload`` 仍然是试运行结果的键，语义不变）。
 
     待票05（GitHub #51）：依赖响应顶层与快照里的 ``reportPreviewPayload``。
     """
@@ -484,15 +486,21 @@ def test_agreeing_the_draft_keeps_the_simulated_values_and_runs_the_trial():
         for state in ("VALIDATING", "PREVIEWING", "PREVIEW_READY"):
             harness.advance(state)
 
-        # 试运行结果落进了 ``previewPayload``（它装的是试运行结果）。
+        # 模板态的试运行结果**不落库**（模拟业务数据不进持久化存储）。
         snapshot = harness.persisted_snapshot()
-        assert snapshot["previewPayload"]["regions"]
+        assert "previewPayload" not in snapshot
+        # 运行标识与运行状态**照旧保存**（规格 #46：运行状态与运行标识可保存）。
+        assert snapshot["lastReportRun"]["reportRunId"]
         # 模拟业务结果仍然**不落库**。
         assert REPORT_PREVIEW_PAYLOAD_FIELD not in snapshot
+        # 但读会话时**仍然拿得到**试运行结果（响应级，内存里现取的）。
+        restored = harness.read_session_snapshot()
+        assert restored["previewPayload"]["regions"]
         # 示意数值一点没变（恢复出来的与确认那一轮逐字段相等）。
-        restored = harness.read_session_snapshot()[REPORT_PREVIEW_PAYLOAD_FIELD]
-        assert restored["regions"] == before["regions"]
-        assert restored["previewContext"] == before["previewContext"]
+        assert restored[REPORT_PREVIEW_PAYLOAD_FIELD]["regions"] == before["regions"]
+        assert restored[REPORT_PREVIEW_PAYLOAD_FIELD]["previewContext"] == before[
+            "previewContext"
+        ]
 
 
 # --------------------------------------------------------------------------

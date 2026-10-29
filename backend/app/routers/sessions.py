@@ -185,6 +185,10 @@ def get_session(session_id: str) -> SessionDetail:
         snapshot = dict(snapshot)
         snapshot["definition"] = resolve_placeholders(snapshot["definition"])
     snapshot = _with_report_preview_payload(record, snapshot)
+    # 模板态的试运行结果**不落库**（ADR 0004：模拟业务数据只存在于响应与内存），
+    # 读会话时按**内存里**的运行结果挂回响应 —— 响应里可以有模拟数据，
+    # 持久化快照里不行。非模板态的既有链路原样保留库里那份。
+    snapshot = session_service.restore_trial_preview_payload(snapshot)
     return SessionDetail(
         sessionId=record.id,
         title=record.title,
