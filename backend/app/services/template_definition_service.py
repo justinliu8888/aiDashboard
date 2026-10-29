@@ -63,6 +63,12 @@ _KIND_DEFAULT_UNITS: dict[str, str] = {
     "cabinet_status": "",
 }
 
+#: 上游没给占位原因时的**兜底文案**（规格 US15：页面上不出现旧口径）。
+#:
+#: 与 ``report_template_service`` 的说法**完全一致** —— 全仓库只有这一套
+#: 口径：能力没接通就说「能力待接通」，不用旧的说法。
+_DEFAULT_PENDING_REASON = "能力待接通：当前已接通的能力里没有对应指标。"
+
 #: 定义组件类型 → 方案组件类型（历史定义的只读适配用）。
 _DEFINITION_COMPONENT_TYPES: dict[str, str] = {
     "METRIC_CARD": "metric_card",
@@ -100,7 +106,10 @@ def _empty_shell(
         component["columns"] = [dict(column) for column in (columns or [])]
         component["rowNumber"] = True
     elif shape["componentType"] == "TEXT":
-        component["content"] = {"format": "PLAIN", "template": reason or "数据待连接"}
+        component["content"] = {
+            "format": "PLAIN",
+            "template": reason or _DEFAULT_PENDING_REASON,
+        }
     return {"role": shape["role"], "component": component}
 
 
@@ -418,7 +427,8 @@ def build_template_definition(
             # 不降级成纯文字区域（#39 硬要求）。**不编任何数值** ——
             # 数值由模拟业务数据渲染，能力待接通的还要标出来。
             converted = _empty_shell(
-                kind, title=title, reason=region.placeholderReason or "数据待连接",
+                kind, title=title,
+                reason=region.placeholderReason or _DEFAULT_PENDING_REASON,
                 columns=declared_columns,
             )
             converted["context"] = _plan_context(plan_time_window, plan_grain)
@@ -426,7 +436,10 @@ def build_template_definition(
             text = (region.data or {}).get("template") or (region.data or {}).get("rendered") or title
             converted = {
                 "role": "DESCRIPTION", "component": {
-                    "type": "TEXT", "content": {"format": "PLAIN", "template": text or "数据待连接"},
+                    "type": "TEXT", "content": {
+                        "format": "PLAIN",
+                        "template": text or _DEFAULT_PENDING_REASON,
+                    },
                 },
                 "context": _plan_context(plan_time_window, plan_grain),
             }

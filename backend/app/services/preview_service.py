@@ -814,7 +814,7 @@ class PreviewService:
         bound = (((region.get("data") or {}).get("pipeline") or {}).get("nodes") or [])
         if ctype in {"METRIC_CARD", "TABLE", "CHART"} and not bound:
             reason = ((region.get("templateBinding") or {}).get("placeholderReason")
-                      or "数据待连接：当前已接通的能力里没有对应指标。")
+                      or "能力待接通：当前已接通的能力里没有对应指标。")
             return {"placeholder": True, "reason": reason,
                     "chartKind": component.get("chartKind", "LINE"),
                     "columns": component.get("columns") or [], "rows": []}
@@ -1401,6 +1401,44 @@ def _payload_with_unit(
     return payload
 
 
+#: 区域级来源标记的兜底值：草稿阶段一律用**模拟业务数据**渲染（ADR 0004）。
+_REGION_DATA_SOURCE_FALLBACK = "simulated"
+
+
+def _region_data_source(payload: dict[str, Any]) -> str:
+    """区域级来源标记：与载荷自己说的来源保持一致。
+
+    载荷没带就按草稿阶段的默认口径给 ``simulated``（ADR 0004：草稿阶段
+    一律用系统生成的模拟业务数据渲染，接入真实数据后才换）。
+    """
+    return str(payload.get("dataSource") or _REGION_DATA_SOURCE_FALLBACK)
+
+
+def _region_capability_pending(
+    payload: dict[str, Any], spec: dict[str, Any]
+) -> bool:
+    """区域级能力标记 = **各项指标的逻辑或**（规格 #46）。
+
+    不是「这个区域是不是占位区」：区域里只要**有一项**指标还没接通，
+    这一块就要标「能力待接通」；全部接通了才是 False。
+
+    取值顺序：载荷里造数时真正用到的 ``metrics[]`` → 区域的示意语义
+    描述 ``previewSpec.metrics[]``（它本身就是各项的逻辑或）→
+    ``previewSpec.capabilityPending``。表格 / 图表 / 文字区的载荷里
+    没有 ``metrics[]``，走第二条。
+    """
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, list) or not metrics:
+        metrics = spec.get("metrics")
+    if isinstance(metrics, list) and metrics:
+        return any(
+            bool(item.get("capabilityPending"))
+            for item in metrics
+            if isinstance(item, dict)
+        )
+    return bool(spec.get("capabilityPending"))
+
+
 def build_report_preview_payload(
     definition: dict[str, Any],
     preview_context: dict[str, Any],
@@ -1414,7 +1452,8 @@ def build_report_preview_payload(
         {
           "previewContext": {...8 个字段...},
           "regions": [
-            {"regionId", "name", "role", "componentType", "payload"}, ...
+            {"regionId", "name", "role", "componentType",
+             "dataSource", "capabilityPending", "payload"}, ...
           ]
         }
 
@@ -1422,7 +1461,11 @@ def build_report_preview_payload(
       渲染逻辑；
     - ``role`` 必须带 —— 前端靠它跳过标题区；
     - ``role == "REPORT_TITLE"`` 的区域**不出数、不进 regions**；
-    - 数值型组件的 ``payload`` 一定带 ``unit``。
+    - 数值型组件的 ``payload`` 一定带 ``unit``；
+    - 每个区域额外带 ``dataSource``（来源标记）与 ``capabilityPending``
+      （能力标记，= 各项指标的逻辑或）。载荷里的 ``payload.dataSource``
+      与 ``payload.metrics[].capabilityPending`` **照旧保留** —— 前端
+      区域级优先、载荷级回退，两边都要用。
 
     造数失败（定义非法 / 时间窗推不出来 / 粒度解析不了 / 表格没有列）
     时抛 :class:`SimulatedDataError` —— **不退回空表、不给半份载荷**。
@@ -1452,15 +1495,20 @@ def build_report_preview_payload(
             )
         component_type = str((region.get("component") or {}).get("type") or "")
         spec = ((region.get("templateBinding") or {}).get("previewSpec")) or {}
+        final_payload = _payload_with_unit(
+            payload, component_type=component_type, spec=spec
+        )
         regions.append(
             {
                 "regionId": region_id,
                 "name": region.get("name"),
                 "role": role,
                 "componentType": component_type,
-                "payload": _payload_with_unit(
-                    payload, component_type=component_type, spec=spec
-                ),
+                # 区域级来源标记：草稿阶段一律是模拟业务数据。
+                "dataSource": _region_data_source(final_payload),
+                # 区域级能力标记 = 各项指标的逻辑或（不是「是不是占位区」）。
+                "capabilityPending": _region_capability_pending(final_payload, spec),
+                "payload": final_payload,
             }
         )
 
