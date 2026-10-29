@@ -112,7 +112,6 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const chatScroll = $("chat-scroll");
 const previewRoot = $("preview-root");
 const previewEmpty = $("preview-empty");
-const planRoot = $("plan-root");
 let activeRequest = null;
 let requestEpoch = 0;
 let lockedChoice = null;
@@ -148,6 +147,91 @@ const planState = {
   planExpanded: false,
 };
 
+// --------------------------------------------------------------------------
+// 文字方案的挂载位置：左侧对话区里的一条 AI 回复。
+//
+// 工单 06 / 规格 #46：文字方案出现在左侧对话区，作为一条 AI 回复里的可折叠块；
+// 右侧报表面板不再出现文字方案（容器一并移除，不留任何入口）。
+//
+// 方案模块（workbench_plan.js）仍然只接收一个根节点、只往那个根节点里写，
+// 所以这里换的只是「那个根节点在哪儿」：
+//   - planBubble：承载方案的一条 AI 气泡（头像 + 卡片），与对话流里的气泡同构；
+//   - planRoot：方案模块的挂载根（气泡里的 #plan-root）。
+//
+// 气泡是**动态建**的：对话区会被清空（新建对话 / 恢复会话），
+// 静态写在页面里的容器会被一起清掉，所以按需重建。
+// --------------------------------------------------------------------------
+
+let planBubble = null;
+let planRoot = null;
+
+/** 建一条承载方案模块的 AI 气泡。 */
+function createPlanBubble() {
+  const bubble = document.createElement("div");
+  bubble.className = "flex gap-2.5";
+  bubble.setAttribute("data-plan-bubble", "");
+
+  const avatar = document.createElement("div");
+  avatar.className = "w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center";
+  avatar.innerHTML = '<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>';
+
+  const body = document.createElement("div");
+  body.className = "flex-1 min-w-0";
+
+  const root = document.createElement("div");
+  root.id = "plan-root";
+
+  body.appendChild(root);
+  bubble.appendChild(avatar);
+  bubble.appendChild(body);
+  return { bubble, root };
+}
+
+/**
+ * 拿到方案容器（必要时重建），并挂到对话流里。
+ * 对话区被清空过 → 旧容器已经不在文档里了 → 重建一条。
+ * @returns {{root: Element|null, fresh: boolean}} fresh=true 表示这次是新挂上去的
+ */
+function mountPlanHost() {
+  if (!chatScroll) return { root: null, fresh: false };
+  if (!planBubble || !planRoot || !planRoot.isConnected) {
+    const host = createPlanBubble();
+    planBubble = host.bubble;
+    planRoot = host.root;
+  }
+  if (planBubble.parentNode !== chatScroll) {
+    chatScroll.appendChild(planBubble);
+    chatBubbleObserver.observe(planBubble);
+    return { root: planRoot, fresh: true };
+  }
+  return { root: planRoot, fresh: false };
+}
+
+/**
+ * 把方案气泡挪到对话流的末尾。
+ *
+ * 只在气泡**刚挂进对话流**时做：延到本轮渲染之后再挪，
+ * 响应处理是同步的，等它跑完，卡片就落在这一轮 AI 回复文本的下面 ——
+ * 读起来就是「AI 回复里的一块」。
+ *
+ * 已经在对话流里的卡片不再挪：它留在自己那条回复的位置上，
+ * 后来的对话接在它下面，用户看着不跳。
+ */
+let planAnchorScheduled = false;
+function anchorPlanBubble() {
+  if (!planBubble || !chatScroll) return;
+  if (planAnchorScheduled) return;
+  planAnchorScheduled = true;
+  const run = () => {
+    planAnchorScheduled = false;
+    if (!planBubble || !chatScroll || !planBubble.isConnected) return;
+    chatScroll.appendChild(planBubble);
+    scrollChatBottom();
+  };
+  if (typeof queueMicrotask === "function") queueMicrotask(run);
+  else setTimeout(run, 0);
+}
+
 /** 能不能确认：只由明确的几个条件决定，不靠文案猜。 */
 function planCanConfirm(state = planState) {
   if (!state) return false;
@@ -160,10 +244,9 @@ function planCanConfirm(state = planState) {
 }
 
 function renderPlanModule() {
-  if (!planRoot) return;
   const api = window.WorkbenchPlan;
   if (!api) return;
-  // 草稿阶段也要保留方案面板（折叠的已确认方案）—— 不再排除 DRAFT_READY。
+  // 草稿阶段也要保留方案卡片（折叠的已确认方案）—— 不再排除 DRAFT_READY。
   const hasPlan = !!planState.reportPlan || !!planState.designPhase;
   // 草稿空态只在「有方案、但还没出草稿」时让位。
   // DRAFT_READY 时若草稿还没到，宁可显示空态，也不要留一块空白。
@@ -171,14 +254,18 @@ function renderPlanModule() {
   const hideEmpty = hasPlan && !hasDraft && planState.designPhase !== "DRAFT_READY";
   previewRoot.classList.toggle("plan-active", hideEmpty);
   if (!hasPlan) {
-    api.clear(planRoot);
+    // 没有方案：把气泡从对话流里摘掉，不留空白位置。
+    if (planRoot) api.clear(planRoot);
+    if (planBubble && planBubble.parentNode) planBubble.parentNode.removeChild(planBubble);
     return;
   }
+  const { root, fresh } = mountPlanHost();
+  if (!root) return;
   // 记住用户有没有展开折叠视图：重渲染（busy 抖动 / 新响应）时不把它弹回去。
-  const existing = planRoot.querySelector("details.confirmed-plan-details");
+  const existing = root.querySelector("details.confirmed-plan-details");
   if (existing) planState.planExpanded = existing.open === true;
   api.render(
-    planRoot,
+    root,
     {
       designPhase: planState.designPhase,
       reportPlan: planState.reportPlan,
@@ -189,6 +276,7 @@ function renderPlanModule() {
     },
     { onAction: handlePlanAction }
   );
+  if (fresh) anchorPlanBubble();
 }
 
 /** 从一次响应里同步方案状态。 */
@@ -203,7 +291,7 @@ function syncPlanFromResponse(data) {
   planState.error = data.error ? data.error.message || data.error.code || null : null;
   renderPlanModule();
   // 草稿已出：把右侧滚回顶部，让用户第一眼看到草稿而不是聊天记录。
-  if (phase === "DRAFT_READY") planRoot.parentElement.scrollTop = 0;
+  if (phase === "DRAFT_READY") previewRoot.parentElement.scrollTop = 0;
 }
 
 /** 从会话详情里恢复方案（刷新 / 重建服务后）。 */

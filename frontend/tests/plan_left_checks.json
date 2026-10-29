@@ -1,0 +1,57 @@
+{
+  "baseDir": "../..",
+  "serve": "../..",
+  "outDir": "../../.selfcheck/tmpl-06-plan-left",
+  "waitMs": 1500,
+  "ignore": ["modao.cc"],
+  "pages": [
+    {
+      "name": "workbench-左侧方案",
+      "path": "/frontend/pages/workbench.html",
+      "title": "AI 报表生成工作台",
+      "waitMs": 2500,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#chat-scroll",
+        "#chat-input",
+        "#btn-send",
+        "#preview-root",
+        "#session-nav",
+        "#session-list",
+        "#draft-badge"
+      ],
+      "texts": [
+        "AI 报表助理",
+        "还没有草稿",
+        "新建对话"
+      ],
+      "counts": [
+        "#chat-scroll>=1",
+        "#preview-root>=1",
+        "#session-nav>=1"
+      ]
+    },
+    {
+      "name": "report-plan-harness-左侧方案",
+      "path": "/frontend/tests/report_plan_harness.html",
+      "title": "D 模块自检 harness",
+      "waitMs": 1500,
+      "selectors": [
+        "[data-plan-bubble] #plan-root",
+        ".plan-module",
+        ".plan-confirm",
+        ".plan-column"
+      ],
+      "texts": [
+        "PUE 专题报表",
+        "看总量，指标卡最直观",
+        "设备名称"
+      ],
+      "counts": [
+        ".plan-module>=1",
+        ".plan-column>=3",
+        ".plan-confirm>=1"
+      ]
+    }
+  ]
+}
