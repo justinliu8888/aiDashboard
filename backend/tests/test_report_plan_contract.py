@@ -10,8 +10,11 @@ import pytest
 
 from app.schemas.report_plan import (
     ComponentType,
+    DisplayIntent,
+    GrainUnit,
     PlanCandidate,
     PlanContentRejectedError,
+    PlanSection,
     PlanValidationError,
     ReportPlan,
 )
@@ -27,6 +30,7 @@ FROZEN_PLAN_SAMPLE = {
         "subject": None,
         "timeRange": None,
         "exclusions": ["设备耗电排名"],
+        "grainUnit": "DAY",
     },
     "sections": [
         {
@@ -34,6 +38,10 @@ FROZEN_PLAN_SAMPLE = {
             "title": "PUE 总览",
             "metricIntents": ["PUE"],
             "componentType": "metric_card",
+            "displayIntent": "total",
+            "explicitComponentType": None,
+            "selectionReason": "按展示目的「看总量」选指标卡。",
+            "columns": [],
         }
     ],
     "assumptions": ["PUE 统计口径待核实，数据待连接"],
@@ -311,3 +319,155 @@ def test_legitimate_design_wording_is_accepted():
 
     assert candidate.requirements.timeRange == "过去 7 天"
     assert candidate.suggestions == ["可增加同比趋势板块"]
+
+
+# ---------- 选型与栏目的契约（20261029 规格「跨工单契约」） ----------
+
+
+def test_display_intent_is_one_of_the_five_contract_values():
+    assert [item.value for item in DisplayIntent] == [
+        "total",
+        "trend",
+        "comparison",
+        "composition",
+        "records",
+    ]
+
+
+def test_grain_unit_uses_the_existing_grain_enum():
+    assert [item.value for item in GrainUnit] == [
+        "MINUTE",
+        "HOUR",
+        "DAY",
+        "WEEK",
+        "MONTH",
+    ]
+
+
+def test_a_section_carries_the_selection_fields():
+    """定稿板块带着展示目的、用户指定的类型和选择理由。"""
+    plan = ReportPlan.model_validate(
+        {
+            "id": "plan_001",
+            "revision": 1,
+            "topic": "机房运行日报",
+            "requirements": {
+                "metrics": ["总耗电"],
+                "subject": None,
+                "timeRange": "最近 7 天",
+                "exclusions": [],
+                "grainUnit": "DAY",
+            },
+            "sections": [
+                {
+                    "id": "section_1",
+                    "title": "各机房耗电对比",
+                    "metricIntents": ["总耗电"],
+                    "componentType": "bar_chart",
+                    "displayIntent": "comparison",
+                    "explicitComponentType": "bar_chart",
+                    "selectionReason": "你明确指定用柱状图。",
+                    "columns": [],
+                }
+            ],
+            "assumptions": [],
+            "suggestions": [],
+            "referenceTemplates": [],
+        }
+    )
+
+    section = plan.sections[0]
+    assert section.displayIntent == DisplayIntent.COMPARISON
+    assert section.explicitComponentType == ComponentType.BAR_CHART
+    assert section.selectionReason == "你明确指定用柱状图。"
+    assert plan.requirements.grainUnit == GrainUnit.DAY
+
+
+def test_a_finalized_column_needs_id_label_and_field_ref():
+    """定稿栏目三项齐全：稳定身份、显示名、行对象取值键。"""
+    with pytest.raises(PlanValidationError):
+        PlanSection.model_validate(
+            {
+                "id": "section_1",
+                "title": "当前告警列表",
+                "metricIntents": ["告警"],
+                "componentType": "table",
+                "columns": [{"id": "col_1", "label": "设备名称"}],
+            }
+        )
+
+
+def test_a_candidate_column_may_carry_only_the_label():
+    """模型可以只给显示名，id 与取值键由服务端定稿时补齐。"""
+    candidate = PlanCandidate.model_validate(
+        {
+            "topic": "机房运行日报",
+            "requirements": {
+                "metrics": ["告警"],
+                "subject": None,
+                "timeRange": None,
+                "exclusions": [],
+            },
+            "sections": [
+                {
+                    "title": "当前告警列表",
+                    "metricIntents": ["告警"],
+                    "componentType": "table",
+                    "columns": [{"label": "设备名称"}, {"label": "时间"}],
+                }
+            ],
+            "assumptions": [],
+            "suggestions": [],
+            "referenceTemplates": [],
+        }
+    )
+
+    assert [column.label for column in candidate.sections[0].columns] == [
+        "设备名称",
+        "时间",
+    ]
+    assert candidate.sections[0].columns[0].id is None
+    assert candidate.sections[0].columns[0].fieldRef is None
+
+
+def test_a_column_field_ref_may_not_contain_whitespace():
+    """取值键要能当行对象的键用，不能带空白。"""
+    with pytest.raises(PlanValidationError):
+        PlanSection.model_validate(
+            {
+                "id": "section_1",
+                "title": "当前告警列表",
+                "metricIntents": ["告警"],
+                "componentType": "table",
+                "columns": [
+                    {"id": "col_1", "label": "设备名称", "fieldRef": "device name"}
+                ],
+            }
+        )
+
+
+def test_the_candidate_has_no_explicit_component_type_field():
+    """用户明确指定的类型由服务端从用户指令里认，模型说了不算。"""
+    with pytest.raises(PlanValidationError):
+        PlanCandidate.model_validate(
+            {
+                "topic": "机房运行日报",
+                "requirements": {
+                    "metrics": ["总耗电"],
+                    "subject": None,
+                    "timeRange": None,
+                    "exclusions": [],
+                },
+                "sections": [
+                    {
+                        "title": "各机房耗电对比",
+                        "metricIntents": ["总耗电"],
+                        "componentType": "bar_chart",
+                        "explicitComponentType": "bar_chart",
+                    }
+                ],
+                "assumptions": [],
+                "suggestions": [],
+                "referenceTemplates": [],
+            }
+        )

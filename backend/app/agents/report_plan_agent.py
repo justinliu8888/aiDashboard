@@ -23,6 +23,14 @@ import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from app.schemas.report_plan import PlanValidationError
+from app.services.report_plan_service import (
+    COLUMNS_NOTE_PREFIX,
+    PlanResolution,
+    drop_unaccepted_suggestion_sections,
+    resolve_plan,
+)
+
 logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "report_plan.md"
@@ -355,6 +363,21 @@ COMPONENT_TYPES: tuple[str, ...] = (
     "text",
 )
 
+#: 板块可用的展示目的：用户想看什么（语义候选，最终组件类型由服务端定）。
+DISPLAY_INTENTS: tuple[str, ...] = (
+    "total",
+    "trend",
+    "comparison",
+    "composition",
+    "records",
+)
+
+#: 时间粒度（既有粒度枚举）。
+GRAIN_UNITS: tuple[str, ...] = ("MINUTE", "HOUR", "DAY", "WEEK", "MONTH")
+
+#: 表格板块的组件类型：只有它用得上栏目声明。
+_TABLE_COMPONENT_TYPE = "table"
+
 #: 需求里必须出现的字段：指标和排除项被省略，就等于把用户明确的要求悄悄丢掉。
 _REQUIRED_REQUIREMENT_KEYS: tuple[str, ...] = ("metrics", "exclusions")
 #: 需求里可以为空的字段：用户没给就是 null，不算错。
@@ -410,7 +433,42 @@ def _validate_requirements(raw: Any) -> dict[str, Any]:
     validated["exclusions"] = _require_string_list(
         requirements["exclusions"], "requirements.exclusions"
     )
+    # 时间粒度：与时间范围单位不是一回事；用户没说就由服务端推定。
+    grain_unit = requirements.get("grainUnit")
+    if isinstance(grain_unit, str) and grain_unit.strip():
+        unit = grain_unit.strip().upper()
+        if unit in GRAIN_UNITS:
+            validated["grainUnit"] = unit
+        else:
+            logger.info("模型给的 grainUnit 非法，已忽略：%s", grain_unit)
     return validated
+
+
+def _validate_columns(raw: Any, label: str) -> list[dict[str, Any]]:
+    """表格栏目：模型可以只给显示名。
+
+    结构完全不可用时（不是数组）不在这里判死：交给服务端的栏目解析，
+    由它决定「补齐 → 追问 → 失败」哪条路。
+    """
+    if not isinstance(raw, list):
+        logger.info("%s的 columns 不是数组，交给服务端解析", label)
+        return []
+    columns: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            logger.info("%s的 columns 里有非对象项，已忽略", label)
+            continue
+        text = str(item.get("label") or "").strip()
+        if not text:
+            logger.info("%s的 columns 里有空显示名，已忽略", label)
+            continue
+        column: dict[str, Any] = {"label": text}
+        for key in ("id", "fieldRef"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                column[key] = value.strip()
+        columns.append(column)
+    return columns
 
 
 def _validate_sections(raw: Any) -> list[dict[str, Any]]:
@@ -441,6 +499,16 @@ def _validate_sections(raw: Any) -> list[dict[str, Any]]:
         # 板块 id 只在引用已有板块时出现；新板块不编号，由领域层生成。
         if section.get("id") is not None:
             validated["id"] = _require_string(section["id"], "板块 id")
+        # 展示目的：模型的语义候选。非法就丢掉，由服务端按请求推定。
+        intent = section.get("displayIntent")
+        if isinstance(intent, str) and intent.strip():
+            if intent.strip() in DISPLAY_INTENTS:
+                validated["displayIntent"] = intent.strip()
+            else:
+                logger.info("%s的 displayIntent 非法，已忽略：%s", label, intent)
+        # 表格板块的栏目声明：只有表格板块用得上。
+        if component_type == _TABLE_COMPONENT_TYPE and section.get("columns") is not None:
+            validated["columns"] = _validate_columns(section["columns"], label)
         sections.append(validated)
     return sections
 
@@ -498,6 +566,33 @@ def _validate_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             candidate.get("referenceTemplates") or []
         ),
     }
+
+
+def _apply_resolution(candidate: dict[str, Any], resolution: PlanResolution) -> None:
+    """把服务端定稿的栏目写回候选，并把补齐说明记进假设。
+
+    系统补的栏目必须**出现在方案里**（用户看得见、能改），不能只在
+    渲染时按标题偷偷补列。
+    """
+    sections = candidate.get("sections") or []
+    assumptions = candidate.setdefault("assumptions", [])
+    for index, section in enumerate(sections):
+        if index not in resolution.columns:
+            continue
+        columns: list[dict[str, Any]] = []
+        for spec in resolution.columns[index]:
+            column: dict[str, Any] = {"label": spec.label}
+            if spec.id:
+                column["id"] = spec.id
+            if spec.fieldRef:
+                column["fieldRef"] = spec.fieldRef
+            columns.append(column)
+        section["columns"] = columns
+        note = resolution.column_notes.get(index)
+        if note:
+            entry = f"{COLUMNS_NOTE_PREFIX}{note}"
+            if entry not in assumptions:
+                assumptions.append(entry)
 
 
 def _failure(code: str, message: str) -> dict[str, Any]:
@@ -604,6 +699,46 @@ async def generate_candidate(
                 FAILURE_MODEL_OUTPUT_INVALID,
                 f"模型输出的方案结构不合法（{exc}）",
             )
+
+        # ---- 选型与栏目：服务端定稿，模型说了不算 ----
+        # 模型只给语义候选；组件类型、栏目身份、取值键都由服务端按优先级定。
+        # 未接受的建议先剔掉：追问与补齐都只针对真正要做的板块。
+        try:
+            kept_sections = drop_unaccepted_suggestion_sections(
+                list(candidate.get("sections") or []),
+                list(candidate.get("suggestions") or []),
+            )
+            validated["sections"] = drop_unaccepted_suggestion_sections(
+                list(validated.get("sections") or []),
+                list(validated.get("suggestions") or []),
+            )
+        except PlanValidationError as exc:
+            logger.info("候选里的板块都只是未接受的建议：%s", exc)
+            return await _fail(
+                emit,
+                getattr(exc, "code", None) or FAILURE_MODEL_OUTPUT_INVALID,
+                f"模型输出的方案结构不合法（{exc}）",
+            )
+
+        resolution = resolve_plan(
+            kept_sections,
+            request_text=str(message or ""),
+            previous_sections=(current_plan or {}).get("sections") or [],
+        )
+        if resolution.question:
+            # 猜不出来、且猜错会影响这块的用途 → 走澄清追问通道，
+            # 问题出现在左侧对话区。「没有真实数据」不是追问的理由。
+            logger.info("方案需要澄清：%s", resolution.question)
+            return {"kind": KIND_CLARIFICATION, "question": resolution.question}
+        if resolution.failure_code:
+            # 修正仍失败：明确报失败并允许重试，不给空表。
+            return await _fail(
+                emit,
+                resolution.failure_code,
+                resolution.failure_message or "方案生成失败，请重试。",
+            )
+
+        _apply_resolution(validated, resolution)
         return {"kind": KIND_PLAN_CANDIDATE, "candidate": validated}
 
     if kind == KIND_CLARIFICATION:
