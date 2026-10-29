@@ -57,6 +57,28 @@ function extractConst(name) {
   return match[0];
 }
 
+/** 抽出一条顶层 const 对象/数组语句（大括号配平，允许跨行）。 */
+function extractConstBlock(name) {
+  const marker = `const ${name} =`;
+  const start = WORKBENCH_JS.indexOf(marker);
+  assert.ok(start >= 0, `源码里找不到 const ${name}`);
+  let depth = 0;
+  let opened = false;
+  for (let i = start; i < WORKBENCH_JS.length; i += 1) {
+    const ch = WORKBENCH_JS[i];
+    if (ch === "{" || ch === "[") {
+      depth += 1;
+      opened = true;
+    } else if (ch === "}" || ch === "]") {
+      depth -= 1;
+      if (opened && depth === 0) return WORKBENCH_JS.slice(start, i + 1);
+    } else if (ch === ";" && opened && depth === 0) {
+      return WORKBENCH_JS.slice(start, i + 1);
+    }
+  }
+  throw new Error(`const ${name} 的括号没有配平`);
+}
+
 /** 把选中的片段放进沙箱跑一遍，返回它们组成的 API。 */
 function loadApi(names, extraStatements = []) {
   const snippets = [...extraStatements, ...names.map(extractFunction)].join("\n\n");
@@ -514,4 +536,292 @@ test("面板顶部有模拟业务数据说明，每块有角标", () => {
 
 test("页面仍然声明空态提示位（草稿在但示意没到时说清楚）", () => {
   assert.ok(WORKBENCH_HTML.includes("data-preview-empty-hint"), "空态应有可更新的提示位");
+});
+
+// ---------------------------------------------------------------- 图表渲染后端
+//
+// 图表有两条渲染后端：
+//   - ECharts：CDN 可达时走真图表（单位画在纵轴名上，DOM 里抓不到）；
+//   - SVG 兜底：CDN 挂了时走方案模块的渲染器（单位写在图下方的说明里）。
+//
+// 两条后端都要把「单位来自载荷」表达出来，而且要用**同一种**可断言的标记
+// （data-chart-unit，属性值就是载荷里的单位）—— 否则同一条断言只能覆盖其中一条路，
+// 另一条后端等于没被测过。
+//
+// 这里仍然用 node:vm 把 renderChartPayload 原样抽出来跑（源码原文，不是复制品），
+// 配一个够用的假 DOM 与假 echarts，把两条分支都走一遍。
+
+/** 假 DOM 元素：只够 renderChartPayload 用（建元素、挂子节点、dataset、textContent）。 */
+function makeFakeElement(tagName = "div") {
+  return {
+    tagName: String(tagName).toUpperCase(),
+    className: "",
+    style: {},
+    dataset: {},
+    textContent: "",
+    children: [],
+    appendChild(child) {
+      this.children.push(child);
+      return child;
+    },
+    setAttribute(name, value) {
+      this[name] = value;
+    },
+    getAttribute(name) {
+      return this[name] ?? null;
+    },
+  };
+}
+
+function makeFakeDom() {
+  return { createElement: (tagName) => makeFakeElement(tagName) };
+}
+
+/** 假 echarts：把 setOption 的参数截下来供断言。 */
+function makeFakeEcharts(capture) {
+  return {
+    init(el) {
+      capture.el = el;
+      return {
+        setOption(option) {
+          capture.option = option;
+        },
+        dispose() {},
+      };
+    },
+  };
+}
+
+/** 容器里带 data-chart-unit 标记的元素。 */
+function unitMarkers(container) {
+  return container.children.filter(
+    (child) => child.dataset && child.dataset.chartUnit !== undefined
+  );
+}
+
+/** 图表渲染要用的那几段源码（原样抽出来）。 */
+function loadChartApi() {
+  return loadApi(["renderChartPayload", "hasEcharts", "readPayloadUnit"], [
+    extractConstBlock("CHART_KIND_TO_COMPONENT_TYPE"),
+    extractConst("CHART_SERIES_COLORS"),
+    extractConst("_chartInstances"),
+    extractConst("esc"),
+  ]);
+}
+
+test("ECharts 路径：纵轴名取载荷单位，并产出与 SVG 路径同一种单位标记", () => {
+  const api = loadChartApi();
+  const dom = makeFakeDom();
+  const capture = {};
+  api.document = dom;
+  api.window.echarts = makeFakeEcharts(capture);
+
+  const region = {
+    regionId: "region_trend",
+    name: "耗电趋势",
+    componentType: "CHART",
+    payload: {
+      chartKind: "LINE",
+      xLabels: ["09:00", "10:00", "11:00"],
+      yValues: [210.5, 233.1, 198.7],
+      unit: "kWh",
+    },
+  };
+  const unit = api.__api.readPayloadUnit(region, region.payload, null);
+  assert.equal(unit, "kWh");
+
+  const container = dom.createElement("div");
+  api.__api.renderChartPayload(container, region, region.payload, unit);
+
+  // 纵轴名来自载荷（不是写死的 kWh）。
+  assert.equal(capture.option.yAxis.name, "kWh");
+  assert.equal(capture.option.series.length, 1);
+  assert.equal(capture.option.series[0].name, "kWh", "单指标图没有指标名时退回单位");
+
+  // 单位标记：属性值就是载荷里的单位，文本里也写着这个单位。
+  const markers = unitMarkers(container);
+  assert.equal(markers.length, 1, "ECharts 路径也要产出 [data-chart-unit] 标记");
+  assert.equal(markers[0].dataset.chartUnit, "kWh");
+  assert.ok(markers[0].textContent.includes("kWh"), "标记的文本要写明单位");
+  assert.ok(markers[0].textContent.includes("3"), "标记要写明数据点数");
+});
+
+test("ECharts 路径：换一张图，单位跟着载荷变（不写死 kWh）", () => {
+  const api = loadChartApi();
+  const dom = makeFakeDom();
+  const capture = {};
+  api.document = dom;
+  api.window.echarts = makeFakeEcharts(capture);
+
+  // 总电费那张图：单位是元，纵轴名与标记都必须跟着变。
+  const cost = {
+    regionId: "region_cost",
+    name: "总电费趋势",
+    componentType: "CHART",
+    payload: {
+      chartKind: "LINE",
+      xLabels: ["09:00", "10:00"],
+      yValues: [12.5, 13.5],
+      unit: "元",
+    },
+  };
+  const costUnit = api.__api.readPayloadUnit(cost, cost.payload, null);
+  const costContainer = dom.createElement("div");
+  api.__api.renderChartPayload(costContainer, cost, cost.payload, costUnit);
+
+  assert.equal(capture.option.yAxis.name, "元");
+  const markers = unitMarkers(costContainer);
+  assert.equal(markers.length, 1);
+  assert.equal(markers[0].dataset.chartUnit, "元");
+  assert.ok(markers[0].textContent.includes("元"));
+  assert.ok(!markers[0].textContent.includes("kWh"), "不能把别的单位顶上来");
+
+  // 载荷没带单位：既不写单位，也不造一个标记出来。
+  const bare = {
+    regionId: "region_bare",
+    name: "某指标",
+    componentType: "CHART",
+    payload: { chartKind: "LINE", xLabels: ["09:00"], yValues: [1] },
+  };
+  const bareUnit = api.__api.readPayloadUnit(bare, bare.payload, null);
+  assert.equal(bareUnit, "");
+  const bareContainer = dom.createElement("div");
+  api.__api.renderChartPayload(bareContainer, bare, bare.payload, bareUnit);
+  assert.equal(capture.option.yAxis.name, undefined, "没单位就不写纵轴名");
+  assert.equal(unitMarkers(bareContainer).length, 0, "没单位就不产出单位标记");
+});
+
+test("ECharts 路径：多指标图，系列名各取载荷里的指标名，单位按载荷链读", () => {
+  const api = loadChartApi();
+  const dom = makeFakeDom();
+  const capture = {};
+  api.document = dom;
+  api.window.echarts = makeFakeEcharts(capture);
+
+  const region = {
+    regionId: "region_multi",
+    name: "多指标对比",
+    componentType: "CHART",
+    payload: {
+      chartKind: "LINE",
+      xLabels: ["09:00", "10:00"],
+      series: [
+        { metricKey: "energy", label: "总耗电", unit: "kWh", yValues: [210.5, 233.1] },
+        { metricKey: "cost", label: "总电费", unit: "元", yValues: [12.5, 13.5] },
+      ],
+    },
+  };
+  // 载荷顶层没带 unit：单位按回退链取第一条序列的（各序列的单位没被丢掉）。
+  const unit = api.__api.readPayloadUnit(region, region.payload, null);
+  assert.equal(unit, "kWh");
+
+  const container = dom.createElement("div");
+  api.__api.renderChartPayload(container, region, region.payload, unit);
+
+  assert.equal(capture.option.series.length, 2);
+  assert.equal(capture.option.series[0].name, "总耗电", "系列名取各自的指标名");
+  assert.equal(capture.option.series[1].name, "总电费");
+  assert.equal(capture.option.yAxis.name, "kWh");
+
+  const markers = unitMarkers(container);
+  assert.equal(markers.length, 1);
+  assert.equal(markers[0].dataset.chartUnit, "kWh");
+
+  // 顶层写了单位就用顶层的（各序列的单位仍在载荷里，没被顶替）。
+  const withTopUnit = { ...region, payload: { ...region.payload, unit: "kW" } };
+  assert.equal(api.__api.readPayloadUnit(withTopUnit, withTopUnit.payload, null), "kW");
+});
+
+test("SVG 兜底路径：补出同一种单位标记（属性值就是载荷里的单位）", () => {
+  const api = loadChartApi();
+  const dom = makeFakeDom();
+  api.document = dom;
+  api.window.echarts = undefined; // CDN 挂了：没有 echarts
+
+  // 方案模块的渲染器：柱条那条不会自带「单位：」说明（折线那条自带）。
+  api.window.WorkbenchPlan = {
+    renderChart: () => {
+      const node = dom.createElement("div");
+      node.textContent = "A-1 机架120.5A-2 机架98.2";
+      return node;
+    },
+  };
+
+  const region = {
+    regionId: "region_rank_chart",
+    name: "设备耗电对比",
+    componentType: "CHART",
+    payload: {
+      chartKind: "BAR",
+      xLabels: ["A-1 机架", "A-2 机架"],
+      yValues: [120.5, 98.2],
+      unit: "kWh",
+    },
+  };
+  const unit = api.__api.readPayloadUnit(region, region.payload, null);
+  const container = dom.createElement("div");
+  api.__api.renderChartPayload(container, region, region.payload, unit);
+
+  const markers = unitMarkers(container);
+  assert.equal(markers.length, 1, "SVG 兜底路径也要产出 [data-chart-unit] 标记");
+  assert.equal(markers[0].dataset.chartUnit, "kWh", "标记的属性值与 ECharts 路径一致");
+  assert.ok(markers[0].textContent.includes("单位：kWh"));
+});
+
+test("SVG 兜底路径：渲染器自己写了单位时，不重复再写一遍", () => {
+  const api = loadChartApi();
+  const dom = makeFakeDom();
+  api.document = dom;
+  api.window.echarts = undefined;
+
+  // 折线渲染器自带「单位：…，共 N 个数据点」：这时不重复补一条。
+  api.window.WorkbenchPlan = {
+    renderChart: () => {
+      const node = dom.createElement("div");
+      node.textContent = "单位：kWh，共 2 个数据点";
+      return node;
+    },
+  };
+
+  const region = {
+    regionId: "region_trend",
+    name: "耗电趋势",
+    componentType: "CHART",
+    payload: {
+      chartKind: "LINE",
+      xLabels: ["09:00", "10:00"],
+      yValues: [210.5, 233.1],
+      unit: "kWh",
+    },
+  };
+  const unit = api.__api.readPayloadUnit(region, region.payload, null);
+  const container = dom.createElement("div");
+  api.__api.renderChartPayload(container, region, region.payload, unit);
+
+  const text = container.children.map((child) => child.textContent).join("|");
+  assert.ok(text.includes("单位：kWh"), "单位要写在图上");
+  assert.equal((text.match(/单位：/g) || []).length, 1, "单位只写一遍，不重复");
+});
+
+test("两条渲染后端产出同一种单位标记，且不写死单位", () => {
+  const chartBlock = WORKBENCH_JS.slice(
+    WORKBENCH_JS.indexOf("function renderChartPayload("),
+    WORKBENCH_JS.indexOf("// -------- 会话导航栏")
+  );
+  const split = chartBlock.indexOf("// ECharts 不可用");
+  assert.ok(split > 0, "应能分出 ECharts 分支与 SVG 兜底分支");
+
+  // ECharts 分支也要产出标记：否则同一条断言只能覆盖 SVG 兜底那条路。
+  const echartsBranch = chartBlock.slice(0, split);
+  assert.ok(
+    echartsBranch.includes("dataset.chartUnit"),
+    "ECharts 分支应产出 data-chart-unit 标记（单位只在纵轴名上时 DOM 抓不到）"
+  );
+  // SVG 兜底分支同样产出标记：两条后端用同一套选择器断言。
+  const svgBranch = chartBlock.slice(split);
+  assert.ok(svgBranch.includes("dataset.chartUnit"), "SVG 兜底分支应产出 data-chart-unit 标记");
+
+  // 单位一律来自载荷：整个图表块里不出现写死的单位字面量。
+  assert.ok(!/["']kWh["']/.test(chartBlock), "图表渲染块不应出现写死的 kWh");
+  assert.ok(!/["']耗电["']/.test(chartBlock), "图表渲染块不应出现写死的耗电");
 });

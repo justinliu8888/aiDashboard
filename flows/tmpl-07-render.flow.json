@@ -38,7 +38,9 @@
 
         { "assertText": "设备耗电对比" },
         { "assertText": "A-2 机架" },
-        { "assertCount": "#preview-root [data-chart-unit]", "count": 1, "op": "===" },
+        { "assertCount": "#preview-root [data-chart-unit]", "count": 1, "op": ">=" },
+        { "assertCount": "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit]", "count": 1, "op": "===" },
+        { "assertCount": "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit=\"kWh\"]", "count": 1, "op": "===" },
 
         { "assertText": "设备名称" },
         { "assertText": "A-1 机架" },
@@ -134,6 +136,35 @@
         { "eval": "(() => { const stale = JSON.parse(JSON.stringify(session.reportPreviewPayload)); stale.previewContext.definitionId = 'def_other_999'; stale.regions[1].payload.value = 99999; const accepted = applyReportPreviewPayload(stale); return accepted === false && session.reportPreviewPayload.previewContext.definitionId === 'def_demo_001'; })()" },
         { "eval": "document.querySelector('#preview-root').textContent.includes('99999') === false" },
         { "assertText": "306.1" }
+      ]
+    },
+    {
+      "name": "07-06 ECharts 路径：单位标记与纵轴名都来自载荷（CDN 不可达时降级到 SVG 兜底，结构断言仍成立）",
+      "path": "/frontend/tests/render_harness.html?echarts=1",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#preview-root [data-region-badge]" },
+        { "wait": 300 },
+
+        { "eval": "window.__chartBackend()", "save": "chartBackend" },
+        { "eval": "chartBackend === 'echarts' || chartBackend === 'svg'" },
+        { "eval": "document.body.getAttribute('data-chart-backend') === chartBackend" },
+
+        { "assertText": "单位：kWh" },
+        { "assertCount": "#preview-root [data-chart-unit]", "count": 1, "op": ">=" },
+        { "assertCount": "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit]", "count": 1, "op": "===" },
+        { "assertCount": "#preview-root [data-region-id=\"region_rank_chart\"] [data-chart-unit=\"kWh\"]", "count": 1, "op": "===" },
+        { "assertCount": "#preview-root [data-region-badge]", "count": 5, "op": "===" },
+        { "assertCount": "#preview-root table tbody tr", "count": 3, "op": "===" },
+        { "assertText": "306.1" },
+        { "assertText": "244.88" },
+        { "assertText": "总耗电" },
+        { "assertText": "PUE" },
+
+        { "eval": "chartBackend !== 'echarts' || document.querySelectorAll('#preview-root canvas').length >= 1" },
+        { "eval": "chartBackend !== 'echarts' || document.querySelectorAll('#preview-root [data-chart-unit]').length === document.querySelectorAll('#preview-root canvas').length" },
+        { "eval": "chartBackend !== 'svg' || document.querySelectorAll('#preview-root svg').length >= 1" },
+        { "screenshot": "07-06-ECharts 路径" }
       ]
     }
   ]
