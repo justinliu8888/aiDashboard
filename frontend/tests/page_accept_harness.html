@@ -22,15 +22,18 @@
 
   【真实形状】后端当前实际吐出来的 reportPreviewPayload（核对结论）：
     - 顶层只有 ``previewContext`` 与 ``regions``；
-    - ``regions[]`` 每项**只有** regionId / name / role / componentType / payload；
+    - ``regions[]`` 每项**七个**键：regionId / name / role / componentType /
+      dataSource / capabilityPending / payload；
     - ``role`` 的取值集合是 SUMMARY / TREND / DETAIL / DESCRIPTION
       （指标卡是 **SUMMARY**，不是 TOTAL）；
-    - 「能力待接通」挂在 ``payload.metrics[].capabilityPending`` / ``pendingReason``，
-      **区域级没有** capabilityPending；
-    - ``dataSource`` 挂在 ``payload`` 里，**区域级没有** dataSource；
+    - 区域级 ``dataSource`` = "simulated"（草稿阶段一律是模拟业务数据）；
+    - 区域级 ``capabilityPending`` = 该区域各项指标的**逻辑或**
+      （不是「是不是占位区」）；逐项标记与原因仍在 ``payload.metrics[]`` 里；
     - ``previewContext`` 固定八字段，generatorVersion = "simulated-data/1"；
-    - 表格列的 ``format`` 是 **null**（后端当前不产出列单位），表格载荷里
-      也没有 truncated / totalRows —— 所以真实形状下**判不出**表格行被截断。
+    - 表格列的 ``format`` **带单位**：模型声明的单位一路传到载荷，系统补齐的
+      数值列带预设单位（负载率 %、耗电量 kWh）；非数值列没有格式（format = null）；
+    - 表格载荷里**没有** truncated / totalRows —— 「行被截断」只能靠**勾稽反推**
+      （行数达到这张表声明的 topN，且行和明显小于同口径的总量卡片）。
 
   场景切换（给交互流程与静态自检用）：
     window.__pageAcceptScene('waiting' | 'draft' | 'validated' | 'pending' | 'failed' | 'truncated')
@@ -81,10 +84,11 @@
   左侧文字方案走产品自己的 <code>renderPlanModule()</code>，
   右侧报表走产品自己的 <code>renderReportPanel()</code>。
   <br />
-  <strong>与真实形状有关的三点</strong>：区域级<strong>没有</strong> <code>dataSource</code> /
-  <code>capabilityPending</code>（能力标记在 <code>payload.metrics[]</code> 里）；
+  <strong>与真实形状有关的三点</strong>：区域级带 <code>dataSource</code> 与
+  <code>capabilityPending</code>（后者 = 该区域各项指标的逻辑或）；
   <code>role</code> 的取值是 <code>SUMMARY</code> / <code>TREND</code> / <code>DETAIL</code> /
-  <code>DESCRIPTION</code>；表格列的 <code>format</code> 是空值。
+  <code>DESCRIPTION</code>；表格列的 <code>format</code> <strong>带单位</strong>
+  （模型声明的单位，或系统补齐列的预设单位）。
   <br />
   场景切换：<code>window.__pageAcceptScene('waiting' | 'draft' | 'validated' | 'pending' | 'failed' | 'truncated')</code>
   或直接开 <code>?scene=draft</code>。
@@ -167,19 +171,19 @@
       "daily"
     ],
     "templateBinding": {
-      "templateId": "rtpl_ca53febf746c",
+      "templateId": "rtpl_526c22d5c995",
       "templateRevision": 1,
-      "planId": "rplan_cd501c467310",
+      "planId": "rplan_e485825fd729",
       "planRevision": 1,
-      "definitionId": "rplan_cd501c467310",
+      "definitionId": "rplan_e485825fd729",
       "definitionVersion": 1
     },
     "pendingNotes": [
       "「总电费概览」「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
       "「PUE 总览」「PUE」口径待核实：当前数据源没有登记这个字段，算不出数值。",
       "「电费趋势」「能耗成本」口径待核实：当前数据源没有登记这个字段，算不出数值。",
-      "「实时功率」数据待连接：当前已接通的能力里没有对应指标。",
-      "「功率趋势」数据待连接：当前已接通的能力里没有对应指标。"
+      "「实时功率」能力待接通：当前已接通的能力里没有对应指标。",
+      "「功率趋势」能力待接通：当前已接通的能力里没有对应指标。"
     ]
   },
   "parameters": {},
@@ -898,7 +902,12 @@
           {
             "id": "c_energy",
             "label": "耗电",
-            "fieldRef": "ranking.energy"
+            "fieldRef": "ranking.energy",
+            "format": {
+              "kind": "NUMBER",
+              "precision": 1,
+              "unitLabel": "kWh"
+            }
           },
           {
             "id": "c_time",
@@ -930,7 +939,12 @@
             {
               "id": "c_energy",
               "label": "耗电",
-              "fieldRef": "ranking.energy"
+              "fieldRef": "ranking.energy",
+              "format": {
+                "kind": "NUMBER",
+                "precision": 1,
+                "unitLabel": "kWh"
+              }
             },
             {
               "id": "c_time",
@@ -1069,14 +1083,19 @@
         "type": "TABLE",
         "columns": [
           {
-            "id": "c_device",
+            "id": "col_1",
             "label": "设备名称",
-            "fieldRef": "ranking.device_name"
+            "fieldRef": "section_7.col_1"
           },
           {
-            "id": "c_energy",
-            "label": "耗电",
-            "fieldRef": "ranking.energy"
+            "id": "col_2",
+            "label": "耗电量",
+            "fieldRef": "section_7.col_2",
+            "format": {
+              "kind": "NUMBER",
+              "precision": 1,
+              "unitLabel": "kWh"
+            }
           }
         ],
         "rowNumber": true
@@ -1097,14 +1116,19 @@
           "capabilityPending": false,
           "columns": [
             {
-              "id": "c_device",
+              "id": "col_1",
               "label": "设备名称",
-              "fieldRef": "ranking.device_name"
+              "fieldRef": "section_7.col_1"
             },
             {
-              "id": "c_energy",
-              "label": "耗电",
-              "fieldRef": "ranking.energy"
+              "id": "col_2",
+              "label": "耗电量",
+              "fieldRef": "section_7.col_2",
+              "format": {
+                "kind": "NUMBER",
+                "precision": 1,
+                "unitLabel": "kWh"
+              }
             }
           ],
           "metrics": [
@@ -1454,7 +1478,7 @@
       "templateBinding": {
         "sectionId": "section_11",
         "dataStatus": "placeholder",
-        "placeholderReason": "数据待连接：当前已接通的能力里没有对应指标。",
+        "placeholderReason": "能力待接通：当前已接通的能力里没有对应指标。",
         "dataSourceLabel": null,
         "metricRefs": [],
         "pendingReason": null,
@@ -1471,7 +1495,7 @@
               "kind": "power",
               "unit": "kW",
               "capabilityPending": true,
-              "pendingReason": "数据待连接：当前已接通的能力里没有对应指标。"
+              "pendingReason": "能力待接通：当前已接通的能力里没有对应指标。"
             }
           ]
         }
@@ -1520,7 +1544,7 @@
       "templateBinding": {
         "sectionId": "section_12",
         "dataStatus": "placeholder",
-        "placeholderReason": "数据待连接：当前已接通的能力里没有对应指标。",
+        "placeholderReason": "能力待接通：当前已接通的能力里没有对应指标。",
         "dataSourceLabel": null,
         "metricRefs": [],
         "pendingReason": null,
@@ -1537,7 +1561,7 @@
               "kind": "power",
               "unit": "kW",
               "capabilityPending": true,
-              "pendingReason": "数据待连接：当前已接通的能力里没有对应指标。"
+              "pendingReason": "能力待接通：当前已接通的能力里没有对应指标。"
             }
           ]
         }
@@ -1584,9 +1608,10 @@
   }
 };
 
-  // 截断场景用：把设备明细表的前 topN 行留着（真实形状下后端**没有**给
-  // truncated / totalRows，也没给列单位，所以页面判不出「行被截断」——
-  // 这一点由流程 08b-04 如实断言，不编字段）。
+  // 截断场景用：把设备明细表的前 topN 行留着。
+  // 真实形状下后端**没有** truncated / totalRows（不编字段）；但列**带单位**
+  // （耗电量 kWh），页面能靠勾稽反推（行数达到这张表声明的 topN，且行和明显
+  // 小于同口径的总量卡片）判出「行被截断」—— 这一点由流程 08b-04 如实断言。
   var DEFINITION_TRUNCATED = JSON.parse(JSON.stringify(DEFINITION));
   DEFINITION_TRUNCATED.regions.forEach(function (r) {
     if (r.id === "region_7" && r.binding) r.binding.topN = 2;
@@ -1597,10 +1622,10 @@
   // 字段名 / 层级 / 类型 / role 取值集合都以后端实际吐出来的为准。
   var REAL_PAYLOAD = {
   "previewContext": {
-    "definitionId": "rplan_cd501c467310",
+    "definitionId": "rplan_e485825fd729",
     "definitionVersion": 1,
     "timezone": "Asia/Shanghai",
-    "anchorTime": "2026-10-29T21:19:57.473559+08:00",
+    "anchorTime": "2026-10-29T22:36:45.234858+08:00",
     "windowStart": "2026-10-22T00:00:00+08:00",
     "windowEnd": "2026-10-29T00:00:00+08:00",
     "grainUnit": "DAY",
@@ -1612,12 +1637,14 @@
       "name": "总耗电概览",
       "role": "SUMMARY",
       "componentType": "METRIC_CARD",
+      "dataSource": "simulated",
+      "capabilityPending": false,
       "payload": {
         "label": "总耗电概览",
         "value": 37357.8,
         "unit": "kWh",
         "precision": 1,
-        "yoyPercent": -4.1,
+        "yoyPercent": 13,
         "comparisonAvailable": true,
         "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
         "dataSource": "simulated",
@@ -1640,6 +1667,8 @@
       "name": "耗电趋势",
       "role": "TREND",
       "componentType": "CHART",
+      "dataSource": "simulated",
+      "capabilityPending": false,
       "payload": {
         "chartKind": "LINE",
         "grain": "DAY",
@@ -1702,12 +1731,14 @@
       "name": "总电费概览",
       "role": "SUMMARY",
       "componentType": "METRIC_CARD",
+      "dataSource": "simulated",
+      "capabilityPending": true,
       "payload": {
         "label": "总电费概览",
         "value": 26150.46,
         "unit": "元",
         "precision": 2,
-        "yoyPercent": -4.1,
+        "yoyPercent": 13,
         "comparisonAvailable": true,
         "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
         "dataSource": "simulated",
@@ -1730,12 +1761,14 @@
       "name": "PUE 总览",
       "role": "SUMMARY",
       "componentType": "METRIC_CARD",
+      "dataSource": "simulated",
+      "capabilityPending": true,
       "payload": {
         "label": "PUE 总览",
         "value": 1.6,
         "unit": "",
         "precision": 1,
-        "yoyPercent": -4.1,
+        "yoyPercent": 19.8,
         "comparisonAvailable": true,
         "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
         "dataSource": "simulated",
@@ -1758,6 +1791,8 @@
       "name": "设备耗电对比",
       "role": "TREND",
       "componentType": "CHART",
+      "dataSource": "simulated",
+      "capabilityPending": false,
       "payload": {
         "chartKind": "BAR",
         "grain": "DAY",
@@ -1820,6 +1855,8 @@
       "name": "设备耗电排名",
       "role": "TREND",
       "componentType": "TABLE",
+      "dataSource": "simulated",
+      "capabilityPending": false,
       "payload": {
         "columns": [
           {
@@ -1832,7 +1869,11 @@
             "id": "c_energy",
             "label": "耗电",
             "fieldRef": "ranking.energy",
-            "format": null
+            "format": {
+              "kind": "NUMBER",
+              "precision": 1,
+              "unitLabel": "kWh"
+            }
           },
           {
             "id": "c_time",
@@ -1870,7 +1911,7 @@
           },
           {
             "ranking.device_name": "A-1 机架",
-            "ranking.energy": 3801.0,
+            "ranking.energy": 3801,
             "ranking.collected_at": ""
           },
           {
@@ -1902,62 +1943,68 @@
       "name": "设备耗电明细",
       "role": "DETAIL",
       "componentType": "TABLE",
+      "dataSource": "simulated",
+      "capabilityPending": false,
       "payload": {
         "columns": [
           {
-            "id": "c_device",
+            "id": "col_1",
             "label": "设备名称",
-            "fieldRef": "ranking.device_name",
+            "fieldRef": "section_7.col_1",
             "format": null
           },
           {
-            "id": "c_energy",
-            "label": "耗电",
-            "fieldRef": "ranking.energy",
-            "format": null
+            "id": "col_2",
+            "label": "耗电量",
+            "fieldRef": "section_7.col_2",
+            "format": {
+              "kind": "NUMBER",
+              "precision": 1,
+              "unitLabel": "kWh"
+            }
           }
         ],
         "rowNumber": true,
         "rows": [
           {
-            "ranking.device_name": "UPS-01 不间断",
-            "ranking.energy": 5177.6
+            "section_7.col_1": "UPS-01 不间断",
+            "section_7.col_2": 5177.6
           },
           {
-            "ranking.device_name": "A-4 机架",
-            "ranking.energy": 4113.2
+            "section_7.col_1": "A-4 机架",
+            "section_7.col_2": 4113.2
           },
           {
-            "ranking.device_name": "PDU-02 配电",
-            "ranking.energy": 4042.6
+            "section_7.col_1": "PDU-02 配电",
+            "section_7.col_2": 4042.6
           },
           {
-            "ranking.device_name": "CRAC-02 空调",
-            "ranking.energy": 3929.2
+            "section_7.col_1": "CRAC-02 空调",
+            "section_7.col_2": 3929.2
           },
           {
-            "ranking.device_name": "A-5 机架",
-            "ranking.energy": 3851.5
+            "section_7.col_1": "A-5 机架",
+            "section_7.col_2": 3851.5
           },
           {
-            "ranking.device_name": "A-1 机架",
-            "ranking.energy": 3801.0
+            "section_7.col_1": "A-1 机架",
+            "section_7.col_2": 3801
           },
           {
-            "ranking.device_name": "A-3 机架",
-            "ranking.energy": 3684.9
+            "section_7.col_1": "A-3 机架",
+            "section_7.col_2": 3684.9
           },
           {
-            "ranking.device_name": "CRAC-01 空调",
-            "ranking.energy": 3063.6
+            "section_7.col_1": "CRAC-01 空调",
+            "section_7.col_2": 3063.6
           },
           {
-            "ranking.device_name": "PDU-01 配电",
-            "ranking.energy": 2949.5
+            "section_7.col_1": "PDU-01 配电",
+            "section_7.col_2": 2949.5
           },
           {
-            "ranking.device_name": "A-2 机架",
-            "ranking.energy": 2744.7
+            "section_7.col_1": "A-2 机架",
+            "section_7.col_2": 2744.7
           }
         ],
         "dataSource": "simulated"
@@ -1968,6 +2015,8 @@
       "name": "设备耗电对比",
       "role": "DETAIL",
       "componentType": "CHART",
+      "dataSource": "simulated",
+      "capabilityPending": false,
       "payload": {
         "chartKind": "BAR",
         "grain": "DAY",
@@ -1992,7 +2041,7 @@
           4042.6,
           3929.2,
           3851.5,
-          3801.0,
+          3801,
           3684.9,
           3063.6,
           2949.5,
@@ -2021,7 +2070,7 @@
           },
           {
             "deviceName": "A-1 机架",
-            "energyKwh": 3801.0
+            "energyKwh": 3801
           },
           {
             "deviceName": "A-3 机架",
@@ -2048,6 +2097,8 @@
       "name": "口径说明",
       "role": "DESCRIPTION",
       "componentType": "TEXT",
+      "dataSource": "simulated",
+      "capabilityPending": false,
       "payload": {
         "rendered": "口径说明",
         "template": "口径说明",
@@ -2059,6 +2110,8 @@
       "name": "电费趋势",
       "role": "TREND",
       "componentType": "CHART",
+      "dataSource": "simulated",
+      "capabilityPending": true,
       "payload": {
         "chartKind": "LINE",
         "grain": "DAY",
@@ -2121,12 +2174,14 @@
       "name": "实时功率",
       "role": "SUMMARY",
       "componentType": "METRIC_CARD",
+      "dataSource": "simulated",
+      "capabilityPending": true,
       "payload": {
         "label": "实时功率",
-        "value": 242.4,
+        "value": 242.6,
         "unit": "kW",
         "precision": 1,
-        "yoyPercent": -4.1,
+        "yoyPercent": -1.7,
         "comparisonAvailable": true,
         "windowLabel": "2026-10-22 ~ 2026-10-28（7 天）",
         "dataSource": "simulated",
@@ -2136,10 +2191,10 @@
             "label": "实时功率",
             "kind": "power",
             "unit": "kW",
-            "value": 242.4,
+            "value": 242.6,
             "precision": 1,
             "capabilityPending": true,
-            "pendingReason": "数据待连接：当前已接通的能力里没有对应指标。"
+            "pendingReason": "能力待接通：当前已接通的能力里没有对应指标。"
           }
         ]
       }
@@ -2149,6 +2204,8 @@
       "name": "功率趋势",
       "role": "TREND",
       "componentType": "CHART",
+      "dataSource": "simulated",
+      "capabilityPending": true,
       "payload": {
         "chartKind": "LINE",
         "grain": "DAY",
@@ -2165,42 +2222,42 @@
           "10-28"
         ],
         "yValues": [
-          214.892,
-          230.287,
-          193.922,
-          218.155,
-          227.686,
-          229.278,
-          242.355
+          222.927,
+          210.377,
+          204.945,
+          232.655,
+          225.817,
+          194.263,
+          265.591
         ],
         "points": [
           {
             "timestamp": "2026-10-22T00:00:00+08:00",
-            "powerKw": 214.892
+            "powerKw": 222.927
           },
           {
             "timestamp": "2026-10-23T00:00:00+08:00",
-            "powerKw": 230.287
+            "powerKw": 210.377
           },
           {
             "timestamp": "2026-10-24T00:00:00+08:00",
-            "powerKw": 193.922
+            "powerKw": 204.945
           },
           {
             "timestamp": "2026-10-25T00:00:00+08:00",
-            "powerKw": 218.155
+            "powerKw": 232.655
           },
           {
             "timestamp": "2026-10-26T00:00:00+08:00",
-            "powerKw": 227.686
+            "powerKw": 225.817
           },
           {
             "timestamp": "2026-10-27T00:00:00+08:00",
-            "powerKw": 229.278
+            "powerKw": 194.263
           },
           {
             "timestamp": "2026-10-28T00:00:00+08:00",
-            "powerKw": 242.355
+            "powerKw": 265.591
           }
         ],
         "dataSource": "simulated"
@@ -2350,7 +2407,7 @@
 
     if (scene === "truncated") {
       // 设备明细表只留前 2 行（真实形状：后端没给 truncated / totalRows，
-      // 也没给列单位 format，页面**判不出**行被截断 —— 不编字段，如实断言）。
+      // 但列带单位 kWh —— 页面能靠勾稽反推判出「行被截断」，如实断言，不编字段）。
       mountPlan("DRAFT_READY");
       var payload = basePayload();
       var detail = payload.regions.filter(function (r) { return r.regionId === "region_7"; })[0];
