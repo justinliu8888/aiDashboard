@@ -633,3 +633,170 @@ def test_valid_candidate_comes_back_as_plan_candidate() -> None:
     assert candidate["requirements"]["exclusions"] == ["设备耗电排名"]
     assert candidate["sections"][0]["componentType"] == "metric_card"
     assert candidate["assumptions"] == ["PUE 统计口径待核实，数据待连接"]
+
+
+# ---------- 选型与栏目（20261029 规格「跨工单契约」） ----------
+
+
+def _table_candidate(**overrides) -> dict[str, Any]:
+    candidate = {
+        "topic": "机房运行日报",
+        "requirements": {
+            "metrics": ["告警"],
+            "subject": None,
+            "timeRange": "最近 7 天",
+            "exclusions": [],
+        },
+        "sections": [
+            {
+                "title": "当前告警列表",
+                "metricIntents": ["告警"],
+                "componentType": "table",
+                "displayIntent": "records",
+            }
+        ],
+        "assumptions": [],
+        "suggestions": [],
+        "referenceTemplates": [],
+    }
+    candidate.update(overrides)
+    return candidate
+
+
+def test_the_display_purpose_and_the_grain_unit_survive_normalization() -> None:
+    """模型给的语义候选原样带进候选，不在适配层丢掉。"""
+    candidate = _table_candidate()
+    candidate["requirements"]["grainUnit"] = "HOUR"
+
+    result = run_async(
+        generate_candidate(
+            message="给我一份告警列表",
+            current_plan=None,
+            history=[],
+            model_call=model_returning({"kind": "plan_candidate", "candidate": candidate}),
+        )
+    )
+
+    assert result["kind"] == "plan_candidate"
+    assert result["candidate"]["sections"][0]["displayIntent"] == "records"
+    assert result["candidate"]["requirements"]["grainUnit"] == "HOUR"
+
+
+def test_the_model_columns_are_kept_in_the_candidate() -> None:
+    candidate = _table_candidate()
+    candidate["sections"][0]["columns"] = [{"label": "设备名称"}, {"label": "告警级别"}]
+
+    result = run_async(
+        generate_candidate(
+            message="给我一份告警列表",
+            current_plan=None,
+            history=[],
+            model_call=model_returning({"kind": "plan_candidate", "candidate": candidate}),
+        )
+    )
+
+    assert result["kind"] == "plan_candidate"
+    assert [column["label"] for column in result["candidate"]["sections"][0]["columns"]] == [
+        "设备名称",
+        "告警级别",
+    ]
+
+
+def test_missing_columns_are_completed_by_the_system_and_written_into_the_candidate() -> None:
+    """模型漏写栏目时系统替他补上，补的内容要出现在方案里，用户能看见。"""
+    result = run_async(
+        generate_candidate(
+            message="给我一份告警列表",
+            current_plan=None,
+            history=[],
+            model_call=model_returning(
+                {"kind": "plan_candidate", "candidate": _table_candidate()}
+            ),
+        )
+    )
+
+    assert result["kind"] == "plan_candidate"
+    columns = result["candidate"]["sections"][0]["columns"]
+    assert [column["label"] for column in columns] == ["设备名称", "时间", "告警级别"]
+    assert any(
+        line.startswith("栏目：") and "告警级别" in line
+        for line in result["candidate"]["assumptions"]
+    )
+
+
+def test_columns_that_cannot_be_guessed_come_back_as_a_clarification() -> None:
+    """猜不出来就追问：走澄清通道，问题要具体。"""
+    candidate = _table_candidate()
+    candidate["sections"][0]["title"] = "运维工单明细"
+    candidate["sections"][0]["metricIntents"] = ["工单"]
+
+    result = run_async(
+        generate_candidate(
+            message="给我一份运维工单明细",
+            current_plan=None,
+            history=[],
+            model_call=model_returning({"kind": "plan_candidate", "candidate": candidate}),
+        )
+    )
+
+    assert result["kind"] == "clarification"
+    assert "运维工单明细" in result["question"]
+    assert "栏目" in result["question"]
+
+
+def test_a_broken_column_structure_comes_back_as_a_retryable_failure() -> None:
+    """修正仍失败时明确报生成失败并允许重试，不返回空表、不宣称成功。"""
+    candidate = _table_candidate()
+    candidate["sections"][0]["columns"] = "设备名称,时间"
+
+    result = run_async(
+        generate_candidate(
+            message="给我一份告警列表",
+            current_plan=None,
+            history=[],
+            model_call=model_returning({"kind": "plan_candidate", "candidate": candidate}),
+        )
+    )
+
+    assert result["kind"] == "failure"
+    assert result["code"] == "PLAN_COLUMNS_UNRESOLVED"
+    assert "重试" in result["message"]
+
+
+def test_the_model_never_marks_a_component_type_as_user_specified() -> None:
+    """模型自己选的类型不算「用户明确指定」。"""
+    candidate = _table_candidate()
+    candidate["sections"][0]["explicitComponentType"] = "table"
+
+    result = run_async(
+        generate_candidate(
+            message="给我一份告警列表",
+            current_plan=None,
+            history=[],
+            model_call=model_returning({"kind": "plan_candidate", "candidate": candidate}),
+        )
+    )
+
+    assert result["kind"] == "plan_candidate"
+    assert "explicitComponentType" not in result["candidate"]["sections"][0]
+
+
+def test_an_explicit_type_that_matches_no_section_comes_back_as_a_clarification() -> None:
+    """指令对不上板块就澄清，不偷偷改其他板块。"""
+    candidate = _table_candidate()
+    candidate["sections"] = [
+        {"title": "总耗电", "metricIntents": ["总耗电"], "componentType": "metric_card"},
+        {"title": "各机房耗电对比", "metricIntents": ["总耗电"], "componentType": "metric_card"},
+    ]
+
+    result = run_async(
+        generate_candidate(
+            message="用柱状图看",
+            current_plan=None,
+            history=[],
+            model_call=model_returning({"kind": "plan_candidate", "candidate": candidate}),
+        )
+    )
+
+    assert result["kind"] == "clarification"
+    assert "柱状图" in result["question"]
