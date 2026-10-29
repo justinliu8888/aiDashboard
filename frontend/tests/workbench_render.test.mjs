@@ -242,6 +242,69 @@ test("旧版本的载荷被丢掉，不覆盖新模板", () => {
   assert.equal(session.reportPreviewPayload, SAMPLE_PAYLOAD);
 });
 
+test("版本校对按方案口径（templateBinding），不拿定义编辑计数去比", () => {
+  const api = loadApi(["normalizeVersionNumber", "isStaleReportPayload", "applyReportPreviewPayload"]);
+  // 草稿阶段的定义：metadata.revision 是**定义的编辑计数**（0 起），
+  // templateBinding.definitionVersion 才是**方案 revision** —— 两条轴，不能混。
+  // 混了会把同一份载荷误判成过期，草稿阶段的数字直接被丢掉。
+  api.session = makeSession({
+    definition: {
+      metadata: {
+        id: "def_001",
+        revision: 0,
+        templateBinding: { definitionId: "plan_001", definitionVersion: 1 },
+      },
+    },
+  });
+
+  const payload = {
+    previewContext: { definitionId: "plan_001", definitionVersion: 1 },
+    regions: [],
+  };
+  // 同一份方案版本：不是过期，载荷必须收下。
+  assert.equal(api.__api.isStaleReportPayload(payload), false);
+  assert.equal(api.__api.applyReportPreviewPayload(payload), true);
+  assert.equal(api.session.reportPreviewPayload, payload);
+
+  // 方案版本变了：过期，丢掉。
+  const bumped = {
+    previewContext: { definitionId: "plan_001", definitionVersion: 2 },
+    regions: [],
+  };
+  assert.equal(api.__api.isStaleReportPayload(bumped), true);
+  assert.equal(api.__api.applyReportPreviewPayload(bumped), false);
+  assert.equal(api.session.reportPreviewPayload, payload);
+
+  // 方案 id 变了：过期。
+  const otherPlan = {
+    previewContext: { definitionId: "plan_002", definitionVersion: 1 },
+    regions: [],
+  };
+  assert.equal(api.__api.isStaleReportPayload(otherPlan), true);
+});
+
+test("版本号 0 是合法版本号，不能被当成缺省而回退", () => {
+  const api = loadApi(["normalizeVersionNumber", "isStaleReportPayload"]);
+  api.session = makeSession({
+    definition: {
+      metadata: {
+        revision: 5,
+        templateBinding: { definitionId: "plan_001", definitionVersion: 0 },
+      },
+    },
+  });
+  // templateBinding 的版本 0 优先于 metadata.revision 5 —— 不该判过期。
+  assert.equal(
+    api.__api.isStaleReportPayload({ previewContext: { definitionId: "plan_001", definitionVersion: 0 } }),
+    false,
+  );
+  // 对比版本 1：与 templateBinding 的 0 不一致 → 过期。
+  assert.equal(
+    api.__api.isStaleReportPayload({ previewContext: { definitionId: "plan_001", definitionVersion: 1 } }),
+    true,
+  );
+});
+
 test("定义还没落位时不拿载荷的版本乱比（不误杀）", () => {
   const api = loadApi(["isStaleReportPayload"]);
   api.session = makeSession();
