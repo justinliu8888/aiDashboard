@@ -382,10 +382,10 @@ def test_plan_written_during_a_turn_is_not_lost(service: SessionService):
 
     original_build = service._build_snapshot
 
-    def build_and_save(request, response):
+    def build_and_save(request, response, **kwargs):
         # 模拟：本轮处理期间另一个请求存了新的待确认计划
         service.save_pending_plan("sess_1", _plan(planId="plan_during"))
-        return original_build(request, response)
+        return original_build(request, response, **kwargs)
 
     service._build_snapshot = build_and_save  # type: ignore[method-assign]
     try:

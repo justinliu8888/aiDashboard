@@ -93,6 +93,54 @@ def _response_preview_context(response: AgentResponse) -> dict[str, Any] | None:
     return context if isinstance(context, dict) else None
 
 
+def _definition_is_template_mode(definition: Any) -> bool:
+    """这份定义是不是**模板态**。
+
+    模板态的定义带 ``metadata.templateBinding``（模板转换层落的）。
+
+    模板态下渲染出来的业务数值**一律是模拟业务数据**（ADR 0004
+    「模板态一律用模拟业务数据渲染」），后台的试运行也不例外 ——
+    服务端自己的回复就写着「本次试运行同样使用能耗模拟数据，
+    不是生产事实表」。
+    """
+    if definition is None:
+        return False
+    dump = getattr(definition, "model_dump", None)
+    if callable(dump):
+        definition = dump(mode="json")
+    if not isinstance(definition, dict):
+        return False
+    metadata = definition.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return bool(metadata.get("templateBinding"))
+
+
+def _payload_is_simulated(payload: Any) -> bool:
+    """这份结果载荷自己是不是**模拟数据**（带来源标记）。
+
+    造数器（``simulated_data_service``）产出的载荷在区域载荷上带
+    ``dataSource == "simulated"``。带这个标记的结果一律不落库。
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("dataSource") == "simulated":
+        return True
+    regions = payload.get("regions")
+    if not isinstance(regions, list):
+        return False
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        region_payload = region.get("payload")
+        if (
+            isinstance(region_payload, dict)
+            and region_payload.get("dataSource") == "simulated"
+        ):
+            return True
+    return False
+
+
 def _persisted_response_payload(response: AgentResponse) -> dict[str, Any]:
     """消息落库用的响应体：**不含模拟业务结果**。
 
@@ -278,8 +326,12 @@ class SessionService:
                     message_count=message_count,
                     current=current,
                 )
-            snapshot = self._build_snapshot(request, response)
             previous_snapshot = (current.snapshot or {}) if current else {}
+            snapshot = self._build_snapshot(
+                request,
+                response,
+                previous_snapshot=previous_snapshot,
+            )
             previous = previous_snapshot.get("definition")
             incoming = (snapshot or {}).get("definition")
             if isinstance(previous, dict) and not isinstance(incoming, dict):
@@ -406,9 +458,16 @@ class SessionService:
 
         title = self._derive_title(session_id, user_text, is_advance)
         state = self._state_to_store(session_id, response)
-        snapshot = self._build_snapshot(request, response) or {}
         current = self._repo.get_session(session_id)
         previous_snapshot = (current.snapshot if current else None) or {}
+        snapshot = (
+            self._build_snapshot(
+                request,
+                response,
+                previous_snapshot=previous_snapshot,
+            )
+            or {}
+        )
         snapshot = self._carry_over_business_objects(snapshot, previous_snapshot)
         snapshot = {**(snapshot or {}), **self._read_edit_state(session_id)}
 
@@ -579,10 +638,89 @@ class SessionService:
         preview = response.domainObjects.reportRunPreview
         return preview.reportRunId if preview is not None else None
 
+    @staticmethod
+    def _is_simulated_run(
+        *,
+        request: AgentRequest | None,
+        response: AgentResponse,
+        previous_snapshot: dict[str, Any] | None,
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        """这次试运行的结果是不是**模拟业务数据**。
+
+        判据是**来源**，不是字段名（规格 #46：不得按字段名剔除
+        ``previewPayload``，要按内容的来源判断）：
+
+        1. **结果自己带来源标记**：载荷上带 ``dataSource == "simulated"``
+           （造数器的标记）→ 模拟数据，不落库；
+        2. **跑它的定义是模板态**：模板态一律用模拟业务数据渲染
+           （ADR 0004），后台试运行也不例外 → 模拟数据，不落库。
+
+        「跑它的定义」按**服务端实际用的那份**取，优先级与
+        ``agent_service._handle_previewing`` 一致：
+
+        1. ``request.snapshots.reportDefinition`` —— 试运行就是拿它跑的；
+        2. ``response.domainObjects.reportDefinitionDraft`` —— 本轮响应带的草稿；
+        3. **库里上一轮落下的定义**（``previous_snapshot["definition"]``）。
+
+        第 3 条是模板态的**兜底**：试运行那一轮的响应里没有草稿、请求也
+        未必带得回来，但「确认方案」那一轮已经把带
+        ``metadata.templateBinding`` 的定义落进库了 —— 恢复不依赖内存里的
+        runId，也不依赖客户端把草稿带回来。
+
+        三处都取不到定义时按「不是模拟」处理：既有历史数据不迁移、不删改，
+        非模板态的既有链路照旧。
+        """
+        if _payload_is_simulated(payload):
+            return True
+        definition: Any = None
+        if request is not None and request.snapshots.reportDefinition is not None:
+            definition = request.snapshots.reportDefinition
+        elif response.domainObjects.reportDefinitionDraft is not None:
+            definition = response.domainObjects.reportDefinitionDraft
+        else:
+            definition = (previous_snapshot or {}).get("definition")
+        return _definition_is_template_mode(definition)
+
+    def restore_trial_preview_payload(
+        self,
+        snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """恢复会话时把**内存里**的试运行结果挂回响应（**不落库**）。
+
+        模板态的试运行结果不进持久化快照（ADR 0004：模拟业务数据只存在于
+        响应与内存），但它是**响应级**的 —— 读会话时按内存里的运行结果挂回
+        响应，前端拿到的结构与落库前完全一样（非模板态那条既有链路不受影响：
+        快照里已经有 ``previewPayload`` 时原样保留）。
+
+        - 快照里已有 ``previewPayload`` → 原样保留（非模板态的既有语义）；
+        - 快照里没有、内存里还有这次运行的结果 → 挂回来；
+        - 内存里也没有（后端重启过）→ 不挂：重启后按定义/上下文重新生成的是
+          **示意载荷**（``reportPreviewPayload``），不是试运行产物。
+        """
+        if not isinstance(snapshot, dict):
+            return snapshot
+        if isinstance(snapshot.get("previewPayload"), dict):
+            return snapshot
+        last_run = snapshot.get("lastReportRun")
+        if not isinstance(last_run, dict):
+            return snapshot
+        run_id = last_run.get("reportRunId")
+        if not run_id:
+            return snapshot
+        payload = preview_service.get_result_payload(str(run_id))
+        if payload is None:
+            return snapshot
+        result = dict(snapshot)
+        result["previewPayload"] = payload
+        return result
+
     def _build_snapshot(
         self,
         request: AgentRequest | None,
         response: AgentResponse,
+        *,
+        previous_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """组装恢复现场需要的快照。
 
@@ -592,11 +730,14 @@ class SessionService:
 
         - 写：``definition`` / ``policy`` / ``reportPlan`` /
           ``templateDesign`` / ``designPhase`` / ``previewContext``，
-          以及既有 ``previewPayload``（**只装试运行结果**，语义不变）；
+          以及**非模拟**时的 ``previewPayload``（**只装试运行结果**，语义不变）；
         - 不写：``reportPreviewPayload`` —— 模拟业务结果只在响应与内存里。
 
         注意这里**不是**「按字段名把某些键剔掉」，而是**只写允许的键**：
         ``previewPayload`` 同时承载试运行结果，按字段名剔除会误伤那条链路。
+
+        ``previewPayload`` 的去留按**来源**判断（见 ``_is_simulated_run``）：
+        这次试运行的结果是模拟业务数据 → 不写；不是 → 按原语义写。
         """
         snapshot: dict[str, Any] = {}
 
@@ -620,9 +761,18 @@ class SessionService:
         if last_run is not None:
             snapshot["lastReportRun"] = last_run.model_dump(mode="json")
             # 预览数据在内存态里，后端重启后 /api/report/preview/{runId} 会 404，
-            # 所以在这里缓存一份，恢复会话时直接用。
+            # 所以非模板态的既有链路在这里缓存一份，恢复会话时直接用。
             payload = preview_service.get_result_payload(last_run.reportRunId)
-            if payload is not None:
+            # 但**模拟业务结果不落库**（ADR 0004 / 规格 #46「模拟业务数据只
+            # 存在于响应与内存」）：模板态的试运行跑的是模拟数据，结果只留在
+            # 内存与响应里；恢复会话时按内存里的运行结果挂回响应
+            # （见 ``restore_trial_preview_payload``），不靠落库。
+            if payload is not None and not self._is_simulated_run(
+                request=request,
+                response=response,
+                previous_snapshot=previous_snapshot,
+                payload=payload,
+            ):
                 snapshot["previewPayload"] = payload
 
         # 示意上下文（#51）：**上下文**，不是业务数值 —— 落库是为了让
