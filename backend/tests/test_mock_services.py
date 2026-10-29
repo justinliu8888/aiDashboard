@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+from app.data.machine_room_energy import METRIC_TOTAL_ENERGY
 from app.services import catalog_mock_service, metric_mock_service
 from app.services.mock_data_service import ROOM_A_DEVICES
 from app.services.simulated_data_service import (
@@ -485,7 +486,7 @@ def test_payload_shape_matches_the_public_preview_contract():
     card = payloads["r_total"]
     assert {"label", "value", "unit", "precision", "windowLabel"} <= set(card)
     trend = payloads["r_trend"]
-    assert {"chartKind", "grain", "xField", "yField", "xLabels", "yValues", "points"} <= set(trend)
+    assert {"chartKind", "grain", "xField", "yField", "unit", "xLabels", "yValues", "points"} <= set(trend)
     assert len(trend["points"]) == len(trend["xLabels"]) == len(trend["yValues"])
     table = payloads["r_table"]
     assert {"columns", "rowNumber", "rows"} <= set(table)
@@ -493,3 +494,111 @@ def test_payload_shape_matches_the_public_preview_contract():
     assert {"coverage", "missing", "duplicates", "freshnessSeconds"} <= set(quality)
     text = payloads["r_text"]
     assert {"rendered", "template"} <= set(text)
+
+
+# ---------------------------------------------------------------- 图表单位
+
+
+def _chart(region_id="r_trend", name="趋势", *, kind=None, unit=None, metrics=None,
+           role="TREND"):
+    """图表区域（CHART）。"""
+    return _region(
+        region_id,
+        name,
+        role,
+        {"type": "CHART", "chartKind": "LINE", "encodings": []},
+        kind=kind,
+        unit=unit,
+        metrics=metrics,
+    )
+
+
+def test_chart_payload_carries_unit():
+    """图表载荷自带单位：前端从 payload 读，不硬编码 kWh。"""
+    definition = _definition([_chart(kind="energy", unit="kWh")])
+    payloads = generate_simulated_data(definition, _context())
+    assert payloads["r_trend"]["unit"] == "kWh"
+
+
+def test_chart_unit_prefers_the_declared_unit_over_the_identity():
+    """区域声明的单位优先于量身份的默认值。"""
+    definition = _definition([_chart(kind="cost", unit="CNY")])
+    payloads = generate_simulated_data(definition, _context())
+    assert payloads["r_trend"]["unit"] == "CNY"
+
+
+def test_chart_unit_falls_back_to_the_quantity_identity():
+    """``previewSpec.unit`` 缺失时按量身份推导，不留空、不瞎猜。"""
+    expected = {
+        "energy": "kWh",
+        "cost": "元",
+        "power": "kW",
+        "pue": "",  # PUE 无量纲
+        "generic": "",  # 认不出来的量用模拟示例，不猜单位
+    }
+    for kind, unit in expected.items():
+        definition = _definition([_chart(kind=kind)])
+        payloads = generate_simulated_data(definition, _context())
+        assert payloads["r_trend"]["unit"] == unit, kind
+
+
+def test_chart_unit_works_without_a_preview_spec():
+    """历史定义没有 previewSpec 时不崩：按既有执行绑定的量身份推导单位。"""
+    region = {
+        "id": "r_trend",
+        "name": "耗电趋势",
+        "role": "TREND",
+        "component": {"type": "CHART", "chartKind": "LINE", "encodings": []},
+        "binding": {"metricRefs": [METRIC_TOTAL_ENERGY["metricRef"]]},
+    }
+    payloads = generate_simulated_data(_definition([region]), _context())
+    assert payloads["r_trend"]["unit"] == "kWh"
+
+
+def test_multi_metric_chart_series_carry_their_own_unit():
+    """多指标图表：每个系列带自己的单位（能耗 kWh + 电费 元）。"""
+    region = _chart(
+        name="能耗与电费",
+        kind="energy",
+        unit="kWh",
+        metrics=[
+            {"metricKey": "energy", "label": "总耗电", "kind": "energy", "unit": "kWh"},
+            {"metricKey": "cost", "label": "总电费", "kind": "cost", "unit": "元"},
+        ],
+    )
+    payloads = generate_simulated_data(_definition([region]), _context())
+    chart = payloads["r_trend"]
+    assert chart["unit"] == "kWh"
+    assert [s["metricKey"] for s in chart["series"]] == ["energy", "cost"]
+    assert [s["unit"] for s in chart["series"]] == ["kWh", "元"]
+
+
+def test_chart_series_unit_does_not_leak_from_the_region_unit():
+    """区域单位属于主量：没自己声明单位的别的系列按量身份推导，不跟着串。"""
+    region = _chart(
+        name="能耗与电费",
+        kind="energy",
+        unit="kWh",
+        metrics=[
+            {"metricKey": "energy", "label": "总耗电", "kind": "energy"},
+            {"metricKey": "cost", "label": "总电费", "kind": "cost"},
+        ],
+    )
+    payloads = generate_simulated_data(_definition([region]), _context())
+    chart = payloads["r_trend"]
+    assert chart["unit"] == "kWh"
+    assert [s["unit"] for s in chart["series"]] == ["kWh", "元"]
+
+
+def test_chart_unit_does_not_change_any_number():
+    """补单位不得改变任何数值（确定性与勾稽不受影响）。"""
+    with_unit = generate_simulated_data(
+        _definition([_chart(kind="energy", unit="kWh")]), _context()
+    )["r_trend"]
+    without_unit = generate_simulated_data(
+        _definition([_chart(kind="energy")]), _context()
+    )["r_trend"]
+    assert with_unit["unit"] == without_unit["unit"] == "kWh"
+    assert with_unit["yValues"] == without_unit["yValues"]
+    assert with_unit["points"] == without_unit["points"]
+    assert with_unit["xLabels"] == without_unit["xLabels"]

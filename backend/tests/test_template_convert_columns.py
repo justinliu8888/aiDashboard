@@ -23,6 +23,7 @@ from app.services.template_definition_service import (
     adapt_preview_spec,
     build_template_definition,
 )
+from app.services.validation_service import validate_definition
 
 
 # --------------------------------------------------------------------------
@@ -487,3 +488,34 @@ def test_adapt_preview_spec_keeps_an_existing_preview_spec():
         },
     }
     assert adapt_preview_spec(region)["kind"] == "energy"
+
+
+# --------------------------------------------------------------------------
+# 4. 模板态的列取值键不是数据源绑定 —— 草稿仍要过校验
+# --------------------------------------------------------------------------
+
+
+def test_declared_row_keys_do_not_block_validation():
+    """方案声明的取值键落进草稿后，草稿**要过得了校验**。
+
+    工单 02 的取值键是**行对象里的键**（``section_1.col_1`` 这种），不是数据源
+    字段；工单 03 把它原样落进 ``component.columns``。校验层若把它当数据源
+    字段查，草稿就永远停在 VALIDATION_FAILED，出不了预览（ADR 0004 §2.4）。
+    """
+    section = {
+        "id": "section_1", "title": "设备耗电明细",
+        "metricIntents": ["设备耗电"], "componentType": "table",
+        "columns": [
+            {"id": "col_1", "label": "设备名称", "fieldRef": "section_1.col_1"},
+            {"id": "col_2", "label": "耗电量", "fieldRef": "section_1.col_2"},
+        ],
+    }
+    _, draft = _convert([section])
+
+    # 取值键原样落位（工单 03 的契约）。
+    assert [c["fieldRef"] for c in draft.regions[0]["component"]["columns"]] == [
+        "section_1.col_1", "section_1.col_2",
+    ]
+    # 但它不是数据源字段 —— 校验不能因此判失败。
+    result = validate_definition(draft.model_dump(mode="json"))
+    assert result.passed, [issue.message for issue in result.issues]

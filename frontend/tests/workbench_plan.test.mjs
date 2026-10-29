@@ -21,6 +21,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 
 const require = createRequire(import.meta.url);
 const Plan = require("../pages/workbench_plan.js");
@@ -759,4 +760,225 @@ test("折线图区域把取到的点画出来（renderChart 已导出给草稿�
   const text = textOf(root);
   assert.ok(text.includes("2026-10-22"), "应显示横轴标签");
   assert.ok(text.includes("620"), "应显示纵轴数值");
+});
+
+// ---------------------------------------------------------------- 选型与栏目
+//
+// 工单 06（#46）：方案卡片要能显示**板块类型和它的选择理由**，
+// 以及表格板块声明的**栏目**。
+//
+// 字段来自开发规格「跨工单契约」：
+//   - 每个板块定稿携带 displayIntent / explicitComponentType（可空）/ selectionReason；
+//   - 定稿栏目每项有 id / label / fieldRef。
+//
+// 前端**不猜**后端字段：字段不存在就当没有，不按标题猜、不自造默认值。
+
+test("板块显示展示目的与选型理由", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_total",
+          title: "总耗电概览",
+          metricIntents: ["总耗电"],
+          componentType: "metric_card",
+          displayIntent: "total",
+          selectionReason: "看总量，指标卡最直观",
+        },
+      ],
+    },
+  }), {});
+
+  const section = oneClass(root, "plan-section");
+  assert.ok(section.textContent.includes("总量"), "应显示展示目的");
+  assert.ok(section.textContent.includes("看总量，指标卡最直观"), "应显示选型理由");
+  assert.equal(
+    oneClass(root, "plan-display-intent").getAttribute("data-plan-display-intent"),
+    "total"
+  );
+});
+
+test("没有选型字段时什么都不显示（不猜后端字段）", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith(), {});
+
+  assert.equal(byClass(root, "plan-display-intent").length, 0, "没有 displayIntent 就不显示展示目的");
+  assert.equal(byClass(root, "plan-selection-reason").length, 0, "没有 selectionReason 就不显示理由");
+  assert.equal(byClass(root, "plan-explicit-type").length, 0, "没有 explicitComponentType 就不显示指定类型");
+});
+
+test("用户指定的展示类型单独标出，不与系统选型混为一谈", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_rank",
+          title: "设备耗电排名",
+          metricIntents: ["总耗电"],
+          componentType: "bar_chart",
+          displayIntent: "comparison",
+          explicitComponentType: "bar_chart",
+          selectionReason: "用户明确要求用柱状图",
+        },
+      ],
+    },
+  }), {});
+
+  const explicit = oneClass(root, "plan-explicit-type");
+  assert.equal(explicit.getAttribute("data-plan-explicit-type"), "bar_chart");
+  assert.ok(explicit.textContent.includes("柱状图"), "应显示指定类型的中文名");
+  assert.ok(explicit.textContent.includes("用户指定"), "应标明这是用户指定的");
+});
+
+test("表格板块显示它声明的栏目", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_alarm",
+          title: "当前告警列表",
+          metricIntents: ["告警"],
+          componentType: "table",
+          displayIntent: "records",
+          columns: [
+            { id: "col_device", label: "设备名称", fieldRef: "section_alarm.device_name" },
+            { id: "col_level", label: "告警级别", fieldRef: "section_alarm.level" },
+          ],
+        },
+      ],
+    },
+  }), {});
+
+  const columns = byClass(root, "plan-column");
+  assert.equal(columns.length, 2, "应显示 2 个栏目");
+  assert.ok(columns[0].textContent.includes("设备名称"));
+  assert.ok(columns[1].textContent.includes("告警级别"));
+  assert.equal(columns[0].getAttribute("data-plan-column-id"), "col_device");
+  assert.equal(columns[0].getAttribute("data-plan-column-field-ref"), "section_alarm.device_name");
+  // 取值键是技术键：放在 title 里（悬停可见），不和栏目名挤在一行
+  assert.equal(columns[0].getAttribute("title"), "section_alarm.device_name");
+  assert.ok(!columns[0].textContent.includes("section_alarm.device_name"), "取值键不与栏目名挤在一行");
+});
+
+test("方案里没有栏目声明时不显示栏目（不按标题猜列）", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        { id: "section_alarm", title: "当前告警列表", metricIntents: ["告警"], componentType: "table" },
+      ],
+    },
+  }), {});
+
+  assert.equal(byClass(root, "plan-columns").length, 0, "没有声明就不显示栏目");
+});
+
+test("栏目没有显示名时整项跳过（不拿 id 当栏目名）", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_alarm",
+          title: "当前告警列表",
+          metricIntents: ["告警"],
+          componentType: "table",
+          columns: [
+            { id: "col_device", fieldRef: "section_alarm.device_name" },
+            { id: "col_level", label: "告警级别", fieldRef: "section_alarm.level" },
+          ],
+        },
+      ],
+    },
+  }), {});
+
+  const columns = byClass(root, "plan-column");
+  assert.equal(columns.length, 1, "只有有显示名的栏目才显示");
+  assert.ok(columns[0].textContent.includes("告警级别"));
+});
+
+test("选型与栏目里的 HTML 只作为文本显示", () => {
+  const { doc, root } = makeRoot();
+  const nasty = '<img src=x onerror="window.__pwned=9">';
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_alarm",
+          title: "当前告警列表",
+          metricIntents: ["告警"],
+          componentType: "table",
+          displayIntent: "records",
+          selectionReason: nasty,
+          columns: [{ id: "col_device", label: nasty, fieldRef: "section_alarm.device_name" }],
+        },
+      ],
+    },
+  }), {});
+
+  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应该使用 innerHTML");
+  const tags = walk(root).map((node) => node.tagName);
+  assert.ok(!tags.includes("IMG"), "不该由模型文本生成 img 元素");
+  assert.ok(textOf(root).includes(nasty), "模型文本应当原样以文本显示");
+});
+
+test("方案卡片允许换行（左侧 340px 窄栏不溢出）", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith(), {});
+  const style = oneClass(root, "plan-module").getAttribute("style") || "";
+  assert.ok(
+    style.includes("overflow-wrap:anywhere") && style.includes("word-break:break-word"),
+    "方案卡片必须允许长文本换行，否则窄栏会横向溢出"
+  );
+});
+
+test("展示目的的标签映射", () => {
+  assert.equal(Plan.displayIntentLabel("total"), "总量");
+  assert.equal(Plan.displayIntentLabel("trend"), "趋势");
+  assert.equal(Plan.displayIntentLabel("comparison"), "对比");
+  assert.equal(Plan.displayIntentLabel("composition"), "构成");
+  assert.equal(Plan.displayIntentLabel("records"), "明细");
+  assert.equal(Plan.displayIntentLabel(""), "");
+  assert.equal(Plan.displayIntentLabel(null), "");
+});
+
+// ---------------------------------------------------------------- 工作台页面结构
+//
+// 工单 06（#46）：文字方案移到左侧对话区，右侧报表面板不再出现文字方案。
+//
+// 这一层是**静态存在性检查**：页面骨架与挂载点由 workbench.html / workbench.js 决定，
+// 没有浏览器就跑不了交互，这里守住「右侧不再声明方案容器」「方案挂进左侧对话流」两条。
+
+const WORKBENCH_HTML = readFileSync(new URL("../pages/workbench.html", import.meta.url), "utf8");
+const WORKBENCH_JS = readFileSync(new URL("../pages/workbench.js", import.meta.url), "utf8");
+
+test("右侧报表面板不再声明文字方案容器", () => {
+  const right = WORKBENCH_HTML.split("右：报表预览区")[1] || "";
+  assert.ok(right.length > 0, "应能在页面里定位到右侧报表面板");
+  assert.ok(!right.includes('id="plan-root"'), "右侧不再声明方案容器");
+  assert.ok(!right.includes('id="plan-bubble"'), "右侧不再声明方案气泡");
+});
+
+test("左侧对话区仍然存在（方案的落点）", () => {
+  assert.ok(WORKBENCH_HTML.includes('id="chat-scroll"'), "左侧对话区应当存在");
+});
+
+test("工作台把方案挂进左侧对话流，而不是页面里的静态容器", () => {
+  assert.ok(
+    !WORKBENCH_JS.includes('$("plan-root")'),
+    "方案容器不再由页面静态声明，主工作台自己建一条 AI 气泡承载它"
+  );
+  assert.ok(
+    /chatScroll\.appendChild\(planBubble\)/.test(WORKBENCH_JS),
+    "方案气泡应当挂到左侧对话流（#chat-scroll）里"
+  );
 });

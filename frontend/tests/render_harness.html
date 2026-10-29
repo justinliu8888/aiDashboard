@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>工单 07 自检 harness · 草稿面板按载荷渲染</title>
+<style>
+  body {
+    margin: 0;
+    padding: 16px 20px 40px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f1f5f9;
+    color: #1e293b;
+  }
+  h1 { font-size: 18px; margin: 0 0 6px; color: #0f172a; }
+  .banner {
+    margin: 0 0 14px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid #fcd34d;
+    background: #fffbeb;
+    color: #92400e;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  /* 工作台的关键骨架：让 workbench.js 原样跑起来（不接后端）。 */
+  #workbench-root { display: flex; gap: 12px; align-items: flex-start; }
+  #chat-scroll { width: 340px; min-width: 340px; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; }
+  #preview-root { flex: 1 1 auto; min-width: 320px; }
+  #preview-empty { background: #fff; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 20px; text-align: center; color: #94a3b8; }
+  #draft-badge { display: inline-block; }
+  #session-list { min-height: 20px; }
+  #toast { display: none; }
+</style>
+</head>
+<body>
+
+<h1>工单 07 自检 harness · 草稿面板按载荷渲染</h1>
+
+<div class="banner">
+  <strong>这是测试 harness，不是产品页面。</strong>
+  载荷是<strong>静态样例</strong>（照开发规格 #46「跨工单契约」的字段形状写死），
+  不是生产数据、不是模板库资产、也不是模型回复。
+  本页<strong>不接后端、不调模型</strong>：fetch 被桩掉，工作台脚本原样加载，
+  只把一份静态载荷塞进去，验证「右侧按载荷出图出表 + 角标 + 徽标」这条路径。
+  <br />
+  场景切换：<code>window.__renderDemo('default' | 'truncated' | 'validated' | 'pending')</code>
+</div>
+
+<div class="toolbar">
+  <span id="draft-badge" class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-slate-100 text-slate-500 border-slate-200">尚无草稿</span>
+  <span id="state-badge" class="mono">ANALYZING</span>
+  <span id="meta-rev">—</span>
+  <span id="meta-session">—</span>
+  <span id="footer-state">ANALYZING</span>
+  <span id="health-badge" class="hidden"></span>
+</div>
+
+<div id="workbench-root">
+  <div id="chat-scroll">
+    <div id="session-list"></div>
+  </div>
+  <div id="preview-root">
+    <div id="preview-empty">
+      <div data-preview-empty-hint>还没有草稿，试试左侧「生成能耗日报」</div>
+    </div>
+  </div>
+</div>
+
+<!-- 工作台脚本需要的其余骨架元素（不显示，只是不许缺）。 -->
+<div class="hidden">
+  <button id="btn-new-session"></button>
+  <button id="btn-send"></button>
+  <button id="btn-stop"></button>
+  <button id="btn-regenerate"></button>
+  <input id="chat-input" />
+  <input id="session-search" />
+  <button id="btn-jump-bottom"></button>
+  <button data-quick="生成 A 机房昨日能耗日报"></button>
+</div>
+
+<script>
+  // ── 不接后端：所有 fetch 都给空结果 ─────────────────────────────
+  // 只桩掉列表与健康检查；工作台脚本的其他行为照常。
+  window.fetch = function (url) {
+    var href = String(url);
+    var isSessionList = href.indexOf("/api/sessions") >= 0;
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: function () { return Promise.resolve(isSessionList ? { items: [] } : {}); },
+      text: function () { return Promise.resolve(""); },
+    });
+  };
+  window.AI_REPORT_API_BASE = window.location.origin;
+
+  // 本机不接 CDN（图表库取不到）：强制走**不依赖 CDN** 的 SVG 渲染路径，
+  // 让本页的断言是确定的（曲线真的画出来了、单位真的写在图上）。
+  // ECharts 那条路要真实 CDN，在有网的环境里由工作台页承担。
+  try { delete window.echarts; } catch (e) { window.echarts = undefined; }
+</script>
+
+<script src="../pages/workbench_query.js"></script>
+<script src="../pages/workbench_plan.js"></script>
+<script src="../pages/workbench.js" defer></script>
+
+<script>
+  // ── 静态载荷样例 ────────────────────────────────────────────────
+  // 字段形状照开发规格 #46「跨工单契约」：
+  //   顶层 previewContext + regions[]；
+  //   区域带 regionId / name / componentType / role / payload / dataSource / capabilityPending。
+  var DEFINITION = {
+    schemaVersion: "1.0",
+    metadata: { id: "def_demo_001", revision: 3, name: "A 机房能耗日报", status: "DRAFT" },
+    regions: [
+      { id: "region_total", name: "总耗电概览", role: "TOTAL", component: { type: "METRIC_CARD" }, binding: {} },
+      { id: "region_pue", name: "PUE 总览", role: "TOTAL", component: { type: "METRIC_CARD" }, binding: {} },
+      { id: "region_trend", name: "耗电趋势", role: "TREND", component: { type: "CHART" }, binding: {} },
+      { id: "region_ranking", name: "设备耗电排名", role: "DETAIL", component: { type: "TABLE" }, binding: { topN: 10 } }
+    ]
+  };
+
+  // 截断场景用：这张表只声明前 2 行，行和（218.7）小于总量（306.1）。
+  var DEFINITION_TRUNCATED = {
+    schemaVersion: "1.0",
+    metadata: { id: "def_demo_001", revision: 3, name: "A 机房能耗日报", status: "DRAFT" },
+    regions: [
+      { id: "region_total", name: "总耗电概览", role: "TOTAL", component: { type: "METRIC_CARD" }, binding: {} },
+      { id: "region_pue", name: "PUE 总览", role: "TOTAL", component: { type: "METRIC_CARD" }, binding: {} },
+      { id: "region_trend", name: "耗电趋势", role: "TREND", component: { type: "CHART" }, binding: {} },
+      { id: "region_ranking", name: "设备耗电排名", role: "DETAIL", component: { type: "TABLE" }, binding: { topN: 2 } }
+    ]
+  };
+
+  function basePayload() {
+    return {
+      previewContext: {
+        definitionId: "def_demo_001",
+        definitionVersion: 3,
+        timezone: "Asia/Shanghai",
+        anchorTime: "2026-10-28T00:00:00+08:00",
+        windowStart: "2026-10-27T00:00:00+08:00",
+        windowEnd: "2026-10-28T00:00:00+08:00",
+        grainUnit: "HOUR",
+        generatorVersion: "sim-1"
+      },
+      regions: [
+        {
+          regionId: "region_title",
+          name: "A 机房昨日能耗日报",
+          componentType: "TEXT",
+          role: "REPORT_TITLE",
+          dataSource: "simulated",
+          capabilityPending: false,
+          payload: { rendered: "A 机房昨日能耗日报", template: "{{roomName}} 昨日能耗日报" }
+        },
+        {
+          regionId: "region_total",
+          name: "总耗电概览",
+          componentType: "METRIC_CARD",
+          role: "TOTAL",
+          dataSource: "simulated",
+          capabilityPending: false,
+          payload: {
+            label: "总耗电",
+            value: 306.1,
+            unit: "kWh",
+            precision: 1,
+            yoyPercent: 6.2,
+            comparisonAvailable: true,
+            windowLabel: "2026-10-27 全天",
+            dataSource: "simulated",
+            metrics: [
+              { metricKey: "total_energy", label: "总耗电", kind: "energy", unit: "kWh", value: 306.1, precision: 1, capabilityPending: false },
+              { metricKey: "total_cost", label: "总电费", kind: "cost", unit: "元", value: 244.88, precision: 2, capabilityPending: false }
+            ]
+          }
+        },
+        {
+          regionId: "region_pue",
+          name: "PUE 总览",
+          componentType: "METRIC_CARD",
+          role: "TOTAL",
+          dataSource: "simulated",
+          capabilityPending: true,
+          payload: {
+            label: "PUE",
+            value: 1.42,
+            unit: "",
+            precision: 2,
+            yoyPercent: -1.1,
+            comparisonAvailable: true,
+            windowLabel: "2026-10-27 全天",
+            dataSource: "simulated",
+            metrics: [
+              {
+                metricKey: "pue",
+                label: "PUE",
+                kind: "pue",
+                unit: "",
+                value: 1.42,
+                precision: 2,
+                capabilityPending: true,
+                pendingReason: "PUE 口径待核实，当前数据源没有登记这个字段"
+              }
+            ]
+          }
+        },
+        {
+          regionId: "region_trend",
+          name: "耗电趋势",
+          componentType: "CHART",
+          role: "TREND",
+          dataSource: "simulated",
+          capabilityPending: false,
+          payload: {
+            chartKind: "LINE",
+            grain: "HOUR",
+            xField: "timestamp",
+            yField: "energyKwh",
+            xLabels: ["09:00", "10:00", "11:00", "12:00"],
+            yValues: [210.5, 233.1, 198.7, 221.4],
+            points: [],
+            unit: "kWh",
+            dataSource: "simulated"
+          }
+        },
+        {
+          regionId: "region_rank_chart",
+          name: "设备耗电对比",
+          componentType: "CHART",
+          role: "DETAIL",
+          dataSource: "simulated",
+          capabilityPending: false,
+          payload: {
+            chartKind: "BAR",
+            grain: "",
+            xField: "deviceName",
+            yField: "energyKwh",
+            xLabels: ["A-1 机架", "A-2 机架", "A-3 机架"],
+            yValues: [120.5, 98.2, 87.4],
+            points: [],
+            unit: "kWh",
+            dataSource: "simulated"
+          }
+        },
+        {
+          regionId: "region_ranking",
+          name: "设备耗电排名",
+          componentType: "TABLE",
+          role: "DETAIL",
+          dataSource: "simulated",
+          capabilityPending: false,
+          payload: {
+            columns: [
+              { id: "col_device", label: "设备名称", fieldRef: "ranking.device_name", format: { kind: "TEXT" } },
+              { id: "col_energy", label: "耗电", fieldRef: "ranking.energy", format: { kind: "NUMBER", precision: 1, unitLabel: "kWh" } }
+            ],
+            rowNumber: true,
+            rows: [
+              { "ranking.device_name": "A-1 机架", "ranking.energy": 120.5 },
+              { "ranking.device_name": "A-2 机架", "ranking.energy": 98.2 },
+              { "ranking.device_name": "A-3 机架", "ranking.energy": 87.4 }
+            ],
+            dataSource: "simulated"
+          }
+        }
+      ]
+    };
+  }
+
+  // 场景切换：给流程与自检用。
+  window.__renderDemo = function (kind) {
+    var payload = basePayload();
+    var definition = DEFINITION;
+    var state = "ANALYZING";
+    if (kind === "truncated") {
+      // 行被截断：这张表只声明前 2 行，行和（218.7）小于总量（306.1）
+      // → 渲染层必须标注「仅显示前 2 行」。
+      definition = DEFINITION_TRUNCATED;
+      var ranking = payload.regions.filter(function (r) { return r.regionId === "region_ranking"; })[0];
+      ranking.payload.rows = ranking.payload.rows.slice(0, 2);
+    } else if (kind === "validated") {
+      state = "READY";
+    } else if (kind === "pending") {
+      state = "VALIDATING";
+    }
+    session.definition = definition;
+    session.baseDefinitionRevision = definition.metadata.revision;
+    session.state = state;
+    session.reportPreviewPayload = payload;
+    setState(state);
+    updateMeta();
+    renderReportPanel();
+    return kind;
+  };
+
+  window.addEventListener("load", function () {
+    // 默认场景：草稿阶段的报表示意。
+    window.__renderDemo("default");
+    document.body.setAttribute("data-harness-ready", "true");
+  });
+</script>
+
+</body>
+</html>
