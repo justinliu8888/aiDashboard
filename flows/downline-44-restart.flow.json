@@ -1,0 +1,164 @@
+{
+  "_comment": "#44 交付票新增流程：验证「草稿已就绪阶段点『重新开始』后会话掉出设计流」这个缺陷已修好。链路：确认方案 → 出草稿 → 点『重新开始』→ 阶段复位回 PLAN_NEEDED → 提新需求 → 重新回到文字方案流 → 再确认 → 出**新**草稿。环境：真实后端 + 真实模型（VOLC_MODEL=doubao-seed-2-1-lite-260915）。waitFor 的 timeout ≥ 180000（真实模型出方案约 45 秒）。产物落 .selfcheck/downline-grid/real-model/。",
+  "baseDir": "..",
+  "outDir": "../.selfcheck/downline-grid/real-model",
+  "waitMs": 2500,
+  "timeout": 20000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "wb44-01 「重新开始」后能重新回到设计流并出新草稿",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成A机房最近7天的能耗报表，两个板块：总耗电指标卡、每日耗电趋势图。"
+        },
+        {
+          "click": "#btn-send"
+        },
+        {
+          "waitFor": "#plan-root .plan-module",
+          "timeout": 180000
+        },
+        {
+          "waitFor": "#plan-root .plan-confirm:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-module').getAttribute('data-plan-phase') === 'PLAN_WAITING_CONFIRM'"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('#plan-root .plan-status'); const m = t && /版本\\s*(\\d+)/.exec(t.innerText); return m ? Number(m[1]) : -1; })()",
+          "save": "planVersionV1"
+        },
+        {
+          "screenshot": "wb44-01-第一版文字方案待确认"
+        },
+        {
+          "click": "#plan-root .plan-confirm"
+        },
+        {
+          "waitFor": "#preview-root [data-region-id]",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-module').getAttribute('data-plan-phase') === 'DRAFT_READY'"
+        },
+        {
+          "eval": "document.querySelectorAll('#preview-root [data-region-id]').length",
+          "save": "draftRegionCountV1"
+        },
+        {
+          "waitFor": ".question-select",
+          "timeout": 60000
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('.question-select')).some(s => ['同意','修改','重新开始'].every(t => Array.from(s.options).some(o => o.textContent.trim() === t)))"
+        },
+        {
+          "screenshot": "wb44-02-草稿已就绪待确认下一步"
+        },
+
+        {
+          "eval": "(() => { const s = Array.from(document.querySelectorAll('.question-select')).filter(x => !x.disabled).pop(); const opt = Array.from(s.options).find(o => o.textContent.trim() === '重新开始'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "screenshot": "wb44-03-点重新开始之后"
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-module').getAttribute('data-plan-phase') === 'PLAN_NEEDED'"
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-module').getAttribute('data-plan-can-confirm') === 'false'"
+        },
+        {
+          "eval": "document.querySelectorAll('#preview-root [data-region-id]').length === 0"
+        },
+        {
+          "eval": "(() => { const sel = Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled); return !sel.some(s => Array.from(s.options).some(o => o.textContent.trim() === '重新开始')); })()"
+        },
+
+        {
+          "type": "#chat-input",
+          "text": "改成B机房最近7天的能耗报表，两个板块：总耗电指标卡、每日耗电趋势图。"
+        },
+        {
+          "click": "#btn-send"
+        },
+        {
+          "waitFor": "#plan-root .plan-confirm:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 800
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-module').getAttribute('data-plan-phase') === 'PLAN_WAITING_CONFIRM'"
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-module').getAttribute('data-plan-can-confirm') === 'true'"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('#plan-root .plan-status'); const m = t && /版本\\s*(\\d+)/.exec(t.innerText); return m ? Number(m[1]) : -1; })()",
+          "save": "planVersionV2"
+        },
+        {
+          "eval": "planVersionV2 === planVersionV1 + 1"
+        },
+        {
+          "screenshot": "wb44-04-重新开始后的新文字方案"
+        },
+        {
+          "click": "#plan-root .plan-confirm"
+        },
+        {
+          "waitFor": "#preview-root [data-region-id]",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.querySelector('#plan-root .plan-module').getAttribute('data-plan-phase') === 'DRAFT_READY'"
+        },
+        {
+          "eval": "document.querySelectorAll('#preview-root [data-region-id]').length > 0"
+        },
+        {
+          "eval": "document.querySelectorAll('#preview-root [data-region-id]').length",
+          "save": "draftRegionCountV2"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(c => c.innerText.replace(/\\s+/g, ' ').slice(0, 100)).join(' || ')",
+          "save": "draftCardTextsV2"
+        },
+        {
+          "eval": "(() => { const d = document.querySelector('#plan-root details.confirmed-plan-details'); const secs = d ? d.querySelectorAll('.plan-section').length : -1; const regions = document.querySelectorAll('#preview-root [data-region-id]').length; return secs > 0 && secs === regions; })()"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.replace(/\\s+/g, ' ').slice(0, 400)",
+          "save": "previewRootTextV2"
+        },
+        {
+          "screenshot": "wb44-05-重新开始后的新草稿"
+        }
+      ]
+    }
+  ]
+}
