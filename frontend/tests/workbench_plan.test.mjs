@@ -36,6 +36,9 @@ class FakeElement {
     this.attributes = new Map();
     this.listeners = new Map();
     this.disabled = false;
+    // 行内样式：图表条形宽度要用它。真实浏览器里 style 是 CSSStyleDeclaration，
+    // 桩里只保留被写进去的属性就够了。
+    this.style = {};
     this._text = "";
   }
 
@@ -555,4 +558,215 @@ test("浏览器侧暴露 window.WorkbenchPlan", () => {
   assert.equal(typeof Plan.render, "function");
   assert.equal(typeof Plan.clear, "function");
   assert.equal(Plan.DESIGN_ACTION_CONFIRM, "CONFIRM_PLAN");
+});
+
+// ---------------------------------------------------------------- 模板渲染
+//
+// 工单 02：确认方案后生成模板。用户口径（需求访谈 Q13）：
+// 「数据库里有啥数据就展示啥，没有的就按 Q11 和 Q12 的方案来」。
+//
+// 所以要验的是：
+//   - 接到数据的区域把**真实值**显示出来；
+//   - 没接到数据的区域是占位（指标卡 `--`、图表空框、表格表头加空行）；
+//   - 占位区域**不含任何数值**；
+//   - 数据来源性质必须显示出来，不能让人把演示数值当生产数据。
+
+const SAMPLE_TEMPLATE = {
+  id: "rtpl_example",
+  revision: 1,
+  planId: SAMPLE_PLAN.id,
+  planRevision: 1,
+  title: "A 机房能耗日报",
+  dataStatus: "partial",
+  regions: [
+    {
+      id: "region_1",
+      sectionId: "section_total",
+      title: "总耗电概览",
+      componentType: "metric_card",
+      metricIntents: ["总耗电"],
+      metricRefs: ["metric.machine_room.total_energy"],
+      dataStatus: "bound",
+      placeholderReason: null,
+      data: {
+        label: "总耗电",
+        value: 5123.4,
+        unit: "kWh",
+        precision: 1,
+        yoyPercent: 6.2,
+        comparisonAvailable: true,
+        windowLabel: "2026-10-22 ~ 2026-10-28（7 天）",
+      },
+      dataSource: "mock_energy",
+      dataSourceLabel: "模拟数据（能耗 Mock 源，非生产事实表）",
+    },
+    {
+      id: "region_2",
+      sectionId: "section_pue",
+      title: "PUE 总览",
+      componentType: "metric_card",
+      metricIntents: ["PUE"],
+      metricRefs: ["metric.machine_room.pue"],
+      dataStatus: "placeholder",
+      placeholderReason: "「PUE」口径待核实：当前数据源没有登记这个字段，算不出数值。",
+      data: null,
+      dataSource: null,
+      dataSourceLabel: null,
+    },
+  ],
+  layout: { columns: 2, items: [] },
+  referenceTemplates: [],
+  pendingNotes: ["「PUE 总览」「PUE」口径待核实：当前数据源没有登记这个字段，算不出数值。"],
+};
+
+function templateView(overrides = {}) {
+  return {
+    designPhase: "TEMPLATE_READY",
+    reportPlan: SAMPLE_PLAN,
+    templateDesign: SAMPLE_TEMPLATE,
+    busy: false,
+    error: null,
+    canConfirm: false,
+    ...overrides,
+  };
+}
+
+test("模板已就绪：阶段标签是「模板已就绪」", () => {
+  assert.equal(Plan.designPhaseLabel("TEMPLATE_READY"), "模板已就绪");
+});
+
+test("接到数据的区域显示真实取到的值", () => {
+  const { root } = makeRoot();
+  Plan.render(root, templateView(), {});
+  const text = textOf(root);
+  assert.ok(text.includes("总耗电"), "应显示指标名");
+  assert.ok(text.includes("5123.4"), "应显示真实取到的数值");
+  assert.ok(text.includes("kWh"), "应显示单位");
+  assert.ok(text.includes("2026-10-22 ~ 2026-10-28（7 天）"), "应显示统计窗口");
+});
+
+test("数据来源性质必须显示出来", () => {
+  const { root } = makeRoot();
+  Plan.render(root, templateView(), {});
+  assert.ok(textOf(root).includes("模拟数据"), "必须标明这是模拟数据");
+});
+
+test("没接到数据的区域是占位：指标值显示 -- 且写明原因", () => {
+  const { root } = makeRoot();
+  Plan.render(root, templateView(), {});
+  const text = textOf(root);
+  assert.ok(text.includes("PUE 总览"), "应保留该区域");
+  assert.ok(text.includes("--"), "占位指标值应为 --");
+  assert.ok(text.includes("口径待核实"), "应写明占位原因");
+});
+
+test("占位区域不带任何数值", () => {
+  const { root } = makeRoot();
+  Plan.render(root, templateView(), {});
+  const placeholders = walk(root).filter(
+    (node) => node.getAttribute("data-template-region-status") === "placeholder"
+  );
+  assert.equal(placeholders.length, 1);
+  // 占位区域里除了「--」不该出现数字
+  const text = placeholders[0].textContent;
+  assert.ok(!/\d/.test(text.replace("PUE", "")), "占位区域不应含数值：" + text);
+});
+
+test("区域带状态标记，界面与测试都能定位", () => {
+  const { root } = makeRoot();
+  Plan.render(root, templateView(), {});
+  const bound = walk(root).filter(
+    (node) => node.getAttribute("data-template-region-status") === "bound"
+  );
+  assert.equal(bound.length, 1);
+});
+
+test("模板已就绪时不再摆「确认方案」入口", () => {
+  const { root } = makeRoot();
+  const calls = [];
+  Plan.render(root, templateView(), { onAction: (payload) => calls.push(payload) });
+  assert.equal(byClass(root, "plan-confirm").length, 0);
+  assert.equal(calls.length, 0);
+});
+
+test("图表区域把取到的点画出来", () => {
+  const { root } = makeRoot();
+  const chartTemplate = {
+    ...SAMPLE_TEMPLATE,
+    dataStatus: "bound",
+    pendingNotes: [],
+    regions: [
+      {
+        id: "region_1",
+        sectionId: "section_trend",
+        title: "耗电趋势",
+        componentType: "line_chart",
+        metricIntents: ["总耗电"],
+        metricRefs: ["metric.machine_room.total_energy"],
+        dataStatus: "bound",
+        placeholderReason: null,
+        data: {
+          chartKind: "LINE",
+          xLabels: ["2026-10-22", "2026-10-23"],
+          yValues: [500, 620],
+          points: [],
+          unit: "kWh",
+        },
+        dataSource: "mock_energy",
+        dataSourceLabel: "模拟数据",
+      },
+    ],
+  };
+  Plan.render(root, templateView({ templateDesign: chartTemplate }), {});
+  const text = textOf(root);
+  assert.ok(text.includes("2026-10-22"), "应显示横轴标签");
+  assert.ok(text.includes("620"), "应显示纵轴数值");
+});
+
+test("表格区域有表头和数据行；没有数据时是表头加空行", () => {
+  const { root } = makeRoot();
+  const tableTemplate = {
+    ...SAMPLE_TEMPLATE,
+    dataStatus: "bound",
+    pendingNotes: [],
+    regions: [
+      {
+        id: "region_1",
+        sectionId: "section_ranking",
+        title: "设备耗电排名",
+        componentType: "table",
+        metricIntents: ["设备耗电"],
+        metricRefs: ["metric.machine_room.device_energy"],
+        dataStatus: "bound",
+        placeholderReason: null,
+        data: {
+          columns: [
+            { id: "deviceName", label: "设备", fieldRef: "deviceName" },
+            { id: "energyKwh", label: "耗电（kWh）", fieldRef: "energyKwh" },
+          ],
+          rows: [{ deviceName: "CRAC-01 空调", energyKwh: 812.3 }],
+          rowNumber: true,
+        },
+        dataSource: "mock_energy",
+        dataSourceLabel: "模拟数据",
+      },
+    ],
+  };
+  Plan.render(root, templateView({ templateDesign: tableTemplate }), {});
+  const text = textOf(root);
+  assert.ok(text.includes("设备"), "应有表头");
+  assert.ok(text.includes("CRAC-01 空调"), "应有数据行");
+  assert.ok(text.includes("812.3"), "应有数值");
+});
+
+test("模板区域里的 HTML 只作为文本显示", () => {
+  const { root, doc } = makeRoot();
+  const evil = {
+    ...SAMPLE_TEMPLATE,
+    title: "<img src=x onerror=alert(1)>",
+    pendingNotes: [],
+  };
+  Plan.render(root, templateView({ templateDesign: evil }), {});
+  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应写 innerHTML");
+  assert.ok(textOf(root).includes("<img src=x onerror=alert(1)>"));
 });

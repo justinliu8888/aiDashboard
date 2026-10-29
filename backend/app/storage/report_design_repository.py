@@ -29,8 +29,12 @@ DESIGN_PHASE_PLAN_NEEDED = "PLAN_NEEDED"
 DESIGN_PHASE_PLAN_WAITING_CONFIRM = "PLAN_WAITING_CONFIRM"
 DESIGN_PHASE_TEMPLATE_READY = "TEMPLATE_READY"
 
-# 首波能落库的阶段：模板生成属于工单 02。
-DESIGN_PHASES = (DESIGN_PHASE_PLAN_NEEDED, DESIGN_PHASE_PLAN_WAITING_CONFIRM)
+# 能落库的阶段。模板已就绪（工单 02 起）。
+DESIGN_PHASES = (
+    DESIGN_PHASE_PLAN_NEEDED,
+    DESIGN_PHASE_PLAN_WAITING_CONFIRM,
+    DESIGN_PHASE_TEMPLATE_READY,
+)
 
 
 # ---------- 操作状态 ----------
@@ -57,6 +61,7 @@ class LoadResult(TypedDict):
 
     designPhase: str
     reportPlan: dict[str, Any] | None
+    templateDesign: dict[str, Any] | None
 
 
 class ClaimResult(TypedDict, total=False):
@@ -105,6 +110,24 @@ class CommitResult(TypedDict, total=False):
     currentRevision: int | None
     reason: str
     error: dict[str, str] | None
+    # 模板提交（工单 02）时才有。
+    template: dict[str, Any] | None
+    templateId: str | None
+    templateRevision: int | None
+
+
+class ConfirmationResult(TypedDict, total=False):
+    """一条确认关系：哪一版方案被确认过，产出了哪个模板。
+
+    这是「重复确认不重复生成」的底座：确认按
+    ``(session_id, plan_id, plan_revision)`` 唯一。
+    """
+
+    sessionId: str
+    planId: str
+    planRevision: int
+    templateId: str
+    createdAt: str
 
 
 # write_turn：协调者注入的同事务消息 / 会话写入回调。
@@ -188,3 +211,37 @@ class ReportDesignRepository(Protocol):
         self, operation_id: str, safe_error: str | Mapping[str, Any]
     ) -> None:
         """把操作标记为失败，保留上一成功方案。"""
+
+    def commit_template(
+        self,
+        operation_id: str,
+        expected_revision: int | None,
+        template: Mapping[str, Any],
+        write_turn: WriteTurn | None = None,
+    ) -> CommitResult:
+        """提交由已确认方案生成的模板（工单 02）。
+
+        模板、确认关系、阶段（``TEMPLATE_READY``）、操作结果与 write_turn
+        回调同事务提交。
+
+        两处刻意的设计：
+
+            1. **确认关系单独建唯一键**。操作表上的
+               ``(session_id, plan_id, plan_revision)`` 唯一索引已经被
+               「提交方案」那次操作占用了 —— 确认动作不能再往同一组键上写，
+               否则第二次确认会撞库。确认按 ``(session_id, plan_id,
+               plan_revision)`` 建在确认关系表上，跨进程也成立。
+            2. **确认操作不在操作表上记方案版本**。操作表那组键留给方案提交，
+               确认操作只记「这次操作成功了」，方案版本记在确认关系表里。
+        """
+
+    def find_confirmation(
+        self, session_id: str, plan_id: str, plan_revision: int
+    ) -> ConfirmationResult | None:
+        """查某一版方案有没有被确认过。
+
+        确认过就**不重复生成**：直接返回已提交的模板。
+        """
+
+    def load_template(self, session_id: str) -> dict[str, Any] | None:
+        """读会话当前已提交的模板设计。"""

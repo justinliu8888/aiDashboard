@@ -261,6 +261,8 @@ class AgentResponseDomainObjects(BaseModel):
     # 老会话恢复时可能缺新增字段，缺字段的旧记录仍要能读出来，
     # 不能因为一个可选对象把整条会话读挂。
     reportPlan: dict[str, Any] | None = None
+    # 模板设计（工单 02）。同样是 dict：老会话没有这个字段时要能读出来。
+    templateDesign: dict[str, Any] | None = None
 
 
 class AgentResponse(BaseModel):

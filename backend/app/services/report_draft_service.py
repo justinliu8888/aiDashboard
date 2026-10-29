@@ -294,6 +294,18 @@ def _resolve_time_window(
     }
 
 
+def resolve_time_window(
+    time_window: dict[str, Any] | str | None,
+) -> dict[str, Any] | None:
+    """公开的时间窗解析入口。
+
+    同一句「最近 7 天」在草稿组装与模板生成里必须落在**同一个窗口**上，
+    否则用户看到的模板和设计对不上。所以这里公开一份，而不是让调用方
+    各自复制一份解析逻辑。
+    """
+    return _resolve_time_window(time_window)
+
+
 # ---------- 组件键归一 ----------
 
 def _normalize_component(name: str) -> str | None:

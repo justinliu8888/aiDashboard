@@ -142,6 +142,7 @@ let businessMenuReplayed = false;
 const planState = {
   designPhase: null,
   reportPlan: null,
+  templateDesign: null,
   busy: false,
   error: null,
 };
@@ -173,6 +174,7 @@ function renderPlanModule() {
     {
       designPhase: planState.designPhase,
       reportPlan: planState.reportPlan,
+      templateDesign: planState.templateDesign,
       busy: planState.busy,
       error: planState.error,
       canConfirm: planCanConfirm(),
@@ -186,9 +188,11 @@ function syncPlanFromResponse(data) {
   if (!data) return;
   const phase = data.designPhase || null;
   const plan = data.domainObjects?.reportPlan || null;
-  if (!phase && !plan) return;
+  const template = data.domainObjects?.templateDesign || null;
+  if (!phase && !plan && !template) return;
   planState.designPhase = phase || planState.designPhase;
   if (plan) planState.reportPlan = plan;
+  if (template) planState.templateDesign = template;
   // 出错时展示错误条；成功时清掉上一次的错误。
   planState.error = data.error ? data.error.message || data.error.code || null : null;
   renderPlanModule();
@@ -199,6 +203,7 @@ function restorePlanFromDetail(detail) {
   const snapshot = detail?.snapshot || {};
   planState.designPhase = snapshot.designPhase || null;
   planState.reportPlan = snapshot.reportPlan || null;
+  planState.templateDesign = snapshot.templateDesign || null;
   planState.busy = false;
   planState.error = null;
   renderPlanModule();

@@ -35,9 +35,15 @@
   /** 确认动作名（与冻结契约 v1 一致）。 */
   const DESIGN_ACTION_CONFIRM = "CONFIRM_PLAN";
 
-  /** 设计阶段。首波只有这两个值。 */
+  /** 设计阶段。 */
   const PHASE_PLAN_NEEDED = "PLAN_NEEDED";
   const PHASE_PLAN_WAITING_CONFIRM = "PLAN_WAITING_CONFIRM";
+  const PHASE_TEMPLATE_READY = "TEMPLATE_READY";
+
+  /** 区域数据状态。 */
+  const REGION_BOUND = "bound";
+  const REGION_PLACEHOLDER = "placeholder";
+  const REGION_TEXT = "text";
 
   /** 图表类型 → 中文标签。未知类型原样显示（安全文本）。 */
   const COMPONENT_TYPE_LABELS = {
@@ -53,6 +59,7 @@
   const PHASE_LABELS = {
     PLAN_NEEDED: "需要生成方案",
     PLAN_WAITING_CONFIRM: "待确认方案",
+    TEMPLATE_READY: "模板已就绪",
   };
 
   /** 容器上挂的标记属性，便于上层和测试定位自己的内容。 */
@@ -86,6 +93,30 @@
     empty: "font-size:13px;color:#94a3b8;",
     row: "font-size:13px;color:#475569;margin:2px 0;",
     rowKey: "color:#64748b;",
+    templateWrap: "margin-top:18px;border-top:1px solid #e2e8f0;padding-top:14px;",
+    templateTitle: "margin:0 0 4px;font-size:14px;font-weight:600;color:#0f172a;",
+    templateMeta: "font-size:12px;color:#64748b;margin:0 0 10px;",
+    region: "border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-bottom:8px;background:#ffffff;",
+    regionPlaceholder: "border:1px dashed #cbd5e1;border-radius:8px;padding:10px 12px;margin-bottom:8px;background:#f8fafc;",
+    regionHead: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;",
+    regionTitle: "font-size:13px;font-weight:600;color:#0f172a;",
+    badgeBound: "display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;background:#dcfce7;color:#15803d;font-size:11px;",
+    badgePlaceholder: "display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;background:#fef3c7;color:#b45309;font-size:11px;",
+    badgeText: "display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;background:#e2e8f0;color:#475569;font-size:11px;",
+    metricValue: "font-size:22px;font-weight:600;color:#0f172a;margin:2px 0;",
+    metricLabel: "font-size:12px;color:#64748b;",
+    metricNote: "font-size:11px;color:#b45309;margin-top:2px;",
+    sourceNote: "font-size:11px;color:#64748b;margin-top:4px;",
+    chartRow: "display:flex;align-items:center;gap:8px;font-size:12px;color:#475569;margin:3px 0;",
+    chartLabel: "width:96px;flex:0 0 96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+    chartTrack: "flex:1 1 auto;height:10px;border-radius:5px;background:#f1f5f9;overflow:hidden;",
+    chartFill: "height:100%;border-radius:5px;background:#60a5fa;",
+    chartValue: "width:72px;flex:0 0 72px;text-align:right;color:#334155;",
+    emptyFrame: "border:1px dashed #cbd5e1;border-radius:6px;padding:14px;text-align:center;font-size:12px;color:#94a3b8;background:#f8fafc;",
+    table: "width:100%;border-collapse:collapse;font-size:12px;color:#475569;",
+    tableHead: "text-align:left;border-bottom:1px solid #e2e8f0;padding:4px 6px;font-weight:600;color:#334155;",
+    tableCell: "padding:4px 6px;border-bottom:1px solid #f1f5f9;",
+    tableEmpty: "padding:8px 6px;color:#94a3b8;",
   };
 
   // ---------------------------------------------------------------- 状态
@@ -158,6 +189,7 @@
     const source = isPlainObject(view) ? view : {};
     const plan = isPlainObject(source.reportPlan) ? source.reportPlan : null;
     const requirements = plan && isPlainObject(plan.requirements) ? plan.requirements : {};
+    const template = isPlainObject(source.templateDesign) ? source.templateDesign : null;
 
     return {
       designPhase: ownString(source.designPhase),
@@ -173,6 +205,10 @@
       assumptions: stringList(plan && plan.assumptions),
       suggestions: stringList(plan && plan.suggestions),
       referenceTemplates: Array.isArray(plan && plan.referenceTemplates) ? plan.referenceTemplates : [],
+      templateDesign: template,
+      templateTitle: template ? safeText(template.title) : "",
+      templateRegions: template && Array.isArray(template.regions) ? template.regions : [],
+      templatePendingNotes: stringList(template && template.pendingNotes),
       busy: source.busy === true,
       error: errorText(source.error),
       canConfirm: source.canConfirm === true,
@@ -339,6 +375,264 @@
     return box;
   }
 
+  // ---------------------------------------------------------------- 模板渲染
+  //
+  // 用户口径（需求访谈 Q13）：「数据库里有啥数据就展示啥，没有的
+  // 就按 Q11 和 Q12 的方案来」。
+  //
+  // 所以这里分两种画法：
+  //   - 接到数据的区域：把**真实取到的值**画出来；
+  //   - 没接到数据的区域：画占位（指标卡显示 `--`、图表是空框、
+  //     表格是表头加空行），并把原因写出来。
+  //
+  // 占位区域**不画任何数值** —— 那会把假数画成真数。
+
+  function regionBadge(doc, status) {
+    if (status === REGION_BOUND) {
+      return makeText(doc, "span", STYLE.badgeBound, "已接数据");
+    }
+    if (status === REGION_TEXT) {
+      return makeText(doc, "span", STYLE.badgeText, "文字说明");
+    }
+    return makeText(doc, "span", STYLE.badgePlaceholder, "占位");
+  }
+
+  function renderRegionHead(doc, region, status) {
+    const head = makeBlock(doc, "div", STYLE.regionHead, "template-region-head");
+    const title = makeText(
+      doc,
+      "span",
+      STYLE.regionTitle,
+      safeText(region.title) || "（未命名区域）"
+    );
+    title.setAttribute("class", "template-region-title");
+    head.appendChild(title);
+
+    const typeLabel = componentTypeLabel(region.componentType);
+    if (typeLabel) {
+      const tag = makeText(doc, "span", STYLE.tag, typeLabel);
+      tag.setAttribute("class", "template-component-type");
+      head.appendChild(tag);
+    }
+    head.appendChild(regionBadge(doc, status));
+    return head;
+  }
+
+  function renderMetricCard(doc, region) {
+    const data = isPlainObject(region.data) ? region.data : {};
+    const label = safeText(data.label) || "指标";
+    const box = makeBlock(doc, "div", "", "template-metric-card");
+
+    box.appendChild(makeText(doc, "div", STYLE.metricLabel, label));
+
+    const value = safeText(data.value);
+    const unit = safeText(data.unit);
+    box.appendChild(
+      makeText(
+        doc,
+        "div",
+        STYLE.metricValue,
+        value === "" ? "--" : value + (unit ? " " + unit : "")
+      )
+    );
+
+    if (data.comparisonAvailable === true && safeText(data.yoyPercent) !== "") {
+      box.appendChild(
+        makeText(
+          doc,
+          "div",
+          STYLE.sourceNote,
+          "较上一期 " + safeText(data.yoyPercent) + "%"
+        )
+      );
+    }
+    if (safeText(data.windowLabel)) {
+      box.appendChild(
+        makeText(doc, "div", STYLE.sourceNote, "统计窗口：" + safeText(data.windowLabel))
+      );
+    }
+    return box;
+  }
+
+  function renderChart(doc, region) {
+    const data = isPlainObject(region.data) ? region.data : {};
+    const labels = Array.isArray(data.xLabels) ? data.xLabels : [];
+    const values = Array.isArray(data.yValues) ? data.yValues : [];
+    const box = makeBlock(doc, "div", "", "template-chart");
+
+    if (!labels.length || !values.length) {
+      box.appendChild(makeText(doc, "div", STYLE.emptyFrame, "暂无数据"));
+      return box;
+    }
+
+    let max = 0;
+    for (const value of values) {
+      const num = Number(value);
+      if (isFinite(num) && num > max) max = num;
+    }
+
+    const limit = 12;
+    for (let index = 0; index < labels.length && index < limit; index += 1) {
+      const row = makeBlock(doc, "div", STYLE.chartRow, "template-chart-row");
+      row.appendChild(makeText(doc, "span", STYLE.chartLabel, safeText(labels[index]) || "—"));
+
+      const track = makeBlock(doc, "span", STYLE.chartTrack, "template-chart-track");
+      const fill = makeBlock(doc, "span", STYLE.chartFill, "template-chart-fill");
+      const num = Number(values[index]);
+      const ratio = max > 0 && isFinite(num) ? Math.max(0, Math.min(1, num / max)) : 0;
+      fill.style.width = Math.round(ratio * 100) + "%";
+      track.appendChild(fill);
+      row.appendChild(track);
+
+      row.appendChild(
+        makeText(doc, "span", STYLE.chartValue, safeText(values[index]) || "—")
+      );
+      box.appendChild(row);
+    }
+    if (labels.length > limit) {
+      box.appendChild(
+        makeText(doc, "div", STYLE.sourceNote, "仅显示前 " + limit + " 项")
+      );
+    }
+    return box;
+  }
+
+  function renderTable(doc, region) {
+    const data = isPlainObject(region.data) ? region.data : {};
+    const columns = Array.isArray(data.columns) ? data.columns : [];
+    const rows = Array.isArray(data.rows) ? data.rows : [];
+    const box = makeBlock(doc, "div", "", "template-table");
+
+    const table = makeBlock(doc, "table", STYLE.table, "template-table-el");
+    const head = makeBlock(doc, "thead", "", "");
+    const headRow = makeBlock(doc, "tr", "", "");
+    for (const column of columns) {
+      const item = isPlainObject(column) ? column : {};
+      headRow.appendChild(
+        makeText(doc, "th", STYLE.tableHead, safeText(item.label) || safeText(item.id))
+      );
+    }
+    head.appendChild(headRow);
+    table.appendChild(head);
+
+    const body = makeBlock(doc, "tbody", "", "");
+    if (!rows.length) {
+      const tr = makeBlock(doc, "tr", "", "template-table-empty-row");
+      const td = makeBlock(doc, "td", STYLE.tableEmpty, "暂无数据");
+      td.setAttribute("colspan", String(Math.max(1, columns.length)));
+      tr.appendChild(td);
+      body.appendChild(tr);
+    } else {
+      for (const row of rows) {
+        const item = isPlainObject(row) ? row : {};
+        const tr = makeBlock(doc, "tr", "", "template-table-row");
+        for (const column of columns) {
+          const col = isPlainObject(column) ? column : {};
+          const fieldRef = safeText(col.fieldRef);
+          tr.appendChild(makeText(doc, "td", STYLE.tableCell, safeText(item[fieldRef])));
+        }
+        body.appendChild(tr);
+      }
+    }
+    table.appendChild(body);
+    box.appendChild(table);
+    return box;
+  }
+
+  function renderRegion(doc, region, index) {
+    const item = isPlainObject(region) ? region : {};
+    const status = ownString(item.dataStatus) || REGION_PLACEHOLDER;
+    const card = makeBlock(
+      doc,
+      "div",
+      status === REGION_BOUND ? STYLE.region : STYLE.regionPlaceholder,
+      "template-region"
+    );
+    card.setAttribute("data-template-region-status", status);
+    card.setAttribute("data-template-region-index", String(index));
+
+    card.appendChild(renderRegionHead(doc, item, status));
+
+    if (status === REGION_BOUND) {
+      const type = ownString(item.componentType);
+      if (type === "metric_card") {
+        card.appendChild(renderMetricCard(doc, item));
+      } else if (type === "table") {
+        card.appendChild(renderTable(doc, item));
+      } else if (type === "text") {
+        const data = isPlainObject(item.data) ? item.data : {};
+        card.appendChild(makeText(doc, "div", STYLE.row, safeText(data.rendered)));
+      } else {
+        card.appendChild(renderChart(doc, item));
+      }
+      const sourceLabel = safeText(item.dataSourceLabel);
+      if (sourceLabel) {
+        const note = makeText(doc, "div", STYLE.sourceNote, sourceLabel);
+        note.setAttribute("class", "template-source-note");
+        card.appendChild(note);
+      }
+    } else if (status === REGION_TEXT) {
+      const data = isPlainObject(item.data) ? item.data : {};
+      card.appendChild(makeText(doc, "div", STYLE.row, safeText(data.rendered)));
+    } else {
+      // 占位：不画数值，只说明为什么还没有数。
+      const type = ownString(item.componentType);
+      if (type === "metric_card") {
+        card.appendChild(makeText(doc, "div", STYLE.metricLabel, "指标"));
+        card.appendChild(makeText(doc, "div", STYLE.metricValue, "--"));
+      } else if (type === "table") {
+        card.appendChild(renderTable(doc, { data: { columns: [], rows: [] } }));
+      } else {
+        card.appendChild(
+          makeText(doc, "div", STYLE.emptyFrame, "数据待连接，暂无内容")
+        );
+      }
+      const reason = safeText(item.placeholderReason);
+      if (reason) {
+        const note = makeText(doc, "div", STYLE.metricNote, reason);
+        note.setAttribute("class", "template-placeholder-reason");
+        card.appendChild(note);
+      }
+    }
+    return card;
+  }
+
+  function renderTemplate(doc, view) {
+    if (!view.templateDesign) return null;
+    const box = makeBlock(doc, "div", STYLE.templateWrap, "template-design");
+    box.setAttribute(MODULE_ATTR, "template");
+
+    const title = makeText(
+      doc,
+      "h4",
+      STYLE.templateTitle,
+      view.templateTitle || "报表模板"
+    );
+    title.setAttribute("class", "template-title");
+    box.appendChild(title);
+
+    const bound = view.templateRegions.filter(
+      (region) => (isPlainObject(region) ? region.dataStatus : "") === REGION_BOUND
+    ).length;
+    const metaParts = ["共 " + view.templateRegions.length + " 个区域"];
+    metaParts.push(bound + " 个已接数据");
+    metaParts.push(view.templateRegions.length - bound + " 个占位");
+    box.appendChild(makeText(doc, "p", STYLE.templateMeta, metaParts.join(" · ")));
+
+    for (let index = 0; index < view.templateRegions.length; index += 1) {
+      box.appendChild(renderRegion(doc, view.templateRegions[index], index));
+    }
+
+    if (view.templatePendingNotes.length) {
+      const notes = makeBlock(doc, "div", "", "template-pending-notes");
+      for (const note of view.templatePendingNotes) {
+        notes.appendChild(makeText(doc, "div", STYLE.metricNote, note));
+      }
+      box.appendChild(notes);
+    }
+    return box;
+  }
+
   function renderStringList(doc, title, items, className, note) {
     const box = makeBlock(doc, "div", "", className);
     box.appendChild(makeText(doc, "div", STYLE.blockTitle, title));
@@ -396,6 +690,14 @@
   function renderActions(doc, view, state) {
     const box = makeBlock(doc, "div", STYLE.actions, "plan-actions");
 
+    // 模板已经生成：不再摆「确认方案」入口 —— 方案已经确认过了。
+    if (view.templateDesign) {
+      box.appendChild(
+        makeText(doc, "span", STYLE.hint, "方案已确认，模板已生成；需要调整请直接说明。")
+      );
+      return box;
+    }
+
     const enabled = canConfirmNow(view);
     const button = makeBlock(
       doc,
@@ -450,6 +752,8 @@
     body.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
     body.appendChild(renderSuggestions(doc, view));
     body.appendChild(renderReferences(doc, view));
+    const template = renderTemplate(doc, view);
+    if (template) body.appendChild(template);
     body.appendChild(renderActions(doc, view, state));
     return body;
   }

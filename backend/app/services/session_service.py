@@ -295,7 +295,7 @@ class SessionService:
                 result[key] = previous[key]
         # 设计阶段与方案是**原样带过**，不是「缺了才补」：
         # 本轮响应没带设计状态时，库里那份就是权威。
-        for key in ("designPhase", "reportPlan"):
+        for key in ("designPhase", "reportPlan", "templateDesign"):
             if key not in result and key in previous:
                 result[key] = previous[key]
         return result
@@ -584,6 +584,11 @@ class SessionService:
             plan = response.domainObjects.reportPlan
             if plan is not None:
                 snapshot["reportPlan"] = plan
+            # 模板设计（工单 02）同理：刷新后要能拿回同一份模板，
+            # 而不是让用户重新确认一次。
+            template = response.domainObjects.templateDesign
+            if template is not None:
+                snapshot["templateDesign"] = template
 
         # 路由层已收集的槽位。下一轮恢复时带回 Deep Route，
         # 避免重新问用户已经答过的问题。

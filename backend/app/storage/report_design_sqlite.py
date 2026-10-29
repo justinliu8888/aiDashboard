@@ -32,11 +32,13 @@ from app.storage.report_design_repository import (
     COMMIT_KIND_CONFLICT,
     DESIGN_PHASE_PLAN_NEEDED,
     DESIGN_PHASE_PLAN_WAITING_CONFIRM,
+    DESIGN_PHASE_TEMPLATE_READY,
     OPERATION_FAILED,
     OPERATION_PROCESSING,
     OPERATION_SUCCEEDED,
     ClaimResult,
     CommitResult,
+    ConfirmationResult,
     DesignOperationStateError,
     DesignPlanInvalidError,
     LoadResult,
@@ -85,6 +87,34 @@ CREATE INDEX IF NOT EXISTS idx_report_design_ops_session
 CREATE UNIQUE INDEX IF NOT EXISTS idx_report_design_ops_plan
     ON report_design_operations (session_id, plan_id, plan_revision)
     WHERE status = 'SUCCEEDED' AND plan_id IS NOT NULL AND plan_revision IS NOT NULL;
+
+-- 已提交的模板设计（工单 02）。一个会话一份当前模板。
+CREATE TABLE IF NOT EXISTS report_design_templates (
+    session_id        TEXT PRIMARY KEY,
+    template_id       TEXT NOT NULL,
+    template_revision INTEGER NOT NULL,
+    plan_id           TEXT NOT NULL,
+    plan_revision     INTEGER NOT NULL,
+    data_status       TEXT NOT NULL,
+    template_json     TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+
+-- 确认关系：哪一版方案被确认过，产出了哪个模板。
+--
+-- 唯一键在这里，而**不在**操作表上：操作表那组 (session_id, plan_id,
+-- plan_revision) 已经被「提交方案」那次操作占用了，确认动作不能往同一组
+-- 键上再写一条 —— 否则第二次确认会撞库。规格写的是「确认另按 sessionId、
+-- planId、planRevision 保证唯一」，就是这张表。
+CREATE TABLE IF NOT EXISTS report_design_confirmations (
+    session_id    TEXT NOT NULL,
+    plan_id       TEXT NOT NULL,
+    plan_revision INTEGER NOT NULL,
+    template_id   TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (session_id, plan_id, plan_revision)
+);
 """
 
 
@@ -158,9 +188,14 @@ class SqliteReportDesignRepository:
         """读会话的设计状态；没进过设计流程时返回 None。"""
         with self._lock:
             state = self._fetch_design_state(self._conn, session_id)
+            template = self._fetch_template(self._conn, session_id)
         if state is None:
             return None
-        return {"designPhase": state.phase, "reportPlan": _load_json(state.plan_json)}
+        return {
+            "designPhase": state.phase,
+            "reportPlan": _load_json(state.plan_json),
+            "templateDesign": template,
+        }
 
     # ---------- 认领 ----------
 
@@ -526,6 +561,240 @@ class SqliteReportDesignRepository:
             "alreadyCommitted": False,
         }
 
+    # ---------- 模板（工单 02） ----------
+
+    def commit_template(
+        self,
+        operation_id: str,
+        expected_revision: int | None,
+        template: Mapping[str, Any],
+        write_turn: WriteTurn | None = None,
+    ) -> CommitResult:
+        """提交由已确认方案生成的模板。
+
+        模板、确认关系、阶段（``TEMPLATE_READY``）、操作结果与 write_turn
+        回调在**同一笔事务**里提交：回调抛错就整体回滚，
+        上一成功方案与上一成功模板原样保留。
+        """
+        data = self._validate_template(template)
+
+        with self._lock:
+            conn = self._conn
+            self._begin(conn)
+            try:
+                operation = self._fetch_operation(conn, operation_id)
+                if operation is None:
+                    raise DesignOperationStateError(f"未知操作：{operation_id}")
+                if operation.status == OPERATION_SUCCEEDED:
+                    state = self._fetch_design_state(conn, operation.session_id)
+                    existing = self._fetch_template(conn, operation.session_id)
+                    conn.commit()
+                    return {
+                        "kind": COMMIT_KIND_COMMITTED,
+                        "operationId": operation_id,
+                        "sessionId": operation.session_id,
+                        "planId": data["planId"],
+                        "revision": data["planRevision"],
+                        "designPhase": state.phase if state is not None else None,
+                        "plan": _load_json(state.plan_json)
+                        if state is not None
+                        else None,
+                        "template": existing,
+                        "templateId": existing.get("id") if existing else None,
+                        "templateRevision": existing.get("revision") if existing else None,
+                        "alreadyCommitted": True,
+                    }
+                if operation.status == OPERATION_FAILED:
+                    raise DesignOperationStateError(f"操作已失败：{operation_id}")
+                if operation.expected_revision != expected_revision:
+                    raise DesignOperationStateError(
+                        f"提交的基础版本与认领时不一致：{operation_id}"
+                    )
+
+                state = self._fetch_design_state(conn, operation.session_id)
+                current_revision = state.revision if state is not None else None
+                if current_revision != expected_revision:
+                    message = (
+                        f"基础版本已变：当前 {current_revision}，"
+                        f"本次基于 {expected_revision}"
+                    )
+                    self._mark_failed(conn, operation_id, "revision_conflict", message)
+                    conn.commit()
+                    return {
+                        "kind": COMMIT_KIND_CONFLICT,
+                        "operationId": operation_id,
+                        "sessionId": operation.session_id,
+                        "currentPlan": _load_json(state.plan_json)
+                        if state is not None
+                        else None,
+                        "currentRevision": current_revision,
+                        "designPhase": state.phase if state is not None else None,
+                        "reason": "revision_mismatch",
+                        "error": {"code": "revision_conflict", "message": message},
+                    }
+
+                # 模板必须对应**已确认的那一版**方案：方案换了、模板没换，
+                # 或者反过来，都会让用户看到的模板和方案对不上。
+                if state is None or state.plan_id != data["planId"]:
+                    raise DesignPlanInvalidError(
+                        "模板对应的方案 id 与当前成功方案不一致"
+                    )
+                if current_revision != data["planRevision"]:
+                    raise DesignPlanInvalidError(
+                        f"模板对应的方案版本应为 {current_revision}，"
+                        f"实际 {data['planRevision']}"
+                    )
+
+                now = _now()
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO report_design_confirmations
+                            (session_id, plan_id, plan_revision, template_id,
+                             created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            operation.session_id,
+                            data["planId"],
+                            data["planRevision"],
+                            data["id"],
+                            now,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    # 另一个进程已经确认过同一版方案：**不重复生成**。
+                    # 回滚这一笔，把已提交的模板原样带回去。
+                    conn.rollback()
+                    existing = self._fetch_template(self._conn, operation.session_id)
+                    logger.info(
+                        "[report_design] 同一版方案已被确认过，不重复生成 "
+                        "session=%s plan=%s rev=%s",
+                        operation.session_id,
+                        data["planId"],
+                        data["planRevision"],
+                    )
+                    return {
+                        "kind": COMMIT_KIND_COMMITTED,
+                        "operationId": operation_id,
+                        "sessionId": operation.session_id,
+                        "planId": data["planId"],
+                        "revision": data["planRevision"],
+                        "designPhase": DESIGN_PHASE_TEMPLATE_READY,
+                        "plan": _load_json(state.plan_json)
+                        if state is not None
+                        else None,
+                        "template": existing,
+                        "templateId": existing.get("id") if existing else None,
+                        "templateRevision": existing.get("revision") if existing else None,
+                        "alreadyCommitted": True,
+                    }
+
+                previous = self._fetch_template(conn, operation.session_id)
+                template_revision = (
+                    int(previous.get("revision") or 0) + 1 if previous else 1
+                )
+                conn.execute(
+                    """
+                    INSERT INTO report_design_templates
+                        (session_id, template_id, template_revision, plan_id,
+                         plan_revision, data_status, template_json,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        template_id = excluded.template_id,
+                        template_revision = excluded.template_revision,
+                        plan_id = excluded.plan_id,
+                        plan_revision = excluded.plan_revision,
+                        data_status = excluded.data_status,
+                        template_json = excluded.template_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        operation.session_id,
+                        data["id"],
+                        template_revision,
+                        data["planId"],
+                        data["planRevision"],
+                        str(data.get("dataStatus") or "placeholder"),
+                        json.dumps(data, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE report_design_sessions"
+                    " SET design_phase = ?, updated_at = ? WHERE session_id = ?",
+                    (DESIGN_PHASE_TEMPLATE_READY, now, operation.session_id),
+                )
+                # 确认操作**不**在操作表上记方案版本：那组键留给方案提交，
+                # 确认的方案版本记在确认关系表里。
+                cursor = conn.execute(
+                    """
+                    UPDATE report_design_operations
+                       SET status = ?, plan_id = NULL, plan_revision = NULL,
+                           updated_at = ?
+                     WHERE operation_id = ? AND status = ?
+                    """,
+                    (OPERATION_SUCCEEDED, now, operation_id, OPERATION_PROCESSING),
+                )
+                if cursor.rowcount != 1:
+                    raise DesignOperationStateError(f"操作状态已变：{operation_id}")
+
+                if write_turn is not None:
+                    write_turn(conn)
+                    if not conn.in_transaction:
+                        logger.warning(
+                            "[report_design] write_turn 回调自行结束了事务，"
+                            "同事务提交无法保证：operation=%s",
+                            operation_id,
+                        )
+
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return {
+            "kind": COMMIT_KIND_COMMITTED,
+            "operationId": operation_id,
+            "sessionId": operation.session_id,
+            "planId": data["planId"],
+            "revision": data["planRevision"],
+            "designPhase": DESIGN_PHASE_TEMPLATE_READY,
+            "plan": data,
+            "template": data,
+            "templateId": data["id"],
+            "templateRevision": template_revision,
+            "alreadyCommitted": False,
+        }
+
+    def find_confirmation(
+        self, session_id: str, plan_id: str, plan_revision: int
+    ) -> ConfirmationResult | None:
+        """查某一版方案有没有被确认过。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT session_id, plan_id, plan_revision, template_id, created_at"
+                " FROM report_design_confirmations"
+                " WHERE session_id = ? AND plan_id = ? AND plan_revision = ?",
+                (session_id, plan_id, plan_revision),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "sessionId": row[0],
+            "planId": row[1],
+            "planRevision": row[2],
+            "templateId": row[3],
+            "createdAt": row[4],
+        }
+
+    def load_template(self, session_id: str) -> dict[str, Any] | None:
+        """读会话当前已提交的模板设计。"""
+        with self._lock:
+            return self._fetch_template(self._conn, session_id)
+
     # ---------- 失败 ----------
 
     def fail_operation(
@@ -615,6 +884,80 @@ class SqliteReportDesignRepository:
         except (TypeError, ValueError) as exc:
             raise DesignPlanInvalidError(f"方案不是可保存的 JSON：{exc}") from exc
         return data
+
+    @staticmethod
+    def _validate_template(template: Mapping[str, Any]) -> dict[str, Any]:
+        """校验模板是可保存的 JSON 形态。
+
+        领域语义（区域与方案的对应、占位与数据的比例）由模板服务保证，
+        这里只守结构与版本绑定。
+        """
+        if not isinstance(template, Mapping):
+            raise DesignPlanInvalidError("模板必须是 JSON mapping")
+        data = dict(template)
+        template_id = data.get("id")
+        if not isinstance(template_id, str) or not template_id.strip():
+            raise DesignPlanInvalidError("模板缺少 id")
+        revision = data.get("revision")
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+        ):
+            raise DesignPlanInvalidError("模板 revision 必须是正整数")
+        plan_id = data.get("planId")
+        if not isinstance(plan_id, str) or not plan_id.strip():
+            raise DesignPlanInvalidError("模板缺少 planId")
+        plan_revision = data.get("planRevision")
+        if (
+            isinstance(plan_revision, bool)
+            or not isinstance(plan_revision, int)
+            or plan_revision < 1
+        ):
+            raise DesignPlanInvalidError("模板 planRevision 必须是正整数")
+        regions = data.get("regions")
+        if not isinstance(regions, list) or not regions:
+            raise DesignPlanInvalidError("模板至少要有一个区域")
+        try:
+            json.dumps(data, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise DesignPlanInvalidError(f"模板不是可保存的 JSON：{exc}") from exc
+        return data
+
+    @staticmethod
+    def _fetch_template(
+        conn: sqlite3.Connection, session_id: str
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            "SELECT template_json FROM report_design_templates WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _load_json(row[0])
+
+    @staticmethod
+    def _fetch_confirmation(
+        conn: sqlite3.Connection,
+        session_id: str,
+        plan_id: str,
+        plan_revision: int,
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            "SELECT session_id, plan_id, plan_revision, template_id, created_at"
+            " FROM report_design_confirmations"
+            " WHERE session_id = ? AND plan_id = ? AND plan_revision = ?",
+            (session_id, plan_id, plan_revision),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "sessionId": row[0],
+            "planId": row[1],
+            "planRevision": row[2],
+            "templateId": row[3],
+            "createdAt": row[4],
+        }
 
     @staticmethod
     def _check_plan_base(

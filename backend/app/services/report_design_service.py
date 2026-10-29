@@ -59,6 +59,7 @@ from app.schemas.session import (
     CLARIFICATION_QUESTION_KEY,
 )
 from app.services.report_plan_service import apply_candidate
+from app.services.report_template_service import build_template_design
 from app.services.session_context import current_session_key
 from app.services.session_service import session_service
 from app.storage.report_design_repository import (
@@ -67,6 +68,8 @@ from app.storage.report_design_repository import (
     COMMIT_KIND_CONFLICT,
     DESIGN_PHASE_PLAN_NEEDED,
     DESIGN_PHASE_PLAN_WAITING_CONFIRM,
+    DESIGN_PHASE_TEMPLATE_READY,
+    OPERATION_SUCCEEDED,
     DesignOperationStateError,
     DesignPlanInvalidError,
     ReportDesignRepository,
@@ -85,6 +88,8 @@ UI_ACTION_PLAN_READY = "plan_ready"
 UI_ACTION_PLAN_CLARIFICATION = "plan_clarification"
 UI_ACTION_PLAN_CONFIRM_PENDING = "plan_confirm_pending"
 UI_ACTION_PLAN_RETRY = "plan_retry"
+#: 模板已就绪。刻意与旧的确认报表动作分开。
+UI_ACTION_TEMPLATE_READY = "template_ready"
 
 
 # --------------------------------------------------------------------------
@@ -510,16 +515,24 @@ class ReportDesignService:
         *,
         state: dict[str, Any] | None,
     ) -> AgentResponse:
-        """确认当前文字方案。
+        """确认当前文字方案 → 生成模板。
 
-        **首波边界**：模板生成是工单 02 的范围。所以这里做的是
+        这一步做的是：
 
             - 校验动作确实指向当前这一版方案（版本过期要可辨识地拒绝）；
-            - 如实说明「模板生成尚未接入」，**不伪造完成状态**；
-            - 方案与阶段原样保留（仍是 PLAN_WAITING_CONFIRM）。
+            - **生成模板**：按已确认的方案逐板块出可视区域，
+              区域与方案板块一一对应；
+            - **逐区域接数**：当前已接通能力算得出来的区域填数据，
+              算不出来的保留占位并写明原因（数据待连接 / 口径待核实）；
+            - 模板、确认关系、阶段（``TEMPLATE_READY``）与本轮消息同事务落库。
 
-        明确**不**接旧的「确认报表」链路：确认方案不保存草稿、不校验、
-        不预览、不取数。设计确认与确认报表是两件事（规格补充说明 2）。
+        用户口径（需求访谈 Q13）：「数据库里有啥数据就展示啥，没有的
+        就按 Q11 和 Q12 的方案来」—— 所以这里**不能**一律出占位，
+        更不能把流程断在这里。
+
+        明确**不**接旧的「确认报表」链路：确认方案不校验、不预览、
+        不改旧草稿的保存与运行推进。设计确认与确认报表是两件事
+        （规格补充说明 2）。
         """
         current_plan = (state or {}).get("reportPlan")
         if not isinstance(current_plan, dict) or not current_plan:
@@ -565,26 +578,164 @@ class ReportDesignService:
                 },
             )
 
-        message = (
-            f"已收到你对第 {current_revision} 版方案的确认。"
-            "模板生成还没有接入（这一步由工单 02 交付），"
-            "所以现在只保留方案、继续等待，"
-            "不会生成模板，也不会保存草稿或取数。"
+        session_key = self.session_key(request)
+
+        # 这一版方案已经确认过：**不重复生成**，原样返回已提交的模板。
+        # 重复点确认按钮、同一条消息重发，都走这里。
+        existing = self._existing_confirmation(
+            session_key, str(current_plan_id or ""), current_revision
         )
-        return AgentResponse(
-            conversationId=request.conversationId,
-            state=AgentState.ANALYZING,
-            reply=message,
-            designSessionId=request.context.designSessionId,
-            designPhase=(state or {}).get("designPhase") or DESIGN_PHASE_PLAN_WAITING_CONFIRM,
-            domainObjects=AgentResponseDomainObjects(reportPlan=current_plan),
-            uiActions=[UI_ACTION_PLAN_CONFIRM_PENDING],
-            debug={
-                "designOutcome": "confirm_pending_template",
-                "planRevision": current_revision,
-                "planId": current_plan.get("id"),
-            },
+        if existing is not None:
+            return self._template_response(
+                request,
+                plan=current_plan,
+                template=existing,
+                duplicate=True,
+            )
+
+        message_id = request.messageId
+        if not message_id:
+            # 没有幂等键就没法认领操作。方案与阶段原样保留，
+            # 这一轮按失败收尾，用户可以重试。
+            return self._failure_response(
+                request,
+                state,
+                code="PLAN_OPERATION_KEY_MISSING",
+                message="这次确认缺少消息标识，没法安全地记录这次操作。方案保持原样，请重试。",
+            )
+
+        # ---- 认领（事务外） ----
+        try:
+            claim = self.repository.claim_operation(
+                session_key, message_id, current_revision
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[report_design] 认领确认操作失败")
+            return self._failure_response(
+                request,
+                state,
+                code="PLAN_CLAIM_FAILED",
+                message="这次确认没能开始，方案保持原样，请重试。",
+            )
+
+        if claim["kind"] == CLAIM_KIND_CONFLICT:
+            return self._conflict_response(request, claim)
+
+        if claim["kind"] == CLAIM_KIND_DUPLICATE:
+            # 同一条消息重复到达：处理中就如实说处理中；
+            # 已经成功就原样返回已提交的模板，不重复生成。
+            if claim.get("status") == OPERATION_SUCCEEDED:
+                existing = self._existing_confirmation(
+                    session_key, str(current_plan_id or ""), current_revision
+                )
+                if existing is not None:
+                    return self._template_response(
+                        request,
+                        plan=current_plan,
+                        template=existing,
+                        duplicate=True,
+                    )
+            return self._duplicate_response(request, claim)
+
+        operation_id = claim["operationId"]
+        assert operation_id is not None
+
+        # ---- 生成模板（事务外） ----
+        try:
+            template = build_template_design(
+                current_plan,
+                subject_id=request.context.subjectId,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[report_design] 生成模板失败")
+            self._fail_operation(operation_id, "TEMPLATE_BUILD_FAILED", "生成模板失败")
+            return self._failure_response(
+                request,
+                state,
+                code="TEMPLATE_BUILD_FAILED",
+                message="这次没能生成模板，方案保持原样，请重试。",
+                retryable=True,
+            )
+
+        template_data = template.model_dump(mode="json")
+        response = self._template_response(
+            request,
+            plan=current_plan,
+            template=template_data,
         )
+        write_turn = self._make_write_turn(request, response)
+
+        # ---- 提交（模板 + 确认关系 + 阶段 + 本轮消息，同事务） ----
+        try:
+            commit = self.repository.commit_template(
+                operation_id,
+                current_revision,
+                template_data,
+                write_turn,
+            )
+        except (DesignPlanInvalidError, DesignOperationStateError) as exc:
+            logger.warning("[report_design] 提交模板被拒：%s", exc)
+            self._fail_operation(operation_id, "TEMPLATE_COMMIT_REJECTED", str(exc))
+            return self._failure_response(
+                request,
+                state,
+                code="TEMPLATE_COMMIT_REJECTED",
+                message="这次模板没能保存下来，方案保持原样，请重试。",
+                retryable=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[report_design] 提交模板失败")
+            self._fail_operation(operation_id, "TEMPLATE_COMMIT_FAILED", "提交模板失败")
+            return self._failure_response(
+                request,
+                state,
+                code="TEMPLATE_COMMIT_FAILED",
+                message="这次模板没能保存下来，方案保持原样，请重试。",
+                retryable=True,
+            )
+
+        if commit["kind"] == COMMIT_KIND_CONFLICT:
+            return self._conflict_response(request, commit)
+
+        committed = commit.get("template") or template_data
+        response = self._template_response(
+            request,
+            plan=current_plan,
+            template=committed,
+            duplicate=bool(commit.get("alreadyCommitted")),
+        )
+        if commit.get("alreadyCommitted"):
+            # 别的进程已经确认过同一版方案：这一轮不重复写消息，
+            # 让路由层按普通轮落库即可。
+            return response
+
+        # 只有真正共同提交成功，才把这一轮标成「已落库」。
+        response.turnPersisted = True
+        return response
+
+    def _existing_confirmation(
+        self,
+        session_key: str,
+        plan_id: str,
+        plan_revision: int | None,
+    ) -> dict[str, Any] | None:
+        """这一版方案确认过没有；确认过就返回已提交的模板。"""
+        if not plan_id or plan_revision is None:
+            return None
+        try:
+            confirmation = self.repository.find_confirmation(
+                session_key, plan_id, int(plan_revision)
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[report_design] 查确认关系失败")
+            return None
+        if not confirmation:
+            return None
+        try:
+            return self.repository.load_template(session_key)
+        except Exception:  # noqa: BLE001
+            logger.exception("[report_design] 读已提交模板失败")
+            return None
 
     async def _handle_design_turn(
         self,
@@ -1021,6 +1172,73 @@ class ReportDesignService:
                 "designOutcome": "plan_ready",
                 "planRevision": (plan or {}).get("revision"),
                 "planId": (plan or {}).get("id"),
+            },
+        )
+
+    def _template_response(
+        self,
+        request: AgentRequest,
+        *,
+        plan: dict[str, Any] | None,
+        template: dict[str, Any] | None,
+        duplicate: bool = False,
+    ) -> AgentResponse:
+        """模板已就绪的响应。
+
+        正文由前端模板模块渲染；这里给一句可读的摘要 ——
+        接上数据的区域报数、占位的区域报原因，不让用户自己猜。
+        """
+        template = template or {}
+        regions = template.get("regions") or []
+        bound = [r for r in regions if r.get("dataStatus") == "bound"]
+        placeholders = [r for r in regions if r.get("dataStatus") == "placeholder"]
+        title = template.get("title") or (plan or {}).get("topic") or "报表"
+        plan_revision = template.get("planRevision") or (plan or {}).get("revision")
+
+        reply = f"已按第 {plan_revision} 版方案生成模板：{title}。"
+        if bound:
+            reply += f"{len(bound)} 个区域已接上当前能取到的数据"
+            if placeholders:
+                reply += f"，{len(placeholders)} 个区域保留占位"
+            reply += "。"
+        elif placeholders:
+            reply += f"{len(placeholders)} 个区域保留占位。"
+        notes = template.get("pendingNotes") or []
+        if notes:
+            # 原因本身已经带句号了，直接拼会变成「。。」。
+            cleaned = [
+                str(note).rstrip("。；;，,") for note in notes[:4] if str(note).strip()
+            ]
+            if cleaned:
+                reply += "占位原因：" + "；".join(cleaned) + "。"
+        if duplicate:
+            reply += "（这一版方案之前已经确认过，直接沿用已生成的模板，没有重复生成。）"
+        else:
+            reply += "模板已经保存，刷新后仍然在。"
+
+        ui_actions = [UI_ACTION_TEMPLATE_READY]
+        if duplicate:
+            ui_actions.append("template_duplicate")
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.ANALYZING,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            designPhase=DESIGN_PHASE_TEMPLATE_READY,
+            domainObjects=AgentResponseDomainObjects(
+                reportPlan=plan,
+                templateDesign=template or None,
+            ),
+            uiActions=ui_actions,
+            debug={
+                "designPhase": DESIGN_PHASE_TEMPLATE_READY,
+                "designOutcome": "template_ready",
+                "templateId": template.get("id"),
+                "templateRevision": template.get("revision"),
+                "planRevision": plan_revision,
+                "dataStatus": template.get("dataStatus"),
+                "boundRegions": len(bound),
+                "placeholderRegions": len(placeholders),
             },
         )
 
