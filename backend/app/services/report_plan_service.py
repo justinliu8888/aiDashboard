@@ -334,6 +334,31 @@ _CLAUSE_SPLIT_RE = re.compile(r"[，,。；;！!？?\n]")
 _ORDINAL_RE = re.compile(r"第\s*([一二三四五六七八九十\d]+)\s*(?:个|块|项|条|部分|板块)?")
 _ORDINAL_VALUES = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
+
+@dataclass(frozen=True)
+class _PresetColumn:
+    """预设补齐的**一列**：列名 + 可选的单位与精度。
+
+    单位只给**数值型**列（负载率、耗电量）。名称、状态、时间这类离散列
+    没有单位 —— 给它们硬塞单位，表头就会出现莫名其妙的括号。
+    """
+
+    label: str
+    #: 单位标注（``%`` / ``kWh`` …）。None = 这一列不是数值列，不带单位。
+    unit: str | None = None
+    #: 显示精度（小数位数）。None = 不限定精度。
+    precision: int | None = None
+
+    def format(self) -> dict[str, Any] | None:
+        """这一列的展示格式。非数值列没有格式（也就没有单位标注）。"""
+        if self.unit is None:
+            return None
+        out: dict[str, Any] = {"kind": "NUMBER", "unitLabel": self.unit}
+        if self.precision is not None:
+            out["precision"] = self.precision
+        return out
+
+
 #: 表格栏目的补齐模板（按板块标题与指标意图判断）。
 #: 第一条来自需求稿 4.1：「告警列表」建议设备名称、时间、告警级别；
 #: 第二条来自 ADR 0004 §3：「机柜运行状态」对应成套机柜、状态、负载率。
@@ -341,11 +366,30 @@ _ORDINAL_VALUES = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "
 #: 补出来的列必须是**能被渲染出合理内容**的列（规格 US47）。「机房」曾经
 #: 在能耗与设备两类预设里，但造数器没有机房列的值类型，它会落进兜底的
 #: 「示例值 69」—— 占位观感的列不算合理的列，所以拿掉。
-_TABLE_COLUMN_PRESETS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("告警", "alarm"), ("设备名称", "时间", "告警级别")),
-    (("机柜", "cabinet"), ("机柜名称", "状态", "负载率")),
-    (("能耗", "耗电", "用电", "energy"), ("设备名称", "耗电量")),
-    (("设备", "device"), ("设备名称", "状态")),
+#:
+#: 数值列自带单位（规格《契约缺口补充》A2）：载荷的
+#: ``payload.columns[].format.unitLabel`` 要有单位，表头才读得出量纲。
+_TABLE_COLUMN_PRESETS: tuple[tuple[tuple[str, ...], tuple[_PresetColumn, ...]], ...] = (
+    (
+        ("告警", "alarm"),
+        (_PresetColumn("设备名称"), _PresetColumn("时间"), _PresetColumn("告警级别")),
+    ),
+    (
+        ("机柜", "cabinet"),
+        (
+            _PresetColumn("机柜名称"),
+            _PresetColumn("状态"),
+            _PresetColumn("负载率", unit="%", precision=1),
+        ),
+    ),
+    (
+        ("能耗", "耗电", "用电", "energy"),
+        (_PresetColumn("设备名称"), _PresetColumn("耗电量", unit="kWh", precision=1)),
+    ),
+    (
+        ("设备", "device"),
+        (_PresetColumn("设备名称"), _PresetColumn("状态")),
+    ),
 )
 
 #: 用户在需求里点名栏目的说法。
@@ -754,8 +798,12 @@ def _column_hints_from_request(request_text: str) -> list[str]:
 
 def _infer_columns(
     section: Mapping[str, Any], *, request_text: str = ""
-) -> list[str]:
-    """系统补齐栏目：先按板块语义，再按用户点名的栏目。"""
+) -> list[_PresetColumn]:
+    """系统补齐栏目：先按板块语义，再按用户点名的栏目。
+
+    预设的列自带单位（数值列）；用户点名的列**不知道是什么量**，一律
+    不带单位 —— 不写错的单位。
+    """
     title = str(section.get("title") or "")
     intents = [
         str(intent)
@@ -763,10 +811,10 @@ def _infer_columns(
         if isinstance(intent, str)
     ]
     haystack = " ".join([title, *intents]).lower()
-    for keywords, labels in _TABLE_COLUMN_PRESETS:
+    for keywords, columns in _TABLE_COLUMN_PRESETS:
         if any(keyword in haystack for keyword in keywords):
-            return list(labels)
-    return _column_hints_from_request(request_text)
+            return list(columns)
+    return [_PresetColumn(label) for label in _column_hints_from_request(request_text)]
 
 
 def normalize_column_format(raw: Any) -> dict[str, Any] | None:
@@ -846,10 +894,12 @@ def resolve_table_columns(
 
     inferred = _infer_columns(section, request_text=request_text)
     if inferred:
-        note = f"系统为「{title}」补齐了栏目：{'、'.join(inferred)}。"
+        note = f"系统为「{title}」补齐了栏目：{'、'.join(c.label for c in inferred)}。"
         return ColumnResolution(
             kind="inferred",
-            specs=tuple(ColumnSpec(label=label) for label in inferred),
+            specs=tuple(
+                ColumnSpec(label=c.label, format=c.format()) for c in inferred
+            ),
             note=note,
         )
 

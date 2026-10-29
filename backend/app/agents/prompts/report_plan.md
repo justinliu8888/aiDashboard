@@ -32,7 +32,7 @@
 | `topic` | string | 非空主题 |
 | `requirements` | object | `metrics` 字符串数组、`subject` 可空字符串、`timeRange` 可空字符串、`exclusions` 字符串数组、`grainUnit` 可空字符串 |
 | `sections` | array | 每项：`id`、`title`、`metricIntents` 字符串数组、`componentType`、`displayIntent`、`columns`（仅表格板块） |
-| `assumptions` | array | 字符串数组，注明假设和待核实口径 |
+| `assumptions` | array | 字符串数组，注明假设和待核实口径；口径类假设按「指标名 + 原因」写（见硬规则 8） |
 | `suggestions` | array | 字符串数组，尚未被用户接受的额外建议 |
 | `referenceTemplates` | array | 每项：`assetId`、`version`（正整数）、`name`、`reason` |
 
@@ -97,7 +97,9 @@
 7. **未知口径标为待核实**。PUE 这类没有确认口径的指标照常写进 `requirements.metrics`，
    同时在 `assumptions` 里写明「口径待核实」，**不要自己推断公式**。
 8. **缺数据不阻断设计**。目录里没有这个指标、暂时没有数据，都照常给方案，
-   在 `assumptions` 里说明「数据待连接」。
+   在 `assumptions` 里按「**指标名 + 原因**」写清楚：口径还没定就写「<指标名> 口径待核实」，
+   这个指标当前还算不出来就写「<指标名> 能力待接通」。
+   **只用这两种说法**（仓库里现有的口径），不要另造措辞描述同一件事。
 9. **额外板块放 `suggestions`**。用户没要求的板块不要直接进 `sections`，
    放进 `suggestions` 等用户点头。
 10. **不伪造模板来源**。没有可参考的模板时 `referenceTemplates` 输出空数组，
@@ -126,7 +128,7 @@
     "sections": [
       {"id": "section_pue", "title": "PUE 总览", "metricIntents": ["PUE"], "componentType": "metric_card", "displayIntent": "total"}
     ],
-    "assumptions": ["PUE 统计口径待核实，数据待连接"],
+    "assumptions": ["PUE 统计口径待核实，PUE 能力待接通"],
     "suggestions": [],
     "referenceTemplates": []
   }
