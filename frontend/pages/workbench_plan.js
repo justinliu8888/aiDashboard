@@ -51,6 +51,21 @@
     text: "文字块",
   };
 
+  /**
+   * 展示目的 → 中文标签。
+   *
+   * 字段来自开发规格「跨工单契约」：每个板块定稿携带 displayIntent，
+   * 取值是 total / trend / comparison / composition / records。
+   * 未知取值原样显示（安全文本），空值不显示。
+   */
+  const DISPLAY_INTENT_LABELS = {
+    total: "总量",
+    trend: "趋势",
+    comparison: "对比",
+    composition: "构成",
+    records: "明细",
+  };
+
   /** 设计阶段 → 中文标签。 */
   const PHASE_LABELS = {
     PLAN_NEEDED: "需要生成方案",
@@ -66,7 +81,9 @@
   // 用内联样式而不是外部 CSS：本模块不引入样式表、不改宿主页面，
   // 协调者接入时可以直接覆盖这些类名。
   const STYLE = {
-    module: "font-family:inherit;color:#1e293b;",
+    // overflow-wrap / word-break 是继承属性：写在容器上，方案卡片里所有长文本
+    // 都会换行。左侧对话区最窄只有 340px，没有换行就会横向溢出。
+    module: "font-family:inherit;color:#1e293b;max-width:100%;overflow-wrap:anywhere;word-break:break-word;",
     status: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#64748b;margin-bottom:10px;",
     badge: "display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;background:#e2e8f0;color:#475569;font-size:11px;",
     badgeBusy: "display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;background:#fef3c7;color:#b45309;font-size:11px;",
@@ -81,6 +98,12 @@
     sectionHead: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;",
     sectionTitle: "font-size:13px;font-weight:600;color:#0f172a;",
     sectionMetrics: "font-size:12px;color:#64748b;",
+    reason: "font-size:12px;color:#475569;margin:4px 0 0;",
+    columnBlock: "margin-top:8px;",
+    columnTitle: "font-size:12px;font-weight:600;color:#64748b;margin:0 0 4px;",
+    columnList: "display:flex;flex-wrap:wrap;gap:4px;",
+    column: "display:inline-flex;align-items:baseline;max-width:100%;padding:1px 8px;border-radius:999px;border:1px solid #cbd5e1;background:#ffffff;color:#475569;font-size:11px;",
+    columnLabel: "flex:0 1 auto;min-width:0;",
     note: "font-size:12px;color:#b45309;margin:0 0 6px;",
     actions: "margin-top:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;",
     button: "padding:7px 16px;border-radius:8px;border:1px solid #1d4ed8;background:#1d4ed8;color:#ffffff;font-size:13px;font-weight:500;cursor:pointer;",
@@ -164,6 +187,49 @@
   // ---------------------------------------------------------------- 视图归一
 
   /**
+   * 归一一个板块（section）。
+   *
+   * 只取契约里有的字段，缺的就是缺：
+   *   - displayIntent / explicitComponentType / selectionReason（选型契约）
+   *   - columns[]：定稿栏目，每项有 id / label / fieldRef（栏目契约）
+   * 字段不存在就当没有 —— 不按标题猜、不自造默认值。
+   */
+  function normalizeSection(section) {
+    const item = isPlainObject(section) ? section : {};
+    return {
+      id: safeText(item.id),
+      title: safeText(item.title),
+      metricIntents: stringList(item.metricIntents),
+      componentType: safeText(item.componentType),
+      displayIntent: safeText(item.displayIntent),
+      explicitComponentType: safeText(item.explicitComponentType),
+      selectionReason: safeText(item.selectionReason),
+      columns: normalizeColumns(item.columns),
+    };
+  }
+
+  /**
+   * 归一栏目声明。
+   * 没有显示名（label）的栏目整项跳过：显示名是给人看的，id / fieldRef 是技术键，
+   * 拿它们当栏目名就是「自造默认值」。
+   */
+  function normalizeColumns(value) {
+    if (!Array.isArray(value)) return [];
+    const out = [];
+    for (const column of value) {
+      if (!isPlainObject(column)) continue;
+      const label = safeText(column.label);
+      if (!label) continue;
+      out.push({
+        id: safeText(column.id),
+        label,
+        fieldRef: safeText(column.fieldRef),
+      });
+    }
+    return out;
+  }
+
+  /**
    * 把上层传进来的 view 归一成一份安全、好用的视图对象。
    * 字段缺失 / 类型不对都不抛错，只按「空」处理。
    */
@@ -171,6 +237,7 @@
     const source = isPlainObject(view) ? view : {};
     const plan = isPlainObject(source.reportPlan) ? source.reportPlan : null;
     const requirements = plan && isPlainObject(plan.requirements) ? plan.requirements : {};
+    const sections = plan && Array.isArray(plan.sections) ? plan.sections : [];
 
     return {
       designPhase: ownString(source.designPhase),
@@ -182,7 +249,7 @@
       subject: safeText(requirements.subject),
       timeRange: safeText(requirements.timeRange),
       exclusions: stringList(requirements.exclusions),
-      sections: Array.isArray(plan && plan.sections) ? plan.sections : [],
+      sections: sections.map(normalizeSection),
       assumptions: stringList(plan && plan.assumptions),
       suggestions: stringList(plan && plan.suggestions),
       referenceTemplates: Array.isArray(plan && plan.referenceTemplates) ? plan.referenceTemplates : [],
@@ -241,6 +308,17 @@
     if (!key) return "";
     return Object.prototype.hasOwnProperty.call(COMPONENT_TYPE_LABELS, key)
       ? COMPONENT_TYPE_LABELS[key]
+      : key;
+  }
+
+  /**
+   * 展示目的 → 中文标签。未知取值原样显示（安全文本），空值返回空串。
+   */
+  function displayIntentLabel(intent) {
+    const key = safeText(intent);
+    if (!key) return "";
+    return Object.prototype.hasOwnProperty.call(DISPLAY_INTENT_LABELS, key)
+      ? DISPLAY_INTENT_LABELS[key]
       : key;
   }
 
@@ -345,6 +423,25 @@
         tag.setAttribute("data-plan-component-type", safeText(item.componentType));
         head.appendChild(tag);
       }
+
+      // 展示目的：用户想看什么（总量 / 趋势 / 对比 / 构成 / 明细）。
+      const intentLabel = displayIntentLabel(item.displayIntent);
+      if (intentLabel) {
+        const tag = makeText(doc, "span", STYLE.tag, intentLabel);
+        tag.setAttribute("class", "plan-display-intent");
+        tag.setAttribute("data-plan-display-intent", safeText(item.displayIntent));
+        head.appendChild(tag);
+      }
+
+      // 用户明确指定的展示类型：与系统按意图选出的类型分开标，
+      // 免得把「用户指定」看成「系统自己决定的」。
+      const explicitLabel = componentTypeLabel(item.explicitComponentType);
+      if (explicitLabel) {
+        const tag = makeText(doc, "span", STYLE.tag, "用户指定：" + explicitLabel);
+        tag.setAttribute("class", "plan-explicit-type");
+        tag.setAttribute("data-plan-explicit-type", safeText(item.explicitComponentType));
+        head.appendChild(tag);
+      }
       card.appendChild(head);
 
       const intents = stringList(item.metricIntents);
@@ -356,6 +453,36 @@
       );
       metrics.setAttribute("class", "plan-section-metrics");
       card.appendChild(metrics);
+
+      // 选型理由：系统为什么这么画。没有这一项就不显示，不自造。
+      const reason = safeText(item.selectionReason);
+      if (reason) {
+        const reasonBox = makeText(doc, "div", STYLE.reason, "选型理由：" + reason);
+        reasonBox.setAttribute("class", "plan-selection-reason");
+        reasonBox.setAttribute("data-plan-selection-reason", reason);
+        card.appendChild(reasonBox);
+      }
+
+      // 表格板块声明的栏目：方案里写清楚这张表要展示哪些列。
+      const columns = Array.isArray(item.columns) ? item.columns : [];
+      if (columns.length) {
+        const columnBox = makeBlock(doc, "div", STYLE.columnBlock, "plan-columns");
+        columnBox.appendChild(makeText(doc, "div", STYLE.columnTitle, "栏目"));
+        const list = makeBlock(doc, "div", STYLE.columnList, "plan-column-list");
+        for (const column of columns) {
+          const chip = makeBlock(doc, "span", STYLE.column, "plan-column");
+          chip.setAttribute("data-plan-column-id", safeText(column.id));
+          chip.setAttribute("data-plan-column-field-ref", safeText(column.fieldRef));
+          // 给人看的是栏目名；取值键（fieldRef）是技术键，
+          // 放 title 里（悬停可见），不跟名字挤在一行 —— 窄栏里挤在一起会被拦腰截断。
+          if (safeText(column.fieldRef)) chip.setAttribute("title", safeText(column.fieldRef));
+          chip.appendChild(makeText(doc, "span", STYLE.columnLabel, safeText(column.label)));
+          list.appendChild(chip);
+        }
+        columnBox.appendChild(list);
+        card.appendChild(columnBox);
+      }
+
       box.appendChild(card);
     }
     return box;
@@ -694,6 +821,7 @@
     PHASE_PLAN_WAITING_CONFIRM,
     PHASE_DRAFT_READY,
     COMPONENT_TYPE_LABELS,
+    DISPLAY_INTENT_LABELS,
     PHASE_LABELS,
     MODULE_ATTR,
     MODULE_NAME,
@@ -702,6 +830,7 @@
     canConfirmNow,
     confirmPayload,
     componentTypeLabel,
+    displayIntentLabel,
     designPhaseLabel,
     // 图表渲染器：模板中间页下线后**改由草稿路径复用**
     // （事实：草稿路径的 region.data 是执行绑定描述符，不含 xLabels / yValues，

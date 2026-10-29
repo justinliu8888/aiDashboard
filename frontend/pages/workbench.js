@@ -29,7 +29,13 @@ const session = {
   policy: null,     // 当前报表策略草稿
   editingTargetRegionId: null, // 5.5 用户编辑模版中当前指向的 section
   lastReportRun: null, // 预览运行记录（ReportRunPreview）
-  previewPayload: null, // 从 /api/report/preview/{runId} 拉下来的真实数据
+  previewPayload: null, // 试运行结果（/api/report/preview/{runId} 的产物）
+  // 报表示意载荷：草稿阶段的模拟业务数据（聊天响应顶层 reportPreviewPayload，
+  // 会话恢复时在 snapshot.reportPreviewPayload 临时带回）。
+  // 与上面的 previewPayload 是两回事：一个是模拟示意，一个是试运行产物，
+  // 语义不同、互不覆盖、互不替代（规格 #46「跨工单契约」）。
+  // 它只活在内存里：不写 localStorage、不写任何持久化位置。
+  reportPreviewPayload: null,
   pendingResume: null, // 停止后等待重新执行的原请求
   workspaceId: null, // 归属项目
 };
@@ -112,7 +118,6 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const chatScroll = $("chat-scroll");
 const previewRoot = $("preview-root");
 const previewEmpty = $("preview-empty");
-const planRoot = $("plan-root");
 let activeRequest = null;
 let requestEpoch = 0;
 let lockedChoice = null;
@@ -148,6 +153,91 @@ const planState = {
   planExpanded: false,
 };
 
+// --------------------------------------------------------------------------
+// 文字方案的挂载位置：左侧对话区里的一条 AI 回复。
+//
+// 工单 06 / 规格 #46：文字方案出现在左侧对话区，作为一条 AI 回复里的可折叠块；
+// 右侧报表面板不再出现文字方案（容器一并移除，不留任何入口）。
+//
+// 方案模块（workbench_plan.js）仍然只接收一个根节点、只往那个根节点里写，
+// 所以这里换的只是「那个根节点在哪儿」：
+//   - planBubble：承载方案的一条 AI 气泡（头像 + 卡片），与对话流里的气泡同构；
+//   - planRoot：方案模块的挂载根（气泡里的 #plan-root）。
+//
+// 气泡是**动态建**的：对话区会被清空（新建对话 / 恢复会话），
+// 静态写在页面里的容器会被一起清掉，所以按需重建。
+// --------------------------------------------------------------------------
+
+let planBubble = null;
+let planRoot = null;
+
+/** 建一条承载方案模块的 AI 气泡。 */
+function createPlanBubble() {
+  const bubble = document.createElement("div");
+  bubble.className = "flex gap-2.5";
+  bubble.setAttribute("data-plan-bubble", "");
+
+  const avatar = document.createElement("div");
+  avatar.className = "w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center";
+  avatar.innerHTML = '<iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>';
+
+  const body = document.createElement("div");
+  body.className = "flex-1 min-w-0";
+
+  const root = document.createElement("div");
+  root.id = "plan-root";
+
+  body.appendChild(root);
+  bubble.appendChild(avatar);
+  bubble.appendChild(body);
+  return { bubble, root };
+}
+
+/**
+ * 拿到方案容器（必要时重建），并挂到对话流里。
+ * 对话区被清空过 → 旧容器已经不在文档里了 → 重建一条。
+ * @returns {{root: Element|null, fresh: boolean}} fresh=true 表示这次是新挂上去的
+ */
+function mountPlanHost() {
+  if (!chatScroll) return { root: null, fresh: false };
+  if (!planBubble || !planRoot || !planRoot.isConnected) {
+    const host = createPlanBubble();
+    planBubble = host.bubble;
+    planRoot = host.root;
+  }
+  if (planBubble.parentNode !== chatScroll) {
+    chatScroll.appendChild(planBubble);
+    chatBubbleObserver.observe(planBubble);
+    return { root: planRoot, fresh: true };
+  }
+  return { root: planRoot, fresh: false };
+}
+
+/**
+ * 把方案气泡挪到对话流的末尾。
+ *
+ * 只在气泡**刚挂进对话流**时做：延到本轮渲染之后再挪，
+ * 响应处理是同步的，等它跑完，卡片就落在这一轮 AI 回复文本的下面 ——
+ * 读起来就是「AI 回复里的一块」。
+ *
+ * 已经在对话流里的卡片不再挪：它留在自己那条回复的位置上，
+ * 后来的对话接在它下面，用户看着不跳。
+ */
+let planAnchorScheduled = false;
+function anchorPlanBubble() {
+  if (!planBubble || !chatScroll) return;
+  if (planAnchorScheduled) return;
+  planAnchorScheduled = true;
+  const run = () => {
+    planAnchorScheduled = false;
+    if (!planBubble || !chatScroll || !planBubble.isConnected) return;
+    chatScroll.appendChild(planBubble);
+    scrollChatBottom();
+  };
+  if (typeof queueMicrotask === "function") queueMicrotask(run);
+  else setTimeout(run, 0);
+}
+
 /** 能不能确认：只由明确的几个条件决定，不靠文案猜。 */
 function planCanConfirm(state = planState) {
   if (!state) return false;
@@ -160,25 +250,30 @@ function planCanConfirm(state = planState) {
 }
 
 function renderPlanModule() {
-  if (!planRoot) return;
   const api = window.WorkbenchPlan;
   if (!api) return;
-  // 草稿阶段也要保留方案面板（折叠的已确认方案）—— 不再排除 DRAFT_READY。
-  const hasPlan = !!planState.reportPlan || !!planState.designPhase;
+  // 草稿阶段也要保留方案卡片（折叠的已确认方案）—— 不再排除 DRAFT_READY。
+  // 只有**真的有方案**才挂卡片：澄清追问（栏目推不出来时的那句提问）这类响应
+  // 可能只带 designPhase、不带方案，挂上去会变成一张「尚未生成方案」的空卡片。
+  const hasPlan = !!planState.reportPlan;
   // 草稿空态只在「有方案、但还没出草稿」时让位。
   // DRAFT_READY 时若草稿还没到，宁可显示空态，也不要留一块空白。
   const hasDraft = !!(session.definition && Array.isArray(session.definition.regions) && session.definition.regions.length);
   const hideEmpty = hasPlan && !hasDraft && planState.designPhase !== "DRAFT_READY";
   previewRoot.classList.toggle("plan-active", hideEmpty);
   if (!hasPlan) {
-    api.clear(planRoot);
+    // 没有方案：把气泡从对话流里摘掉，不留空白位置。
+    if (planRoot) api.clear(planRoot);
+    if (planBubble && planBubble.parentNode) planBubble.parentNode.removeChild(planBubble);
     return;
   }
+  const { root, fresh } = mountPlanHost();
+  if (!root) return;
   // 记住用户有没有展开折叠视图：重渲染（busy 抖动 / 新响应）时不把它弹回去。
-  const existing = planRoot.querySelector("details.confirmed-plan-details");
+  const existing = root.querySelector("details.confirmed-plan-details");
   if (existing) planState.planExpanded = existing.open === true;
   api.render(
-    planRoot,
+    root,
     {
       designPhase: planState.designPhase,
       reportPlan: planState.reportPlan,
@@ -189,6 +284,7 @@ function renderPlanModule() {
     },
     { onAction: handlePlanAction }
   );
+  if (fresh) anchorPlanBubble();
 }
 
 /** 从一次响应里同步方案状态。 */
@@ -203,7 +299,7 @@ function syncPlanFromResponse(data) {
   planState.error = data.error ? data.error.message || data.error.code || null : null;
   renderPlanModule();
   // 草稿已出：把右侧滚回顶部，让用户第一眼看到草稿而不是聊天记录。
-  if (phase === "DRAFT_READY") planRoot.parentElement.scrollTop = 0;
+  if (phase === "DRAFT_READY") previewRoot.parentElement.scrollTop = 0;
 }
 
 /** 从会话详情里恢复方案（刷新 / 重建服务后）。 */
@@ -471,18 +567,51 @@ function setState(state) {
   badge.className = "inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border mono " + (palette[state] || palette.ANALYZING);
 }
 
+// --------------------------------------------------------------------------
+// 草稿徽标
+//
+// 规格 #46 / ADR 0004 §2.4：
+//   - 草稿阶段（右侧已经是带数的报表）→ 「示意」；
+//   - 点「同意」并**校验成功后** → 「已校验 / 待接真数」；
+//   - 校验失败或进行中 → **不得**提前显示成功徽标，原来的「示意」保持可见。
+//
+// 校验通过的判据是状态机：VALIDATING 通过后才进 PREVIEWING，
+// 所以「过了 VALIDATING」才算校验成功。
+// --------------------------------------------------------------------------
+const VALIDATED_AGENT_STATES = new Set(["PREVIEWING", "PREVIEW_READY", "RENDERING", "READY"]);
+
+function draftBadgeView() {
+  const payload = session.reportPreviewPayload;
+  const hasPayload = !!(payload && Array.isArray(payload.regions) && payload.regions.length);
+  if (!hasPayload) {
+    // 草稿在、示意还没到：说「草稿」，不说「示意」（屏幕上还没有数）。
+    if (session.definition) return { key: "draft", text: "草稿", tone: "amber" };
+    return { key: "none", text: "尚无草稿", tone: "slate" };
+  }
+  if (VALIDATED_AGENT_STATES.has(session.state)) {
+    return { key: "validated", text: "已校验 / 待接真数", tone: "emerald" };
+  }
+  // 校验进行中 / 失败：示意保持可见，只是换个颜色提示当前状态。
+  const tone = session.state === "VALIDATION_FAILED" ? "rose" : "amber";
+  return { key: "simulated", text: "示意", tone };
+}
+
+const DRAFT_BADGE_TONES = {
+  slate: "bg-slate-100 text-slate-500 border-slate-200",
+  amber: "bg-amber-50 text-amber-700 border-amber-200",
+  rose: "bg-rose-50 text-rose-700 border-rose-200",
+  emerald: "bg-emerald-50 text-emerald-700 border-emerald-200",
+};
+
 function updateMeta() {
   $("meta-rev").textContent = session.baseDefinitionRevision ?? "—";
   $("meta-session").textContent = session.designSessionId ?? "—";
 
   const draftBadge = $("draft-badge");
-  if (session.definition) {
-    draftBadge.className = "inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-amber-50 text-amber-700 border-amber-200";
-    draftBadge.innerHTML = '<iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>AI 生成草稿 v' + (session.baseDefinitionRevision ?? "?");
-  } else {
-    draftBadge.className = "inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-slate-100 text-slate-500 border-slate-200";
-    draftBadge.innerHTML = '<iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>尚无草稿';
-  }
+  const view = draftBadgeView();
+  draftBadge.className = "inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border " + (DRAFT_BADGE_TONES[view.tone] || DRAFT_BADGE_TONES.slate);
+  draftBadge.dataset.draftBadge = view.key;
+  draftBadge.innerHTML = '<iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>' + esc(view.text);
 }
 
 // -------- 对话气泡 --------
@@ -1617,6 +1746,19 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
     pendingPlanRendered = true;
   };
 
+  // 定义先落位（各状态共用）：示意载荷的版本校对拿它当基准。
+  const draftDefinition = data.domainObjects?.reportDefinitionDraft;
+  if (draftDefinition) {
+    session.definition = draftDefinition;
+    session.policy = data.domainObjects?.reportPolicyDraft || session.policy;
+    session.reportDefinitionId = draftDefinition?.metadata?.id || session.reportDefinitionId;
+    session.baseDefinitionRevision = draftDefinition?.metadata?.revision ?? session.baseDefinitionRevision;
+  }
+
+  // 报示意载荷：草稿确认的**同一轮**响应就带它（不做二次请求）。
+  // 旧版本的载荷（定义已经改过）直接丢掉，不覆盖新模板。
+  applyReportPreviewPayload(readReportPreviewPayload(data));
+
   // 分发渲染
   switch (data.state) {
     case "ANALYZING":
@@ -1628,6 +1770,7 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
         session.editingTargetRegionId = null;
         session.lastReportRun = null;
         session.previewPayload = null;
+        session.reportPreviewPayload = null;
         destroyCharts();
         previewRoot.innerHTML = "";
         previewRoot.appendChild(previewEmpty);
@@ -1648,13 +1791,9 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
       else appendAiText(data.reply || "这个请求当前不能继续处理。");
       break;
     case "WAITING_USER_CONFIRM":
-      session.definition = data.domainObjects?.reportDefinitionDraft || session.definition;
-      session.policy = data.domainObjects?.reportPolicyDraft || session.policy;
       session.editingTargetRegionId = null;
-      session.reportDefinitionId = session.definition?.metadata?.id || session.reportDefinitionId;
-      session.baseDefinitionRevision = session.definition?.metadata?.revision ?? session.baseDefinitionRevision;
       appendAiText(data.reply || '已生成报表草稿，右侧可以直接编辑；满意后点"同意"。');
-      renderPreview(session.definition);
+      renderReportPanel();
       if (pendingPlan) {
         // 后端把待确认计划放在这个状态时，按新契约走计划卡，不画旧的草稿确认菜单
         renderPendingPlan();
@@ -1663,9 +1802,6 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
       }
       break;
     case "USER_EDITING_TEMPLATE":
-      session.definition = data.domainObjects?.reportDefinitionDraft || session.definition;
-      session.policy = data.domainObjects?.reportPolicyDraft || session.policy;
-      session.baseDefinitionRevision = session.definition?.metadata?.revision ?? session.baseDefinitionRevision;
       appendAiText(data.reply || "请继续说明要怎么编辑当前草稿。");
       if (!pendingPlan) {
         appendTemplateEditSummary(
@@ -1673,7 +1809,7 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
           data.debug?.markdownPreview
         );
       }
-      if (session.definition) renderPreview(session.definition, session.editingTargetRegionId ? [session.editingTargetRegionId] : []);
+      renderReportPanel(session.editingTargetRegionId ? [session.editingTargetRegionId] : []);
       if (pendingPlan) {
         // 计划卡片自带「接受修改 / 继续调整 / 取消」，不再画旧的「同意 / 修改 / 重新开始」
         renderPendingPlan();
@@ -1713,18 +1849,23 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
         session.lastReportRun = data.domainObjects.reportRunPreview;
       }
       appendAiText(data.reply || "预览已就绪。");
-      await fetchAndStorePreview(epoch);
+      // 试运行照跑（后端照旧推进状态机），但它的产物**不再单独渲染**：
+      // 草稿阶段右侧已经是带数的报表，点「同意」之后屏幕上的数字不动。
+      // 二次请求的代码留在主线上（fetchAndStorePreview），将来接真实数据直接复用。
       if (epoch !== requestEpoch) return;
       if (WorkbenchQuery.shouldAutoAdvance(data)) queueAdvance(500, epoch);
       break;
     case "RENDERING":
       appendAiText(data.reply || "正在渲染报表界面…");
-      // 渲染出问题（图表库挂了、某个区域数据异常）不能把状态机按死在 RENDERING。
-      try {
-        await renderFinalReport();
-      } catch (err) {
-        console.error("[AI Report] 渲染报表失败", err);
-        appendAiText("报表渲染遇到问题，已跳过部分内容，流程继续。");
+      // 不再按预览状态重画一块面板：示意数字保持不动。
+      // 面板上还没有载荷（例如中途刷新）时才补画一次。
+      if (!session.reportPreviewPayload) {
+        try {
+          renderReportPanel();
+        } catch (err) {
+          console.error("[AI Report] 渲染报表失败", err);
+          appendAiText("报表渲染遇到问题，已跳过部分内容，流程继续。");
+        }
       }
       if (epoch !== requestEpoch) return;
       if (WorkbenchQuery.shouldAutoAdvance(data)) queueAdvance(450, epoch);
@@ -1737,18 +1878,11 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
       // 这个状态以前只画一张变更卡：右侧没有草稿、没有确认下拉、也没有输入锁，
       // 用户既看不到草稿也走不下去（死路）。
       // 现在：草稿同步到右侧 + 变更卡 + 一个一定能点的确认下拉。
-      const draft = data.domainObjects?.reportDefinitionDraft;
-      if (draft) {
-        session.definition = draft;
-        session.policy = data.domainObjects?.reportPolicyDraft || session.policy;
-        session.reportDefinitionId = draft?.metadata?.id || session.reportDefinitionId;
-        session.baseDefinitionRevision = draft?.metadata?.revision ?? session.baseDefinitionRevision;
-        renderPreview(session.definition);
-      }
       appendAiText(data.reply || "已生成修改方案。");
       if (data.domainObjects?.changeSet) {
         appendAiChangeSet(data.domainObjects.changeSet);
       }
+      renderReportPanel();
       if (pendingPlan) {
         // 有待确认计划时，计划卡自带「接受修改 / 继续调整 / 取消」，不再叠一层确认下拉。
         renderPendingPlan();
@@ -1770,6 +1904,20 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
   renderSessionList();
 }
 
+/**
+ * 拉一次试运行结果。
+ *
+ * 规格 #46 取消了独立的报表预览面板：草稿阶段右侧已经是带数的报表，
+ * 示意数据随草稿确认的同一轮响应就回来（reportPreviewPayload），**不再二次请求**，
+ * 所以这条链路当前不会被调用。
+ *
+ * 代码与它的产物都保留在主线上（ADR 0004 §2.4）：将来接真实数据时，
+ * 试运行结果直接复用这条路径。
+ *
+ * 注意它写进的是 `session.previewPayload`（**试运行结果**），
+ * 与 `session.reportPreviewPayload`（草稿阶段的模拟示意）是两个键：
+ * 语义不同、互不覆盖、互不替代。
+ */
 async function fetchAndStorePreview(epoch) {
   const runId = session.lastReportRun?.reportRunId;
   if (!runId) return;
@@ -1871,7 +2019,7 @@ function applyChangeSet(cs, bubbleWrap) {
     '<span class="inline-flex items-center gap-1 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-medium px-2.5 py-1.5"><iconify-icon icon="mdi:check" class="text-sm"></iconify-icon>变更已应用</span>';
 
   setState("WAITING_USER_CONFIRM"); // 应用后回到确认态
-  renderPreview(definition, cs.changed.map((e) => e.regionId));
+  renderReportPanel(cs.changed.map((e) => e.regionId));
   updateMeta();
   toast("变更已应用，revision → " + definition.metadata.revision);
 }
@@ -1957,55 +2105,315 @@ function renderGenerationInputs(definition) {
     </div>`;
 }
 
-function renderPreview(definition, highlightRegionIds = []) {
+// --------------------------------------------------------------------------
+// 报示意载荷（reportPreviewPayload）
+//
+// 规格 #46 / ADR 0004：草稿阶段不再画空壳，右侧直接用**模拟业务数据**渲染。
+//
+// 载荷从两处来，结构同构：
+//   - 聊天响应顶层 `reportPreviewPayload`：草稿确认的**同一轮**就带它，不做二次请求；
+//   - 会话读取响应 `snapshot.reportPreviewPayload`：后端按同一份定义与上下文
+//     重新生成的同构载荷（响应级字段，没有落库；前端也不缓存它）。
+//
+// 与既有键 `session.previewPayload`（**试运行结果**）是两回事：
+// 一个是草稿阶段的模拟示意，一个是试运行的产物 —— 语义不同、互不覆盖、互不替代。
+// --------------------------------------------------------------------------
+
+/**
+ * 从一次响应里取出报示意载荷。
+ * 载荷必须是对象且带 regions 数组，否则当作没有载荷（不猜、不补、不造）。
+ */
+function readReportPreviewPayload(data) {
+  const payload = data?.reportPreviewPayload;
+  if (!payload || typeof payload !== "object") return null;
+  if (!Array.isArray(payload.regions)) return null;
+  return payload;
+}
+
+/** 版本号归一：只认「整数形态」的版本号，形态对不上就不比较（宁可放过，不误杀）。 */
+function normalizeVersionNumber(value) {
+  const text = String(value ?? "").trim().replace(/^v/i, "");
+  return /^\d+$/.test(text) ? Number(text) : null;
+}
+
+/**
+ * 载荷是不是过期版本。
+ *
+ * 契约：previewContext 带 definitionId / definitionVersion。
+ * 旧版本的异步响应不能覆盖新模板 —— 对不上就丢掉这份载荷。
+ */
+function isStaleReportPayload(payload) {
+  const ctx = payload?.previewContext || {};
+  const definition = session.definition;
+  const definitionId = definition?.metadata?.id;
+  if (ctx.definitionId && definitionId && String(ctx.definitionId) !== String(definitionId)) {
+    return true;
+  }
+  const definitionVersion = definition?.metadata?.revision;
+  if (ctx.definitionVersion != null && definitionVersion != null) {
+    const left = normalizeVersionNumber(ctx.definitionVersion);
+    const right = normalizeVersionNumber(definitionVersion);
+    if (left != null && right != null && left !== right) return true;
+  }
+  return false;
+}
+
+/** 收下一份示意载荷（过期就丢掉）。返回是否收下了。 */
+function applyReportPreviewPayload(payload) {
+  if (!payload) return false;
+  if (isStaleReportPayload(payload)) {
+    console.warn("[AI Report] 丢弃过期版本的示意载荷（定义已经改过）");
+    return false;
+  }
+  session.reportPreviewPayload = payload;
+  return true;
+}
+
+/** 定义里的区域（按 id 找）：载荷只带 regionId，编辑入口与 topN 都要回定义里取。 */
+function findDefinitionRegion(definition, regionId) {
+  if (!definition || !regionId) return null;
+  return (definition.regions || []).find((item) => item?.id === regionId) || null;
+}
+
+/**
+ * 单位一律从载荷里读，绝不硬编码 kWh / 耗电。
+ *
+ * 契约：数值型组件的载荷带 `unit`（指标卡、图表）；
+ * 多指标时逐条序列也带 `unit`；表格列的单位在 `columns[].format.unitLabel`。
+ * 都没有才退回定义里声明的单位（templateBinding.previewSpec.unit）——
+ * 那也是声明值，不是猜的。再没有就不写单位，不拿别的单位顶替。
+ */
+function readPayloadUnit(region, payload, defRegion) {
+  const p = payload || {};
+  const candidates = [
+    p.unit,
+    Array.isArray(p.series) ? p.series[0]?.unit : null,
+    Array.isArray(p.metrics) ? p.metrics[0]?.unit : null,
+    region?.unit,
+    defRegion?.templateBinding?.previewSpec?.unit,
+  ];
+  for (const candidate of candidates) {
+    const text = String(candidate ?? "").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+/**
+ * 「能力待接通」标注要说明的具体项。
+ *
+ * 契约：区域带 capabilityPending（布尔）；多指标区域在 metrics[] 里逐项带
+ * capabilityPending / pendingReason（载荷与定义的 previewSpec 都可能带）。
+ * 这里只如实说明**哪个指标还没接通、为什么**，不承诺计算口径或公式。
+ */
+function readCapabilityNotes(region, payload, defRegion) {
+  const notes = [];
+  const seen = new Set();
+  const collect = (metrics) => {
+    if (!Array.isArray(metrics)) return;
+    for (const metric of metrics) {
+      if (!metric || typeof metric !== "object") continue;
+      if (metric.capabilityPending !== true) continue;
+      const label = String(metric.label || metric.metricKey || "指标").trim();
+      if (!label || seen.has(label)) continue;
+      seen.add(label);
+      const reason = String(metric.pendingReason || "").trim();
+      notes.push(reason ? `${label}（${reason}）` : label);
+    }
+  };
+  collect(payload?.metrics);
+  collect(defRegion?.templateBinding?.previewSpec?.metrics);
+  if (!notes.length && region?.capabilityPending === true) notes.push("该指标尚未接通");
+  return notes;
+}
+
+/** 载荷里的总量卡片（按单位索引）：表格勾稽要用它。 */
+function buildTotalsByUnit(regions) {
+  const totals = new Map();
+  for (const region of regions) {
+    if (region?.componentType !== "METRIC_CARD") continue;
+    const p = region.payload || {};
+    const unit = String(p.unit || "").trim();
+    const value = Number(p.value);
+    if (!unit || !Number.isFinite(value)) continue;
+    if (!totals.has(unit)) totals.set(unit, value);
+  }
+  return totals;
+}
+
+function readPositiveInt(value) {
+  const num = Number(value);
+  return Number.isInteger(num) && num > 0 ? num : null;
+}
+
+/** 表格某一列的行和（只算数值列；非数值列返回 null）。 */
+function sumColumnValues(rows, column) {
+  let sum = 0;
+  let seen = false;
+  for (const row of rows) {
+    const value = Number(row?.[column.fieldRef]);
+    if (!Number.isFinite(value)) continue;
+    sum += value;
+    seen = true;
+  }
+  return seen ? sum : null;
+}
+
+/**
+ * 表格行是不是被截断了。
+ *
+ * 硬约束是「表格各行之和 = 报表总量」（开发规格的勾稽）：
+ * 行被截断时行和会小于总量，渲染层必须说清楚，不能让两者悄悄不等。
+ *
+ * 判定分两层：
+ *   1. 载荷自己说了截断（truncated / totalRows）：直接采信；
+ *   2. 载荷没说：行数**达到了这张表声明的 topN**，且行和明显小于同口径的总量卡片。
+ *      两件事都成立才敢这么说 —— 只满足一条时不能断言「还有别的行没显示」
+ *      （行数不足可能只是对象本来就少，行和小可能只是这张表管的是另一段范围）。
+ */
+function readTableTruncation(payload, defRegion, totalsByUnit) {
+  const p = payload || {};
+  const rows = Array.isArray(p.rows) ? p.rows : [];
+  const topN = readPositiveInt(defRegion?.binding?.topN);
+  const declaredTotal = [p.totalRows, p.totalRowCount, p.objectCount]
+    .map((value) => Number(value))
+    .find((value) => Number.isFinite(value));
+
+  if (p.truncated === true) {
+    return { truncated: true, shown: rows.length, limit: topN ?? declaredTotal ?? rows.length };
+  }
+  if (declaredTotal != null && declaredTotal > rows.length) {
+    return { truncated: true, shown: rows.length, limit: topN ?? rows.length, total: declaredTotal };
+  }
+  if (topN == null || rows.length < topN || !totalsByUnit) return null;
+
+  for (const column of p.columns || []) {
+    const unit = String(column?.format?.unitLabel || "").trim();
+    if (!unit) continue;
+    const total = totalsByUnit.get(unit);
+    if (total == null) continue;
+    const sum = sumColumnValues(rows, column);
+    if (sum == null) continue;
+    const tolerance = Math.max(0.1, Math.abs(total) * 0.01);
+    if (sum < total - tolerance) {
+      return { truncated: true, shown: rows.length, limit: rows.length };
+    }
+  }
+  return null;
+}
+
+/** 数字按载荷给的精度显示；不是数字就原样显示。 */
+function formatMetricValue(value, precision) {
+  if (value == null || value === "") return "—";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  const digits = Number.isFinite(Number(precision)) ? Number(precision) : 1;
+  return num.toFixed(Math.max(0, Math.min(6, digits)));
+}
+
+// --------------------------------------------------------------------------
+// 渲染：右侧报表面板（草稿阶段与预览阶段共用一套）
+//
+// 入口只有一个：renderReportPanel()。
+// 数据来源只有一个：session.reportPreviewPayload（模拟业务数据的区域载荷）。
+// 组件类型、板块标题、表格栏目一律取自载荷与已确认方案 —— 前端不改写、不按标题猜。
+// --------------------------------------------------------------------------
+
+function renderReportPanel(highlightRegionIds = []) {
   // 先销毁旧图表实例：直接 innerHTML="" 只会移除 DOM，
   // ECharts 实例仍然持有对已脱离文档节点的引用，内存泄漏 + 后续 resize 报错。
   destroyCharts();
-  if (!definition || !definition.regions?.length) {
-    previewRoot.innerHTML = "";
+  previewRoot.innerHTML = "";
+
+  const payload = session.reportPreviewPayload;
+  const regions = Array.isArray(payload?.regions) ? payload.regions : [];
+  // 标题区（role == REPORT_TITLE）不出数，也不占一块。
+  const bodyRegions = regions.filter((region) => !isTitleRegion(region));
+  const definition = session.definition;
+
+  if (!bodyRegions.length) {
+    // 没有载荷就没有数可画：回到空态，不画空壳卡片。
+    setPreviewEmptyHint(definition ? "draft" : "none");
     previewRoot.appendChild(previewEmpty);
     return;
   }
-  previewRoot.innerHTML = "";
 
-  const bodyRegions = definition.regions.filter((r) => !isTitleRegion(r));
+  const totalsByUnit = buildTotalsByUnit(bodyRegions);
+  previewRoot.appendChild(renderPanelHeader(definition, payload, bodyRegions.length));
 
-  // 顶部摘要（报表名）
-  const summary = document.createElement("div");
-  summary.className = "bg-white rounded-xl border border-slate-200 p-5";
-  summary.innerHTML = `
+  for (const region of bodyRegions) {
+    const card = renderRegionCard(region, definition, payload, totalsByUnit);
+    if (highlightRegionIds.includes(region.regionId)) card.classList.add("region-highlight");
+    previewRoot.appendChild(card);
+  }
+  syncPreviewEditability();
+  requestAnimationFrame(() => _chartInstances.forEach((chart) => {
+    try { chart.resize(); } catch (e) {}
+  }));
+}
+
+/** 空态提示：没有草稿与「草稿已在、示意还没到」是两种情况，说清楚。 */
+function setPreviewEmptyHint(kind) {
+  const hint = previewEmpty.querySelector("[data-preview-empty-hint]");
+  if (!hint) return;
+  hint.textContent = kind === "draft"
+    ? "草稿已保存，示意数据还没生成"
+    : "还没有草稿，试试左侧「生成能耗日报」";
+}
+
+/** 载荷里的窗口标签：previewContext 只给起止时间，标签自己拼。 */
+function readPayloadWindowLabel(payload) {
+  const ctx = payload?.previewContext || {};
+  if (ctx.windowLabel) return String(ctx.windowLabel);
+  const start = ctx.windowStart ? String(ctx.windowStart).slice(0, 10) : "";
+  const end = ctx.windowEnd ? String(ctx.windowEnd).slice(0, 10) : "";
+  if (start && end) return start === end ? start : `${start} ~ ${end}`;
+  return start || end || "";
+}
+
+/** 面板顶部：报表名 + 一行「这是模拟业务数据」的说明。 */
+function renderPanelHeader(definition, payload, regionCount) {
+  const header = document.createElement("div");
+  header.className = "bg-white rounded-xl border border-slate-200 p-5";
+  const name = definition?.metadata?.name || "报表草稿";
+  const windowLabel = readPayloadWindowLabel(payload);
+  header.innerHTML = `
     <div class="flex items-start justify-between gap-4">
       <div class="flex-1 min-w-0">
         <div class="flex items-center gap-2 flex-wrap">
-          <h2 class="report-name editable-field text-lg font-semibold text-slate-900">${esc(definition.metadata?.name || "报表草稿")}</h2>
-          <span class="inline-flex items-center rounded-md text-xs font-medium px-2 py-1 border bg-blue-50 text-blue-700 border-blue-200">${esc(definition.schemaVersion || "1.0")}</span>
+          <h2 class="report-name editable-field text-lg font-semibold text-slate-900">${esc(name)}</h2>
+          <span class="inline-flex items-center rounded-md text-xs font-medium px-2 py-1 border bg-blue-50 text-blue-700 border-blue-200">${esc(definition?.schemaVersion || "1.0")}</span>
           <span class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-amber-50 text-amber-700 border-amber-200 draft-status-badge">
-            <iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>${esc(definition.metadata?.status || "DRAFT")}
+            <iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>${esc(definition?.metadata?.status || "DRAFT")}
           </span>
           <span class="edit-hint text-[11px] text-slate-400 inline-flex items-center gap-1"><iconify-icon icon="mdi:pencil-outline"></iconify-icon>点击名称可直接编辑</span>
         </div>
         <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500 draft-meta-row">
-          <span>revision: <span class="mono">${definition.metadata?.revision ?? "—"}</span></span>
-          <span>区域数: <span class="mono">${bodyRegions.length}</span></span>
-          <span>数据集: ${Object.keys(definition.datasets || {}).map((d) => `<span class="mono">${esc(d)}</span>`).join(", ") || "—"}</span>
+          <span>revision: <span class="mono">${definition?.metadata?.revision ?? "—"}</span></span>
+          <span>区域数: <span class="mono">${regionCount}</span></span>
+          ${windowLabel ? `<span>时间窗: <span class="mono">${esc(windowLabel)}</span></span>` : ""}
         </div>
         ${renderGenerationInputs(definition)}
       </div>
     </div>
+    <div class="mt-3 flex items-start gap-1.5 text-[11px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5" data-simulated-note>
+      <iconify-icon class="text-sm mt-px" icon="mdi:flask-outline"></iconify-icon>
+      <span>当前显示的是<b>模拟业务数据</b>，用于核对版式；接入真实数据后会自动替换。</span>
+    </div>
   `;
-  const nameEl = summary.querySelector(".report-name");
+
+  const nameEl = header.querySelector(".report-name");
   nameEl.addEventListener("blur", () => {
     if (!isEditingEnabled()) {
-      nameEl.textContent = definition.metadata?.name || "报表草稿";
+      nameEl.textContent = name;
       return;
     }
     const newName = nameEl.textContent.trim();
-    const originalName = definition.metadata?.name || "报表草稿";
-    if (newName && newName !== originalName) {
-      nameEl.textContent = originalName;
+    if (newName && newName !== name) {
+      nameEl.textContent = name;
       sendTemplateEditAction(`报表名称改成${newName}`);
     } else {
-      nameEl.textContent = originalName;
+      nameEl.textContent = name;
     }
   });
   nameEl.addEventListener("keydown", (e) => {
@@ -2014,85 +2422,79 @@ function renderPreview(definition, highlightRegionIds = []) {
       nameEl.blur();
     }
   });
-  previewRoot.appendChild(summary);
-
-  // 各区域
-  for (const region of bodyRegions) {
-    const card = renderRegion(region);
-    if (highlightRegionIds.includes(region.id)) {
-      card.classList.add("region-highlight");
-    }
-    previewRoot.appendChild(card);
-  }
-  syncPreviewEditability();
+  return header;
 }
 
-function renderRegion(region) {
+/**
+ * 一个板块的卡片：外壳（标题、角标、编辑入口）+ 正文（按载荷渲染）。
+ *
+ * 外壳里的编辑入口只对**定义里存在的板块**开放 —— 载荷没有对应定义时
+ * 没有可改的对象，就不摆入口。
+ */
+function renderRegionCard(region, definition, payload, totalsByUnit) {
+  const defRegion = findDefinitionRegion(definition, region.regionId);
+  const p = region.payload || {};
+  const unit = readPayloadUnit(region, p, defRegion);
+  const capabilityNotes = readCapabilityNotes(region, p, defRegion);
+
   const card = document.createElement("div");
   card.className = "bg-white rounded-xl border border-slate-200 p-5 group";
-  card.dataset.regionId = region.id;
+  card.dataset.regionId = region.regionId || "";
 
+  const title = region.name || defRegion?.name || region.componentType || "板块";
+  const chartKind = p.chartKind || defRegion?.component?.chartKind || "";
   const header = `
     <div class="flex items-start justify-between gap-4">
       <div class="flex-1 min-w-0">
-        <h3 class="region-name editable-field font-semibold text-slate-900">${esc(region.name || region.component?.title || region.role)}</h3>
-        <p class="text-xs text-slate-500 mt-0.5">role: <span class="mono">${esc(region.role)}</span> · component: <span class="mono">${esc(region.component?.type)}</span>${region.component?.chartKind ? ' / <span class="mono">' + esc(region.component.chartKind) + "</span>" : ""}</p>
+        <h3 class="region-name editable-field font-semibold text-slate-900">${esc(title)}</h3>
+        <p class="text-xs text-slate-500 mt-0.5">role: <span class="mono">${esc(region.role || defRegion?.role || "")}</span> · component: <span class="mono">${esc(region.componentType || defRegion?.component?.type || "")}</span>${chartKind ? ' / <span class="mono">' + esc(chartKind) + "</span>" : ""}</p>
       </div>
       <div class="flex items-center gap-1 shrink-0">
+        <span class="region-badge inline-flex items-center gap-1 rounded-md text-[11px] font-medium px-2 py-0.5 border bg-slate-100 text-slate-600 border-slate-200" data-region-badge="simulated" title="模拟业务数据，接入真实数据后自动替换">
+          <iconify-icon class="text-xs" icon="mdi:flask-outline"></iconify-icon>示意
+        </span>
+        ${defRegion ? `
         <span class="region-tools">
-          ${region.data ? `
-            <button class="btn-display-options h-7 rounded border border-slate-200 hover:bg-blue-50 hover:border-blue-200 hover:text-blue-700 text-[11px] text-slate-500 px-2 transition" title="查看适合当前数据的展示方式">展示方式</button>
-            <button class="btn-grain-options h-7 rounded border border-slate-200 hover:bg-blue-50 hover:border-blue-200 hover:text-blue-700 text-[11px] text-slate-500 px-2 transition" title="查看当前数据源支持的粒度">粒度</button>
-          ` : ""}
+          <button class="btn-display-options h-7 rounded border border-slate-200 hover:bg-blue-50 hover:border-blue-200 hover:text-blue-700 text-[11px] text-slate-500 px-2 transition" title="查看适合当前数据的展示方式">展示方式</button>
+          <button class="btn-grain-options h-7 rounded border border-slate-200 hover:bg-blue-50 hover:border-blue-200 hover:text-blue-700 text-[11px] text-slate-500 px-2 transition" title="查看当前数据源支持的粒度">粒度</button>
           <button class="btn-del-region w-7 h-7 rounded border border-slate-200 hover:bg-rose-50 hover:border-rose-200 hover:text-rose-600 text-slate-400 flex items-center justify-center transition" title="删除此区域">
             <iconify-icon class="text-base" icon="mdi:trash-can-outline"></iconify-icon>
           </button>
         </span>
-        <span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 shrink-0">${esc(region.id)}</span>
+        ` : ""}
+        <span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 shrink-0">${esc(region.regionId || "")}</span>
       </div>
     </div>`;
 
-  const { html: body, node: bodyNode } = renderRegionBody(region);
+  card.innerHTML = header + '<div class="mt-3 region-body"></div>';
 
-  card.innerHTML = header + '<div class="mt-3 region-body">' + body + "</div>";
-
-  // 图表区域：真的拿到数据点时画真实图表（renderChart 由方案模块导出，见 W-14）。
-  if (bodyNode) {
-    const bodyWrap = card.querySelector(".region-body");
-    if (bodyWrap) bodyWrap.appendChild(bodyNode);
+  // 正文：按载荷渲染（草稿阶段与预览阶段共用这一套）。
+  const body = card.querySelector(".region-body");
+  try {
+    renderRegionPayloadBody(body, region, payload, { unit, defRegion, totalsByUnit });
+  } catch (err) {
+    console.error("[AI Report] 板块渲染失败", region?.regionId, err);
+    body.innerHTML = `
+      <div class="rounded-lg bg-rose-50 border border-rose-200 p-3 text-xs text-rose-700">
+        这个板块渲染失败：${esc(err?.message || String(err))}。其余板块和后续流程不受影响。
+      </div>`;
   }
 
-  // 占位原因与数据来源性质（#39 ↔ #40 接口约定，见实施票）。
-  // 字段缺失时静默降级：不渲染这两行，不报错、不留空框。
-  // ⚠️ 这是全前端唯一一处读 region.templateBinding 的地方：
-  //    字段名就是为这件事设计的，不要当成意外耦合删掉。
-  const binding = region.templateBinding || {};
-  if (binding.dataStatus === "placeholder" && binding.placeholderReason) {
-    const reason = document.createElement("div");
-    reason.className = "region-placeholder-reason text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-2";
-    reason.dataset.regionPlaceholderReason = "true";
-    reason.textContent = "暂无数值：" + binding.placeholderReason;
-    card.appendChild(reason);
-  } else if (binding.dataStatus === "bound" && binding.pendingReason) {
-    // bound 区域：指标已绑定但草稿阶段还没取数（#39 新增的 templateBinding.pendingReason）。
-    // 读法与占位原因对称：都从 templateBinding 取，都用 textContent 写。
-    const pending = document.createElement("div");
-    pending.className = "region-pending-reason text-[11px] text-slate-400 mt-2";
-    pending.dataset.regionPendingReason = "true";
-    pending.textContent = binding.pendingReason;
-    card.appendChild(pending);
+  // 「能力待接通」：角标之外额外写明哪些指标还没接通、为什么。
+  // 不承诺计算口径或公式 —— 那不是前端能说的事。
+  if (capabilityNotes.length) {
+    const note = document.createElement("div");
+    note.className = "region-capability-note text-[11px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-2";
+    note.dataset.regionCapability = "pending";
+    note.textContent = "能力待接通：" + capabilityNotes.join("、");
+    card.appendChild(note);
   }
-  if (binding.dataSourceLabel) {
-    const source = document.createElement("div");
-    source.className = "region-source-note text-[11px] text-slate-400 mt-2";
-    source.dataset.regionSourceNote = "true";
-    source.textContent = binding.dataSourceLabel;
-    card.appendChild(source);
-  }
+
+  if (!defRegion) return card;
 
   // 区域名编辑
   const nameEl = card.querySelector(".region-name");
-  const originalName = region.name || region.component?.title || region.role;
+  const originalName = title;
   nameEl.addEventListener("blur", () => {
     if (!isEditingEnabled()) {
       nameEl.textContent = originalName;
@@ -2101,7 +2503,7 @@ function renderRegion(region) {
     const newName = nameEl.textContent.trim();
     if (newName && newName !== originalName) {
       nameEl.textContent = originalName;
-      sendTemplateEditAction(`标题改成${newName}`, region.id);
+      sendTemplateEditAction(`标题改成${newName}`, defRegion.id);
     } else {
       nameEl.textContent = originalName;
     }
@@ -2114,326 +2516,79 @@ function renderRegion(region) {
   });
 
   card.querySelector(".btn-display-options")?.addEventListener("click", () => {
-    sendTemplateEditAction("这个 section 可以怎么展示？", region.id);
+    sendTemplateEditAction("这个 section 可以怎么展示？", defRegion.id);
   });
   card.querySelector(".btn-grain-options")?.addEventListener("click", () => {
-    sendTemplateEditAction("这个数据能按哪些粒度编译？", region.id);
+    sendTemplateEditAction("这个数据能按哪些粒度编译？", defRegion.id);
   });
 
   // 区域删除
   card.querySelector(".btn-del-region")?.addEventListener("click", () => {
-    if (!confirm(`确定删除「${region.name || region.id}」吗？`)) return;
-    sendTemplateEditAction("删除这个 section", region.id);
+    if (!confirm(`确定删除「${originalName}」吗？`)) return;
+    sendTemplateEditAction("删除这个 section", defRegion.id);
   });
 
   return card;
 }
 
 /**
- * 区域正文。
+ * 板块正文：**按载荷渲染**。
  *
- * 返回 { html, node }：
- *   - html：直接拼进卡片的 HTML 片段；
- *   - node：需要用真 DOM 画的内容（目前只有图表），由调用方挂上去。
+ * 这是草稿阶段与预览阶段共用的唯一一套渲染逻辑（规格 #46）：
+ * 数据一律从 `region.payload` 读，前端不造数、不按标题猜口径、不改写组件类型。
  */
-function renderRegionBody(region) {
-  const type = region.component?.type;
-  if (type === "TEXT") return { html: renderText(region), node: null };
-  if (type === "METRIC_CARD") return { html: renderMetricCard(region), node: null };
-  if (type === "TABLE") return { html: renderTable(region), node: null };
-  if (type === "CHART") {
-    // 事实：草稿路径的 region.data 是**执行绑定描述符**（{inputs, pipeline, outputs}），
-    // 不含 xLabels / yValues，所以这里拿不到数据点、始终回落到空壳卡片（不编造数值）。
-    // 该渲染器按需求稿 §3.3 保留；草稿路径真的拿到数据点时才会被用到（当前无此数据源）。
-    const chartNode = renderRealChart(region);
-    if (chartNode) return { html: "", node: chartNode };
-    return { html: renderChartPlaceholder(region), node: null };
-  }
-  if (type === "DATA_QUALITY") return { html: renderDataQuality(region), node: null };
-  if (type === "ANALYSIS") return { html: renderAnalysis(region), node: null };
-  return {
-    html: `<pre class="mono text-[11px] text-slate-500 bg-slate-50 rounded p-2 overflow-x-auto">${esc(JSON.stringify(region.component, null, 2).slice(0, 400))}</pre>`,
-    node: null,
-  };
-}
-
-function renderText(region) {
-  const tpl = region.component?.content?.template || "";
-  return `<div class="text-lg font-semibold text-slate-800">${esc(tpl)}</div>
-    <div class="text-[11px] text-slate-400 mt-1">模板变量将在渲染时由后端注入</div>`;
-}
-
-function renderMetricCard(region) {
-  const m = region.component?.metric || {};
-  return `
-    <div class="rounded-lg border border-slate-200 bg-slate-50 px-5 py-4 inline-block">
-      <div class="text-[11px] text-slate-500">${esc(m.label || "指标")}</div>
-      <div class="text-2xl font-semibold text-slate-900 mt-1">—<span class="text-xs font-normal text-slate-400 ml-1">${esc(m.format?.unitLabel || "")}</span></div>
-      <div class="text-[11px] text-slate-400 mt-1">metricRef: <span class="mono">${esc(region.data?.pipeline?.nodes?.[0]?.metricRef || "")}</span></div>
-    </div>`;
-}
-
-function renderTable(region) {
-  const cols = region.component?.columns || [];
-  const head = cols
-    .map(
-      (c) =>
-        `<th class="text-left font-medium px-3 py-2 text-slate-500">${esc(c.label)}${c.format?.unitLabel ? ' <span class="text-slate-400 font-normal">(' + esc(c.format.unitLabel) + ")</span>" : ""}</th>`
-    )
-    .join("");
-  const sampleRow = `<tr>${cols.map(() => '<td class="px-3 py-2.5 text-slate-300">—</td>').join("")}</tr>`;
-  return `
-    <table class="w-full text-sm">
-      <thead class="bg-slate-50 text-xs">
-        <tr>${region.component?.rowNumber ? '<th class="text-left font-medium px-3 py-2 text-slate-500 w-10">#</th>' : ""}${head}</tr>
-      </thead>
-      <tbody class="divide-y divide-slate-100">
-        ${Array.from({ length: 3 }, () => `<tr>${region.component?.rowNumber ? '<td class="px-3 py-2.5 text-slate-300">—</td>' : ""}${sampleRow.replace(/<\/?tr>/g, "")}</tr>`).join("")}
-      </tbody>
-    </table>
-    <div class="text-[11px] text-slate-400 mt-2">表格样例占位（真实数据将在后端渲染）</div>`;
-}
-
-function renderChartPlaceholder(region) {
-  const window = region.context?.timeWindow?.value || {};
-  return `
-    <div class="rounded-lg bg-slate-50 border border-slate-200 h-[200px] flex items-center justify-center">
-      <div class="text-center text-slate-400">
-        <iconify-icon class="text-4xl" icon="mdi:chart-line"></iconify-icon>
-        <div class="text-sm mt-1">${esc(region.component?.chartKind || "LINE")} 图表占位</div>
-        <div class="text-[11px] mt-1 mono">${esc(window.unit || "?")} · offset=${window.offset ?? "?"} · count=${window.count ?? "?"}</div>
-      </div>
-    </div>`;
-}
-
-// 草稿区域的 chartKind（LINE / BAR / PIE）→ 图表渲染器认识的 componentType。
-const CHART_KIND_TO_COMPONENT_TYPE = {
-  LINE: "line_chart",
-  BAR: "bar_chart",
-  PIE: "pie_chart",
-};
-
-/**
- * 图表区域：区域里真的带数据点时画真实图表。
- *
- * 事实（下线拖拽后）：
- *   - 草稿路径的 `region.data` 是**执行绑定描述符**（{inputs, pipeline, outputs}），
- *     **不含** xLabels / yValues —— 所以这里**始终**返回 null，继续显示空壳卡片
- *     （需求稿 §2.6：不编造数值）；
- *   - 真正带 xLabels / yValues 的是**预览 payload**，走的是 ECharts 那条路
- *     （renderFinalRegion），不走这里。
- *
- * 本函数按需求稿 §3.3「严禁删除折线图 SVG 渲染」保留：草稿路径哪天真的拿到
- * 数据点就能直接用上（当前没有这样的数据源）。
- * 调用前必须判空、调用失败必须吞掉：绝不允许因为接图表把草稿面板渲染搞崩。
- */
-function renderRealChart(region) {
-  const data = region?.data;
-  if (!data || typeof data !== "object") return null;
-  if (!Array.isArray(data.xLabels) || !data.xLabels.length) return null;
-  if (!Array.isArray(data.yValues) || !data.yValues.length) return null;
-  const api = window.WorkbenchPlan;
-  if (!api || typeof api.renderChart !== "function") return null;
-  const kind = String(region.component?.chartKind || "LINE").toUpperCase();
-  try {
-    return api.renderChart(document, {
-      componentType: CHART_KIND_TO_COMPONENT_TYPE[kind] || "line_chart",
-      title: region.name || region.component?.title || "",
-      data,
-    });
-  } catch (err) {
-    console.error("[AI Report] 图表渲染失败", err);
-    return null;
-  }
-}
-
-function renderDataQuality(region) {
-  const fields = region.component?.fields || [];
-  return `<div class="flex gap-3">${fields
-    .map(
-      (f) =>
-        `<div class="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 flex-1">
-          <div class="text-[11px] text-slate-500">${esc(f)}</div>
-          <div class="text-sm font-semibold text-slate-800 mt-1">—</div>
-        </div>`
-    )
-    .join("")}</div>`;
-}
-
-function renderAnalysis(region) {
-  return `
-    <div class="rounded-lg bg-slate-50 border border-slate-200 p-4">
-      <div class="text-[11px] text-slate-500 mb-1">分析目标</div>
-      <div class="text-sm text-slate-700">${esc(region.component?.goal || "—")}</div>
-      <div class="text-[11px] text-slate-400 mt-2">模式: <span class="mono">${esc(region.component?.mode || "")}</span> · promptTemplate: <span class="mono">${esc(region.component?.promptTemplateRef || "")}</span></div>
-    </div>`;
-}
-
-// -------- 节点 11 RENDERING：用真实预览数据渲染 --------
-const _chartInstances = [];
-
-// 图表库可用性：CDN 挂了（断网 / 被墙 / CSP 拦了）也不能让整条状态机卡在 RENDERING。
-// 以前这里是 `echarts.init(...)` 裸调，CDN 一失败就抛 ReferenceError，
-// renderFinalReport 整个 reject，queueAdvance 永远不会执行 —— 页面永远停在 RENDERING。
-function hasEcharts() {
-  return typeof window !== "undefined" && !!window.echarts && typeof window.echarts.init === "function";
-}
-
-function destroyCharts() {
-  for (const c of _chartInstances.splice(0)) {
-    try { c.dispose(); } catch (e) {}
-  }
-}
-
-async function renderFinalReport() {
-  const payload = session.previewPayload;
-  if (!payload) {
-    toast("没有预览数据，无法渲染");
-    return;
-  }
-  destroyCharts();
-  previewRoot.innerHTML = "";
-  previewRoot.classList.remove("preview-editable"); // 成稿不可编辑
-
-  const snapshot = payload.snapshot || {};
-  const yoy = Number(snapshot.yoyPercent || 0);
-  const yoyColor = yoy >= 0 ? "text-rose-600" : "text-emerald-600";
-  const yoyArrow = yoy >= 0 ? "mdi:arrow-up" : "mdi:arrow-down";
-
-  // 顶部摘要
-  const header = document.createElement("div");
-  header.className = "bg-white rounded-xl border border-slate-200 p-5";
-  header.innerHTML = `
-    <div class="flex items-start justify-between gap-4 flex-wrap">
-      <div class="min-w-0">
-        <div class="flex items-center gap-2 flex-wrap">
-          <h2 class="text-lg font-semibold text-slate-900">${esc(payload.reportName || "报表预览")}</h2>
-          <span class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-emerald-50 text-emerald-700 border-emerald-200">
-            <iconify-icon class="text-sm" icon="mdi:check-circle-outline"></iconify-icon>预览就绪
-          </span>
-        </div>
-        <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
-          <span>机房：<span class="mono">${esc(snapshot.roomName || "—")}</span></span>
-          <span>日期：<span class="mono">${esc(payload.logicalDate || "—")}</span></span>
-          <span>runId：<span class="mono">${esc(payload.reportRunId || "—")}</span></span>
-        </div>
-      </div>
-      <div class="rounded-lg border border-slate-200 bg-slate-50 px-5 py-3">
-        <div class="text-[11px] text-slate-500">总耗电（kWh）</div>
-        <div class="text-2xl font-semibold text-slate-900 mt-1">${esc(snapshot.totalEnergyKwh ?? "—")}</div>
-        <div class="text-[11px] mt-1 inline-flex items-center gap-0.5 ${yoyColor}">
-          <iconify-icon icon="${yoyArrow}" class="text-sm"></iconify-icon>${Math.abs(yoy)}% 较前一日
-        </div>
-      </div>
-    </div>
-    ${renderGenerationInputs(session.definition)}
-  `;
-  previewRoot.appendChild(header);
-
-  // 异常提示
-  if (payload.anomalies?.length) {
-    const warn = document.createElement("div");
-    warn.className = "bg-amber-50 border border-amber-200 rounded-xl p-4";
-    warn.innerHTML = `
-      <div class="flex items-start gap-2">
-        <iconify-icon icon="mdi:alert-outline" class="text-amber-600 text-lg mt-0.5"></iconify-icon>
-        <div class="flex-1 min-w-0">
-          <div class="text-sm font-semibold text-amber-900 mb-1">数据质量提示</div>
-          <ul class="text-xs text-amber-800 space-y-0.5 list-disc ml-4">
-            ${payload.anomalies.map((a) => `<li><span class="mono">${esc(a.timeRange)}</span> · ${esc(a.note)}</li>`).join("")}
-          </ul>
-        </div>
-      </div>`;
-    previewRoot.appendChild(warn);
-  }
-
-  // 每个 region 一张卡（标题区跳过：头部已经显示报表名）
-  // 单个区域渲染失败只影响它自己：其余区域照常出，状态机照常往前走。
-  const failedRegions = [];
-  for (const region of payload.regions || []) {
-    if (isTitleRegion(region)) continue;
-    const card = document.createElement("div");
-    card.className = "bg-white rounded-xl border border-slate-200 p-5";
-    card.innerHTML = `
-      <div class="flex items-start justify-between gap-4 mb-3">
-        <h3 class="font-semibold text-slate-900">${esc(region.name || region.componentType)}</h3>
-        <span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5">${esc(finalPreviewBadge(region))}</span>
-      </div>
-      <div class="region-body"></div>
-    `;
-    const body = card.querySelector(".region-body");
-    previewRoot.appendChild(card);
-    try {
-      renderFinalRegion(body, region, payload);
-    } catch (err) {
-      console.error("[AI Report] 区域渲染失败", region?.regionId, err);
-      failedRegions.push(region?.regionId || region?.componentType || "未知区域");
-      body.innerHTML = `
-        <div class="rounded-lg bg-rose-50 border border-rose-200 p-3 text-xs text-rose-700">
-          这个区域渲染失败：${esc(err?.message || String(err))}。其余区域和后续流程不受影响。
-        </div>`;
-    }
-  }
-
-  if (failedRegions.length) {
-    const failBanner = document.createElement("div");
-    failBanner.className = "bg-rose-50 border border-rose-200 rounded-xl p-4";
-    failBanner.innerHTML = `
-      <div class="flex items-start gap-2">
-        <iconify-icon icon="mdi:alert-circle-outline" class="text-rose-600 text-lg mt-0.5"></iconify-icon>
-        <div class="flex-1 min-w-0">
-          <div class="text-sm font-semibold text-rose-900 mb-1">部分区域没有渲染出来</div>
-          <div class="text-xs text-rose-800">${failedRegions.map((id) => `<span class="mono">${esc(id)}</span>`).join("、")} 渲染失败，其余内容已正常展示。</div>
-        </div>
-      </div>`;
-    previewRoot.appendChild(failBanner);
-  }
-
-  requestAnimationFrame(() => _chartInstances.forEach((chart) => {
-    try { chart.resize(); } catch (e) {}
-  }));
-}
-
-function renderFinalRegion(container, region, payload) {
-  const t = region.componentType;
+function renderRegionPayloadBody(container, region, payload, ctx = {}) {
+  const type = region.componentType;
   const p = region.payload || {};
-  // #39 起，占位区域的预览 payload 是 {placeholder: true, reason, ...} ——
-  // **没有** value / label / unit / rows / yValues。
-  // 任何组件类型都要如实显示「暂无数值 + 原因」：
-  //   · 不显示原因 = 用户只看到一个空卡片，不知道为什么没有数；
-  //   · 直接插 ${p.value} = 页面上出现字面量 "undefined"。
-  if (p.placeholder) {
-    container.innerHTML = `
-      <div class="rounded-lg border border-dashed border-amber-200 bg-amber-50 px-4 py-3">
-        <div class="text-sm font-medium text-amber-900">暂无数值</div>
-        <div class="text-[11px] text-amber-800 mt-1">${esc(p.reason || "数据待连接：当前已接通的能力里没有对应指标。")}</div>
-      </div>`;
+  const unit = ctx.unit ?? readPayloadUnit(region, p, ctx.defRegion);
+
+  if (type === "TEXT") {
+    container.innerHTML = `<div class="text-xl font-semibold text-slate-800">${esc(p.rendered || p.template || "")}</div>`;
     return;
   }
-  if (t === "TEXT") {
-    container.innerHTML = `<div class="text-xl font-semibold text-slate-800">${esc(p.rendered || p.template || "")}</div>`;
-  } else if (t === "METRIC_CARD") {
+
+  if (type === "METRIC_CARD") {
+    const metrics = Array.isArray(p.metrics) ? p.metrics.filter((m) => m && typeof m === "object") : [];
+    // 主量已经在大卡片上显示了，其余指标单独列出来（多指标区域不能只剩一个数）。
+    const others = metrics.filter((m) => !(String(m.label || "") === String(p.label || "") && Number(m.value) === Number(p.value)));
+    const yoy = Number(p.yoyPercent);
+    const showYoy = p.comparisonAvailable !== false && p.yoyPercent != null && Number.isFinite(yoy);
     container.innerHTML = `
       <div class="rounded-lg border border-slate-200 bg-slate-50 px-5 py-4 inline-block">
-        <div class="text-[11px] text-slate-500">${esc(p.label)}</div>
-        <div class="text-3xl font-semibold text-slate-900 mt-1">${esc(p.value ?? "—")}<span class="text-sm font-normal text-slate-400 ml-1">${esc(p.unit)}</span></div>
-      </div>`;
-  } else if (t === "TABLE") {
-    const headCells = (p.columns || [])
+        <div class="text-[11px] text-slate-500">${esc(p.label || "指标")}</div>
+        <div class="text-3xl font-semibold text-slate-900 mt-1">${esc(formatMetricValue(p.value, p.precision))}<span class="text-sm font-normal text-slate-400 ml-1">${esc(unit)}</span></div>
+        ${showYoy ? `<div class="text-[11px] mt-1 ${yoy >= 0 ? "text-rose-600" : "text-emerald-600"}">${yoy >= 0 ? "↑" : "↓"} ${Math.abs(yoy)}% 较上一周期</div>` : ""}
+        ${p.windowLabel ? `<div class="text-[11px] text-slate-400 mt-1">${esc(p.windowLabel)}</div>` : ""}
+      </div>
+      ${others.length ? `
+      <div class="mt-3 grid gap-2 sm:grid-cols-2">
+        ${others.map((m) => `
+          <div class="rounded-lg border border-slate-200 bg-white px-3 py-2" data-region-metric="${esc(m.metricKey || m.label || "")}">
+            <div class="text-[11px] text-slate-500">${esc(m.label || m.metricKey || "指标")}</div>
+            <div class="text-base font-semibold text-slate-900 mt-0.5">${esc(formatMetricValue(m.value, m.precision))}<span class="text-[11px] font-normal text-slate-400 ml-1">${esc(m.unit || "")}</span></div>
+          </div>`).join("")}
+      </div>` : ""}`;
+    return;
+  }
+
+  if (type === "TABLE") {
+    const columns = Array.isArray(p.columns) ? p.columns : [];
+    const rows = Array.isArray(p.rows) ? p.rows : [];
+    const headCells = columns
       .map(
         (c) =>
           `<th class="text-left font-medium px-3 py-2 text-slate-500">${esc(c.label)}${c.format?.unitLabel ? ` <span class="text-slate-400 font-normal">(${esc(c.format.unitLabel)})</span>` : ""}</th>`
       )
       .join("");
-    const bodyRows = (p.rows || [])
+    const bodyRows = rows
       .map((row, idx) => {
-        const cells = (p.columns || [])
+        const cells = columns
           .map((c) => {
-            const val = row[c.fieldRef];
-            const kind = c.format?.kind;
-            if (kind === "NUMBER") {
-              const prec = c.format.precision ?? 1;
-              return `<td class="px-3 py-2.5 text-slate-700 mono">${Number(val).toFixed(prec)}</td>`;
+            const val = row?.[c.fieldRef];
+            if (c.format?.kind === "NUMBER") {
+              const num = Number(val);
+              const text = Number.isFinite(num) ? num.toFixed(c.format.precision ?? 1) : val == null ? "" : String(val);
+              return `<td class="px-3 py-2.5 text-slate-700 mono">${esc(text)}</td>`;
             }
             return `<td class="px-3 py-2.5 text-slate-700">${esc(val ?? "")}</td>`;
           })
@@ -2441,74 +2596,38 @@ function renderFinalRegion(container, region, payload) {
         return `<tr class="hover:bg-slate-50">${p.rowNumber ? `<td class="px-3 py-2.5 text-slate-400 mono">${idx + 1}</td>` : ""}${cells}</tr>`;
       })
       .join("");
+
+    // 行被截断时必须说清楚：不然「各行之和 ≠ 报表总量」会变成用户眼里的矛盾。
+    const truncation = readTableTruncation(p, ctx.defRegion, ctx.totalsByUnit);
+    const truncationNote = truncation
+      ? `<div class="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-2" data-table-truncated="true">仅显示前 ${truncation.limit} 行（表格行数被截断，各行之和小于报表总量）</div>`
+      : "";
+
     container.innerHTML = `
       <table class="w-full text-sm">
         <thead class="bg-slate-50 text-xs">
           <tr>${p.rowNumber ? '<th class="text-left font-medium px-3 py-2 text-slate-500 w-10">#</th>' : ""}${headCells}</tr>
         </thead>
         <tbody class="divide-y divide-slate-100">${bodyRows}</tbody>
-      </table>`;
-  } else if (t === "CHART") {
-    // 图表库不可用时给占位，不抛异常：数据已经就绪，不能因为一个 CDN 挂了就卡住整条流程。
-    if (!hasEcharts()) {
-      container.innerHTML = `
-      <div class="rounded-lg bg-amber-50 border border-amber-200 h-[260px] flex items-center justify-center px-4">
-        <div class="text-center text-amber-700">
-          <iconify-icon class="text-3xl" icon="mdi:chart-line-variant"></iconify-icon>
-          <div class="text-sm mt-1">图表库加载失败，但数据已就绪</div>
-          <div class="text-[11px] mt-1">ECharts CDN 不可用；该区域的图表暂时画不出来，后续流程不受影响。</div>
-        </div>
-      </div>`;
-      return;
-    }
-    const div = document.createElement("div");
-    div.style.height = "260px";
-    container.appendChild(div);
-    const kind = p.chartKind || "LINE";
-    let chart = null;
-    try {
-      chart = window.echarts.init(div);
-      _chartInstances.push(chart);
-      chart.setOption({
-        tooltip: { trigger: "axis" },
-        grid: { left: 50, right: 20, top: 24, bottom: 36 },
-        xAxis: {
-          type: "category",
-          data: p.xLabels || [],
-          axisLabel: { fontSize: 11 },
-        },
-        yAxis: {
-          type: "value",
-          name: "kWh",
-          nameTextStyle: { fontSize: 10, color: "#64748b" },
-          axisLabel: { fontSize: 11 },
-        },
-        series: [
-          {
-            name: "耗电",
-            data: p.yValues || [],
-            type: kind === "BAR" ? "bar" : "line",
-            smooth: true,
-            areaStyle: kind === "AREA" ? { opacity: 0.3 } : undefined,
-            itemStyle: { color: "#2563eb" },
-            lineStyle: { color: "#2563eb" },
-          },
-        ],
-      });
-    } catch (err) {
-      console.error("[AI Report] 图表初始化失败", err);
-      container.innerHTML = `
-      <div class="rounded-lg bg-amber-50 border border-amber-200 h-[260px] flex items-center justify-center px-4">
-        <div class="text-center text-amber-700">
-          <iconify-icon class="text-3xl" icon="mdi:chart-line-variant"></iconify-icon>
-          <div class="text-sm mt-1">图表库加载失败，但数据已就绪</div>
-          <div class="text-[11px] mt-1">${esc(err?.message || String(err))}</div>
-        </div>
-      </div>`;
-    }
-  } else if (t === "DATA_QUALITY") {
+      </table>
+      ${truncationNote}`;
+    return;
+  }
+
+  if (type === "CHART") {
+    renderChartPayload(container, region, p, unit);
+    return;
+  }
+
+  if (type === "DATA_QUALITY") {
+    const coverage = Number(p.coverage);
+    const coverageText = p.coverage == null
+      ? "—"
+      : Number.isFinite(coverage)
+        ? (Math.abs(coverage) <= 1 ? (coverage * 100).toFixed(1) + "%" : coverage.toFixed(1) + "%")
+        : String(p.coverage);
     const items = [
-      { label: "覆盖率", value: p.coverage != null ? (p.coverage * 100).toFixed(1) + "%" : "—" },
+      { label: "覆盖率", value: coverageText },
       { label: "缺失点", value: p.missing ?? "—" },
       { label: "重复点", value: p.duplicates ?? 0 },
       { label: "新鲜度 (s)", value: p.freshnessSeconds ?? "—" },
@@ -2525,22 +2644,163 @@ function renderFinalRegion(container, region, payload) {
           )
           .join("")}
       </div>`;
-  } else if (t === "ANALYSIS") {
+    return;
+  }
+
+  if (type === "ANALYSIS") {
     container.innerHTML = `
       <div class="rounded-lg bg-blue-50 border border-blue-200 p-4">
         <div class="flex items-start gap-2">
-          <iconify-icon icon="mdi:lightbulb-on-outline" class="text-blue-600 text-lg mt-0.5"></iconify-icon>
+          <iconify-icon class="text-blue-600 text-lg mt-0.5" icon="mdi:lightbulb-on-outline"></iconify-icon>
           <div class="flex-1 min-w-0">
             <div class="text-[11px] text-blue-700 mb-1">AI 解读</div>
             <div class="text-sm text-slate-800 leading-relaxed">${esc(p.analysis || "")}</div>
           </div>
         </div>
       </div>`;
-  } else {
-    container.innerHTML = `<pre class="mono text-[11px] text-slate-500 bg-slate-50 rounded p-2">${esc(JSON.stringify(p, null, 2).slice(0, 400))}</pre>`;
+    return;
+  }
+
+  container.innerHTML = `<pre class="mono text-[11px] text-slate-500 bg-slate-50 rounded p-2 overflow-x-auto">${esc(JSON.stringify(p, null, 2).slice(0, 400))}</pre>`;
+}
+
+// 草稿区域的 chartKind（LINE / BAR / PIE）→ 图表渲染器认识的 componentType。
+const CHART_KIND_TO_COMPONENT_TYPE = {
+  LINE: "line_chart",
+  BAR: "bar_chart",
+  PIE: "pie_chart",
+  AREA: "line_chart",
+};
+
+// 多指标图表的系列配色（按顺序取）。
+const CHART_SERIES_COLORS = ["#2563eb", "#16a34a", "#d97706", "#9333ea", "#0891b2"];
+
+/**
+ * 图表区域：按载荷真的把图画出来。
+ *
+ * 两条渲染后端，同一套逻辑：
+ *   - ECharts 可用 → 画真图表（纵轴名与系列名都从载荷读，绝不硬编码 kWh / 耗电）；
+ *   - ECharts 不可用（CDN 挂了 / 断网）→ 用方案模块导出的 SVG 渲染器
+ *     （需求稿 §3.3 保护的那段代码），照样把曲线 / 柱条画出来。
+ * 两条都不通 → 把点列出来，数据仍然可见，不留空壳。
+ */
+function renderChartPayload(container, region, p, unit) {
+  const kind = String(p.chartKind || "LINE").toUpperCase();
+  const labels = Array.isArray(p.xLabels) ? p.xLabels : [];
+  const values = Array.isArray(p.yValues) ? p.yValues : [];
+  const series = Array.isArray(p.series) && p.series.length ? p.series : null;
+
+  if (!labels.length || (!values.length && !(series && series[0]?.yValues?.length))) {
+    container.innerHTML = `<div class="rounded-lg bg-slate-50 border border-slate-200 px-4 py-3 text-xs text-slate-500">这个图表还没有数据点。</div>`;
+    return;
+  }
+
+  if (hasEcharts()) {
+    const div = document.createElement("div");
+    div.style.height = "260px";
+    container.appendChild(div);
+    try {
+      const chart = window.echarts.init(div);
+      _chartInstances.push(chart);
+      // 系列名从载荷读：多指标取各自 label，单指标取载荷里的指标名，再退到单位。
+      const seriesOption = series
+        ? series.map((item, index) => ({
+            name: String(item.label || item.metricKey || unit || "指标"),
+            data: Array.isArray(item.yValues) ? item.yValues : [],
+            type: kind === "BAR" ? "bar" : "line",
+            smooth: true,
+            areaStyle: kind === "AREA" ? { opacity: 0.3 } : undefined,
+            itemStyle: { color: CHART_SERIES_COLORS[index % CHART_SERIES_COLORS.length] },
+            lineStyle: { color: CHART_SERIES_COLORS[index % CHART_SERIES_COLORS.length] },
+          }))
+        : [{
+            name: String(p.metrics?.[0]?.label || unit || "数值"),
+            data: values,
+            type: kind === "BAR" ? "bar" : "line",
+            smooth: true,
+            areaStyle: kind === "AREA" ? { opacity: 0.3 } : undefined,
+            itemStyle: { color: CHART_SERIES_COLORS[0] },
+            lineStyle: { color: CHART_SERIES_COLORS[0] },
+          }];
+      chart.setOption({
+        tooltip: { trigger: "axis" },
+        grid: { left: 60, right: 20, top: 24, bottom: 36 },
+        xAxis: {
+          type: "category",
+          data: labels,
+          axisLabel: { fontSize: 11 },
+        },
+        yAxis: {
+          type: "value",
+          // 纵轴单位一律从载荷读：PUE、总电费、实时功率都不是 kWh。
+          name: unit || undefined,
+          nameTextStyle: { fontSize: 10, color: "#64748b" },
+          axisLabel: { fontSize: 11 },
+        },
+        series: seriesOption,
+      });
+      return;
+    } catch (err) {
+      console.error("[AI Report] 图表初始化失败", err);
+      container.innerHTML = "";
+    }
+  }
+
+  // ECharts 不可用：走方案模块的 SVG 渲染器（不依赖 CDN，照样画曲线 / 柱条）。
+  const api = window.WorkbenchPlan;
+  if (api && typeof api.renderChart === "function") {
+    try {
+      const node = api.renderChart(document, {
+        componentType: CHART_KIND_TO_COMPONENT_TYPE[kind] || "line_chart",
+        title: region.name || "",
+        data: { xLabels: labels, yValues: values, unit },
+      });
+      container.appendChild(node);
+      // 折线渲染器自带「单位：…」说明；柱条那条没有 —— 这里补上，
+      // 保证「图上的单位写清楚」这条在两条渲染后端上都成立。
+      if (unit && !String(node.textContent || "").includes("单位：")) {
+        const note = document.createElement("div");
+        note.className = "text-[11px] text-slate-400 mt-1";
+        note.dataset.chartUnit = "true";
+        note.textContent = "单位：" + unit + "，共 " + labels.length + " 个数据点";
+        container.appendChild(note);
+      }
+      return;
+    } catch (err) {
+      console.error("[AI Report] 图表渲染失败", err);
+    }
+  }
+
+  // 兜底：至少把点列出来，数据不丢。
+  container.innerHTML = `
+    <div class="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+      <div class="text-[11px] text-slate-500 mb-1">${esc(unit || "数值")}</div>
+      ${labels.map((label, index) => `<div class="text-xs text-slate-700 mono">${esc(label)}: ${esc(values[index] ?? "")}</div>`).join("")}
+    </div>`;
+}
+
+// -------- 节点 11 RENDERING：用真实预览数据渲染 --------
+const _chartInstances = [];
+
+// 图表库可用性：CDN 挂了（断网 / 被墙 / CSP 拦了）也不能让整条状态机卡住。
+// 以前这里是 `echarts.init(...)` 裸调，CDN 一失败就抛 ReferenceError，
+// 整个渲染 reject，queueAdvance 永远不会执行 —— 页面永远停在 RENDERING。
+// 现在图表还有一条不依赖 CDN 的退路（方案模块的 SVG 渲染器），画不出图也不会卡流程。
+function hasEcharts() {
+  return typeof window !== "undefined" && !!window.echarts && typeof window.echarts.init === "function";
+}
+
+function destroyCharts() {
+  for (const c of _chartInstances.splice(0)) {
+    try { c.dispose(); } catch (e) {}
   }
 }
 
+// 独立的预览面板渲染器（renderFinalReport / renderFinalRegion）已下线：
+// 规格 #46 取消了独立的报表预览阶段 —— 草稿阶段右侧已经是带数的报表，
+// 点「同意」之后屏幕上的数字不动，只由徽标与顶部说明反映进度。
+// 校验与试运行照跑（状态机照旧推进到 READY），产物保留在主线，
+// 将来接真实数据时直接复用；前端不再按预览状态切换渲染入口。
 // -------- 会话导航栏 --------
 const sessionListRoot = $("session-list");
 
@@ -2675,8 +2935,13 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   session.definition = detail.snapshot?.definition ?? null;
   session.policy = detail.snapshot?.policy ?? null;
   session.lastReportRun = detail.snapshot?.lastReportRun ?? null;
+  // 两个键，语义不同：
+  //   - previewPayload：试运行结果（持久化的快照里就有）；
+  //   - reportPreviewPayload：草稿阶段的模拟示意 —— 后端按同一份定义与上下文
+  //     重新生成的同构载荷，**临时附加**在这次会话读取响应上（没有落库）。
   session.previewPayload = detail.snapshot?.previewPayload ?? null;
   session.baseDefinitionRevision = session.definition?.metadata?.revision ?? null;
+  applyReportPreviewPayload(detail.snapshot?.reportPreviewPayload ?? null);
   writeLastSessionId(detail.sessionId);
 
   // 恢复文字方案（#19）：方案与阶段存在服务端快照里，
@@ -2706,17 +2971,11 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
     }
   }
 
-  // 恢复右侧报表预览
-  if (session.previewPayload) {
-    try {
-      await renderFinalReport();
-    } catch (err) {
-      console.error("[AI Report] 恢复预览失败", err);
-    }
-  } else if (session.definition) {
-    renderPreview(session.definition);
-  } else {
-    previewRoot.appendChild(previewEmpty);
+  // 恢复右侧报表面板：只有一条渲染入口，数据只来自示意载荷。
+  try {
+    renderReportPanel();
+  } catch (err) {
+    console.error("[AI Report] 恢复报表失败", err);
   }
 
   // 恢复状态徽标
@@ -2860,6 +3119,7 @@ function startNewSession() {
   session.editingTargetRegionId = null;
   session.lastReportRun = null;
   session.previewPayload = null;
+  session.reportPreviewPayload = null;
   session.pendingResume = null;
   session.workspaceId = null;
   // 新对话还没有自己的 sessionId（要等第一条消息才向后端要），
