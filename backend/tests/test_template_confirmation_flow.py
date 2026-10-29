@@ -793,3 +793,166 @@ def test_reopening_session_database_restores_confirmation_and_can_continue(clien
     assert after["pendingChoice"] == before["pendingChoice"]
     assert _post(client, "同意", message_id="save_restored").json()["state"] == "SAVE_DEFINITION_DRAFT"
     assert _post(client, "__advance__", message_id="advance_restored").json()["state"] == "VALIDATING"
+
+
+# --------------------------------------------------------------------------
+# 6. 「重新开始」：草稿已就绪阶段复位回设计流（工单 #44）
+# --------------------------------------------------------------------------
+#
+# 「下线网格拖拽 + 确认方案直出草稿」改造之后，草稿已就绪阶段的
+# 「重新开始」不再重置设计阶段：这个会话永远停在 DRAFT_READY，
+# 下一句需求被 design_turn 判据排除在设计流之外，再也拿不到新的
+# 文字方案。
+#
+# 修法：阶段**落库**复位回 PLAN_NEEDED（保留方案与版本号），响应带上
+# 复位后的阶段，选择锁一并清掉。
+
+
+def _restart(client, message_id="restart_1"):
+    """点草稿菜单上的「重新开始」。"""
+    return _post(client, "重新开始", message_id=message_id).json()
+
+
+def test_restart_after_draft_ready_resets_the_design_phase(client, monkeypatch):
+    """「重新开始」把设计阶段**落库**复位回「需要生成方案」。
+
+    工单 #44 的根因就在这里：阶段不复位，这个会话就永远停在
+    DRAFT_READY。
+
+    钉住四件事：
+        1. 响应带复位后的阶段 —— 前端靠它把「确认方案」按钮重新放开；
+        2. 阶段是**落库**的，不只是回给前端的一句话；
+        3. 选择锁清掉 —— 这份菜单已经作废；
+        4. 方案与版本号原样保留 —— 复位不是删历史。
+    """
+    model, plan = _plan(client, monkeypatch)
+    _confirm_plan(client, plan)
+
+    restarted = _restart(client)
+
+    assert restarted["error"] is None
+    assert restarted["designPhase"] == "PLAN_NEEDED"
+    assert restarted["uiActions"] == ["restart_from_template_editing"]
+    # 落库的那一份也是复位的。
+    stored = report_design_service.repository.load("sess_tpl_1")
+    assert stored["designPhase"] == "PLAN_NEEDED"
+    detail = client.get("/api/sessions/sess_tpl_1").json()
+    assert detail["snapshot"]["designPhase"] == "PLAN_NEEDED"
+    # 选择锁清掉：菜单作废，锁不能留着挡下一句自由输入。
+    assert detail["pendingChoice"] is None
+    # 方案与版本号保留：复位不是删历史。
+    assert stored["reportPlan"]["id"] == plan["id"]
+    assert stored["reportPlan"]["revision"] == plan["revision"]
+    # 这一轮没有调模型。
+    assert len(model.calls) == 1
+
+
+def test_restart_after_draft_ready_returns_to_the_text_plan_flow(client, monkeypatch):
+    """复位后下一句需求**回到**「文字方案 → 确认方案」链路。
+
+    这是 #44 的用户可见症状：复位前这句需求掉出设计流 —— 走的是旧流程，
+    拿不到新的文字方案。
+
+    钉住：阶段回到「待确认方案」；新方案与旧方案**同 id、版本号 +1**
+    （方案血缘不断，但版本标识与旧方案不同）；模型确实被调了；旧草稿
+    没有被带进新一轮。
+    """
+    model, plan = _plan(
+        client, monkeypatch, _candidate(), _candidate(topic="A 机房能耗周报")
+    )
+    _confirm_plan(client, plan)
+    _restart(client)
+
+    fresh = _post(client, "生成 A 机房最近 7 天能耗周报", message_id="new_req").json()
+
+    assert fresh["error"] is None
+    assert fresh["designPhase"] == "PLAN_WAITING_CONFIRM"
+    new_plan = fresh["domainObjects"]["reportPlan"]
+    assert new_plan is not None
+    # 方案血缘不断：同一 id、版本号 +1。
+    assert new_plan["id"] == plan["id"]
+    assert new_plan["revision"] == plan["revision"] + 1
+    assert (new_plan["id"], new_plan["revision"]) != (plan["id"], plan["revision"])
+    # 模型确实被调了（复位前这一轮根本进不了设计流）。
+    assert len(model.calls) == 2
+    # 旧的草稿没有被带进新一轮。
+    assert fresh["domainObjects"]["reportDefinitionDraft"] is None
+    assert fresh["domainObjects"]["reportPolicyDraft"] is None
+    stored = report_design_service.repository.load("sess_tpl_1")
+    assert stored["designPhase"] == "PLAN_WAITING_CONFIRM"
+    assert stored["reportPlan"]["revision"] == plan["revision"] + 1
+
+
+def test_restart_after_draft_ready_can_produce_a_new_draft(client, monkeypatch):
+    """复位后新一轮确认：出的是**新草稿**，不是复用旧的那一份。
+
+    钉住：新草稿绑定新一版方案（planRevision +1）、与旧草稿不是同一份、
+    模板也是重新生成的那一份。
+    """
+    _, plan = _plan(
+        client, monkeypatch, _candidate(), _candidate(topic="A 机房能耗周报")
+    )
+    confirmed = _confirm_plan(client, plan)
+    old_draft = confirmed["domainObjects"]["reportDefinitionDraft"]
+    old_template = confirmed["domainObjects"]["templateDesign"]
+    _restart(client)
+    fresh = _post(client, "生成 A 机房最近 7 天能耗周报", message_id="new_req").json()
+    new_plan = fresh["domainObjects"]["reportPlan"]
+
+    again = _confirm_plan(client, new_plan, "confirm_plan_2")
+
+    assert again["error"] is None
+    assert again["designPhase"] == "DRAFT_READY"
+    new_draft = again["domainObjects"]["reportDefinitionDraft"]
+    assert new_draft is not None
+    # 新草稿绑定的是**新一版**方案。
+    binding = new_draft["metadata"]["templateBinding"]
+    assert binding["planRevision"] == new_plan["revision"]
+    assert binding["planRevision"] == plan["revision"] + 1
+    # 与旧草稿不是同一份：模板是重新生成的那一份。
+    assert new_draft != old_draft
+    assert again["domainObjects"]["templateDesign"]["id"] != old_template["id"]
+    # 旧草稿仍在库里：复位不删历史。
+    assert report_design_service.repository.load("sess_tpl_1")["definitionDraft"] is not None
+
+
+def test_restart_does_not_break_the_duplicate_confirmation_idempotency(client, monkeypatch):
+    """复位**不破坏**「重复确认复用同一份草稿」的既有契约。
+
+    复位保留方案版本号，所以同一版方案重复确认仍然命中确认关系表，
+    复用同一份草稿、不产生第二份、模板版本号不被推高。
+    """
+    model, plan = _plan(client, monkeypatch)
+    first = _confirm_plan(client, plan, "confirm_plan")
+    _restart(client)
+    # 前置条件：复位确实发生了（否则下面验的不是「复位之后」）。
+    assert report_design_service.repository.load("sess_tpl_1")["designPhase"] == "PLAN_NEEDED"
+
+    again = _confirm_plan(client, plan, "confirm_plan_again")
+
+    assert again["error"] is None
+    assert again["domainObjects"]["reportDefinitionDraft"] == first["domainObjects"]["reportDefinitionDraft"]
+    assert again["domainObjects"]["templateDesign"]["id"] == first["domainObjects"]["templateDesign"]["id"]
+    stored = report_design_service.repository.load("sess_tpl_1")
+    assert stored["definitionDraft"] == first["domainObjects"]["reportDefinitionDraft"]
+    assert stored["templateDesign"]["revision"] == first["domainObjects"]["templateDesign"]["revision"]
+    assert len(model.calls) == 1
+
+
+def test_modify_choice_does_not_reset_the_design_phase(client, monkeypatch):
+    """「修改」不受复位影响：仍进 USER_EDITING_TEMPLATE，阶段仍是 DRAFT_READY。
+
+    复位只由「重新开始」触发 —— 同一个菜单上另外两个按钮的行为不能被
+    带偏。
+
+    这条是**不变式守卫**：它钉的是「修复不该动的地方」，所以修复前后
+    都应当通过；真正检测 #44 回归的是上面三条。
+    """
+    _, plan = _plan(client, monkeypatch)
+    _confirm_plan(client, plan)
+
+    payload = _post(client, "修改", message_id="modify_choice").json()
+
+    assert payload["error"] is None
+    assert payload["state"] == "USER_EDITING_TEMPLATE"
+    assert report_design_service.repository.load("sess_tpl_1")["designPhase"] == "DRAFT_READY"

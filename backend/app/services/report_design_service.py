@@ -699,6 +699,71 @@ class ReportDesignService:
                                               "当前模板保持原样，请修改方案或重试。"
                                           ))
 
+    def restart_design(
+        self, request: AgentRequest, *, state: dict[str, Any] | None
+    ) -> AgentResponse:
+        """「重新开始」：把设计阶段复位回「需要生成方案」（工单 #44）。
+
+        草稿已就绪阶段点「重新开始」之后，这个会话必须能重新回到
+        「文字方案 → 确认方案」链路。复位是**落库**的：设计阶段写回
+        ``PLAN_NEEDED``，当前成功方案与版本号原样保留（不删历史）——
+        新一轮的方案沿用同一 id、版本号 +1，方案血缘不断。
+
+        阶段复位与「重新开始」这一轮的消息、会话快照在**同一笔事务**里
+        提交：要么一起成功，要么一起回滚，不会留下「阶段复位了但这一轮
+        没记下来」的半截状态。
+
+        没有设计状态（旧流程的会话）时保持原语义：只回一句提示，
+        不碰设计存储。
+        """
+        if state is None:
+            # 旧流程的会话没有设计阶段可复位：行为与原来完全一致。
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.ANALYZING,
+                reply="好的，我们重新开始。请描述你想生成的新报表。",
+                uiActions=["restart_from_template_editing"],
+            )
+
+        response = AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.ANALYZING,
+            reply="好的，我们重新开始。请描述你想生成的新报表。",
+            designSessionId=request.context.designSessionId,
+            # 阶段复位必须**回传给前端**：前端的「确认方案」按钮靠
+            # ``designPhase == "PLAN_WAITING_CONFIRM"`` 才可用，复位后这一位
+            # 要回到「需要生成方案」，否则按钮一直禁用。
+            designPhase=DESIGN_PHASE_PLAN_NEEDED,
+            uiActions=["restart_from_template_editing"],
+        )
+        write_turn = self._make_write_turn(request, response)
+
+        def write_restart(connection) -> None:
+            write_turn(connection)
+            # 选择锁一并清掉：这份菜单已经作废，锁留着会让下一句自由
+            # 输入被「必须从菜单里选」挡住。
+            connection.execute(
+                "UPDATE sessions SET pending_choice = NULL WHERE id = ?",
+                (self.session_key(request),),
+            )
+
+        try:
+            self.repository.reset_design_phase(
+                self.session_key(request), write_restart
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[report_design] 阶段复位失败")
+            return self._failure_response(
+                request,
+                state,
+                code="DESIGN_RESET_FAILED",
+                message="没能重新开始，当前草稿保持原样，请重试。",
+                retryable=True,
+            )
+        # 这一轮已经随阶段复位同事务落库：路由层不要再落一遍。
+        response.turnPersisted = True
+        return response
+
     def _handle_vague_approval(
         self,
         request: AgentRequest,

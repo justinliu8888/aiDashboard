@@ -45,6 +45,7 @@ from app.storage.report_design_repository import (
     DesignTemplateConflictError,
     DesignTemplateNotFoundError,
     LoadResult,
+    PhaseResetResult,
     WriteTurn,
 )
 
@@ -967,6 +968,88 @@ class SqliteReportDesignRepository:
             except Exception:
                 conn.rollback()
                 raise
+
+    # ---------- 阶段复位 ----------
+
+    def reset_design_phase(
+        self, session_id: str, write_turn: WriteTurn | None = None
+    ) -> PhaseResetResult:
+        """把设计阶段复位回 ``PLAN_NEEDED``（工单 #44）。
+
+        只改阶段：当前成功方案（``plan_id`` / ``plan_revision`` /
+        ``plan_json``）**原样保留**。清空方案等于删历史，而且会把
+        版本号压回 1 与旧方案撞版本；保留之后新一轮沿用同一 id、
+        版本号 +1，方案血缘不断。
+
+        幂等：本来就已经是 ``PLAN_NEEDED`` 时再复位一次，结果相同，
+        不报错、不动方案、也不动 ``updated_at``。
+        """
+        if not session_id:
+            raise ValueError("session_id 不能为空")
+
+        with self._lock:
+            conn = self._conn
+            self._begin(conn)
+            try:
+                state = self._fetch_design_state(conn, session_id)
+                now = _now()
+                if state is None:
+                    # 会话还没进过设计流程：记下「需要一份方案」。
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO report_design_sessions
+                            (session_id, design_phase, plan_id, plan_revision,
+                             plan_json, created_at, updated_at)
+                        VALUES (?, ?, NULL, NULL, NULL, ?, ?)
+                        """,
+                        (session_id, DESIGN_PHASE_PLAN_NEEDED, now, now),
+                    )
+                    result: PhaseResetResult = {
+                        "sessionId": session_id,
+                        "designPhase": DESIGN_PHASE_PLAN_NEEDED,
+                        "planId": None,
+                        "planRevision": None,
+                        "changed": True,
+                    }
+                elif state.phase == DESIGN_PHASE_PLAN_NEEDED:
+                    # 幂等：已经是「需要生成方案」，什么都不用改。
+                    result = {
+                        "sessionId": session_id,
+                        "designPhase": DESIGN_PHASE_PLAN_NEEDED,
+                        "planId": state.plan_id,
+                        "planRevision": state.revision,
+                        "changed": False,
+                    }
+                else:
+                    conn.execute(
+                        "UPDATE report_design_sessions"
+                        " SET design_phase = ?, updated_at = ?"
+                        " WHERE session_id = ?",
+                        (DESIGN_PHASE_PLAN_NEEDED, now, session_id),
+                    )
+                    result = {
+                        "sessionId": session_id,
+                        "designPhase": DESIGN_PHASE_PLAN_NEEDED,
+                        "planId": state.plan_id,
+                        "planRevision": state.revision,
+                        "changed": True,
+                    }
+                if write_turn is not None:
+                    write_turn(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        logger.info(
+            "[report_design] 设计阶段已复位 session=%s phase=%s plan=%s rev=%s changed=%s",
+            session_id,
+            result["designPhase"],
+            result["planId"],
+            result["planRevision"],
+            result["changed"],
+        )
+        return result
 
     # ---------- 内部 ----------
 
