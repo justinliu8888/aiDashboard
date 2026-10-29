@@ -76,7 +76,10 @@ def test_analysis_of_filtered_report_never_mentions_excluded_devices():
     assert analysis, "分析段不能为空"
     for excluded in ("UPS-01", "UPS", "机架", "配电"):
         assert excluded not in analysis, f"分析段泄漏了被排除的设备/类型：{excluded} —— {analysis}"
-    assert "CRAC-01" in analysis, f"分析段没有引用范围内设备：{analysis}"
+    rows = _ranking_rows(regions)
+    assert {r["deviceId"] for r in rows} == {"crac_01", "crac_02"}
+    # Mock 排名随日期变化，分析应引用过滤后的排名首项。
+    assert rows[0]["deviceName"] in analysis, f"分析段没有引用范围内最高耗电设备：{analysis}"
 
 
 def test_analysis_total_matches_filtered_card_not_room_total():
