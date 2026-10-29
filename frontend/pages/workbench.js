@@ -142,9 +142,10 @@ let businessMenuReplayed = false;
 const planState = {
   designPhase: null,
   reportPlan: null,
-  templateDesign: null,
   busy: false,
   error: null,
+  // 已确认方案的折叠视图是否展开。默认收起（需求稿 §2.8）。
+  planExpanded: false,
 };
 
 /** 能不能确认：只由明确的几个条件决定，不靠文案猜。 */
@@ -162,22 +163,29 @@ function renderPlanModule() {
   if (!planRoot) return;
   const api = window.WorkbenchPlan;
   if (!api) return;
-  const hasPlan = !!(planState.reportPlan || planState.designPhase) && planState.designPhase !== "DRAFT_READY";
-  // 有方案时，右侧草稿预览的空态让位（避免「还没有草稿」误导）。
-  previewRoot.classList.toggle("plan-active", hasPlan);
+  // 草稿阶段也要保留方案面板（折叠的已确认方案）—— 不再排除 DRAFT_READY。
+  const hasPlan = !!planState.reportPlan || !!planState.designPhase;
+  // 草稿空态只在「有方案、但还没出草稿」时让位。
+  // DRAFT_READY 时若草稿还没到，宁可显示空态，也不要留一块空白。
+  const hasDraft = !!(session.definition && Array.isArray(session.definition.regions) && session.definition.regions.length);
+  const hideEmpty = hasPlan && !hasDraft && planState.designPhase !== "DRAFT_READY";
+  previewRoot.classList.toggle("plan-active", hideEmpty);
   if (!hasPlan) {
     api.clear(planRoot);
     return;
   }
+  // 记住用户有没有展开折叠视图：重渲染（busy 抖动 / 新响应）时不把它弹回去。
+  const existing = planRoot.querySelector("details.confirmed-plan-details");
+  if (existing) planState.planExpanded = existing.open === true;
   api.render(
     planRoot,
     {
       designPhase: planState.designPhase,
       reportPlan: planState.reportPlan,
-      templateDesign: planState.templateDesign,
       busy: planState.busy,
       error: planState.error,
       canConfirm: planCanConfirm(),
+      planExpanded: planState.planExpanded,
     },
     { onAction: handlePlanAction }
   );
@@ -188,16 +196,14 @@ function syncPlanFromResponse(data) {
   if (!data) return;
   const phase = data.designPhase || null;
   const plan = data.domainObjects?.reportPlan || null;
-  const template = data.domainObjects?.templateDesign || null;
-  if (!phase && !plan && !template) return;
+  if (!phase && !plan) return;
   planState.designPhase = phase || planState.designPhase;
   if (plan) planState.reportPlan = plan;
-  if (template) planState.templateDesign = template;
-  else if (phase === "PLAN_WAITING_CONFIRM" || phase === "PLAN_NEEDED") planState.templateDesign = null;
   // 出错时展示错误条；成功时清掉上一次的错误。
   planState.error = data.error ? data.error.message || data.error.code || null : null;
   renderPlanModule();
-  if (template) planRoot.parentElement.scrollTop = 0;
+  // 草稿已出：把右侧滚回顶部，让用户第一眼看到草稿而不是聊天记录。
+  if (phase === "DRAFT_READY") planRoot.parentElement.scrollTop = 0;
 }
 
 /** 从会话详情里恢复方案（刷新 / 重建服务后）。 */
@@ -205,27 +211,16 @@ function restorePlanFromDetail(detail) {
   const snapshot = detail?.snapshot || {};
   planState.designPhase = snapshot.designPhase || null;
   planState.reportPlan = snapshot.reportPlan || null;
-  planState.templateDesign = snapshot.templateDesign || null;
   planState.busy = false;
   planState.error = null;
+  // 刷新后默认收起（需求稿 §2.8）。
+  planState.planExpanded = false;
   renderPlanModule();
 }
 
 /** 确认回调：模块只交回意图，真正的请求由上层发。 */
 function handlePlanAction(action) {
   if (isBusy() || !action) return;
-  if (action.designAction === "MODIFY_PLAN") {
-    sendMessage("修改方案");
-    $("chat-input").focus();
-    return;
-  }
-  if (action.designAction === "CONFIRM_TEMPLATE") {
-    sendMessage("确认模板", { designAction: {
-      designAction: "CONFIRM_TEMPLATE", templateId: action.templateId,
-      baseTemplateRevision: action.baseTemplateRevision,
-    } });
-    return;
-  }
   if (!action || action.designAction !== "CONFIRM_PLAN") return;
   if (!planCanConfirm()) return;
   sendMessage("确认", {
@@ -1984,12 +1979,12 @@ function renderPreview(definition, highlightRegionIds = []) {
         <div class="flex items-center gap-2 flex-wrap">
           <h2 class="report-name editable-field text-lg font-semibold text-slate-900">${esc(definition.metadata?.name || "报表草稿")}</h2>
           <span class="inline-flex items-center rounded-md text-xs font-medium px-2 py-1 border bg-blue-50 text-blue-700 border-blue-200">${esc(definition.schemaVersion || "1.0")}</span>
-          <span class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-amber-50 text-amber-700 border-amber-200">
+          <span class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-amber-50 text-amber-700 border-amber-200 draft-status-badge">
             <iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>${esc(definition.metadata?.status || "DRAFT")}
           </span>
           <span class="edit-hint text-[11px] text-slate-400 inline-flex items-center gap-1"><iconify-icon icon="mdi:pencil-outline"></iconify-icon>点击名称可直接编辑</span>
         </div>
-        <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
+        <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500 draft-meta-row">
           <span>revision: <span class="mono">${definition.metadata?.revision ?? "—"}</span></span>
           <span>区域数: <span class="mono">${bodyRegions.length}</span></span>
           <span>数据集: ${Object.keys(definition.datasets || {}).map((d) => `<span class="mono">${esc(d)}</span>`).join(", ") || "—"}</span>
@@ -2057,9 +2052,43 @@ function renderRegion(region) {
       </div>
     </div>`;
 
-  const body = renderRegionBody(region);
+  const { html: body, node: bodyNode } = renderRegionBody(region);
 
-  card.innerHTML = header + '<div class="mt-3">' + body + "</div>";
+  card.innerHTML = header + '<div class="mt-3 region-body">' + body + "</div>";
+
+  // 图表区域：真的拿到数据点时画真实图表（renderChart 由方案模块导出，见 W-14）。
+  if (bodyNode) {
+    const bodyWrap = card.querySelector(".region-body");
+    if (bodyWrap) bodyWrap.appendChild(bodyNode);
+  }
+
+  // 占位原因与数据来源性质（#39 ↔ #40 接口约定，见实施票）。
+  // 字段缺失时静默降级：不渲染这两行，不报错、不留空框。
+  // ⚠️ 这是全前端唯一一处读 region.templateBinding 的地方：
+  //    字段名就是为这件事设计的，不要当成意外耦合删掉。
+  const binding = region.templateBinding || {};
+  if (binding.dataStatus === "placeholder" && binding.placeholderReason) {
+    const reason = document.createElement("div");
+    reason.className = "region-placeholder-reason text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-2";
+    reason.dataset.regionPlaceholderReason = "true";
+    reason.textContent = "暂无数值：" + binding.placeholderReason;
+    card.appendChild(reason);
+  } else if (binding.dataStatus === "bound" && binding.pendingReason) {
+    // bound 区域：指标已绑定但草稿阶段还没取数（#39 新增的 templateBinding.pendingReason）。
+    // 读法与占位原因对称：都从 templateBinding 取，都用 textContent 写。
+    const pending = document.createElement("div");
+    pending.className = "region-pending-reason text-[11px] text-slate-400 mt-2";
+    pending.dataset.regionPendingReason = "true";
+    pending.textContent = binding.pendingReason;
+    card.appendChild(pending);
+  }
+  if (binding.dataSourceLabel) {
+    const source = document.createElement("div");
+    source.className = "region-source-note text-[11px] text-slate-400 mt-2";
+    source.dataset.regionSourceNote = "true";
+    source.textContent = binding.dataSourceLabel;
+    card.appendChild(source);
+  }
 
   // 区域名编辑
   const nameEl = card.querySelector(".region-name");
@@ -2100,15 +2129,31 @@ function renderRegion(region) {
   return card;
 }
 
+/**
+ * 区域正文。
+ *
+ * 返回 { html, node }：
+ *   - html：直接拼进卡片的 HTML 片段；
+ *   - node：需要用真 DOM 画的内容（目前只有图表），由调用方挂上去。
+ */
 function renderRegionBody(region) {
   const type = region.component?.type;
-  if (type === "TEXT") return renderText(region);
-  if (type === "METRIC_CARD") return renderMetricCard(region);
-  if (type === "TABLE") return renderTable(region);
-  if (type === "CHART") return renderChartPlaceholder(region);
-  if (type === "DATA_QUALITY") return renderDataQuality(region);
-  if (type === "ANALYSIS") return renderAnalysis(region);
-  return `<pre class="mono text-[11px] text-slate-500 bg-slate-50 rounded p-2 overflow-x-auto">${esc(JSON.stringify(region.component, null, 2).slice(0, 400))}</pre>`;
+  if (type === "TEXT") return { html: renderText(region), node: null };
+  if (type === "METRIC_CARD") return { html: renderMetricCard(region), node: null };
+  if (type === "TABLE") return { html: renderTable(region), node: null };
+  if (type === "CHART") {
+    // 草稿阶段还没有数据点 → 继续走原来的空壳卡片（不编造数值）。
+    // 试运行出数之后 → 用真实点画折线 / 柱条。
+    const chartNode = renderRealChart(region);
+    if (chartNode) return { html: "", node: chartNode };
+    return { html: renderChartPlaceholder(region), node: null };
+  }
+  if (type === "DATA_QUALITY") return { html: renderDataQuality(region), node: null };
+  if (type === "ANALYSIS") return { html: renderAnalysis(region), node: null };
+  return {
+    html: `<pre class="mono text-[11px] text-slate-500 bg-slate-50 rounded p-2 overflow-x-auto">${esc(JSON.stringify(region.component, null, 2).slice(0, 400))}</pre>`,
+    node: null,
+  };
 }
 
 function renderText(region) {
@@ -2158,6 +2203,43 @@ function renderChartPlaceholder(region) {
         <div class="text-[11px] mt-1 mono">${esc(window.unit || "?")} · offset=${window.offset ?? "?"} · count=${window.count ?? "?"}</div>
       </div>
     </div>`;
+}
+
+// 草稿区域的 chartKind（LINE / BAR / PIE）→ 图表渲染器认识的 componentType。
+const CHART_KIND_TO_COMPONENT_TYPE = {
+  LINE: "line_chart",
+  BAR: "bar_chart",
+  PIE: "pie_chart",
+};
+
+/**
+ * 图表区域：真的拿到数据点时画真实图表。
+ *
+ * - 草稿阶段还没有数据点 → 返回 null，继续显示空壳卡片（需求稿 §2.6：不编造数值）。
+ * - 试运行出数之后，区域里带 xLabels / yValues 时，才调用
+ *   globalThis.WorkbenchPlan.renderChart 画折线 / 柱条。
+ *
+ * 需求稿 §3.3 点名保护那段图表渲染代码，所以这里是**复用**而不是重写。
+ * 调用前必须判空、调用失败必须吞掉：绝不允许因为接图表把草稿面板渲染搞崩。
+ */
+function renderRealChart(region) {
+  const data = region?.data;
+  if (!data || typeof data !== "object") return null;
+  if (!Array.isArray(data.xLabels) || !data.xLabels.length) return null;
+  if (!Array.isArray(data.yValues) || !data.yValues.length) return null;
+  const api = window.WorkbenchPlan;
+  if (!api || typeof api.renderChart !== "function") return null;
+  const kind = String(region.component?.chartKind || "LINE").toUpperCase();
+  try {
+    return api.renderChart(document, {
+      componentType: CHART_KIND_TO_COMPONENT_TYPE[kind] || "line_chart",
+      title: region.name || region.component?.title || "",
+      data,
+    });
+  } catch (err) {
+    console.error("[AI Report] 图表渲染失败", err);
+    return null;
+  }
 }
 
 function renderDataQuality(region) {
@@ -2771,9 +2853,9 @@ function startNewSession() {
   // 新对话没有方案：清掉上一条对话的方案卡片。
   planState.designPhase = null;
   planState.reportPlan = null;
-  planState.templateDesign = null;
   planState.busy = false;
   planState.error = null;
+  planState.planExpanded = false;
   renderPlanModule();
   setState("ANALYZING");
   updateMeta();

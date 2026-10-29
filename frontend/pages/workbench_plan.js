@@ -38,12 +38,8 @@
   /** 设计阶段。 */
   const PHASE_PLAN_NEEDED = "PLAN_NEEDED";
   const PHASE_PLAN_WAITING_CONFIRM = "PLAN_WAITING_CONFIRM";
-  const PHASE_TEMPLATE_READY = "TEMPLATE_READY";
-
-  /** 区域数据状态。 */
-  const REGION_BOUND = "bound";
-  const REGION_PLACEHOLDER = "placeholder";
-  const REGION_TEXT = "text";
+  /** 草稿阶段：方案已确认，右侧直接出报表草稿面板。 */
+  const PHASE_DRAFT_READY = "DRAFT_READY";
 
   /** 图表类型 → 中文标签。未知类型原样显示（安全文本）。 */
   const COMPONENT_TYPE_LABELS = {
@@ -59,7 +55,7 @@
   const PHASE_LABELS = {
     PLAN_NEEDED: "需要生成方案",
     PLAN_WAITING_CONFIRM: "待确认方案",
-    TEMPLATE_READY: "模板已就绪",
+    DRAFT_READY: "草稿已就绪",
   };
 
   /** 容器上挂的标记属性，便于上层和测试定位自己的内容。 */
@@ -93,19 +89,9 @@
     empty: "font-size:13px;color:#94a3b8;",
     row: "font-size:13px;color:#475569;margin:2px 0;",
     rowKey: "color:#64748b;",
-    templateWrap: "margin-top:18px;border-top:1px solid #e2e8f0;padding-top:14px;",
-    templateTitle: "margin:0 0 4px;font-size:14px;font-weight:600;color:#0f172a;",
-    templateMeta: "font-size:12px;color:#64748b;margin:0 0 10px;",
-    region: "border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-bottom:8px;background:#ffffff;",
-    regionPlaceholder: "border:1px dashed #cbd5e1;border-radius:8px;padding:10px 12px;margin-bottom:8px;background:#f8fafc;",
-    regionHead: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;",
-    regionTitle: "font-size:13px;font-weight:600;color:#0f172a;",
-    badgeBound: "display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;background:#dcfce7;color:#15803d;font-size:11px;",
-    badgePlaceholder: "display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;background:#fef3c7;color:#b45309;font-size:11px;",
-    badgeText: "display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;background:#e2e8f0;color:#475569;font-size:11px;",
-    metricValue: "font-size:22px;font-weight:600;color:#0f172a;margin:2px 0;",
-    metricLabel: "font-size:12px;color:#64748b;",
-    metricNote: "font-size:11px;color:#b45309;margin-top:2px;",
+    // ↓↓↓ 以下 7 个样式键是 renderChart 的依赖。
+    // 需求稿 §3.3 明令「严禁删除折线图 SVG 渲染与 chartFill 样式」，
+    // 它们与网格、与模板中间页都无关 —— 模板中间页下线**不代表**删它们。
     sourceNote: "font-size:11px;color:#64748b;margin-top:4px;",
     chartRow: "display:flex;align-items:center;gap:8px;font-size:12px;color:#475569;margin:3px 0;",
     chartLabel: "width:96px;flex:0 0 96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
@@ -113,10 +99,6 @@
     chartFill: "display:block;height:100%;border-radius:5px;background:#60a5fa;",
     chartValue: "width:72px;flex:0 0 72px;text-align:right;color:#334155;",
     emptyFrame: "border:1px dashed #cbd5e1;border-radius:6px;padding:14px;text-align:center;font-size:12px;color:#94a3b8;background:#f8fafc;",
-    table: "width:100%;border-collapse:collapse;font-size:12px;color:#475569;",
-    tableHead: "text-align:left;border-bottom:1px solid #e2e8f0;padding:4px 6px;font-weight:600;color:#334155;",
-    tableCell: "padding:4px 6px;border-bottom:1px solid #f1f5f9;",
-    tableEmpty: "padding:8px 6px;color:#94a3b8;",
   };
 
   // ---------------------------------------------------------------- 状态
@@ -189,7 +171,6 @@
     const source = isPlainObject(view) ? view : {};
     const plan = isPlainObject(source.reportPlan) ? source.reportPlan : null;
     const requirements = plan && isPlainObject(plan.requirements) ? plan.requirements : {};
-    const template = isPlainObject(source.templateDesign) ? source.templateDesign : null;
 
     return {
       designPhase: ownString(source.designPhase),
@@ -205,10 +186,8 @@
       assumptions: stringList(plan && plan.assumptions),
       suggestions: stringList(plan && plan.suggestions),
       referenceTemplates: Array.isArray(plan && plan.referenceTemplates) ? plan.referenceTemplates : [],
-      templateDesign: template,
-      templateTitle: template ? safeText(template.title) : "",
-      templateRegions: template && Array.isArray(template.regions) ? template.regions : [],
-      templatePendingNotes: stringList(template && template.pendingNotes),
+      // 折叠视图的展开态：默认收起，用户主动展开后由上层记住。
+      planExpanded: source.planExpanded === true,
       busy: source.busy === true,
       error: errorText(source.error),
       canConfirm: source.canConfirm === true,
@@ -265,10 +244,17 @@
       : key;
   }
 
+  /**
+   * 阶段 → 中文标签。
+   *
+   * **未知阶段返回空串**（而不是原始 key）：历史会话里可能还留着
+   * 「模板阶段」的旧枚举，直接把 key 渲染出去会露出英文徽标。
+   * 空串意味着「不渲染这个徽标」。
+   */
   function designPhaseLabel(phase) {
     const key = safeText(phase);
     if (!key) return "";
-    return Object.prototype.hasOwnProperty.call(PHASE_LABELS, key) ? PHASE_LABELS[key] : key;
+    return Object.prototype.hasOwnProperty.call(PHASE_LABELS, key) ? PHASE_LABELS[key] : "";
   }
 
   // ---------------------------------------------------------------- 渲染
@@ -375,84 +361,17 @@
     return box;
   }
 
-  // ---------------------------------------------------------------- 模板渲染
+  // ---------------------------------------------------------------- 图表渲染
   //
-  // 用户口径（需求访谈 Q13）：「数据库里有啥数据就展示啥，没有的
-  // 就按 Q11 和 Q12 的方案来」。
+  // renderChart 把一组数据点画成折线图（SVG）或柱条图。
   //
-  // 所以这里分两种画法：
-  //   - 接到数据的区域：把**真实取到的值**画出来；
-  //   - 没接到数据的区域：画占位（指标卡显示 `--`、图表是空框、
-  //     表格是表头加空行），并把原因写出来。
+  // 它**不随模板中间页下线而删除**：需求稿 §3.3 点名保护这段代码
+  // （「严禁删除折线图 SVG 渲染与 chartFill 样式」）—— 它是独立的图表改进，
+  // 与网格、与业务链路都无关。模板中间页下线只是**换了调用方**：
+  //   - 模板中间页下线后，本模块不再调用它；
+  //   - 草稿路径（workbench.js）在区域真的拿到数据点时调用它。
   //
-  // 占位区域**不画任何数值** —— 那会把假数画成真数。
-
-  function regionBadge(doc, status) {
-    if (status === REGION_BOUND) {
-      return makeText(doc, "span", STYLE.badgeBound, "已接数据");
-    }
-    if (status === REGION_TEXT) {
-      return makeText(doc, "span", STYLE.badgeText, "文字说明");
-    }
-    return makeText(doc, "span", STYLE.badgePlaceholder, "占位");
-  }
-
-  function renderRegionHead(doc, region, status) {
-    const head = makeBlock(doc, "div", STYLE.regionHead, "template-region-head");
-    const title = makeText(
-      doc,
-      "span",
-      STYLE.regionTitle,
-      safeText(region.title) || "（未命名区域）"
-    );
-    title.setAttribute("class", "template-region-title");
-    head.appendChild(title);
-
-    const typeLabel = componentTypeLabel(region.componentType);
-    if (typeLabel) {
-      const tag = makeText(doc, "span", STYLE.tag, typeLabel);
-      tag.setAttribute("class", "template-component-type");
-      head.appendChild(tag);
-    }
-    head.appendChild(regionBadge(doc, status));
-    return head;
-  }
-
-  function renderMetricCard(doc, region) {
-    const data = isPlainObject(region.data) ? region.data : {};
-    const label = safeText(data.label) || "指标";
-    const box = makeBlock(doc, "div", "", "template-metric-card");
-
-    box.appendChild(makeText(doc, "div", STYLE.metricLabel, label));
-
-    const value = safeText(data.value);
-    const unit = safeText(data.unit);
-    box.appendChild(
-      makeText(
-        doc,
-        "div",
-        STYLE.metricValue,
-        value === "" ? "--" : value + (unit ? " " + unit : "")
-      )
-    );
-
-    if (data.comparisonAvailable === true && safeText(data.yoyPercent) !== "") {
-      box.appendChild(
-        makeText(
-          doc,
-          "div",
-          STYLE.sourceNote,
-          "较上一期 " + safeText(data.yoyPercent) + "%"
-        )
-      );
-    }
-    if (safeText(data.windowLabel)) {
-      box.appendChild(
-        makeText(doc, "div", STYLE.sourceNote, "统计窗口：" + safeText(data.windowLabel))
-      );
-    }
-    return box;
-  }
+  // 草稿阶段还没有数据点，此时草稿面板继续显示空壳卡片，不调用它。
 
   function renderChart(doc, region) {
     const data = isPlainObject(region.data) ? region.data : {};
@@ -530,142 +449,6 @@
     return box;
   }
 
-  function renderTable(doc, region) {
-    const data = isPlainObject(region.data) ? region.data : {};
-    const columns = Array.isArray(data.columns) ? data.columns : [];
-    const rows = Array.isArray(data.rows) ? data.rows : [];
-    const box = makeBlock(doc, "div", "", "template-table");
-
-    const table = makeBlock(doc, "table", STYLE.table, "template-table-el");
-    const head = makeBlock(doc, "thead", "", "");
-    const headRow = makeBlock(doc, "tr", "", "");
-    for (const column of columns) {
-      const item = isPlainObject(column) ? column : {};
-      headRow.appendChild(
-        makeText(doc, "th", STYLE.tableHead, safeText(item.label) || safeText(item.id))
-      );
-    }
-    head.appendChild(headRow);
-    table.appendChild(head);
-
-    const body = makeBlock(doc, "tbody", "", "");
-    if (!rows.length) {
-      const tr = makeBlock(doc, "tr", "", "template-table-empty-row");
-      const td = makeBlock(doc, "td", STYLE.tableEmpty, "暂无数据");
-      td.setAttribute("colspan", String(Math.max(1, columns.length)));
-      tr.appendChild(td);
-      body.appendChild(tr);
-    } else {
-      for (const row of rows) {
-        const item = isPlainObject(row) ? row : {};
-        const tr = makeBlock(doc, "tr", "", "template-table-row");
-        for (const column of columns) {
-          const col = isPlainObject(column) ? column : {};
-          const fieldRef = safeText(col.fieldRef);
-          tr.appendChild(makeText(doc, "td", STYLE.tableCell, safeText(item[fieldRef])));
-        }
-        body.appendChild(tr);
-      }
-    }
-    table.appendChild(body);
-    box.appendChild(table);
-    return box;
-  }
-
-  function renderRegion(doc, region, index) {
-    const item = isPlainObject(region) ? region : {};
-    const status = ownString(item.dataStatus) || REGION_PLACEHOLDER;
-    const card = makeBlock(
-      doc,
-      "div",
-      status === REGION_BOUND ? STYLE.region : STYLE.regionPlaceholder,
-      "template-region"
-    );
-    card.setAttribute("data-template-region-status", status);
-    card.setAttribute("data-template-region-index", String(index));
-
-    card.appendChild(renderRegionHead(doc, item, status));
-
-    if (status === REGION_BOUND) {
-      const type = ownString(item.componentType);
-      if (type === "metric_card") {
-        card.appendChild(renderMetricCard(doc, item));
-      } else if (type === "table") {
-        card.appendChild(renderTable(doc, item));
-      } else if (type === "text") {
-        const data = isPlainObject(item.data) ? item.data : {};
-        card.appendChild(makeText(doc, "div", STYLE.row, safeText(data.rendered)));
-      } else {
-        card.appendChild(renderChart(doc, item));
-      }
-      const sourceLabel = safeText(item.dataSourceLabel);
-      if (sourceLabel) {
-        const note = makeText(doc, "div", STYLE.sourceNote, sourceLabel);
-        note.setAttribute("class", "template-source-note");
-        card.appendChild(note);
-      }
-    } else if (status === REGION_TEXT) {
-      const data = isPlainObject(item.data) ? item.data : {};
-      card.appendChild(makeText(doc, "div", STYLE.row, safeText(data.rendered)));
-    } else {
-      // 占位：不画数值，只说明为什么还没有数。
-      const type = ownString(item.componentType);
-      if (type === "metric_card") {
-        card.appendChild(makeText(doc, "div", STYLE.metricLabel, "指标"));
-        card.appendChild(makeText(doc, "div", STYLE.metricValue, "--"));
-      } else if (type === "table") {
-        card.appendChild(renderTable(doc, { data: { columns: [], rows: [] } }));
-      } else {
-        card.appendChild(
-          makeText(doc, "div", STYLE.emptyFrame, "数据待连接，暂无内容")
-        );
-      }
-      const reason = safeText(item.placeholderReason);
-      if (reason) {
-        const note = makeText(doc, "div", STYLE.metricNote, reason);
-        note.setAttribute("class", "template-placeholder-reason");
-        card.appendChild(note);
-      }
-    }
-    return card;
-  }
-
-  function renderTemplate(doc, view, state) {
-    if (!view.templateDesign) return null;
-    const box = makeBlock(doc, "div", STYLE.templateWrap, "template-design");
-    box.setAttribute(MODULE_ATTR, "template");
-
-    const title = makeText(
-      doc,
-      "h4",
-      STYLE.templateTitle,
-      view.templateTitle || "报表模板"
-    );
-    title.setAttribute("class", "template-title");
-    box.appendChild(title);
-
-    const bound = view.templateRegions.filter(
-      (region) => (isPlainObject(region) ? region.dataStatus : "") === REGION_BOUND
-    ).length;
-    const metaParts = ["共 " + view.templateRegions.length + " 个区域"];
-    metaParts.push(bound + " 个已接数据");
-    metaParts.push(view.templateRegions.length - bound + " 个占位");
-    box.appendChild(makeText(doc, "p", STYLE.templateMeta, metaParts.join(" · ")));
-
-    for (let index = 0; index < view.templateRegions.length; index += 1) {
-      box.appendChild(renderRegion(doc, view.templateRegions[index], index));
-    }
-
-    if (view.templatePendingNotes.length) {
-      const notes = makeBlock(doc, "div", "", "template-pending-notes");
-      for (const note of view.templatePendingNotes) {
-        notes.appendChild(makeText(doc, "div", STYLE.metricNote, note));
-      }
-      box.appendChild(notes);
-    }
-    return box;
-  }
-
   function renderStringList(doc, title, items, className, note) {
     const box = makeBlock(doc, "div", "", className);
     box.appendChild(makeText(doc, "div", STYLE.blockTitle, title));
@@ -723,29 +506,9 @@
   function renderActions(doc, view, state) {
     const box = makeBlock(doc, "div", STYLE.actions, "plan-actions");
 
-    // 模板已经生成：不再摆「确认方案」入口 —— 方案已经确认过了。
-    if (view.templateDesign) {
-      box.appendChild(makeText(doc, "span", STYLE.hint, "报表已生成，确认继续，还是修改？"));
-      for (const [className, label, action] of [
-        ["template-confirm", "确认报表，继续下一步", "CONFIRM_TEMPLATE"],
-        ["template-modify", "修改报表", "MODIFY_PLAN"],
-      ]) {
-        const button = makeBlock(doc, "button", view.busy ? STYLE.buttonDisabled : STYLE.button, className);
-        button.textContent = label;
-        button.setAttribute("type", "button");
-        button.disabled = view.busy;
-        const handler = () => {
-          if (state.view.busy || state.disposed) return;
-          state.emit({ designAction: action, templateId: state.view.templateDesign.id,
-            baseTemplateRevision: state.view.templateDesign.revision });
-        };
-        button.addEventListener("click", handler);
-        state.listeners.push({ node: button, type: "click", handler });
-        box.appendChild(button);
-      }
-      return box;
-    }
-
+    // 模板中间页整页下线（#40）：这里**不再**有模板中间页的那两个按钮
+    // （确认 / 修改），也不换成任何提示语 —— 规格明写「不替换成单行模板提示」。
+    // 文字方案的「确认方案」入口保留（这是唯一的人工确认入口）。
     const enabled = canConfirmNow(view);
     const button = makeBlock(
       doc,
@@ -781,6 +544,27 @@
     return box;
   }
 
+  /**
+   * 已确认方案的折叠视图。
+   *
+   * - 原生 <details>：默认收起、可展开、零状态、零 CSS。
+   * - 内容与「待确认」时看到的文字方案完全一致（复用同一批渲染函数，不复制逻辑）。
+   * - 纯 DOM 合成，不发任何请求 —— 渲染它不会重新生成方案。
+   */
+  function renderConfirmedPlanDetails(doc, view) {
+    const details = makeBlock(doc, "details", "margin-top:12px;", "confirmed-plan-details");
+    details.setAttribute("data-plan-collapsed", view.planExpanded ? "false" : "true");
+    if (view.planExpanded) details.setAttribute("open", "");
+    details.appendChild(makeText(doc, "summary", STYLE.blockTitle, "查看已确认的文字方案"));
+    details.appendChild(renderTopic(doc, view));
+    details.appendChild(renderRequirements(doc, view));
+    details.appendChild(renderSections(doc, view));
+    details.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
+    details.appendChild(renderSuggestions(doc, view));
+    details.appendChild(renderReferences(doc, view));
+    return details;
+  }
+
   function renderBody(doc, view, state) {
     const body = makeBlock(doc, "div", "", "plan-body");
 
@@ -794,28 +578,25 @@
       return body;
     }
 
-    const template = renderTemplate(doc, view, state);
-    if (template) {
-      body.appendChild(renderActions(doc, view, state));
-      body.appendChild(template);
-      const details = makeBlock(doc, "details", "margin-top:12px;", "confirmed-plan-details");
-      details.appendChild(makeText(doc, "summary", STYLE.blockTitle, "查看已确认的文字方案"));
-      details.appendChild(renderTopic(doc, view));
-      details.appendChild(renderRequirements(doc, view));
-      details.appendChild(renderSections(doc, view));
-      details.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
-      details.appendChild(renderSuggestions(doc, view));
-      details.appendChild(renderReferences(doc, view));
-      body.appendChild(details);
-    } else {
-      body.appendChild(renderTopic(doc, view));
-      body.appendChild(renderRequirements(doc, view));
-      body.appendChild(renderSections(doc, view));
-      body.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
-      body.appendChild(renderSuggestions(doc, view));
-      body.appendChild(renderReferences(doc, view));
+    // 草稿阶段：方案已确认 —— 只保留一份默认收起的折叠视图。
+    // 这里没有动作区：既没有「确认方案」，也没有模板中间页的两个按钮。
+    //
+    // 判据一律以 designPhase 为准，**不要**拿「内部模板」那个中间产物做判据：
+    // 新流程下后端仍可能把内部模板作为只读中间产物带回响应里，
+    // 拿它做判据会让模板态以另一种形式复活。
+    if (view.designPhase === PHASE_DRAFT_READY) {
+      body.appendChild(renderConfirmedPlanDetails(doc, view));
+      return body;
     }
-    if (!template) body.appendChild(renderActions(doc, view, state));
+
+    // 待确认阶段：文字方案完整展开，末尾跟动作区。
+    body.appendChild(renderTopic(doc, view));
+    body.appendChild(renderRequirements(doc, view));
+    body.appendChild(renderSections(doc, view));
+    body.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
+    body.appendChild(renderSuggestions(doc, view));
+    body.appendChild(renderReferences(doc, view));
+    body.appendChild(renderActions(doc, view, state));
     return body;
   }
 
@@ -911,6 +692,7 @@
     DESIGN_ACTION_CONFIRM,
     PHASE_PLAN_NEEDED,
     PHASE_PLAN_WAITING_CONFIRM,
+    PHASE_DRAFT_READY,
     COMPONENT_TYPE_LABELS,
     PHASE_LABELS,
     MODULE_ATTR,
@@ -921,6 +703,10 @@
     confirmPayload,
     componentTypeLabel,
     designPhaseLabel,
+    // 图表渲染器：模板中间页下线后**改由草稿路径复用**
+    // （草稿区域真的拿到 xLabels / yValues 时调用，见 workbench.js 的 renderRegion）。
+    // 需求稿 §3.3 点名保护这段代码，不得因为「没有调用方」而删掉。
+    renderChart,
     render,
     clear,
   };

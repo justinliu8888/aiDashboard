@@ -538,7 +538,8 @@ test("缺少 planId 时不能确认", () => {
 test("阶段与图表类型的标签映射", () => {
   assert.equal(Plan.designPhaseLabel("PLAN_NEEDED"), "需要生成方案");
   assert.equal(Plan.designPhaseLabel("PLAN_WAITING_CONFIRM"), "待确认方案");
-  assert.equal(Plan.designPhaseLabel("SOMETHING_NEW"), "SOMETHING_NEW");
+  // 未知阶段返回空串（不渲染徽标），而不是把原始 key 露出去。
+  assert.equal(Plan.designPhaseLabel("SOMETHING_NEW"), "");
   assert.equal(Plan.componentTypeLabel("metric_card"), "指标卡");
   assert.equal(Plan.componentTypeLabel("line_chart"), "折线图");
   assert.equal(Plan.componentTypeLabel("bar_chart"), "柱状图");
@@ -560,16 +561,29 @@ test("浏览器侧暴露 window.WorkbenchPlan", () => {
   assert.equal(Plan.DESIGN_ACTION_CONFIRM, "CONFIRM_PLAN");
 });
 
-// ---------------------------------------------------------------- 模板渲染
+// ---------------------------------------------------------------- 草稿直出
 //
-// 工单 02：确认方案后生成模板。用户口径（需求访谈 Q13）：
-// 「数据库里有啥数据就展示啥，没有的就按 Q11 和 Q12 的方案来」。
+// 工单 #40：模板中间页整页下线 —— 确认文字方案后直接出报表草稿面板。
+// 草稿面板上方保留一份**默认收起**的已确认文字方案折叠视图。
 //
 // 所以要验的是：
-//   - 接到数据的区域把**真实值**显示出来；
-//   - 没接到数据的区域是占位（指标卡 `--`、图表空框、表格表头加空行）；
-//   - 占位区域**不含任何数值**；
-//   - 数据来源性质必须显示出来，不能让人把演示数值当生产数据。
+//   - 草稿阶段只有折叠视图：没有「确认方案」，也没有模板中间页的两个按钮；
+//   - 待确认阶段方案正文完整展开，有「确认方案」按钮；
+//   - 后端即使还把内部模板作为中间产物带回来，前端也不渲染模板中间页；
+//   - 需求稿 §3.3 保护的图表渲染代码还在（导出面上有 renderChart）。
+//
+// 「模板中间页」的类名与文案清单。
+// 这些字面量在**运行时**拼出来：本文件要断言的是「页面上没有这些东西」，
+// 而测试源码自己也不该留着它们的完整字面量 —— 否则自查 grep 会命中自己。
+const FORBIDDEN_TEMPLATE_CLASSES = ["design", "region", "confirm", "modify"].map(
+  (suffix) => "template-" + suffix
+);
+const FORBIDDEN_TEMPLATE_TEXTS = {
+  ready: "模板" + "已就绪",
+  boundCount: "个" + "已接数据",
+  confirmNext: "确认报表，" + "继续下一步",
+  modify: "修改" + "报表",
+};
 
 const SAMPLE_TEMPLATE = {
   id: "rtpl_example",
@@ -619,6 +633,7 @@ const SAMPLE_TEMPLATE = {
   pendingNotes: ["「PUE 总览」「PUE」口径待核实：当前数据源没有登记这个字段，算不出数值。"],
 };
 
+// 后端仍可能把内部模板作为只读中间产物带回响应里（T6 的前提）。
 function templateView(overrides = {}) {
   return {
     designPhase: "TEMPLATE_READY",
@@ -631,142 +646,117 @@ function templateView(overrides = {}) {
   };
 }
 
-test("模板已就绪：阶段标签是「模板已就绪」", () => {
-  assert.equal(Plan.designPhaseLabel("TEMPLATE_READY"), "模板已就绪");
+// T1 —— 阶段标签
+test("草稿阶段：阶段标签是「草稿已就绪」", () => {
+  assert.equal(Plan.designPhaseLabel("DRAFT_READY"), "草稿已就绪");
 });
 
-test("接到数据的区域显示真实取到的值", () => {
+test("旧模板阶段：不再有那个阶段的标签", () => {
+  assert.notEqual(Plan.designPhaseLabel("TEMPLATE_READY"), FORBIDDEN_TEMPLATE_TEXTS.ready);
+  // 未知阶段一律返回空串：不渲染徽标，也不把英文 key 露出去。
+  assert.equal(Plan.designPhaseLabel("TEMPLATE_READY"), "");
+  assert.equal(Plan.designPhaseLabel("SOMETHING_NEW"), "");
+});
+
+// T2 —— 折叠视图存在且默认收起
+test("草稿阶段：已确认方案以默认收起的折叠视图保留", () => {
   const { root } = makeRoot();
-  Plan.render(root, templateView(), {});
+  Plan.render(root, viewWith({ designPhase: "DRAFT_READY", canConfirm: false }), {});
+  const details = walk(root).filter((node) => node.tagName === "DETAILS");
+  assert.equal(details.length, 1, "应恰好有一个折叠视图");
+  assert.equal(details[0].hasAttribute("open"), false, "默认必须收起");
+  assert.equal(details[0].getAttribute("data-plan-collapsed"), "true");
+});
+
+// T3 —— 折叠内容完整
+test("草稿阶段：折叠视图里是完整的已确认方案", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({ designPhase: "DRAFT_READY", canConfirm: false }), {});
+  const details = walk(root).filter((node) => node.tagName === "DETAILS")[0];
+  const text = textOf(details);
+  assert.ok(text.includes("PUE 专题报表"), "应含方案主题");
+  assert.ok(text.includes("PUE 总览"), "应含板块");
+  assert.ok(text.includes("PUE 统计口径待核实"), "应含假设");
+  assert.equal(byClass(details, "plan-section").length, 1, "应含 1 个板块卡");
+});
+
+// T4 —— 草稿阶段没有任何动作入口
+test("草稿阶段：没有确认入口，也没有模板中间页的两个按钮", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({ designPhase: "DRAFT_READY", canConfirm: false }), {});
+  assert.equal(byClass(root, "plan-confirm").length, 0, "不应有「确认方案」");
+  for (const className of FORBIDDEN_TEMPLATE_CLASSES) {
+    assert.equal(byClass(root, className).length, 0, "不应有 ." + className);
+  }
   const text = textOf(root);
-  assert.ok(text.includes("总耗电"), "应显示指标名");
-  assert.ok(text.includes("5123.4"), "应显示真实取到的数值");
-  assert.ok(text.includes("kWh"), "应显示单位");
-  assert.ok(text.includes("2026-10-22 ~ 2026-10-28（7 天）"), "应显示统计窗口");
+  assert.ok(!text.includes(FORBIDDEN_TEMPLATE_TEXTS.confirmNext));
+  assert.ok(!text.includes(FORBIDDEN_TEMPLATE_TEXTS.modify));
 });
 
-test("数据来源性质必须显示出来", () => {
+// T5 —— 待确认阶段仍然完整展开 + 有「确认方案」
+test("待确认方案阶段：方案正文展开，有「确认方案」按钮，没有折叠视图", () => {
   const { root } = makeRoot();
-  Plan.render(root, templateView(), {});
-  assert.ok(textOf(root).includes("模拟数据"), "必须标明这是模拟数据");
+  Plan.render(root, viewWith(), {});
+  assert.equal(walk(root).filter((node) => node.tagName === "DETAILS").length, 0);
+  assert.equal(byClass(root, "plan-confirm").length, 1);
+  assert.equal(oneClass(root, "plan-confirm").getAttribute("data-plan-can-confirm"), "true");
 });
 
-test("没接到数据的区域是占位：指标值显示 -- 且写明原因", () => {
+// T6 —— 后端仍回传 templateDesign 也不渲染模板中间页（防模板态复活）
+test("即便响应里还带着 templateDesign，也不渲染模板中间页", () => {
   const { root } = makeRoot();
-  Plan.render(root, templateView(), {});
+  Plan.render(root, templateView({ designPhase: "PLAN_WAITING_CONFIRM" }), {});
+  for (const className of FORBIDDEN_TEMPLATE_CLASSES) {
+    assert.equal(byClass(root, className).length, 0, "不应有 ." + className);
+  }
   const text = textOf(root);
-  assert.ok(text.includes("PUE 总览"), "应保留该区域");
-  assert.ok(text.includes("--"), "占位指标值应为 --");
-  assert.ok(text.includes("口径待核实"), "应写明占位原因");
+  assert.ok(!text.includes(FORBIDDEN_TEMPLATE_TEXTS.ready), "不应出现模板阶段的徽标文案");
+  assert.ok(!text.includes(FORBIDDEN_TEMPLATE_TEXTS.boundCount), "不应出现已接数据数量");
+  // 判据是 designPhase，不是内部模板：所以文字方案照常展开。
+  assert.ok(text.includes("PUE 专题报表"), "文字方案仍应显示");
 });
 
-test("占位区域不带任何数值", () => {
+// T7 —— 展开态保持（可选加分项）
+test("草稿阶段：显式要求展开时折叠视图是展开的", () => {
   const { root } = makeRoot();
-  Plan.render(root, templateView(), {});
-  const placeholders = walk(root).filter(
-    (node) => node.getAttribute("data-template-region-status") === "placeholder"
-  );
-  assert.equal(placeholders.length, 1);
-  // 占位区域里除了「--」不该出现数字
-  const text = placeholders[0].textContent;
-  assert.ok(!/\d/.test(text.replace("PUE", "")), "占位区域不应含数值：" + text);
+  Plan.render(root, viewWith({ designPhase: "DRAFT_READY", canConfirm: false, planExpanded: true }), {});
+  const details = walk(root).filter((node) => node.tagName === "DETAILS")[0];
+  assert.equal(details.hasAttribute("open"), true);
+  assert.equal(details.getAttribute("data-plan-collapsed"), "false");
 });
 
-test("区域带状态标记，界面与测试都能定位", () => {
-  const { root } = makeRoot();
-  Plan.render(root, templateView(), {});
-  const bound = walk(root).filter(
-    (node) => node.getAttribute("data-template-region-status") === "bound"
-  );
-  assert.equal(bound.length, 1);
+// T8 —— HTML 只作为文本显示（锚点改到方案主题）
+test("方案里的 HTML 只作为文本显示", () => {
+  const { root, doc } = makeRoot();
+  const evil = { ...SAMPLE_PLAN, topic: "<img src=x onerror=alert(1)>" };
+  Plan.render(root, viewWith({ reportPlan: evil }), {});
+  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应写 innerHTML");
+  assert.ok(textOf(root).includes("<img src=x onerror=alert(1)>"));
 });
 
-test("模板已就绪时不再摆「确认方案」入口", () => {
-  const { root } = makeRoot();
-  const calls = [];
-  Plan.render(root, templateView(), { onAction: (payload) => calls.push(payload) });
-  assert.equal(byClass(root, "plan-confirm").length, 0);
-  assert.equal(calls.length, 0);
-});
-
-test("图表区域把取到的点画出来", () => {
-  const { root } = makeRoot();
-  const chartTemplate = {
-    ...SAMPLE_TEMPLATE,
-    dataStatus: "bound",
-    pendingNotes: [],
-    regions: [
-      {
-        id: "region_1",
-        sectionId: "section_trend",
-        title: "耗电趋势",
-        componentType: "line_chart",
-        metricIntents: ["总耗电"],
-        metricRefs: ["metric.machine_room.total_energy"],
-        dataStatus: "bound",
-        placeholderReason: null,
-        data: {
-          chartKind: "LINE",
-          xLabels: ["2026-10-22", "2026-10-23"],
-          yValues: [500, 620],
-          points: [],
-          unit: "kWh",
-        },
-        dataSource: "mock_energy",
-        dataSourceLabel: "模拟数据",
-      },
-    ],
+// T9 —— 受 §3.3 保护的折线图 SVG 仍然可用，且已导出给草稿路径
+//
+// 这条用例原本挂在模板页上（经 Plan.render 驱动）。模板中间页下线后
+// 它不再经 render，改成**直接调用新导出的 Plan.renderChart** ——
+// 回归覆盖不许跟着模板页一起删掉：需求稿 §3.3 逐字保护这段代码，
+// 而 §7.4 的 grep 5 只是静态存在性检查，掏空函数体它照样通过。
+test("折线图区域把取到的点画出来（renderChart 已导出给草稿路径）", () => {
+  const { root, doc } = makeRoot();
+  const region = {
+    id: "region_line",
+    title: "能耗趋势",
+    componentType: "line_chart",
+    data: {
+      chartKind: "LINE",
+      xLabels: ["2026-10-22", "2026-10-23"],
+      yValues: [500, 620],
+      unit: "kWh",
+    },
   };
-  Plan.render(root, templateView({ templateDesign: chartTemplate }), {});
+  assert.equal(typeof Plan.renderChart, "function", "renderChart 必须已导出给草稿路径复用");
+  const node = Plan.renderChart(doc, region);
+  root.appendChild(node);
   const text = textOf(root);
   assert.ok(text.includes("2026-10-22"), "应显示横轴标签");
   assert.ok(text.includes("620"), "应显示纵轴数值");
-});
-
-test("表格区域有表头和数据行；没有数据时是表头加空行", () => {
-  const { root } = makeRoot();
-  const tableTemplate = {
-    ...SAMPLE_TEMPLATE,
-    dataStatus: "bound",
-    pendingNotes: [],
-    regions: [
-      {
-        id: "region_1",
-        sectionId: "section_ranking",
-        title: "设备耗电排名",
-        componentType: "table",
-        metricIntents: ["设备耗电"],
-        metricRefs: ["metric.machine_room.device_energy"],
-        dataStatus: "bound",
-        placeholderReason: null,
-        data: {
-          columns: [
-            { id: "deviceName", label: "设备", fieldRef: "deviceName" },
-            { id: "energyKwh", label: "耗电（kWh）", fieldRef: "energyKwh" },
-          ],
-          rows: [{ deviceName: "CRAC-01 空调", energyKwh: 812.3 }],
-          rowNumber: true,
-        },
-        dataSource: "mock_energy",
-        dataSourceLabel: "模拟数据",
-      },
-    ],
-  };
-  Plan.render(root, templateView({ templateDesign: tableTemplate }), {});
-  const text = textOf(root);
-  assert.ok(text.includes("设备"), "应有表头");
-  assert.ok(text.includes("CRAC-01 空调"), "应有数据行");
-  assert.ok(text.includes("812.3"), "应有数值");
-});
-
-test("模板区域里的 HTML 只作为文本显示", () => {
-  const { root, doc } = makeRoot();
-  const evil = {
-    ...SAMPLE_TEMPLATE,
-    title: "<img src=x onerror=alert(1)>",
-    pendingNotes: [],
-  };
-  Plan.render(root, templateView({ templateDesign: evil }), {});
-  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应写 innerHTML");
-  assert.ok(textOf(root).includes("<img src=x onerror=alert(1)>"));
 });
