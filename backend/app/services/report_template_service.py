@@ -36,6 +36,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from app.schemas.report_plan import COMPONENT_TYPE_VALUES, PlanContractError
 from app.schemas.template_design import (
     RegionDataStatus,
     TemplateDesign,
@@ -263,12 +264,29 @@ def _build_region(
     section = dict(section or {})
     section_id = str(section.get("id") or f"section_{index + 1}")
     title = str(section.get("title") or f"板块 {index + 1}")
-    component_type = str(section.get("componentType") or "metric_card")
+    # 第二道闸（#39）：组件类型**不猜、不兜底**。缺失或非法都硬失败，
+    # 并且错误信息要点名是哪个板块 —— 静默补成 metric_card 会让草稿
+    # 长成另一个样子（「占位 ≠ 改掉组件类型」）。
+    raw_type = section.get("componentType")
+    component_type = str(getattr(raw_type, "value", raw_type) or "").strip()
+    if component_type not in COMPONENT_TYPE_VALUES:
+        raise PlanContractError(
+            f"板块 {index + 1}「{title}」的组件类型非法：{component_type or '（缺失）'}；"
+            f"合法取值为 {' / '.join(COMPONENT_TYPE_VALUES)}。",
+            section_id=section_id, section_title=title, section_index=index,
+        )
     intents = [
         str(item).strip()
         for item in (section.get("metricIntents") or [])
         if str(item).strip()
     ]
+    # 取数板块必须有指标意图；纯说明板块（text）不强制 —— 它本来就没有指标。
+    if component_type != "text" and not intents:
+        raise PlanContractError(
+            f"板块 {index + 1}「{title}」是取数板块（{component_type}），"
+            f"必须声明至少一条指标意图（metricIntents）。",
+            section_id=section_id, section_title=title, section_index=index,
+        )
 
     def placeholder(reason: str, metric_refs: list[str] | None = None) -> TemplateRegion:
         return TemplateRegion(
@@ -353,8 +371,13 @@ def build_template_design(
 ) -> TemplateDesign:
     """从已确认的文字方案生成模板设计。
 
-    **不抛异常**：能力不足不该让整份模板消失 —— 缺数据的区域转成占位，
-    方案与板块一个都不丢。
+    **能力不足 → 占位（不抛）；契约非法 → 硬失败（抛）**：
+
+    - 指标接不上、统计对象越权、时间窗算不出来 → 该区域转成占位并写明原因，
+      方案与板块一个都不丢（缺数据不该让整份模板消失）。
+    - 组件类型缺失 / 非法、取数板块没有指标意图 → 抛 ``PlanContractError``，
+      错误信息点名是哪个板块。这不是「缺数据」，是**方案本身不合法**，
+      猜一个类型补上去只会让草稿长成另一个样子（#39）。
 
     这一步**不取数、不算数值**（工单 04 / GitHub #38）：区域带的是
     指标绑定与时间窗，数值由试运行时产生。

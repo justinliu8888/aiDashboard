@@ -802,6 +802,16 @@ class PreviewService:
         timezone: str = DEFAULT_TIMEZONE,
     ) -> dict[str, Any]:
         component = region.get("component") or {}
+        # 没有可执行绑定 = 占位区域（#39）：只回占位原因，**不编数值**。
+        # 占位板块保留方案声明的组件类型（空壳卡片），预览若照常算数就会把
+        # 总耗电贴在「PUE 总览」这种标签下面 —— 那就是编造。
+        bound = (((region.get("data") or {}).get("pipeline") or {}).get("nodes") or [])
+        if ctype in {"METRIC_CARD", "TABLE", "CHART"} and not bound:
+            reason = ((region.get("templateBinding") or {}).get("placeholderReason")
+                      or "数据待连接：当前已接通的能力里没有对应指标。")
+            return {"placeholder": True, "reason": reason,
+                    "chartKind": component.get("chartKind", "LINE"),
+                    "columns": component.get("columns") or [], "rows": []}
         if ctype == "TEXT":
             tpl = (component.get("content") or {}).get("template", "")
             return {

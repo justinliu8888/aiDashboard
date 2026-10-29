@@ -33,6 +33,7 @@ from app.schemas.report_plan import (
     PlanSection,
     PlanValidationError,
     ReportPlan,
+    validate_section_contract,
 )
 
 
@@ -44,6 +45,7 @@ _SECTION_ID_PATTERN = re.compile(r"^section_(\d+)$")
 def _coerce_candidate(candidate: Any) -> PlanCandidate:
     """把候选变成校验过的 ``PlanCandidate``。"""
     if isinstance(candidate, PlanCandidate):
+        # 已是校验过的实例 → componentType 必然合法，直接返回（不做 model_dump 往返）。
         return candidate
     if isinstance(candidate, BaseModel):
         candidate = candidate.model_dump()
@@ -52,7 +54,20 @@ def _coerce_candidate(candidate: Any) -> PlanCandidate:
             "候选方案必须是 PlanCandidate 或映射",
             code="PLAN_CANDIDATE_INVALID",
         )
-    return PlanCandidate.model_validate(dict(candidate))
+    payload = dict(candidate)
+    # 板块级契约校验（组件类型 / 指标意图）**先于** pydantic：
+    # pydantic 的报错只说「sections.0.componentType: ...」，没有板块标题；
+    # 先跑这一层才能给出「板块 2「PUE 趋势」的组件类型非法」这种可定位的原因。
+    _validate_candidate_sections(payload.get("sections"))
+    return PlanCandidate.model_validate(payload)
+
+
+def _validate_candidate_sections(sections: Any) -> None:
+    """逐板块校验组件类型与指标意图。错误信息带板块标识。"""
+    if not isinstance(sections, (list, tuple)):
+        return
+    for index, section in enumerate(sections):
+        validate_section_contract(section, index=index)
 
 
 def _coerce_previous(previous: Any) -> ReportPlan | None:

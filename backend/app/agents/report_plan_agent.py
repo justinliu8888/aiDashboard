@@ -418,14 +418,19 @@ def _validate_sections(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         raise _InvalidOutput("sections 必须是数组")
     sections: list[dict[str, Any]] = []
-    for item in raw:
+    for index, item in enumerate(raw):
         section = _require_object(item, "section")
+        # 报错要**点名是哪个板块**（#39）：只说「componentType 不在允许的取值里」
+        # 的话，用户根本不知道要改哪一块。
+        label = f"板块 {index + 1}「{section.get('title') or '未命名'}」"
         for key in _REQUIRED_SECTION_KEYS:
             if key not in section:
-                raise _InvalidOutput(f"板块缺少 {key}")
+                raise _InvalidOutput(f"{label}缺少 {key}")
         component_type = _require_string(section["componentType"], "componentType")
         if component_type not in COMPONENT_TYPES:
-            raise _InvalidOutput("componentType 不在允许的取值里")
+            raise _InvalidOutput(
+                f"{label}的 componentType {component_type!r} 不在允许的取值里"
+            )
         validated: dict[str, Any] = {
             "title": _require_string(section["title"], "title"),
             "metricIntents": _require_string_list(

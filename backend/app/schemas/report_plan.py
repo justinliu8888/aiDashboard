@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from enum import Enum
 from typing import Any
 
@@ -29,6 +30,14 @@ class ComponentType(str, Enum):
     PIE_CHART = "pie_chart"
     TABLE = "table"
     TEXT = "text"
+
+
+#: 组件类型的合法取值集合。**唯一来源**是上面的 ``ComponentType`` 枚举 ——
+#: 模型适配层、模板生成层、草稿转换层都从这里取，不要再各抄一份（#39）。
+COMPONENT_TYPE_VALUES: tuple[str, ...] = tuple(item.value for item in ComponentType)
+
+#: 纯说明板块的组件类型：它不需要指标意图（#39 硬要求「纯说明板块明确声明为文本」）。
+TEXT_COMPONENT_TYPE = ComponentType.TEXT.value
 
 
 class ReportPlanError(Exception):
@@ -56,6 +65,88 @@ class PlanContentRejectedError(ReportPlanError):
     """方案里混进了不该出现的执行性内容（SQL、脚本、凭证、真实数值等）。"""
 
     code = "PLAN_UNSAFE_CONTENT"
+
+
+class PlanContractError(ReportPlanError):
+    """方案契约非法：组件类型缺失/非法，或取数板块没有指标意图。
+
+    错误信息**必须带板块标识**（序号 + 标题）。编排层（#36）会把 ``message``
+    原样透传给用户 —— 用户要能一眼看出是哪个板块出的问题，不能只拿到
+    「生成失败，请重试」。
+    """
+
+    code = "PLAN_CONTRACT_INVALID"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        section_id: str | None = None,
+        section_title: str | None = None,
+        section_index: int | None = None,
+    ) -> None:
+        super().__init__(message, code=code)
+        self.section_id = section_id
+        self.section_title = section_title
+        self.section_index = section_index
+
+
+def _section_label(index: int | None, title: str | None, section_id: str | None) -> str:
+    """板块标识：序号 + 标题（+ id）。错误信息里必须出现它。"""
+    parts = [f"板块 {index + 1}" if index is not None else "板块"]
+    if title:
+        parts.append(f"「{title}」")
+    label = "".join(parts)
+    if section_id:
+        label += f"（id={section_id}）"
+    return label
+
+
+def validate_section_contract(section: Any, *, index: int | None = None) -> None:
+    """板块级契约校验：组件类型必须合法；取数板块必须有指标意图。
+
+    这是方案契约的**唯一权威判据**，写路径与模板层共用。
+
+    抛 ``PlanContractError``，信息里带板块标识。``section`` 可以是原始
+    映射或 pydantic 模型（模型会先 dump 成映射）。
+    """
+    if isinstance(section, BaseModel):
+        section = section.model_dump()
+    if not isinstance(section, Mapping):
+        return  # 结构问题交给 pydantic，那时拿不到板块标识
+
+    raw_title = section.get("title")
+    title = str(raw_title).strip() if isinstance(raw_title, str) else None
+    raw_id = section.get("id")
+    section_id = str(raw_id).strip() if isinstance(raw_id, str) else None
+    label = _section_label(index, title, section_id)
+
+    raw_type = section.get("componentType")
+    component_type = str(getattr(raw_type, "value", raw_type) or "").strip()
+    if not component_type:
+        raise PlanContractError(
+            f"{label}缺少组件类型（componentType）：合法取值为 "
+            f"{' / '.join(COMPONENT_TYPE_VALUES)}。",
+            section_id=section_id, section_title=title, section_index=index,
+        )
+    if component_type not in COMPONENT_TYPE_VALUES:
+        raise PlanContractError(
+            f"{label}的组件类型非法：{component_type!r}；合法取值为 "
+            f"{' / '.join(COMPONENT_TYPE_VALUES)}。",
+            section_id=section_id, section_title=title, section_index=index,
+        )
+
+    if component_type == TEXT_COMPONENT_TYPE:
+        return  # 纯说明板块不强制指标意图
+
+    raw_intents = section.get("metricIntents")
+    intents = raw_intents if isinstance(raw_intents, (list, tuple)) else []
+    if not [item for item in intents if isinstance(item, str) and item.strip()]:
+        raise PlanContractError(
+            f"{label}是取数板块（{component_type}），必须声明至少一条指标意图（metricIntents）。",
+            section_id=section_id, section_title=title, section_index=index,
+        )
 
 
 class PlanRevisionConflictError(ReportPlanError):
