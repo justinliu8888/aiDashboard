@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, NamedTuple
 
+from app.schemas.template_design import UpdateTemplateLayoutRequest
 from app.storage.report_design_repository import (
     CLAIM_KIND_CLAIMED,
     CLAIM_KIND_CONFLICT,
@@ -33,6 +34,7 @@ from app.storage.report_design_repository import (
     DESIGN_PHASE_PLAN_NEEDED,
     DESIGN_PHASE_PLAN_WAITING_CONFIRM,
     DESIGN_PHASE_TEMPLATE_READY,
+    DESIGN_PHASE_DRAFT_READY,
     OPERATION_FAILED,
     OPERATION_PROCESSING,
     OPERATION_SUCCEEDED,
@@ -41,6 +43,8 @@ from app.storage.report_design_repository import (
     ConfirmationResult,
     DesignOperationStateError,
     DesignPlanInvalidError,
+    DesignTemplateConflictError,
+    DesignTemplateNotFoundError,
     LoadResult,
     WriteTurn,
 )
@@ -114,6 +118,13 @@ CREATE TABLE IF NOT EXISTS report_design_confirmations (
     template_id   TEXT NOT NULL,
     created_at    TEXT NOT NULL,
     PRIMARY KEY (session_id, plan_id, plan_revision)
+);
+
+CREATE TABLE IF NOT EXISTS report_design_definitions (
+    session_id TEXT PRIMARY KEY,
+    template_id TEXT NOT NULL,
+    template_revision INTEGER NOT NULL,
+    definition_json TEXT NOT NULL
 );
 """
 
@@ -189,12 +200,17 @@ class SqliteReportDesignRepository:
         with self._lock:
             state = self._fetch_design_state(self._conn, session_id)
             template = self._fetch_template(self._conn, session_id)
+            draft = self._conn.execute(
+                "SELECT definition_json FROM report_design_definitions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
         if state is None:
             return None
         return {
             "designPhase": state.phase,
             "reportPlan": _load_json(state.plan_json),
             "templateDesign": template,
+            "definitionDraft": _load_json(draft[0]) if draft else None,
         }
 
     # ---------- 认领 ----------
@@ -794,6 +810,103 @@ class SqliteReportDesignRepository:
         """读会话当前已提交的模板设计。"""
         with self._lock:
             return self._fetch_template(self._conn, session_id)
+
+    def commit_definition(
+        self, session_id: str, template_id: str, expected_revision: int,
+        definition: Mapping[str, Any], write_turn: WriteTurn, *, operation_id: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            conn = self._conn
+            self._begin(conn)
+            try:
+                operation = self._fetch_operation(conn, operation_id)
+                if (operation.session_id != session_id or operation.status != OPERATION_PROCESSING):
+                    raise DesignOperationStateError("模板确认操作未认领或已结束")
+                current = self._fetch_template(conn, session_id)
+                state = self._fetch_design_state(conn, session_id)
+                if current is None:
+                    raise DesignTemplateNotFoundError("当前会话没有模板")
+                if (current["id"] != template_id or current["revision"] != expected_revision
+                        or state is None or current["planId"] != state.plan_id
+                        or current["planRevision"] != state.revision
+                        or state.phase not in {DESIGN_PHASE_TEMPLATE_READY, DESIGN_PHASE_DRAFT_READY}):
+                    raise DesignTemplateConflictError("模板或方案已变化，请刷新后重试")
+                existing = conn.execute(
+                    "SELECT template_id, template_revision, definition_json"
+                    " FROM report_design_definitions WHERE session_id = ?", (session_id,),
+                ).fetchone()
+                if existing and existing[:2] == (template_id, expected_revision):
+                    conn.execute(
+                        "UPDATE report_design_operations SET status = ?, updated_at = ? WHERE operation_id = ?",
+                        (OPERATION_SUCCEEDED, _now(), operation_id),
+                    )
+                    conn.commit()
+                    return {"definitionDraft": _load_json(existing[2]), "alreadyCommitted": True}
+                if state.phase == DESIGN_PHASE_DRAFT_READY:
+                    raise DesignTemplateConflictError("草稿已经生成，不能再次替换")
+                conn.execute(
+                    "INSERT INTO report_design_definitions VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(session_id) DO UPDATE SET template_id = excluded.template_id,"
+                    " template_revision = excluded.template_revision, definition_json = excluded.definition_json",
+                    (session_id, template_id, expected_revision, json.dumps(dict(definition), ensure_ascii=False)),
+                )
+                conn.execute(
+                    "UPDATE report_design_sessions SET design_phase = ?, updated_at = ? WHERE session_id = ?",
+                    (DESIGN_PHASE_DRAFT_READY, _now(), session_id),
+                )
+                write_turn(conn)
+                conn.execute(
+                    "UPDATE report_design_operations SET status = ?, updated_at = ? WHERE operation_id = ?",
+                    (OPERATION_SUCCEEDED, _now(), operation_id),
+                )
+                conn.commit()
+                return {"definitionDraft": dict(definition), "alreadyCommitted": False}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def update_template_layout(
+        self,
+        session_id: str,
+        template_id: str,
+        expected_revision: int,
+        items: list[dict[str, Any]],
+        write_turn: WriteTurn | None = None,
+    ) -> dict[str, Any]:
+        payload = UpdateTemplateLayoutRequest(
+            templateId=template_id, baseRevision=expected_revision, items=items
+        )
+        with self._lock:
+            conn = self._conn
+            self._begin(conn)
+            try:
+                current = self._fetch_template(conn, session_id)
+                if current is None:
+                    raise DesignTemplateNotFoundError("当前会话没有模板")
+                if current["id"] != template_id or current["revision"] != expected_revision:
+                    raise DesignTemplateConflictError("模板 ID 或基础版本已变化，请刷新后重试")
+                region_ids = {region["id"] for region in current["regions"]}
+                requested_ids = [item.regionId for item in payload.items]
+                if len(requested_ids) != len(region_ids) or set(requested_ids) != region_ids:
+                    raise DesignPlanInvalidError("布局必须恰好覆盖全部区域，不能重复或包含未知区域")
+                current["layout"] = {"columns": 12, "items": payload.model_dump()["items"]}
+                current["revision"] = expected_revision + 1
+                cursor = conn.execute(
+                    "UPDATE report_design_templates"
+                    " SET template_revision = ?, template_json = ?, updated_at = ?"
+                    " WHERE session_id = ? AND template_id = ? AND template_revision = ?",
+                    (current["revision"], json.dumps(current, ensure_ascii=False), _now(),
+                     session_id, template_id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    raise DesignTemplateConflictError("模板基础版本已变化")
+                if write_turn is not None:
+                    write_turn(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return current
 
     # ---------- 失败 ----------
 

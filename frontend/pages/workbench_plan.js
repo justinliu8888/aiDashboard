@@ -110,7 +110,7 @@
     chartRow: "display:flex;align-items:center;gap:8px;font-size:12px;color:#475569;margin:3px 0;",
     chartLabel: "width:96px;flex:0 0 96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
     chartTrack: "flex:1 1 auto;height:10px;border-radius:5px;background:#f1f5f9;overflow:hidden;",
-    chartFill: "height:100%;border-radius:5px;background:#60a5fa;",
+    chartFill: "display:block;height:100%;border-radius:5px;background:#60a5fa;",
     chartValue: "width:72px;flex:0 0 72px;text-align:right;color:#334155;",
     emptyFrame: "border:1px dashed #cbd5e1;border-radius:6px;padding:14px;text-align:center;font-size:12px;color:#94a3b8;background:#f8fafc;",
     table: "width:100%;border-collapse:collapse;font-size:12px;color:#475569;",
@@ -471,6 +471,39 @@
       if (isFinite(num) && num > max) max = num;
     }
 
+    if (region.componentType === "line_chart" && typeof doc.createElementNS === "function") {
+      const svgNode = (tag, attributes) => {
+        const node = doc.createElementNS("http://www.w3.org/2000/svg", tag);
+        for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+        return node;
+      };
+      const svg = svgNode("svg", { viewBox: "0 0 360 180", width: "100%", role: "img", "aria-label": region.title });
+      svg.appendChild(svgNode("path", { d: "M 32 12 V 150 H 348", fill: "none", stroke: "#cbd5e1" }));
+      const points = values.map((value, index) => ({
+        x: 32 + index * 316 / Math.max(1, values.length - 1),
+        y: 150 - (max > 0 && isFinite(Number(value)) ? Number(value) / max : 0) * 125,
+      }));
+      svg.appendChild(svgNode("polyline", {
+        points: points.map(({ x, y }) => x + "," + y).join(" "),
+        fill: "none", stroke: "#2563eb", "stroke-width": 2,
+      }));
+      points.forEach(({ x, y }, index) => {
+        const dot = svgNode("circle", { cx: x, cy: y, r: 3, fill: "#2563eb" });
+        const title = svgNode("title", {});
+        title.textContent = safeText(labels[index]) + ": " + safeText(values[index]) + " " + safeText(data.unit);
+        dot.appendChild(title);
+        svg.appendChild(dot);
+      });
+      for (const [index, x, anchor] of [[0, 32, "start"], [labels.length - 1, 348, "end"]]) {
+        const label = svgNode("text", { x, y: 170, "text-anchor": anchor, "font-size": 11, fill: "#64748b" });
+        label.textContent = safeText(labels[index]);
+        svg.appendChild(label);
+      }
+      box.appendChild(svg);
+      box.appendChild(makeText(doc, "div", STYLE.sourceNote, "单位：" + safeText(data.unit) + "，共 " + values.length + " 个数据点"));
+      return box;
+    }
+
     const limit = 12;
     for (let index = 0; index < labels.length && index < limit; index += 1) {
       const row = makeBlock(doc, "div", STYLE.chartRow, "template-chart-row");
@@ -597,7 +630,66 @@
     return card;
   }
 
-  function renderTemplate(doc, view) {
+  function templateGridItems(template) {
+    const layout = template.layout || {};
+    const placements = new Map((layout.items || []).map((item) => [item.regionId, item]));
+    return (template.regions || []).map((region, index) => {
+      const item = placements.get(region.id);
+      const legacyColumn = item && Number.isInteger(item.column) ? item.column : index % 2;
+      const legacyRow = item && Number.isInteger(item.row) ? item.row : Math.floor(index / 2);
+      return {
+        regionId: region.id,
+        label: region.title,
+        placement: item && item.placement ? { ...item.placement } : {
+          type: "GRID", column: legacyColumn * 6 + 1, row: legacyRow * 5 + 1,
+          columnSpan: 6, rowSpan: 5,
+        },
+      };
+    });
+  }
+
+  function mountTemplateGrid(state) {
+    const gridApi = typeof globalThis !== "undefined" && globalThis.WorkbenchGrid;
+    if (!state.gridRoot || !gridApi) return;
+    state.gridItems = templateGridItems(state.view.templateDesign);
+    const readonly = state.view.busy || !state.onLayoutChange;
+    state.grid = gridApi.mountReportGrid(state.gridRoot, {
+      items: state.gridItems,
+      readonly,
+      renderContent: ({ regionId }) => {
+        const index = state.view.templateRegions.findIndex((region) => region.id === regionId);
+        return renderRegion(docOf(state.gridRoot), state.view.templateRegions[index], index);
+      },
+      onIntent: async (intent) => {
+        if (state.disposed || state.gridSaving || !state.onLayoutChange) return;
+        const previous = state.gridItems;
+        const changed = new Map(intent.placements.map((item) => [item.regionId, item.placement]));
+        const next = previous.map((item) => ({ ...item, placement: changed.get(item.regionId) || item.placement }));
+        state.gridSaving = true;
+        state.gridNote.textContent = "正在保存布局…";
+        state.grid.update({ items: next, readonly: true });
+        try {
+          const template = await state.onLayoutChange(state.view.templateDesign,
+            next.map(({ regionId, placement }) => ({ regionId, placement })));
+          if (state.disposed) return;
+          state.view.templateDesign = template;
+          state.gridItems = templateGridItems(template);
+          state.gridNote.textContent = "布局已保存；可继续拖动区域或蓝色手柄调整。";
+        } catch (error) {
+          if (state.disposed) return;
+          state.gridItems = previous;
+          state.gridNote.textContent = "未保存，已恢复原布局：" + errorText(error);
+        } finally {
+          if (!state.disposed) {
+            state.gridSaving = false;
+            state.grid.update({ items: state.gridItems, readonly: false });
+          }
+        }
+      },
+    });
+  }
+
+  function renderTemplate(doc, view, state) {
     if (!view.templateDesign) return null;
     const box = makeBlock(doc, "div", STYLE.templateWrap, "template-design");
     box.setAttribute(MODULE_ATTR, "template");
@@ -619,8 +711,18 @@
     metaParts.push(view.templateRegions.length - bound + " 个占位");
     box.appendChild(makeText(doc, "p", STYLE.templateMeta, metaParts.join(" · ")));
 
-    for (let index = 0; index < view.templateRegions.length; index += 1) {
-      box.appendChild(renderRegion(doc, view.templateRegions[index], index));
+    const gridApi = typeof globalThis !== "undefined" && globalThis.WorkbenchGrid;
+    if (gridApi) {
+      state.gridNote = makeText(doc, "p", STYLE.templateMeta,
+        state.onLayoutChange ? "拖动区域或蓝色手柄调整布局，松开后自动保存。" : "模板网格预览");
+      state.gridNote.setAttribute("class", "template-grid-status");
+      box.appendChild(state.gridNote);
+      state.gridRoot = makeBlock(doc, "div", "margin-bottom:12px;", "template-grid");
+      box.appendChild(state.gridRoot);
+    } else {
+      for (let index = 0; index < view.templateRegions.length; index += 1) {
+        box.appendChild(renderRegion(doc, view.templateRegions[index], index));
+      }
     }
 
     if (view.templatePendingNotes.length) {
@@ -692,9 +794,24 @@
 
     // 模板已经生成：不再摆「确认方案」入口 —— 方案已经确认过了。
     if (view.templateDesign) {
-      box.appendChild(
-        makeText(doc, "span", STYLE.hint, "方案已确认，模板已生成；需要调整请直接说明。")
-      );
+      box.appendChild(makeText(doc, "span", STYLE.hint, "报表已生成，确认继续，还是修改？"));
+      for (const [className, label, action] of [
+        ["template-confirm", "确认报表，继续下一步", "CONFIRM_TEMPLATE"],
+        ["template-modify", "修改报表", "MODIFY_PLAN"],
+      ]) {
+        const button = makeBlock(doc, "button", view.busy ? STYLE.buttonDisabled : STYLE.button, className);
+        button.textContent = label;
+        button.setAttribute("type", "button");
+        button.disabled = view.busy;
+        const handler = () => {
+          if (state.view.busy || state.gridSaving || state.disposed) return;
+          state.emit({ designAction: action, templateId: state.view.templateDesign.id,
+            baseTemplateRevision: state.view.templateDesign.revision });
+        };
+        button.addEventListener("click", handler);
+        state.listeners.push({ node: button, type: "click", handler });
+        box.appendChild(button);
+      }
       return box;
     }
 
@@ -746,15 +863,28 @@
       return body;
     }
 
-    body.appendChild(renderTopic(doc, view));
-    body.appendChild(renderRequirements(doc, view));
-    body.appendChild(renderSections(doc, view));
-    body.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
-    body.appendChild(renderSuggestions(doc, view));
-    body.appendChild(renderReferences(doc, view));
-    const template = renderTemplate(doc, view);
-    if (template) body.appendChild(template);
-    body.appendChild(renderActions(doc, view, state));
+    const template = renderTemplate(doc, view, state);
+    if (template) {
+      body.appendChild(renderActions(doc, view, state));
+      body.appendChild(template);
+      const details = makeBlock(doc, "details", "margin-top:12px;", "confirmed-plan-details");
+      details.appendChild(makeText(doc, "summary", STYLE.blockTitle, "查看已确认的文字方案"));
+      details.appendChild(renderTopic(doc, view));
+      details.appendChild(renderRequirements(doc, view));
+      details.appendChild(renderSections(doc, view));
+      details.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
+      details.appendChild(renderSuggestions(doc, view));
+      details.appendChild(renderReferences(doc, view));
+      body.appendChild(details);
+    } else {
+      body.appendChild(renderTopic(doc, view));
+      body.appendChild(renderRequirements(doc, view));
+      body.appendChild(renderSections(doc, view));
+      body.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
+      body.appendChild(renderSuggestions(doc, view));
+      body.appendChild(renderReferences(doc, view));
+    }
+    if (!template) body.appendChild(renderActions(doc, view, state));
     return body;
   }
 
@@ -788,6 +918,9 @@
       view: normalized,
       container: null,
       listeners: [],
+      onLayoutChange: typeof opts.onLayoutChange === "function" ? opts.onLayoutChange : null,
+      grid: null,
+      disposed: false,
       confirmable: function () {
         return canConfirmNow(state.view);
       },
@@ -814,6 +947,7 @@
 
     state.container = container;
     states.set(root, state);
+    mountTemplateGrid(state);
   }
 
   /**
@@ -824,6 +958,8 @@
     if (!root || typeof root !== "object") return;
     const state = states.get(root);
     if (!state) return;
+    state.disposed = true;
+    if (state.grid) state.grid.destroy();
 
     for (const entry of state.listeners) {
       if (entry.node && typeof entry.node.removeEventListener === "function") {
@@ -853,6 +989,7 @@
     MODULE_ATTR,
     MODULE_NAME,
     normalizeView,
+    templateGridItems,
     errorText,
     canConfirmNow,
     confirmPayload,

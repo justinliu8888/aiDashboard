@@ -635,6 +635,19 @@ test("模板已就绪：阶段标签是「模板已就绪」", () => {
   assert.equal(Plan.designPhaseLabel("TEMPLATE_READY"), "模板已就绪");
 });
 
+test("两列模板映射为12列网格，已保存的位置刷新后保持不变", () => {
+  const initial = Plan.templateGridItems(SAMPLE_TEMPLATE);
+  assert.equal(initial[0].placement.column, 1);
+  assert.equal(initial[1].placement.column, 7);
+  const placement = { type: "GRID", column: 2, row: 3, columnSpan: 5, rowSpan: 4 };
+  const saved = { ...SAMPLE_TEMPLATE, layout: { columns: 12, items: [
+    { regionId: "region_1", placement },
+  ] } };
+  const mapped = Plan.templateGridItems(saved);
+  assert.deepEqual(mapped[0].placement, placement);
+  assert.notEqual(mapped[0].placement, placement);
+});
+
 test("接到数据的区域显示真实取到的值", () => {
   const { root } = makeRoot();
   Plan.render(root, templateView(), {});

@@ -194,7 +194,11 @@ def _scope_total(
     """
     dates = _window_dates(snap, region)
     conditions = _region_filters(region)
-    if conditions:
+    device_metric = any(
+        node.get("metricRef") == "metric.machine_room.device_energy"
+        for node in ((region.get("data") or {}).get("pipeline") or {}).get("nodes", [])
+    )
+    if conditions or device_metric:
         # 有过滤时，总耗电只算被选中的设备，口径和表格保持一致。
         total = 0.0
         for logical_date in dates:
@@ -1063,4 +1067,3 @@ class PreviewService:
 
 
 preview_service = PreviewService()
-

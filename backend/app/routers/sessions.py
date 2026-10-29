@@ -5,7 +5,9 @@ conversationId 仍是一次请求线程，停止生成时会换新，两者不�
 """
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -22,7 +24,14 @@ from app.schemas.session import (
     WorkspaceItem,
 )
 from app.services.session_service import resolve_placeholders, session_service
+from app.schemas.template_design import UpdateTemplateLayoutRequest, UpdateTemplateLayoutResponse
+from app.services.report_design_service import report_design_service
 from app.storage.models import MessageRecord, SessionRecord, WorkspaceRecord
+from app.storage.report_design_repository import (
+    DesignPlanInvalidError,
+    DesignTemplateConflictError,
+    DesignTemplateNotFoundError,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -159,6 +168,43 @@ def update_session(session_id: str, payload: UpdateSessionRequest) -> SessionSum
     if record is None:
         raise HTTPException(status_code=404, detail="会话不存在")
     return _to_summary(record)
+
+
+@router.patch("/sessions/{session_id}/template-layout", response_model=UpdateTemplateLayoutResponse)
+def update_template_layout(
+    session_id: str, payload: UpdateTemplateLayoutRequest
+) -> UpdateTemplateLayoutResponse:
+    if session_service.repository.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    repository = report_design_service.repository
+
+    def write_snapshot(conn: sqlite3.Connection) -> None:
+        # Read the latest snapshot inside the layout transaction, not before it.
+        row = conn.execute(
+            "SELECT snapshot FROM sessions WHERE id = ? AND deleted_at IS NULL",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise DesignTemplateNotFoundError("会话不存在")
+        snapshot = json.loads(row[0]) if row[0] else {}
+        snapshot["templateDesign"] = repository.load_template(session_id)
+        conn.execute(
+            "UPDATE sessions SET snapshot = ? WHERE id = ? AND deleted_at IS NULL",
+            (json.dumps(snapshot, ensure_ascii=False), session_id),
+        )
+
+    try:
+        template = repository.update_template_layout(
+            session_id, payload.templateId, payload.baseRevision,
+            [item.model_dump() for item in payload.items], write_turn=write_snapshot,
+        )
+    except DesignTemplateNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DesignTemplateConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DesignPlanInvalidError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return UpdateTemplateLayoutResponse(templateDesign=template)
 
 
 @router.delete("/sessions/{session_id}", status_code=204)

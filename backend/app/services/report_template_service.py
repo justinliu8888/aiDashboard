@@ -89,6 +89,9 @@ _INTENT_PATTERNS: tuple[tuple[str, str], ...] = (
     ("电量汇总", METRIC_TOTAL_ENERGY["metricRef"]),
     ("整体能耗", METRIC_TOTAL_ENERGY["metricRef"]),
     ("机房能耗", METRIC_TOTAL_ENERGY["metricRef"]),
+    ("每日耗电", METRIC_TOTAL_ENERGY["metricRef"]),
+    ("耗电量", METRIC_TOTAL_ENERGY["metricRef"]),
+    ("用电量", METRIC_TOTAL_ENERGY["metricRef"]),
     # 裸「能耗」：目录别名匹配不到时兜到总量级。
     #
     # 这一条**不会**把 PUE 顶替成能耗：目录别名先匹配，

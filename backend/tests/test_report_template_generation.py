@@ -164,6 +164,19 @@ def _confirm(client: TestClient, plan: dict[str, Any], message_id: str) -> dict[
 # --------------------------------------------------------------------------
 
 
+def test_daily_energy_wording_binds_available_trend_data(client, monkeypatch):
+    candidate = _candidate(metrics=["每日耗电量"], sections=[{
+        "id": "section_daily", "title": "每日耗电趋势", "metricIntents": ["每日耗电量"],
+        "componentType": "line_chart",
+    }])
+    install_model(monkeypatch, RecordingModel(candidate))
+    plan = _post(client, "生成最近7天每日耗电趋势").json()["domainObjects"]["reportPlan"]
+    template = _confirm(client, plan, "msg_confirm_daily")["domainObjects"]["templateDesign"]
+    region = template["regions"][0]
+    assert region["dataStatus"] == "bound"
+    assert len(region["data"]["yValues"]) == 7
+
+
 def test_confirm_generates_template_bound_to_the_confirmed_plan(client, monkeypatch):
     """确认后阶段推进到 TEMPLATE_READY，模板绑定的是确认的那一版方案。"""
     install_model(monkeypatch, RecordingModel(_candidate()))

@@ -28,12 +28,14 @@ from typing import Any, Protocol, TypedDict, runtime_checkable
 DESIGN_PHASE_PLAN_NEEDED = "PLAN_NEEDED"
 DESIGN_PHASE_PLAN_WAITING_CONFIRM = "PLAN_WAITING_CONFIRM"
 DESIGN_PHASE_TEMPLATE_READY = "TEMPLATE_READY"
+DESIGN_PHASE_DRAFT_READY = "DRAFT_READY"
 
 # 能落库的阶段。模板已就绪（工单 02 起）。
 DESIGN_PHASES = (
     DESIGN_PHASE_PLAN_NEEDED,
     DESIGN_PHASE_PLAN_WAITING_CONFIRM,
     DESIGN_PHASE_TEMPLATE_READY,
+    DESIGN_PHASE_DRAFT_READY,
 )
 
 
@@ -62,6 +64,7 @@ class LoadResult(TypedDict):
     designPhase: str
     reportPlan: dict[str, Any] | None
     templateDesign: dict[str, Any] | None
+    definitionDraft: dict[str, Any] | None
 
 
 class ClaimResult(TypedDict, total=False):
@@ -148,6 +151,14 @@ class DesignPlanInvalidError(DesignStoreError):
 
 class DesignOperationStateError(DesignStoreError):
     """操作不存在，或当前状态不允许这一步。"""
+
+
+class DesignTemplateNotFoundError(DesignStoreError):
+    """当前会话没有模板。"""
+
+
+class DesignTemplateConflictError(DesignStoreError):
+    """模板 ID 或基础版本已变化。"""
 
 
 # ---------- 接口 ----------
@@ -245,3 +256,19 @@ class ReportDesignRepository(Protocol):
 
     def load_template(self, session_id: str) -> dict[str, Any] | None:
         """读会话当前已提交的模板设计。"""
+
+    def commit_definition(
+        self, session_id: str, template_id: str, expected_revision: int,
+        definition: Mapping[str, Any], write_turn: WriteTurn, *, operation_id: str,
+    ) -> dict[str, Any]:
+        """Check the current template and atomically persist draft, phase and turn."""
+
+    def update_template_layout(
+        self,
+        session_id: str,
+        template_id: str,
+        expected_revision: int,
+        items: list[dict[str, Any]],
+        write_turn: WriteTurn | None = None,
+    ) -> dict[str, Any]:
+        """同事务检查模板版本、保存布局并执行快照写入；保留区域数据。"""

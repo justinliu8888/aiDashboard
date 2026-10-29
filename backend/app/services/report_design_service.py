@@ -33,6 +33,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -46,7 +47,9 @@ from app.agents.report_plan_agent import (
 )
 from app.schemas.agent import (
     DESIGN_ACTION_CONFIRM_PLAN,
+    DESIGN_ACTION_CONFIRM_TEMPLATE,
     AgentError,
+    AgentQuestion,
     AgentRequest,
     AgentResponse,
     AgentResponseDomainObjects,
@@ -60,6 +63,9 @@ from app.schemas.session import (
 )
 from app.services.report_plan_service import apply_candidate
 from app.services.report_template_service import build_template_design
+from app.services.report_draft_service import build_policy_draft
+from app.services.template_definition_service import build_template_definition
+from app.schemas.report_definition import ReportDefinitionDraft
 from app.services.session_context import current_session_key
 from app.services.session_service import session_service
 from app.storage.report_design_repository import (
@@ -69,9 +75,12 @@ from app.storage.report_design_repository import (
     DESIGN_PHASE_PLAN_NEEDED,
     DESIGN_PHASE_PLAN_WAITING_CONFIRM,
     DESIGN_PHASE_TEMPLATE_READY,
+    DESIGN_PHASE_DRAFT_READY,
     OPERATION_SUCCEEDED,
     DesignOperationStateError,
     DesignPlanInvalidError,
+    DesignTemplateConflictError,
+    DesignTemplateNotFoundError,
     ReportDesignRepository,
 )
 from app.storage.report_design_sqlite import SqliteReportDesignRepository
@@ -129,6 +138,8 @@ _CONFIRM_MARKERS: tuple[str, ...] = (
 #: 确认时常见的、没有信息量的填充词。剥掉它们才知道这句话是不是「只有确认」。
 _CONFIRM_FILLERS: tuple[str, ...] = (
     "方案",
+    "模板",
+    "模版",
     "这个",
     "这份",
     "当前",
@@ -389,7 +400,8 @@ class ReportDesignService:
             designSessionId=request.context.designSessionId,
             designPhase=phase,
             domainObjects=AgentResponseDomainObjects(
-                reportPlan=current_plan if isinstance(current_plan, dict) else None
+                reportPlan=current_plan if isinstance(current_plan, dict) else None,
+                templateDesign=(state or {}).get("templateDesign"),
             ),
             debug={"designPhase": phase, "designOutcome": "noop"},
         )
@@ -414,6 +426,9 @@ class ReportDesignService:
         plan = state.get("reportPlan")
         if isinstance(plan, dict):
             response.domainObjects.reportPlan = plan
+        template = state.get("templateDesign")
+        if isinstance(template, dict):
+            response.domainObjects.templateDesign = template
         response.debug = {
             **(response.debug or {}),
             "designPhase": phase,
@@ -448,6 +463,25 @@ class ReportDesignService:
         action = (request.context.designAction or "").strip().upper()
         current_plan = (state or {}).get("reportPlan")
 
+        if (state or {}).get("designPhase") == DESIGN_PHASE_TEMPLATE_READY:
+            if _normalize(request.message) in {"修改", "修改方案", "修改模板", "改方案", "调整方案"}:
+                response = self._template_response(
+                    request, plan=current_plan, template=(state or {}).get("templateDesign")
+                )
+                response.reply = "请说明要修改方案的哪些内容。当前模板保持原样，修改后的方案需要重新确认才能生成新模板。"
+                response.uiActions = ["modify_plan", "plan_edit_requested"]
+                return response
+            if is_vague_approval(request.message):
+                return self._handle_vague_approval(request, state=state)
+
+        if action == DESIGN_ACTION_CONFIRM_TEMPLATE or (
+            (state or {}).get("designPhase") == DESIGN_PHASE_TEMPLATE_READY
+            and not action and is_pure_confirmation(request.message)
+        ):
+            if action and request.message.strip() and not is_pure_confirmation(request.message):
+                return await self._handle_design_turn(request, state=state, emit=emit)
+            return self.confirm_template(request, state=state)
+
         # 模糊认可先判：「差不多了」这类不能确定是否认可，
         # 不能推进设计版本，只能返回明确确认入口（规格 #18）。
         if isinstance(current_plan, dict) and current_plan:
@@ -470,6 +504,103 @@ class ReportDesignService:
 
         return await self._handle_design_turn(request, state=state, emit=emit)
 
+    def confirm_template(
+        self, request: AgentRequest, *, state: dict[str, Any] | None,
+    ) -> AgentResponse:
+        template = (state or {}).get("templateDesign")
+        plan = (state or {}).get("reportPlan")
+        phase = (state or {}).get("designPhase")
+        code = None
+        if not template or not plan:
+            code = "TEMPLATE_NOT_AVAILABLE"
+        elif (phase not in {DESIGN_PHASE_TEMPLATE_READY, DESIGN_PHASE_DRAFT_READY}
+              or template["planId"] != plan["id"] or template["planRevision"] != plan["revision"]
+              or request.context.templateId not in (None, template["id"])
+              or request.context.baseTemplateRevision not in (None, template["revision"])
+              or request.context.planId not in (None, plan["id"])
+              or request.context.basePlanRevision not in (None, plan["revision"])):
+            code = "TEMPLATE_REVISION_CONFLICT"
+        if code:
+            response = self._failure_response(request, state, code=code,
+                                              message="当前模板不可确认或版本已变化，请查看当前模板后重试。")
+            if phase == DESIGN_PHASE_DRAFT_READY:
+                response.state = request.state
+            return response
+        if not request.messageId:
+            return self._failure_response(request, state, code="TEMPLATE_OPERATION_KEY_MISSING",
+                                          message="这次确认缺少消息标识，请重试。")
+        if phase == DESIGN_PHASE_DRAFT_READY:
+            record = session_service.repository.get_session(self.session_key(request))
+            snapshot = record.snapshot if record else {}
+            pending = record.pendingChoice if record else None
+            return AgentResponse(
+                conversationId=request.conversationId, state=AgentState(record.state) if record else request.state,
+                designSessionId=record.designSessionId if record else request.context.designSessionId,
+                designPhase=phase, reply="模板已确认，沿用当前草稿，没有重复生成。",
+                domainObjects=AgentResponseDomainObjects(
+                    reportDefinitionDraft=ReportDefinitionDraft(**snapshot["definition"]),
+                    reportPolicyDraft=request.snapshots.reportPolicy,
+                    reportPlan=plan, templateDesign=template,
+                ), questions=[AgentQuestion(**pending["question"])] if pending else [],
+                uiActions=["template_duplicate"],
+            )
+        operation_id = None
+        try:
+            claim = self.repository.claim_operation(self.session_key(request), request.messageId, plan["revision"])
+            if claim["kind"] == CLAIM_KIND_CONFLICT:
+                return self._conflict_response(request, claim)
+            if claim["kind"] == CLAIM_KIND_DUPLICATE:
+                response = self._failure_response(request, state, code="TEMPLATE_OPERATION_DUPLICATE",
+                                                  message="这条消息已经处理过或仍在处理中，没有重复执行。请使用新的消息标识重试。")
+                return response
+            operation_id = claim["operationId"]
+            draft = build_template_definition(template, plan, request.context.subjectId)
+            response = AgentResponse(
+                conversationId=request.conversationId, state=AgentState.WAITING_USER_CONFIRM,
+                designSessionId=request.context.designSessionId,
+                designPhase=DESIGN_PHASE_DRAFT_READY,
+                reply="模板已确认并生成报表草稿。请确认草稿后继续校验、试运行；占位区域仍保留原因，不会编造数值。",
+                domainObjects=AgentResponseDomainObjects(
+                    reportDefinitionDraft=draft, reportPolicyDraft=build_policy_draft(template["title"]),
+                    reportPlan=plan, templateDesign=template,
+                ),
+                questions=[AgentQuestion(
+                    id="template_edit_confirm", prompt="请选择下一步操作：", expects="SINGLE_CHOICE",
+                    selectionOnly=True, options=[{"value": v, "label": v} for v in ("同意", "修改", "重新开始")],
+                )],
+                uiActions=["confirm_framework", "draft_ready"],
+            )
+            write_turn = self._make_write_turn(request, response)
+
+            def write_confirmation(connection):
+                write_turn(connection)
+                connection.execute(
+                    "UPDATE sessions SET pending_choice = ? WHERE id = ?",
+                    (json.dumps({"state": response.state.value,
+                                 "question": response.questions[0].model_dump(mode="json")}, ensure_ascii=False),
+                     self.session_key(request)),
+                )
+
+            commit = self.repository.commit_definition(
+                self.session_key(request), template["id"], template["revision"], draft.model_dump(mode="json"),
+                write_confirmation, operation_id=operation_id,
+            )
+            if commit.get("alreadyCommitted"):
+                return self.confirm_template(request, state=self.load_state(request))
+            response.turnPersisted = True
+            return response
+        except (DesignTemplateConflictError, DesignTemplateNotFoundError):
+            if operation_id:
+                self._fail_operation(operation_id, "TEMPLATE_REVISION_CONFLICT", "模板已变化")
+            return self._failure_response(request, self.load_state(request), code="TEMPLATE_REVISION_CONFLICT",
+                                          message="模板已变化，本次没有覆盖它，请刷新后重试。")
+        except Exception:
+            logger.exception("[report_design] 模板确认失败")
+            if operation_id:
+                self._fail_operation(operation_id, "TEMPLATE_CONFIRM_FAILED", "模板未能安全转换为草稿")
+            return self._failure_response(request, state, code="TEMPLATE_CONFIRM_FAILED",
+                                          message="模板未能安全转换为草稿，当前模板保持原样，请修改方案或重试。")
+
     def _handle_vague_approval(
         self,
         request: AgentRequest,
@@ -487,6 +618,10 @@ class ReportDesignService:
         """
         current_plan = (state or {}).get("reportPlan") or {}
         current_revision = current_plan.get("revision")
+        if (state or {}).get("designPhase") == DESIGN_PHASE_TEMPLATE_READY:
+            response = self._template_response(request, plan=current_plan, template=(state or {}).get("templateDesign"))
+            response.reply = "当前模板保持原样。请明确确认模板，或告诉我要修改方案的哪一处。"
+            return response
         message = (
             "我理解你对这份方案大致认可，但还不能确定是不是要按它生成，"
             "所以我没有改动方案，也没有替你确认。"
@@ -1048,7 +1183,7 @@ class ReportDesignService:
         ui_actions = [UI_ACTION_PLAN_RETRY] if retryable else []
         return AgentResponse(
             conversationId=request.conversationId,
-            state=AgentState.ANALYZING,
+            state=request.state if phase == DESIGN_PHASE_DRAFT_READY else AgentState.ANALYZING,
             reply=message,
             designSessionId=request.context.designSessionId,
             designPhase=phase,
@@ -1215,8 +1350,9 @@ class ReportDesignService:
             reply += "（这一版方案之前已经确认过，直接沿用已生成的模板，没有重复生成。）"
         else:
             reply += "模板已经保存，刷新后仍然在。"
+        reply += "请确认模板以生成报表草稿，或选择修改方案继续调整。"
 
-        ui_actions = [UI_ACTION_TEMPLATE_READY]
+        ui_actions = [UI_ACTION_TEMPLATE_READY, "confirm_template", "modify_plan"]
         if duplicate:
             ui_actions.append("template_duplicate")
         return AgentResponse(

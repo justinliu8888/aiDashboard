@@ -26,12 +26,14 @@ from app.schemas.agent import (
     ADVANCE_MESSAGE,
     ALLOWED_TRANSITIONS,
     AGENT_PROTOCOL_VERSION,
+    DESIGN_ACTION_CONFIRM_TEMPLATE,
     AgentBlock,
     AgentError,
     AgentQuestion,
     AgentRequest,
     AgentResponse,
     AgentResponseDomainObjects,
+    AgentRequestSnapshots,
     AgentState,
     QuestionOption,
     ToolRequest,
@@ -40,6 +42,8 @@ from app.schemas.agent import (
 from app.schemas.edit_plan import EditIntent, EditPlan
 from app.schemas.fact import RECORDED_STAGE_DISCLOSURE, SessionFacts
 from app.schemas.report_definition import ReportDefinitionDraft
+from app.schemas.report_policy import ReportPolicyDraft
+from app.storage.report_design_repository import DESIGN_PHASE_DRAFT_READY
 from app.schemas.session import PendingEditPlan
 from app.services import routing_rules
 from app.services.context_engine import (
@@ -450,6 +454,40 @@ class AgentService:
             )
 
         session_key = bind_session_key(request)
+        design_state = report_design_service.load_state(request)
+        if design_state is not None:
+            record = session_service.repository.get_session(session_key)
+            snapshot = (record.snapshot if record else None) or {}
+            scope = snapshot.get("scope") or {}
+            if any(scope.get(key) not in (None, getattr(request.context, key))
+                   for key in ("projectId", "subjectRef", "subjectId")):
+                response = self._protocol_error(request, code="SESSION_SCOPE_MISMATCH",
+                                                message="请求范围与当前会话不一致，未执行操作。")
+                response.state = AgentState(record.state) if record else request.state
+                # Read-only refusal must not write the mismatched scope into the session.
+                response.turnKind = TURN_KIND_QUERY_ANSWER
+                return response
+            if design_state.get("designPhase") == DESIGN_PHASE_DRAFT_READY:
+                request.state = AgentState(record.state) if record else request.state
+                request.snapshots = AgentRequestSnapshots(
+                    reportDefinition=ReportDefinitionDraft(**snapshot["definition"]) if snapshot.get("definition") else None,
+                    reportPolicy=ReportPolicyDraft(**snapshot["policy"]) if snapshot.get("policy") else None,
+                    lastReportRun=snapshot.get("lastReportRun"),
+                )
+                request.context.reportDefinitionId = record.reportDefinitionId if record else None
+                request.context.baseDefinitionRevision = (
+                    (snapshot.get("definition") or {}).get("metadata", {}).get("revision")
+                )
+                if (request.context.designAction or "").strip().upper() == DESIGN_ACTION_CONFIRM_TEMPLATE:
+                    if request.message.strip() and not is_pure_confirmation(request.message):
+                        return self._protocol_error(request, code="TEMPLATE_ALREADY_CONFIRMED",
+                                                    message="模板已确认，请从当前草稿的修改入口继续。")
+                    return report_design_service.confirm_template(request, state=design_state)
+            else:
+                # Template confirmation never accepts executable client snapshots.
+                request.snapshots = AgentRequestSnapshots()
+                if request.message == ADVANCE_MESSAGE:
+                    return report_design_service.keep_state_response(request, design_state)
         # 恢复上一轮路由层收集到的槽位：本轮路由在它基础上继续补全，
         # 不会重新问用户已经答过的问题。
         loaded_collected = session_service.load_collected_info(session_key)
@@ -610,9 +648,9 @@ class AgentService:
         #   - 只读提问不能被模板流抢走：模板流遇到表达不了的条件会直接
         #     BLOCKED_OR_UNSUPPORTED —— 那是用一句提问触发一条执行分支
         #     （ADR 0002 §6.1 / 规格 #12）。
-        design_state = report_design_service.load_state(request)
         design_turn = (
-            design_state is not None or report_design_service.is_new_build(request)
+            (design_state is not None and design_state.get("designPhase") != DESIGN_PHASE_DRAFT_READY)
+            or (design_state is None and report_design_service.is_new_build(request))
         )
         readonly_rule = routing_rules.is_readonly_question(request.message)
         # 「纯确认」与「模糊认可」这两类消息：都不是提问，也不走查询链路。
@@ -2097,6 +2135,10 @@ class AgentService:
             policyDraft=policy.model_dump(mode="json"),
             definitionDraft=definition.model_dump(mode="json"),
         )
+        if definition.metadata.get("templateBinding"):
+            definition = definition.model_copy(deep=True)
+            definition.metadata.update({"definitionId": saved.definitionId, "revision": saved.revision})
+            saved.definitionDraft = definition.model_dump(mode="json")
         logger.info(
             "[agent.chat] step=save_done conversationId=%s definitionId=%s revision=%s",
             request.conversationId,
@@ -2244,6 +2286,15 @@ class AgentService:
             f"{record.snapshot.roomName} {record.snapshot.logicalDate} 总耗电 "
             f"{record.snapshot.totalEnergyKwh} kWh。"
         )
+        if (definition_dict.get("metadata") or {}).get("templateBinding"):
+            placeholders = sum(
+                (region.get("templateBinding") or {}).get("dataStatus") == "placeholder"
+                for region in definition_dict.get("regions", [])
+            )
+            reply = f"预览已生成（{preview.reportRunId}），按已确认模板的各区域口径展示。"
+            if placeholders:
+                reply += f"{placeholders} 个区域仍保留占位与原因，没有替它们生成数值。"
+            reply += "已接数区域使用能耗 Mock 模拟数据，非生产事实表。"
         return AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.PREVIEW_READY,

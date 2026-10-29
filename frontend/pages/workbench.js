@@ -162,7 +162,7 @@ function renderPlanModule() {
   if (!planRoot) return;
   const api = window.WorkbenchPlan;
   if (!api) return;
-  const hasPlan = !!(planState.reportPlan || planState.designPhase);
+  const hasPlan = !!(planState.reportPlan || planState.designPhase) && planState.designPhase !== "DRAFT_READY";
   // 有方案时，右侧草稿预览的空态让位（避免「还没有草稿」误导）。
   previewRoot.classList.toggle("plan-active", hasPlan);
   if (!hasPlan) {
@@ -179,8 +179,26 @@ function renderPlanModule() {
       error: planState.error,
       canConfirm: planCanConfirm(),
     },
-    { onAction: handlePlanAction }
+    { onAction: handlePlanAction, onLayoutChange: saveTemplateLayout }
   );
+}
+
+async function saveTemplateLayout(template, items) {
+  const sessionId = session.sessionId;
+  if (!sessionId) throw new Error("当前会话尚未保存，请先确认方案。");
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/template-layout`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ templateId: template.id, baseRevision: template.revision, items }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(typeof payload.detail === "string" ? payload.detail : "布局保存失败，请刷新后重试。");
+  }
+  if (session.sessionId === sessionId && planState.templateDesign?.id === template.id) {
+    planState.templateDesign = payload.templateDesign;
+  }
+  return payload.templateDesign;
 }
 
 /** 从一次响应里同步方案状态。 */
@@ -193,9 +211,11 @@ function syncPlanFromResponse(data) {
   planState.designPhase = phase || planState.designPhase;
   if (plan) planState.reportPlan = plan;
   if (template) planState.templateDesign = template;
+  else if (phase === "PLAN_WAITING_CONFIRM" || phase === "PLAN_NEEDED") planState.templateDesign = null;
   // 出错时展示错误条；成功时清掉上一次的错误。
   planState.error = data.error ? data.error.message || data.error.code || null : null;
   renderPlanModule();
+  if (template) planRoot.parentElement.scrollTop = 0;
 }
 
 /** 从会话详情里恢复方案（刷新 / 重建服务后）。 */
@@ -211,6 +231,19 @@ function restorePlanFromDetail(detail) {
 
 /** 确认回调：模块只交回意图，真正的请求由上层发。 */
 function handlePlanAction(action) {
+  if (isBusy() || !action) return;
+  if (action.designAction === "MODIFY_PLAN") {
+    sendMessage("修改方案");
+    $("chat-input").focus();
+    return;
+  }
+  if (action.designAction === "CONFIRM_TEMPLATE") {
+    sendMessage("确认模板", { designAction: {
+      designAction: "CONFIRM_TEMPLATE", templateId: action.templateId,
+      baseTemplateRevision: action.baseTemplateRevision,
+    } });
+    return;
+  }
   if (!action || action.designAction !== "CONFIRM_PLAN") return;
   if (!planCanConfirm()) return;
   sendMessage("确认", {
@@ -2756,6 +2789,7 @@ function startNewSession() {
   // 新对话没有方案：清掉上一条对话的方案卡片。
   planState.designPhase = null;
   planState.reportPlan = null;
+  planState.templateDesign = null;
   planState.busy = false;
   planState.error = null;
   renderPlanModule();

@@ -113,6 +113,7 @@ ALLOWED_TRANSITIONS: dict[AgentState, set[AgentState]] = {
 # 首波只实现 CONFIRM_PLAN 的**边界校验**（版本冲突、过期拒绝）；
 # 模板生成属于工单 02，REQUEST_DATA 属于工单 05，本工单不接。
 DESIGN_ACTION_CONFIRM_PLAN = "CONFIRM_PLAN"
+DESIGN_ACTION_CONFIRM_TEMPLATE = "CONFIRM_TEMPLATE"
 DESIGN_ACTION_REQUEST_DATA = "REQUEST_DATA"
 
 
@@ -133,6 +134,8 @@ class AgentRequestContext(BaseModel):
     designAction: str | None = None
     planId: str | None = None
     basePlanRevision: int | None = None
+    templateId: str | None = None
+    baseTemplateRevision: int | None = Field(default=None, ge=1)
 
 
 class ValidationIssue(BaseModel):
