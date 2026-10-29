@@ -951,6 +951,144 @@ test("展示目的的标签映射", () => {
   assert.equal(Plan.displayIntentLabel(null), "");
 });
 
+// ---------------------------------------------------------------- 展示目的的取值域与兜底
+//
+// 工单 02 把 displayIntent 的取值域**封闭**为 5 个：
+//   total / trend / comparison / composition / records（纯说明板块为 null）。
+// 后端将来加新枚举时，前端不许回落英文 key（用户看不懂，而且裸英文正说明
+// 「后端枚举与前端映射没同步」），也不许猜成某个已知取值（那是错误语义）。
+// 兜底必须：显示中文 + 不丢信息 + 原始值可追溯。
+
+const INTENT_SECTIONS = {
+  total: "总量",
+  trend: "趋势",
+  comparison: "对比",
+  composition: "构成",
+  records: "明细",
+};
+
+test("展示目的的五个已知取值各自显示中文", () => {
+  for (const [intent, label] of Object.entries(INTENT_SECTIONS)) {
+    const { root } = makeRoot();
+    Plan.render(root, viewWith({
+      reportPlan: {
+        ...SAMPLE_PLAN,
+        sections: [
+          {
+            id: "section_intent",
+            title: "总耗电概览",
+            metricIntents: ["总耗电"],
+            componentType: "metric_card",
+            displayIntent: intent,
+          },
+        ],
+      },
+    }), {});
+
+    const tag = oneClass(root, "plan-display-intent");
+    assert.equal(tag.textContent, label, `displayIntent=${intent} 应显示「${label}」`);
+    assert.equal(tag.getAttribute("data-plan-display-intent"), intent, "原始取值要留在 data-* 里");
+    assert.equal(tag.getAttribute("title"), null, "已知取值是中文，不需要 title 兜底");
+    assert.ok(Plan.isKnownDisplayIntent(intent), `${intent} 算已知取值`);
+  }
+});
+
+test("展示目的为 null 时不渲染这一项（板块本身照常渲染）", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_note",
+          title: "口径说明",
+          metricIntents: ["总耗电"],
+          componentType: "text",
+          displayIntent: null,
+        },
+      ],
+    },
+  }), {});
+
+  assert.equal(byClass(root, "plan-display-intent").length, 0, "null 展示目的不渲染这一项");
+  assert.equal(byClass(root, "plan-section").length, 1, "板块卡片本身照常渲染");
+  assert.ok(textOf(root).includes("口径说明"), "板块标题照常显示");
+});
+
+test("未知展示目的回落中文兜底，原始取值可追溯", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_rank",
+          title: "设备耗电排名",
+          metricIntents: ["总耗电"],
+          componentType: "bar_chart",
+          displayIntent: "ranking",
+        },
+      ],
+    },
+  }), {});
+
+  const tag = oneClass(root, "plan-display-intent");
+  // 中文：用户看到的是人话，不是裸英文 key
+  assert.equal(tag.textContent, "未知展示目的", "未知取值要显示中文兜底");
+  assert.ok(!tag.textContent.includes("ranking"), "界面文字里不该出现裸英文 key");
+  assert.ok(!/[a-zA-Z]/.test(tag.textContent), "兜底文字里不该有英文字母");
+  // 不丢信息：这一项照常渲染出来（不是整行消失）
+  assert.equal(byClass(root, "plan-section").length, 1, "板块卡片照常渲染");
+  assert.ok(textOf(root).includes("设备耗电排名"), "板块标题照常显示");
+  // 可追溯：原始取值两处都留着
+  assert.equal(tag.getAttribute("data-plan-display-intent"), "ranking", "原始取值要留在 data-* 里");
+  assert.equal(tag.getAttribute("title"), "ranking", "原始取值要能从 title 里查到");
+});
+
+test("未知展示目的不猜成某个已知取值", () => {
+  const knownLabels = Object.values(Plan.DISPLAY_INTENT_LABELS);
+  for (const unknown of ["ranking", "distribution", "Total", "TOTAL", "records "]) {
+    assert.ok(!Plan.isKnownDisplayIntent(unknown), `${unknown} 不算已知取值`);
+    const label = Plan.displayIntentLabel(unknown);
+    assert.equal(label, "未知展示目的", `${unknown} 应走中文兜底`);
+    assert.ok(!knownLabels.includes(label), `${unknown} 不能被猜成某个已知语义`);
+  }
+});
+
+test("兜底标签本身是中文常量", () => {
+  assert.equal(Plan.DISPLAY_INTENT_UNKNOWN_LABEL, "未知展示目的");
+  assert.ok(!/[a-zA-Z]/.test(Plan.DISPLAY_INTENT_UNKNOWN_LABEL), "兜底标签不该含英文字母");
+});
+
+test("未知展示目的里的文本只作为文本显示（不执行模型 HTML）", () => {
+  const { doc, root } = makeRoot();
+  const nasty = '<img src=x onerror="window.__pwned=9">';
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_rank",
+          title: "设备耗电排名",
+          metricIntents: ["总耗电"],
+          componentType: "bar_chart",
+          displayIntent: nasty,
+          selectionReason: nasty,
+        },
+      ],
+    },
+  }), {});
+
+  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应该使用 innerHTML");
+  const tags = walk(root).map((node) => node.tagName);
+  assert.ok(!tags.includes("IMG"), "不该由模型文本生成 img 元素");
+  assert.ok(textOf(root).includes(nasty), "模型文本应当原样以文本显示");
+
+  const tag = oneClass(root, "plan-display-intent");
+  assert.equal(tag.textContent, "未知展示目的", "未知取值仍然显示中文兜底");
+  assert.equal(tag.getAttribute("title"), nasty, "原始取值原样留在 title 里");
+});
+
 // ---------------------------------------------------------------- 工作台页面结构
 //
 // 工单 06（#46）：文字方案移到左侧对话区，右侧报表面板不再出现文字方案。

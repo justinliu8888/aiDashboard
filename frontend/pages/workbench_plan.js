@@ -56,7 +56,10 @@
    *
    * 字段来自开发规格「跨工单契约」：每个板块定稿携带 displayIntent，
    * 取值是 total / trend / comparison / composition / records。
-   * 未知取值原样显示（安全文本），空值不显示。
+   *
+   * 取值域已封闭为这 5 个（方案侧工单 02）。后端将来加新枚举时，
+   * 走 DISPLAY_INTENT_UNKNOWN_LABEL 兜底，**不**回落英文 key（见 displayIntentLabel）。
+   * 空值（null / 缺字段）不显示。
    */
   const DISPLAY_INTENT_LABELS = {
     total: "总量",
@@ -65,6 +68,15 @@
     composition: "构成",
     records: "明细",
   };
+
+  /**
+   * 未知展示目的的中文兜底标签。
+   *
+   * 后端将来加了新枚举时用它：用户看到的是中文，不是裸英文 key；
+   * 原始 key 由调用方放进 title / data-* 属性，保留可追溯性。
+   * 它**不**代表任何已知语义 —— 未知就是未知，不猜。
+   */
+  const DISPLAY_INTENT_UNKNOWN_LABEL = "未知展示目的";
 
   /** 设计阶段 → 中文标签。 */
   const PHASE_LABELS = {
@@ -312,14 +324,29 @@
   }
 
   /**
-   * 展示目的 → 中文标签。未知取值原样显示（安全文本），空值返回空串。
+   * 展示目的 → 中文标签。
+   *
+   * 三种情况：
+   *   - 空值（null / 缺字段）→ 空串：不渲染这一行；
+   *   - 5 个已知取值 → 对应中文；
+   *   - **未知取值 → 中文兜底**（DISPLAY_INTENT_UNKNOWN_LABEL）。
+   *
+   * 未知取值**不回落英文 key**：用户看不懂英文，而且裸英文正说明
+   * 「后端枚举与前端映射没同步」—— 那是要暴露的问题，不是要洗成中文的样子。
+   * 未知取值也**不映射到任何已知取值**：那是猜，会显示错误语义。
+   * 原始 key 由调用方放进 title / data-* 属性，保留可追溯性。
    */
   function displayIntentLabel(intent) {
     const key = safeText(intent);
     if (!key) return "";
-    return Object.prototype.hasOwnProperty.call(DISPLAY_INTENT_LABELS, key)
-      ? DISPLAY_INTENT_LABELS[key]
-      : key;
+    return isKnownDisplayIntent(key) ? DISPLAY_INTENT_LABELS[key] : DISPLAY_INTENT_UNKNOWN_LABEL;
+  }
+
+  /** 这个展示目的是否是已知取值。空值也算「不是已知取值」。 */
+  function isKnownDisplayIntent(intent) {
+    const key = safeText(intent);
+    if (!key) return false;
+    return Object.prototype.hasOwnProperty.call(DISPLAY_INTENT_LABELS, key);
   }
 
   /**
@@ -430,6 +457,12 @@
         const tag = makeText(doc, "span", STYLE.tag, intentLabel);
         tag.setAttribute("class", "plan-display-intent");
         tag.setAttribute("data-plan-display-intent", safeText(item.displayIntent));
+        // 未知取值：标签上是中文兜底，原始 key 放进 title（悬停可见）——
+        // 既不把英文外露到界面上，又不把「后端加了新枚举」这件事藏起来。
+        // 已知取值不加 title：它的中文已经是人话，原文在 data-* 里就够追溯了。
+        if (!isKnownDisplayIntent(item.displayIntent)) {
+          tag.setAttribute("title", safeText(item.displayIntent));
+        }
         head.appendChild(tag);
       }
 
@@ -495,10 +528,11 @@
   // 它**不随模板中间页下线而删除**：需求稿 §3.3 点名保护这段代码
   // （「严禁删除折线图 SVG 渲染与 chartFill 样式」）—— 它是独立的图表改进，
   // 与网格、与业务链路都无关。模板中间页下线只是**换了调用方**：
-  //   - 模板中间页下线后，本模块不再调用它；
-  //   - 草稿路径（workbench.js）在区域真的拿到数据点时调用它。
+  //   - 模板中间页下线后，本模块自己不再调用它；
+  //   - 草稿路径（workbench.js）在 ECharts 不可用时调用它画 SVG。
   //
-  // 草稿阶段还没有数据点，此时草稿面板继续显示空壳卡片，不调用它。
+  // 草稿阶段**不再画空壳**：按 ADR 0004，模版阶段一律用模拟业务数据渲染，
+  // 图表区域带 xLabels / yValues —— 这条路径是**真的会被调用**的。
 
   function renderChart(doc, region) {
     const data = isPlainObject(region.data) ? region.data : {};
@@ -822,6 +856,7 @@
     PHASE_DRAFT_READY,
     COMPONENT_TYPE_LABELS,
     DISPLAY_INTENT_LABELS,
+    DISPLAY_INTENT_UNKNOWN_LABEL,
     PHASE_LABELS,
     MODULE_ATTR,
     MODULE_NAME,
@@ -831,10 +866,11 @@
     confirmPayload,
     componentTypeLabel,
     displayIntentLabel,
+    isKnownDisplayIntent,
     designPhaseLabel,
     // 图表渲染器：模板中间页下线后**改由草稿路径复用**
-    // （事实：草稿路径的 region.data 是执行绑定描述符，不含 xLabels / yValues，
-    //  所以草稿面板当前不会真的调到这里；带数据点的预览走 ECharts 那条路）。
+    // （事实：草稿路径按 ADR 0004 用模拟业务数据渲染，图表区域带 xLabels / yValues；
+    //  ECharts 可用时走 ECharts，ECharts 不可用时才落到这里画 SVG）。
     // 需求稿 §3.3 点名保护这段代码，不得因为「没有调用方」而删掉。
     renderChart,
     render,
