@@ -89,6 +89,114 @@ METRIC_KIND_BY_REF: dict[str, str] = {
 #: 合法的列取值键形态（行对象的键）。
 _COLUMN_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# --------------------------------------------------------------------------
+# 占位原因的两类：能力待接通 / 范围授权
+# --------------------------------------------------------------------------
+#
+# 规格 #46 第 246 行：「能力待接通与范围授权、既有绑定三态相互独立；
+# 不把所有占位原因都标为能力缺失」。
+#
+# 所以**占位**不等于**能力缺失**：
+#   - 能力待接通 —— 这个指标当前还算不出来（口径没核实 / 目录里没这个指标）；
+#   - 范围授权   —— 指标能力是通的，只是当前账号没有这个统计对象的授权。
+#
+# 两类**分别计数**，不混算。既有绑定（``dataStatus="bound"``）是第三态，
+# 它不是占位。
+
+#: 范围授权类占位的**唯一**原因文案来源。
+#:
+#: 统计对象越权时用它当 ``placeholderReason``；回复正文引用原因时
+#: **沿用同一套说法**，不自造第二套。
+SCOPE_PLACEHOLDER_REASON = (
+    "统计对象不在授权范围内：该指标能力已接通，当前账号没有这个统计对象的授权。"
+)
+
+#: 判「是不是范围授权问题」用的关键词（历史结构缺标记时的兜底）。
+#:
+#: 与前端角标分类用的是同一套词（授权 / 权限 / 越权）—— 关键词稳，
+#: 整句文案会变。
+_SCOPE_KEYWORDS = ("授权", "权限", "越权")
+
+
+def _reason_is_scope(reason: Any) -> bool:
+    """占位原因是不是**范围授权**问题。"""
+    text = str(reason or "")
+    return any(keyword in text for keyword in _SCOPE_KEYWORDS)
+
+
+def region_data_status(region: Mapping[str, Any]) -> str:
+    """区域的 ``dataStatus``。
+
+    两层结构位置不同：模板层的区域把状态挂在区域上，定义层的区域挂在
+    ``templateBinding`` 里（同一份语义的两种落点）。
+    """
+    if not isinstance(region, Mapping):
+        return ""
+    binding = region.get("templateBinding")
+    if isinstance(binding, Mapping):
+        status = str(binding.get("dataStatus") or "")
+        if status:
+            return status
+    return str(region.get("dataStatus") or "")
+
+
+def region_capability_pending(region: Mapping[str, Any]) -> bool:
+    """区域是不是「能力待接通」（**不是**「范围授权」）。
+
+    判据按优先级取，**都来自同一份结构**（不在文案层另算一套）：
+
+    1. 定义层 ``templateBinding.previewSpec.capabilityPending``
+       —— 区域级布尔，规格定义为各项指标 ``capabilityPending`` 的**逻辑或**；
+    2. 模板层区域自身的 ``capabilityPending``；
+    3. 历史结构两处都没有标记 → 按占位原因还原（与历史定义适配同一条规则：
+       **授权范围不算能力缺失**）。
+
+    统计对象越权时这里是 ``False`` —— 那个指标的能力是通的。
+    """
+    if not isinstance(region, Mapping):
+        return False
+    binding = region.get("templateBinding")
+    binding = binding if isinstance(binding, Mapping) else {}
+    spec = binding.get("previewSpec")
+    if isinstance(spec, Mapping) and spec:
+        if "capabilityPending" in spec:
+            return bool(spec.get("capabilityPending"))
+        metrics = spec.get("metrics")
+        if isinstance(metrics, list) and metrics:
+            # 区域能力布尔 = 各项指标能力布尔的逻辑或。
+            return any(
+                isinstance(item, Mapping) and item.get("capabilityPending") is True
+                for item in metrics
+            )
+    if "capabilityPending" in region:
+        return bool(region.get("capabilityPending"))
+    # 历史结构：没有标记 → 按占位原因还原。
+    reason = region.get("placeholderReason") or binding.get("placeholderReason")
+    return not _reason_is_scope(reason)
+
+
+def split_placeholder_regions(
+    regions: Any,
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    """把占位区域按原因类别拆开：``(能力待接通类, 范围授权类)``。
+
+    非占位区域（既有绑定 / 纯说明区）不在这两类里 —— 三态相互独立，
+    **不混算**。
+    """
+    capability: list[Mapping[str, Any]] = []
+    scope: list[Mapping[str, Any]] = []
+    for region in regions or []:
+        if not isinstance(region, Mapping):
+            continue
+        if region_data_status(region) != "placeholder":
+            continue
+        if region_capability_pending(region):
+            capability.append(region)
+        else:
+            scope.append(region)
+    return capability, scope
+
+
 #: 指标意图的常见措辞 → 指标口径。
 #:
 #: 刻意**只用于模板生成**：指标目录里的别名是旧流程的口径，
@@ -454,8 +562,11 @@ def _build_region(
 
     if room_id is None:
         # 统计对象越权 —— 这是**授权范围**问题，不是能力缺失。
+        #
+        # 原因文案走模块级的**唯一来源**（``SCOPE_PLACEHOLDER_REASON``），
+        # 模板层与回复正文引用同一套说法，不各说各的。
         return placeholder(
-            room_reason or "统计对象不在授权范围内：该指标能力已接通，当前账号没有这个统计对象的授权。",
+            room_reason or SCOPE_PLACEHOLDER_REASON,
             [metric_ref],
             capability_pending=False,
         )
