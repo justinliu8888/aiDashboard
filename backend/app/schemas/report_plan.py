@@ -531,6 +531,43 @@ class PlanRequirements(_PlanModel):
         return _require_text(value)
 
 
+class PlanColumnFormat(_PlanModel):
+    """列的**展示格式**：精度与单位标注。
+
+    - ``kind``：数值呈现方式（``NUMBER`` 等）。
+    - ``precision``：小数位数。
+    - ``unitLabel``：表头单位标注（例如 ``kWh``）。
+
+    字段封闭（``extra="forbid"``）：方案侧只认这三个键 —— 模型多写的键
+    在栏目归一时丢掉，不进契约。
+    """
+
+    kind: str = "NUMBER"
+    precision: int | None = None
+    unitLabel: str | None = None
+
+    @field_validator("kind")
+    @classmethod
+    def _check_kind(cls, value: str) -> str:
+        return _require_text(value)
+
+    @field_validator("precision")
+    @classmethod
+    def _check_precision(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if value < 0:
+            raise ValueError("不能是负数")
+        return value
+
+    @field_validator("unitLabel")
+    @classmethod
+    def _check_unit_label(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _require_text(value)
+
+
 class PlanColumnCandidate(_PlanModel):
     """模型给出的栏目候选：**可以只有显示名**。
 
@@ -542,6 +579,8 @@ class PlanColumnCandidate(_PlanModel):
     id: str | None = None
     label: str
     fieldRef: str | None = None
+    #: 列的展示格式（精度、单位标注）。模型不给就没有单位标注。
+    format: PlanColumnFormat | None = None
 
     @field_validator("id", "fieldRef")
     @classmethod
@@ -563,11 +602,14 @@ class PlanColumn(_PlanModel):
     - ``label``：显示名，给人看的。
     - ``fieldRef``：**行对象里的稳定取值键**，不是真实数据源绑定。
       造数器按它造行，渲染层按它读单元格。
+    - ``format``：列的展示格式（精度、单位标注）。可空 —— 没声明就没有
+      单位标注，不写错的单位。
     """
 
     id: str
     label: str
     fieldRef: str
+    format: PlanColumnFormat | None = None
 
     @field_validator("id", "fieldRef")
     @classmethod

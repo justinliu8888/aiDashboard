@@ -290,11 +290,17 @@ def classify_metric_kind(*, intent: str, metric_ref: str | None = None) -> str:
 
 
 def _column_key(section_id: str, column_id: str, index: int) -> str:
-    """缺键时按板块与栏目确定性生成取值键。"""
-    if _COLUMN_KEY_PATTERN.match(column_id):
-        return column_id
+    """缺键时按板块 ID 与栏目 ID 确定性生成取值键。
+
+    形如 ``section_1_col_1`` —— 板块与栏目**两段都在**：不同板块的同名栏目
+    不会撞键，键也一眼看得出属于哪块。
+    """
     safe_section = re.sub(r"[^A-Za-z0-9_]", "_", section_id) or "section"
-    return f"{safe_section}_col_{index + 1}"
+    safe_column = re.sub(r"[^A-Za-z0-9_]", "_", column_id)
+    if not _COLUMN_KEY_PATTERN.match(safe_column):
+        # 栏目 id 不像个标识符（空、纯数字、带非法字符）→ 用序号兜底。
+        safe_column = f"col_{index}"
+    return f"{safe_section}_{safe_column}"
 
 
 def _unique_key(key: str, used: set[str]) -> str:
@@ -314,7 +320,9 @@ def _normalize_columns(
 
     - 顺序一律按方案声明，**不排序、不按标题猜列**；
     - 缺 ``id`` / ``fieldRef`` 时按板块与栏目确定性补齐；
-    - 取值键重复时确定性改键（显示名可以重复，键不行）。
+    - 取值键重复时确定性改键（显示名可以重复，键不行）；
+    - **只留契约里的键**（``id`` / ``label`` / ``fieldRef`` / ``format``）：
+      模型多写的键不进模板设计，也不进落库定义。
     """
     raw = section.get("columns")
     if not isinstance(raw, (list, tuple)):
@@ -331,17 +339,12 @@ def _normalize_columns(
         )
         field_ref = _unique_key(field_ref, used_keys)
         used_keys.add(field_ref)
-        extra = {
-            key: value for key, value in item.items()
-            if key not in {"id", "label", "fieldRef", "format"}
-        }
         columns.append(
             TemplateColumn(
                 id=column_id,
                 label=label,
                 fieldRef=field_ref,
                 format=item.get("format") if isinstance(item.get("format"), Mapping) else None,
-                **extra,
             )
         )
     return columns
