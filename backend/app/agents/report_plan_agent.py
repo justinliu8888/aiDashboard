@@ -644,6 +644,11 @@ def _apply_resolution(candidate: dict[str, Any], resolution: PlanResolution) -> 
                 column["id"] = spec.id
             if spec.fieldRef:
                 column["fieldRef"] = spec.fieldRef
+            # 列的展示格式（精度、单位标注）跟着栏目一起回写：模型声明了
+            # 「耗电量，单位 kWh」就不能在这里把 format 丢掉 —— 丢了表头就没有
+            # 单位标注（规格《契约缺口补充》A2：表格列的 format.unitLabel 同理）。
+            if spec.format:
+                column["format"] = dict(spec.format)
             columns.append(column)
         section["columns"] = columns
         note = resolution.column_notes.get(index)

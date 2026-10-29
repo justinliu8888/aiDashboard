@@ -10,8 +10,8 @@
     2. 逐区域核对**当前已接通的能力**（目录 + 指标 + 授权范围）；
     3. 接得到的区域写明**绑定了哪个指标**、**用哪个时间窗**，
        并标明数据来源性质；
-    4. 接不到的区域保留占位，写明原因（数据待连接 / 口径待核实 /
-       能力待接通）。
+    4. 接不到的区域保留占位，写明原因（能力待接通 / 口径待核实 /
+       授权范围未覆盖）。
 
 同时守住两条边界：
 
@@ -264,7 +264,7 @@ def classify_metric_kind(*, intent: str, metric_ref: str | None = None) -> str:
 
     身份来自**指标口径**；口径对不上时再按方案的指标意图归一化 ——
     「实时功率」「告警列表」「机柜状态」这些系统还没接通的量，身份是
-    **认得出来的**，区域因此能标「能力待接通」，而不是只说「数据待连接」。
+    **认得出来的**，区域因此能标「能力待接通」，而不是只说「没接到数据」。
 
     认不出来时给 ``generic``：陌生指标照样有明确标注的示例，
     **不按区域标题猜真实口径**。
@@ -439,19 +439,23 @@ def _build_region(
         # 目录里没有这个指标 —— 身份认得出来就标「能力待接通」，
         # 认不出来给 generic（照实标，不编口径）。
         return placeholder(
-            intent_reason or "数据待连接：当前已接通的能力里没有对应指标。",
+            intent_reason or "能力待接通：当前已接通的能力里没有对应指标。",
             capability_pending=True,
         )
 
     backed, reason = _metric_is_backed(metric)
     if not backed:
         # 指标登记在册但底层字段没有 —— 系统还算不出这个数（能力待接通）。
-        return placeholder(reason or "数据待连接。", [metric_ref], capability_pending=True)
+        return placeholder(
+            reason or "口径待核实：当前数据源没有登记这个字段，算不出数值。",
+            [metric_ref],
+            capability_pending=True,
+        )
 
     if room_id is None:
         # 统计对象越权 —— 这是**授权范围**问题，不是能力缺失。
         return placeholder(
-            room_reason or "数据待连接：统计对象不在授权范围内。",
+            room_reason or "统计对象不在授权范围内：该指标能力已接通，当前账号没有这个统计对象的授权。",
             [metric_ref],
             capability_pending=False,
         )
