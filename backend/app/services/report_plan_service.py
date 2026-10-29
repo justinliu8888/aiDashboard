@@ -658,6 +658,15 @@ def _resolve_display_intent(
         except ValueError:
             pass
 
+    raw_type = section.get("componentType")
+    try:
+        model_type = ComponentType(str(getattr(raw_type, "value", raw_type)))
+    except ValueError:
+        model_type = ComponentType.TEXT
+    if model_type == ComponentType.TEXT:
+        # 纯说明板块没有展示目的：不要拿请求里的话去猜它是哪张图。
+        return None
+
     clauses = _split_clauses(request_text)
     mentioned = [
         clause
@@ -1108,6 +1117,38 @@ def apply_candidate(
     previous_plan = _coerce_previous(previous)
     request_text = _request_text(original_request, current_request)
 
+    # 调用方式先对不对（版本与方案 ID），再看内容对不对：
+    # 版本冲突要报成版本冲突，不能被一句澄清问题盖过去。
+    if previous_plan is None:
+        if expected_revision is not None:
+            raise PlanValidationError(
+                "新建方案时 expected_revision 必须为 null",
+                code="PLAN_EXPECTED_REVISION_INVALID",
+            )
+        if plan_id is None or not str(plan_id).strip():
+            raise PlanValidationError(
+                "新建方案必须由调用方提供 plan_id",
+                code="PLAN_ID_REQUIRED",
+            )
+    else:
+        if expected_revision is None:
+            raise PlanValidationError(
+                "修改方案必须提供 expected_revision",
+                code="PLAN_EXPECTED_REVISION_REQUIRED",
+            )
+        if expected_revision != previous_plan.revision:
+            raise PlanRevisionConflictError(
+                f"方案版本冲突：期望 revision {expected_revision}，"
+                f"当前方案是 revision {previous_plan.revision}",
+                expected_revision=expected_revision,
+                actual_revision=previous_plan.revision,
+            )
+        if plan_id is not None and str(plan_id).strip() != previous_plan.id:
+            raise PlanValidationError(
+                f"修改方案时 plan_id 必须沿用原方案：{previous_plan.id}",
+                code="PLAN_ID_MISMATCH",
+            )
+
     # 未接受的建议先剔掉：后面选型与栏目都按**留下来的**板块算。
     kept_sections = drop_unaccepted_suggestion_sections(
         list(candidate_plan.sections), list(candidate_plan.suggestions)
@@ -1141,16 +1182,6 @@ def apply_candidate(
     requirements.grainUnit = grain_unit
 
     if previous_plan is None:
-        if expected_revision is not None:
-            raise PlanValidationError(
-                "新建方案时 expected_revision 必须为 null",
-                code="PLAN_EXPECTED_REVISION_INVALID",
-            )
-        if plan_id is None or not str(plan_id).strip():
-            raise PlanValidationError(
-                "新建方案必须由调用方提供 plan_id",
-                code="PLAN_ID_REQUIRED",
-            )
         sections = _build_sections(kept_sections, [], resolution)
         return ReportPlan(
             id=str(plan_id).strip(),
@@ -1166,24 +1197,6 @@ def apply_candidate(
                 template.model_copy(deep=True)
                 for template in candidate_plan.referenceTemplates
             ],
-        )
-
-    if expected_revision is None:
-        raise PlanValidationError(
-            "修改方案必须提供 expected_revision",
-            code="PLAN_EXPECTED_REVISION_REQUIRED",
-        )
-    if expected_revision != previous_plan.revision:
-        raise PlanRevisionConflictError(
-            f"方案版本冲突：期望 revision {expected_revision}，"
-            f"当前方案是 revision {previous_plan.revision}",
-            expected_revision=expected_revision,
-            actual_revision=previous_plan.revision,
-        )
-    if plan_id is not None and str(plan_id).strip() != previous_plan.id:
-        raise PlanValidationError(
-            f"修改方案时 plan_id 必须沿用原方案：{previous_plan.id}",
-            code="PLAN_ID_MISMATCH",
         )
 
     sections = _build_sections(kept_sections, previous_sections, resolution)

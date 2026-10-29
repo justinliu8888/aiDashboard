@@ -771,3 +771,27 @@ def test_saying_all_sections_covers_all_of_them():
         "bar_chart",
         "bar_chart",
     ]
+
+
+def test_a_plain_text_section_stays_plain_text():
+    """纯说明板块没有展示目的，不拿请求里的话去猜它是哪张图。"""
+    payload = _candidate_payload()
+    payload["sections"] = [
+        _section("说明：本表数据为模拟", "text", metricIntents=[]),
+    ]
+
+    plan = apply_candidate(payload, plan_id="plan_001", current_request="看总量")
+
+    assert plan.sections[0].componentType.value == "text"
+    assert plan.sections[0].displayIntent is None
+
+
+def test_a_stale_revision_is_reported_as_a_conflict_not_as_a_question():
+    """版本冲突要报成版本冲突，不能被一句澄清问题盖过去。"""
+    payload = _candidate_payload()
+    payload["sections"] = [
+        _section("运维工单明细", "table", displayIntent="records", metricIntents=["工单"]),
+    ]
+
+    with pytest.raises(PlanRevisionConflictError):
+        apply_candidate(payload, previous=_previous_plan(), expected_revision=99)
