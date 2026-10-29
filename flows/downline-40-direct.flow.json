@@ -1,0 +1,351 @@
+{
+  "_comment": "#42 归档：原实施笔记目录 实施笔记-downline-grid/flow/downline-40-direct.flow.json 收进仓库。baseDir / outDir 由绝对路径改为相对本文件所在目录（flows/）的相对路径，可在任意 worktree 复现。端口 8021 → 8022（#42 交付报告记录的本地服务端口）。证据：.selfcheck/downline-grid/flow/。",
+  "baseDir": "..",
+  "outDir": "../.selfcheck/downline-grid/flow",
+  "waitMs": 2500,
+  "timeout": 20000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "wb40-01 文字方案→点一次确认方案→直接出草稿",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成A机房最近7天的能耗报表，四个板块：总耗电指标卡、每日耗电趋势图、设备耗电排名表、PUE指标卡。"
+        },
+        {
+          "click": "#btn-send"
+        },
+        {
+          "waitFor": "#plan-root .plan-module",
+          "timeout": 180000
+        },
+        {
+          "assertVisible": "#plan-root .plan-confirm"
+        },
+        {
+          "assertAttr": "#plan-root .plan-confirm",
+          "name": "data-plan-can-confirm",
+          "op": "==",
+          "value": "true"
+        },
+        {
+          "screenshot": "wb40-01-文字方案待确认"
+        },
+        {
+          "click": "#plan-root .plan-confirm"
+        },
+        {
+          "waitFor": "#preview-root [data-region-id]",
+          "timeout": 180000
+        },
+        {
+          "assertCount": ".template-design",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-region",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-grid",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-region",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-grid",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": "[data-rg-handle]",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-handle",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".rg-drop-ghost",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-confirm",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-modify",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-title",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": ".template-region-head",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertNotText": "模板已就绪"
+        },
+        {
+          "assertNotText": "个已接数据"
+        },
+        {
+          "assertNotText": "个占位"
+        },
+        {
+          "assertNotText": "确认报表，继续下一步"
+        },
+        {
+          "assertNotText": "修改报表"
+        },
+        {
+          "assertNotText": "拖动区域或蓝色手柄调整布局"
+        },
+        {
+          "assertNotText": "布局已保存"
+        },
+        {
+          "assertNotText": "未保存，已恢复原布局"
+        },
+        {
+          "assertVisible": "#plan-root .plan-module"
+        },
+        {
+          "assertCount": "#plan-root details.confirmed-plan-details",
+          "op": "===",
+          "count": 1
+        },
+        {
+          "assertAttr": "#plan-root details.confirmed-plan-details",
+          "name": "data-plan-collapsed",
+          "op": "==",
+          "value": "true"
+        },
+        {
+          "eval": "document.querySelector('#plan-root details.confirmed-plan-details').open === false"
+        },
+        {
+          "assertCount": "#plan-root .plan-confirm",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertCount": "#plan-root .plan-actions",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "assertVisible": "#preview-root .draft-status-badge"
+        },
+        {
+          "assertText": "DRAFT"
+        },
+        {
+          "assertVisible": "#preview-root .draft-meta-row"
+        },
+        {
+          "assertText": "revision:"
+        },
+        {
+          "assertText": "区域数:"
+        },
+        {
+          "assertText": "数据集:"
+        },
+        {
+          "assertCount": "#preview-root [data-region-id]",
+          "op": ">=",
+          "count": 1
+        },
+        {
+          "assertHidden": "#preview-empty"
+        },
+        {
+          "screenshot": "wb40-02-确认后直接出草稿"
+        },
+        {
+          "assertVisible": "#preview-root [data-region-placeholder-reason]"
+        },
+        {
+          "assertVisible": "#preview-root [data-region-source-note]"
+        },
+        {
+          "assertText": "模拟数据"
+        },
+        {
+          "assertText": "图表占位"
+        },
+        {
+          "assertCount": "#preview-root [data-region-id] svg",
+          "op": "===",
+          "count": 0
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).filter(c => c.querySelector('[data-region-placeholder-reason]')).every(c => !/\\d+\\.\\d+|%|kWh/.test(c.querySelector('[data-region-placeholder-reason]').textContent))"
+        },
+        {
+          "waitFor": ".question-select",
+          "timeout": 30000
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('.question-select')).some(s => ['同意','修改','重新开始'].every(t => Array.from(s.options).some(o => o.textContent.trim() === t)))"
+        },
+        {
+          "screenshot": "wb40-03-草稿与下一步选择菜单"
+        }
+      ]
+    },
+    {
+      "name": "wb40-02 硬刷新后草稿、折叠方案与选择菜单都还在",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "wait": 3500
+        },
+        {
+          "assertVisible": "#session-list"
+        },
+        {
+          "eval": "document.getElementById('state-badge').textContent.trim().length > 0"
+        },
+        {
+          "assertVisible": "#plan-root .plan-module"
+        },
+        {
+          "assertCount": "#plan-root details.confirmed-plan-details",
+          "op": "===",
+          "count": 1
+        },
+        {
+          "eval": "document.querySelector('#plan-root details.confirmed-plan-details').open === false"
+        },
+        {
+          "assertAttr": "#plan-root details.confirmed-plan-details",
+          "name": "data-plan-collapsed",
+          "op": "==",
+          "value": "true"
+        },
+        {
+          "assertCount": "#preview-root [data-region-id]",
+          "op": ">=",
+          "count": 1
+        },
+        {
+          "waitFor": ".question-select",
+          "timeout": 30000
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('.question-select')).some(s => ['同意','修改','重新开始'].every(t => Array.from(s.options).some(o => o.textContent.trim() === t)))"
+        },
+        {
+          "screenshot": "wb40-04-刷新后恢复"
+        }
+      ]
+    },
+    {
+      "name": "wb40-03 选同意→校验→试运行→预览出数",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "wait": 3500
+        },
+        {
+          "waitFor": ".question-select",
+          "timeout": 60000
+        },
+        {
+          "eval": "(() => { const s = Array.from(document.querySelectorAll('.question-select')).filter(x => !x.disabled).pop(); const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitText": "报表已就绪",
+          "timeout": 240000
+        },
+        {
+          "eval": "document.getElementById('state-badge').textContent === 'READY'"
+        },
+        {
+          "screenshot": "wb40-05-选同意后出数"
+        },
+        {
+          "eval": "/\\d+\\.\\d+/.test(document.getElementById('preview-root').innerText)"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('#preview-root > div')).map(c => c.innerText.replace(/\\s+/g, ' ').slice(0, 100)).join(' || ')",
+          "save": "finalCards"
+        },
+        {
+          "eval": "(() => { const ph = Array.from(document.querySelectorAll('#preview-root > div')).filter(c => c.textContent.includes('口径待核实')); return ph.length > 0 && ph.every(c => !/\\d+\\.\\d+/.test(c.textContent) && !c.textContent.includes('%') && !c.textContent.includes('kWh')); })()"
+        }
+      ]
+    },
+    {
+      "name": "wb40-04 §2.6 占位区域保留声明的组件类型（#39 已落地，应通过）",
+      "url": "http://127.0.0.1:8022/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成A机房最近7天的能耗报表，四个板块：总耗电指标卡、每日耗电趋势图、设备耗电排名表、PUE指标卡。"
+        },
+        {
+          "click": "#btn-send"
+        },
+        {
+          "waitFor": "#plan-root .plan-module",
+          "timeout": 180000
+        },
+        {
+          "click": "#plan-root .plan-confirm"
+        },
+        {
+          "waitFor": "#preview-root [data-region-id]",
+          "timeout": 180000
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).filter(c => c.querySelector('[data-region-placeholder-reason]')).map(c => c.innerText.replace(/\\s+/g, ' ').slice(0, 120)).join(' || ')",
+          "save": "placeholderCards"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).filter(c => c.querySelector('[data-region-placeholder-reason]')).some(c => c.textContent.includes('—'))"
+        },
+        {
+          "screenshot": "wb40-06-占位区域形态"
+        }
+      ]
+    }
+  ]
+}
