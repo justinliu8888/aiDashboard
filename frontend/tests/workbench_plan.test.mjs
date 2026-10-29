@@ -301,15 +301,23 @@ test("参考来源显示名称与版本", () => {
   assert.ok(text.includes("结构接近"));
 });
 
-test("未知图表类型原样显示为文本", () => {
-  const { root } = makeRoot();
+test("未知图表类型回落中文兜底，原始值仍按文本保留（不执行）", () => {
+  const { doc, root } = makeRoot();
   Plan.render(root, viewWith({
     reportPlan: {
       ...SAMPLE_PLAN,
       sections: [{ id: "s1", title: "自定义块", metricIntents: [], componentType: "custom_widget" }],
     },
   }), { onAction() {} });
-  assert.ok(textOf(root).includes("custom_widget"));
+
+  // 界面上是中文兜底，不是裸英文 key
+  const tag = oneClass(root, "plan-component-type");
+  assert.equal(tag.textContent, "未知组件类型");
+  assert.ok(!textOf(root).includes("custom_widget"), "界面文字里不该出现裸英文 key");
+  // 原始值仍在，但是**作为文本**存在属性里（不是 HTML，不会被执行）
+  assert.equal(tag.getAttribute("data-plan-component-type"), "custom_widget");
+  assert.equal(tag.getAttribute("title"), "custom_widget");
+  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应该使用 innerHTML");
 });
 
 // ---------------------------------------------------------------- 错误与忙碌
@@ -547,7 +555,8 @@ test("阶段与图表类型的标签映射", () => {
   assert.equal(Plan.componentTypeLabel("pie_chart"), "饼图");
   assert.equal(Plan.componentTypeLabel("table"), "表格");
   assert.equal(Plan.componentTypeLabel("text"), "文字块");
-  assert.equal(Plan.componentTypeLabel("unknown_type"), "unknown_type");
+  // 未知类型回落中文兜底，不再把裸英文 key 露出去（见下面「组件类型的未知值兜底」）。
+  assert.equal(Plan.componentTypeLabel("unknown_type"), "未知组件类型");
 });
 
 test("render 需要一个 DOM 容器，参数不对时明确报错", () => {
@@ -1087,6 +1096,158 @@ test("未知展示目的里的文本只作为文本显示（不执行模型 HTML
   const tag = oneClass(root, "plan-display-intent");
   assert.equal(tag.textContent, "未知展示目的", "未知取值仍然显示中文兜底");
   assert.equal(tag.getAttribute("title"), nasty, "原始取值原样留在 title 里");
+});
+
+// ---------------------------------------------------------------- 组件类型的未知值兜底
+//
+// 与展示目的同一类问题：组件类型也是封闭枚举，未知取值不该回落裸英文 key。
+// 兜底要求同样是四条：中文可见、不丢信息、不猜、原始值可追溯。
+//
+// ⚠️ 显示与逻辑必须分离：componentType 在别处还当判断用
+// （renderChart 用原始值决定画 SVG 折线还是柱条），显示兜底不许改到那条路。
+
+const COMPONENT_TYPE_LABELS_EXPECTED = {
+  metric_card: "指标卡",
+  line_chart: "折线图",
+  bar_chart: "柱状图",
+  pie_chart: "饼图",
+  table: "表格",
+  text: "文字块",
+};
+
+test("组件类型的已知取值译法不变（锁死）", () => {
+  for (const [type, label] of Object.entries(COMPONENT_TYPE_LABELS_EXPECTED)) {
+    const { root } = makeRoot();
+    Plan.render(root, viewWith({
+      reportPlan: {
+        ...SAMPLE_PLAN,
+        sections: [
+          { id: "section_type", title: "板块", metricIntents: ["总耗电"], componentType: type },
+        ],
+      },
+    }), {});
+
+    const tag = oneClass(root, "plan-component-type");
+    assert.equal(tag.textContent, label, `componentType=${type} 应显示「${label}」`);
+    assert.equal(tag.getAttribute("data-plan-component-type"), type, "原始取值要留在 data-* 里");
+    assert.equal(tag.getAttribute("title"), null, "已知取值是中文，不需要 title 兜底");
+    assert.ok(Plan.isKnownComponentType(type), `${type} 算已知取值`);
+  }
+});
+
+test("未知组件类型回落中文兜底，原始取值可追溯", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        { id: "section_type", title: "热力分布", metricIntents: ["总耗电"], componentType: "heatmap" },
+      ],
+    },
+  }), {});
+
+  const tag = oneClass(root, "plan-component-type");
+  // 中文：用户看到的是人话，不是裸英文 key
+  assert.equal(tag.textContent, "未知组件类型", "未知类型要显示中文兜底");
+  assert.ok(!tag.textContent.includes("heatmap"), "界面文字里不该出现裸英文 key");
+  assert.ok(!/[a-zA-Z]/.test(tag.textContent), "兜底文字里不该有英文字母");
+  // 不丢信息：标签照常渲染出来（不是整行不渲染）
+  assert.equal(byClass(root, "plan-section").length, 1, "板块卡片照常渲染");
+  assert.ok(textOf(root).includes("热力分布"), "板块标题照常显示");
+  // 可追溯：原始取值两处都留着
+  assert.equal(tag.getAttribute("data-plan-component-type"), "heatmap", "原始取值要留在 data-* 里");
+  assert.equal(tag.getAttribute("title"), "heatmap", "原始取值要能从 title 里查到");
+});
+
+test("未知组件类型不猜成某个已知类型", () => {
+  const knownLabels = Object.values(Plan.COMPONENT_TYPE_LABELS);
+  for (const unknown of ["heatmap", "gauge", "Metric_Card", "METRIC_CARD", "table "]) {
+    assert.ok(!Plan.isKnownComponentType(unknown), `${unknown} 不算已知取值`);
+    const label = Plan.componentTypeLabel(unknown);
+    assert.equal(label, "未知组件类型", `${unknown} 应走中文兜底`);
+    assert.ok(!knownLabels.includes(label), `${unknown} 不能被猜成某个已知语义`);
+  }
+});
+
+test("组件类型的兜底标签本身是中文常量", () => {
+  assert.equal(Plan.COMPONENT_TYPE_UNKNOWN_LABEL, "未知组件类型");
+  assert.ok(!/[a-zA-Z]/.test(Plan.COMPONENT_TYPE_UNKNOWN_LABEL), "兜底标签不该含英文字母");
+  // 与展示目的的兜底是两句不同的话：两个标签并排时各自说得清是哪个维度。
+  assert.notEqual(Plan.COMPONENT_TYPE_UNKNOWN_LABEL, Plan.DISPLAY_INTENT_UNKNOWN_LABEL);
+});
+
+test("用户指定的未知组件类型也走中文兜底，原始取值可追溯", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_type",
+          title: "热力分布",
+          metricIntents: ["总耗电"],
+          componentType: "metric_card",
+          explicitComponentType: "heatmap",
+        },
+      ],
+    },
+  }), {});
+
+  const tag = oneClass(root, "plan-explicit-type");
+  assert.ok(tag.textContent.includes("用户指定"), "仍要标明这是用户指定的");
+  assert.ok(tag.textContent.includes("未知组件类型"), "未知类型要显示中文兜底");
+  assert.ok(!tag.textContent.includes("heatmap"), "界面文字里不该出现裸英文 key");
+  assert.equal(tag.getAttribute("data-plan-explicit-type"), "heatmap", "原始取值要留在 data-* 里");
+  assert.equal(tag.getAttribute("title"), "heatmap", "原始取值要能从 title 里查到");
+});
+
+test("未知组件类型里的文本只作为文本显示（不执行模型 HTML）", () => {
+  const { doc, root } = makeRoot();
+  const nasty = '<img src=x onerror="window.__pwned=9">';
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        { id: "section_type", title: "热力分布", metricIntents: ["总耗电"], componentType: nasty },
+      ],
+    },
+  }), {});
+
+  assert.equal(doc.innerHTMLWrites.length, 0, "模块不应该使用 innerHTML");
+  const tags = walk(root).map((node) => node.tagName);
+  assert.ok(!tags.includes("IMG"), "不该由模型文本生成 img 元素");
+
+  const tag = oneClass(root, "plan-component-type");
+  assert.equal(tag.textContent, "未知组件类型", "未知类型仍然显示中文兜底");
+  assert.equal(tag.getAttribute("title"), nasty, "原始取值原样留在 title 里");
+});
+
+test("renderChart 的类型判断读原始 componentType（显示兜底不改渲染逻辑）", () => {
+  // 文档桩补上 createElementNS：SVG 分支的另一个前提条件也满足，
+  // 于是「走哪个分支」完全由 componentType 的**原始值**决定。
+  const { doc, root } = makeRoot();
+  const svgNodes = [];
+  doc.createElementNS = (_ns, tagName) => {
+    const node = new FakeElement(tagName, doc);
+    svgNodes.push(node);
+    return node;
+  };
+  const data = { xLabels: ["2026-10-22"], yValues: [500], unit: "kWh" };
+
+  const lineNode = Plan.renderChart(doc, { title: "折线", componentType: "line_chart", data });
+  assert.ok(svgNodes.length > 0, "line_chart 应走 SVG 折线分支");
+
+  svgNodes.length = 0;
+  const unknownNode = Plan.renderChart(doc, { title: "未知类型", componentType: "heatmap", data });
+  assert.equal(svgNodes.length, 0, "未知 componentType 不该被当成 line_chart 落进 SVG 分支");
+
+  root.appendChild(lineNode);
+  root.appendChild(unknownNode);
+  const text = textOf(root);
+  // 兜底标签只出现在「显示标签」这一层，不许渗进渲染结果。
+  assert.ok(!text.includes("未知组件类型"), "渲染结果里不该混进显示标签");
+  assert.ok(!text.includes("heatmap"), "渲染结果里不该出现裸英文 key");
+  assert.ok(text.includes("2026-10-22"), "数据点照常画出来");
 });
 
 // ---------------------------------------------------------------- 工作台页面结构

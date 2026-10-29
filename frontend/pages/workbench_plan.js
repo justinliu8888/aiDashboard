@@ -41,7 +41,12 @@
   /** 草稿阶段：方案已确认，右侧直接出报表草稿面板。 */
   const PHASE_DRAFT_READY = "DRAFT_READY";
 
-  /** 图表类型 → 中文标签。未知类型原样显示（安全文本）。 */
+  /**
+   * 图表类型 → 中文标签。
+   *
+   * 未知类型走 COMPONENT_TYPE_UNKNOWN_LABEL 中文兜底，**不**回落英文 key
+   * （见 componentTypeLabel）。
+   */
   const COMPONENT_TYPE_LABELS = {
     metric_card: "指标卡",
     line_chart: "折线图",
@@ -50,6 +55,16 @@
     table: "表格",
     text: "文字块",
   };
+
+  /**
+   * 未知组件类型的中文兜底标签。
+   *
+   * 与展示目的的兜底**分开**（DISPLAY_INTENT_UNKNOWN_LABEL）：
+   * 两个标签并排出现在同一个板块头里，各说各的维度 —— 用户不悬停就知道
+   * 是哪一个不认识；共用一句「未知项」的话，两个都未知时就分不出谁是谁。
+   * 原始 key 由调用方放进 title / data-* 属性，保留可追溯性。
+   */
+  const COMPONENT_TYPE_UNKNOWN_LABEL = "未知组件类型";
 
   /**
    * 展示目的 → 中文标签。
@@ -315,12 +330,32 @@
     };
   }
 
+  /**
+   * 组件类型 → 中文标签。
+   *
+   * 三种情况：
+   *   - 空值（null / 缺字段）→ 空串：不渲染这个标签；
+   *   - 已知类型 → 对应中文（译法不动，票07 / 票08b 的资产依赖它）；
+   *   - **未知类型 → 中文兜底**（COMPONENT_TYPE_UNKNOWN_LABEL）。
+   *
+   * 未知类型**不回落英文 key**（用户看不懂），也**不映射到任何已知类型**
+   * （那是猜，会显示错误语义）。原始 key 由调用方放进 title / data-* 属性。
+   *
+   * ⚠️ 本函数只管**显示标签**。componentType 在别处还当判断用
+   * （renderChart 用原始值决定画 SVG 折线还是柱条），那些判断一律读原始值，
+   * **不经过本函数** —— 显示兜底不许改到渲染逻辑。
+   */
   function componentTypeLabel(type) {
     const key = safeText(type);
     if (!key) return "";
-    return Object.prototype.hasOwnProperty.call(COMPONENT_TYPE_LABELS, key)
-      ? COMPONENT_TYPE_LABELS[key]
-      : key;
+    return isKnownComponentType(key) ? COMPONENT_TYPE_LABELS[key] : COMPONENT_TYPE_UNKNOWN_LABEL;
+  }
+
+  /** 这个组件类型是否是已知取值。空值也算「不是已知取值」。 */
+  function isKnownComponentType(type) {
+    const key = safeText(type);
+    if (!key) return false;
+    return Object.prototype.hasOwnProperty.call(COMPONENT_TYPE_LABELS, key);
   }
 
   /**
@@ -355,6 +390,10 @@
    * **未知阶段返回空串**（而不是原始 key）：历史会话里可能还留着
    * 「模板阶段」的旧枚举，直接把 key 渲染出去会露出英文徽标。
    * 空串意味着「不渲染这个徽标」。
+   *
+   * 注意：这里的策略与展示目的 / 组件类型**故意不同** ——
+   * 那两个是后端将来会**新增**的枚举，要让人看见落差（回落中文兜底）；
+   * 阶段是历史会话残留的**旧**枚举，要藏起来。两者别互相「统一」。
    */
   function designPhaseLabel(phase) {
     const key = safeText(phase);
@@ -448,6 +487,11 @@
         const tag = makeText(doc, "span", STYLE.tag, typeLabel);
         tag.setAttribute("class", "plan-component-type");
         tag.setAttribute("data-plan-component-type", safeText(item.componentType));
+        // 未知类型：标签上是中文兜底，原始 key 放进 title（悬停可见）——
+        // 既不把英文外露到界面上，又不把「后端加了新类型」这件事藏起来。
+        if (!isKnownComponentType(item.componentType)) {
+          tag.setAttribute("title", safeText(item.componentType));
+        }
         head.appendChild(tag);
       }
 
@@ -473,6 +517,10 @@
         const tag = makeText(doc, "span", STYLE.tag, "用户指定：" + explicitLabel);
         tag.setAttribute("class", "plan-explicit-type");
         tag.setAttribute("data-plan-explicit-type", safeText(item.explicitComponentType));
+        // 同上：用户指定的类型不认识时，标签是中文兜底，原始 key 留在 title 里。
+        if (!isKnownComponentType(item.explicitComponentType)) {
+          tag.setAttribute("title", safeText(item.explicitComponentType));
+        }
         head.appendChild(tag);
       }
       card.appendChild(head);
@@ -855,6 +903,7 @@
     PHASE_PLAN_WAITING_CONFIRM,
     PHASE_DRAFT_READY,
     COMPONENT_TYPE_LABELS,
+    COMPONENT_TYPE_UNKNOWN_LABEL,
     DISPLAY_INTENT_LABELS,
     DISPLAY_INTENT_UNKNOWN_LABEL,
     PHASE_LABELS,
@@ -865,6 +914,7 @@
     canConfirmNow,
     confirmPayload,
     componentTypeLabel,
+    isKnownComponentType,
     displayIntentLabel,
     isKnownDisplayIntent,
     designPhaseLabel,
