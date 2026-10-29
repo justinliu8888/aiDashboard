@@ -2141,15 +2141,25 @@ function normalizeVersionNumber(value) {
  *
  * 契约：previewContext 带 definitionId / definitionVersion。
  * 旧版本的异步响应不能覆盖新模板 —— 对不上就丢掉这份载荷。
+ *
+ * 口径：previewContext 的 definitionId / definitionVersion 对应的是**方案**身份
+ * （方案 id + 方案 revision），落库在 definition.metadata.templateBinding 里。
+ * definition.metadata.revision 是**定义的编辑计数**（另一条轴），拿它去比会把
+ * 同一份载荷误判成过期、导致草稿阶段的数字被丢掉 —— 所以优先读 templateBinding，
+ * 历史定义没有 templateBinding 时才回退到 metadata.id / metadata.revision。
  */
 function isStaleReportPayload(payload) {
   const ctx = payload?.previewContext || {};
   const definition = session.definition;
-  const definitionId = definition?.metadata?.id;
+  const meta = definition?.metadata || {};
+  const binding = meta.templateBinding || {};
+  // 定义身份：空串不算身份（回退到旧字段）。
+  const definitionId = binding.definitionId || meta.id;
+  // 版本号：0 是合法版本号，只能用 ?? 不能用 ||。
+  const definitionVersion = binding.definitionVersion ?? meta.revision;
   if (ctx.definitionId && definitionId && String(ctx.definitionId) !== String(definitionId)) {
     return true;
   }
-  const definitionVersion = definition?.metadata?.revision;
   if (ctx.definitionVersion != null && definitionVersion != null) {
     const left = normalizeVersionNumber(ctx.definitionVersion);
     const right = normalizeVersionNumber(definitionVersion);

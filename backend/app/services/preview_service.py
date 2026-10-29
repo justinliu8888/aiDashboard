@@ -32,6 +32,12 @@ from app.services.mock_data_service import (
     resolve_room_name,
     snapshot_to_dict,
 )
+from app.services.simulated_data_service import (
+    GENERATOR_VERSION,
+    SimulatedDataError,
+    generate_simulated_data,
+)
+from app.services.template_definition_service import adapt_preview_spec
 
 
 logger = logging.getLogger(__name__)
@@ -1077,3 +1083,371 @@ class PreviewService:
 
 
 preview_service = PreviewService()
+
+
+# --------------------------------------------------------------------------
+# 报表示意载荷（#51）
+#
+# ADR 0004：草稿阶段就用**模拟业务数据**把报表定义渲染出来，不再画空壳。
+# 本段是「载荷的生成入口」——**只有这一处**。将来接真实数据时复用同一处，
+# 载荷形状不变，只换数据来源。
+#
+# 两条硬约束：
+#   1. 模拟业务数据只在响应与内存里，**不落库**（落库侧见 session_service
+#      的快照允许列表）；
+#   2. 同一定义版本 + 同一时间窗 → 数字恒定（预览上下文按
+#      ``definitionId + definitionVersion`` 冻结并复用）。
+# --------------------------------------------------------------------------
+
+#: ``previewContext`` 的固定字段（规格「固定时间与造数」）。
+PREVIEW_CONTEXT_FIELDS: tuple[str, ...] = (
+    "definitionId",
+    "definitionVersion",
+    "timezone",
+    "anchorTime",
+    "windowStart",
+    "windowEnd",
+    "grainUnit",
+    "generatorVersion",
+)
+
+#: ``previewContext.grainUnit`` 的合法取值。
+PREVIEW_CONTEXT_GRAINS: tuple[str, ...] = ("MINUTE", "HOUR", "DAY", "WEEK", "MONTH")
+
+#: 标题区域不出数、不进 ``regions[]``（前端靠 ``role`` 跳过它）。
+TITLE_ROLES: tuple[str, ...] = ("REPORT_TITLE",)
+
+#: 数值型组件：载荷必须带 ``unit``（前端照它标注单位）。
+UNIT_BEARING_COMPONENT_TYPES: tuple[str, ...] = ("METRIC_CARD", "CHART")
+
+
+class PreviewContextError(ValueError):
+    """示意上下文建不起来。
+
+    时区非法、粒度越界、窗口推不出来 —— 这些都要**明确报错**，
+    不能静默按 UTC 或按当天兜底。
+    """
+
+
+def _definition_binding(definition: dict[str, Any]) -> dict[str, Any]:
+    """定义里登记的方案身份与版本（票 03 写在 metadata 上）。"""
+    metadata = definition.get("metadata") or {}
+    binding = metadata.get("templateBinding") or {}
+    if not isinstance(binding, dict):
+        binding = {}
+    return binding
+
+
+def _definition_window_value(definition: dict[str, Any]) -> dict[str, Any]:
+    """定义里的日历时间窗取值。"""
+    defaults = definition.get("defaults") or {}
+    window = defaults.get("timeWindow") or {}
+    value = window.get("value") if isinstance(window.get("value"), dict) else window
+    return value if isinstance(value, dict) else {}
+
+
+def _definition_grain_unit(definition: dict[str, Any]) -> str | None:
+    """定义里的默认粒度（区域粒度与它同源）。"""
+    defaults = definition.get("defaults") or {}
+    grain = defaults.get("grain") or {}
+    value = grain.get("value") if isinstance(grain.get("value"), dict) else grain
+    unit = str(value.get("unit") or "").strip().upper()
+    return unit or None
+
+
+def _resolve_report_timezone(definition: dict[str, Any]) -> str:
+    """报表时区：定义里声明的优先；声明了但非法就**明确报错**。"""
+    declared = str(
+        _definition_window_value(definition).get("timezone") or ""
+    ).strip()
+    if not declared:
+        return DEFAULT_TIMEZONE
+    try:
+        ZoneInfo(declared)
+    except Exception as exc:  # noqa: BLE001
+        raise PreviewContextError(
+            f"报表声明的时区 {declared!r} 无法解析，请改成合法的 IANA 时区名。"
+        ) from exc
+    return declared
+
+
+def _window_from_definition(
+    definition: dict[str, Any], anchor: datetime, tz: ZoneInfo
+) -> tuple[datetime, datetime]:
+    """按定义的日历窗口推导**左闭右开**的时间窗。
+
+    口径与造数器一致：``offset = -1`` 是「昨天」，``offset = -7,
+    count = 7`` 是「过去 7 个完整自然日」。定义不是按自然日的日历窗口
+    时，落到锚点所在的那一个自然日 —— 仍然是一个确定的、跨天不变的窗口。
+    """
+    value = _definition_window_value(definition)
+    if str(value.get("type") or "").upper() == "CALENDAR":
+        unit = str(value.get("unit") or "DAY").upper()
+        if unit == "DAY":
+            count = max(1, int(value.get("count") or 1))
+            offset = int(
+                value.get("offset") if value.get("offset") is not None else -1
+            )
+            anchor_date = anchor.astimezone(tz).date()
+            start_date = anchor_date + timedelta(days=offset)
+            end_date = start_date + timedelta(days=count)
+            return (
+                datetime.combine(start_date, time(0, 0), tzinfo=tz),
+                datetime.combine(end_date, time(0, 0), tzinfo=tz),
+            )
+    anchor_date = anchor.astimezone(tz).date()
+    return (
+        datetime.combine(anchor_date, time(0, 0), tzinfo=tz),
+        datetime.combine(anchor_date + timedelta(days=1), time(0, 0), tzinfo=tz),
+    )
+
+
+def build_preview_context(
+    definition: dict[str, Any],
+    *,
+    definition_id: str | None = None,
+    definition_version: int | str | None = None,
+    timezone: str | None = None,
+    grain_unit: str | None = None,
+    anchor_time: datetime | None = None,
+) -> dict[str, Any]:
+    """建一份**示意上下文**（只放上下文，不放业务数值）。
+
+    八个字段：``definitionId`` / ``definitionVersion`` / ``timezone`` /
+    ``anchorTime`` / ``windowStart`` / ``windowEnd`` / ``grainUnit`` /
+    ``generatorVersion``。
+
+    - 时间窗**左闭右开**；
+    - ``anchorTime`` 默认取「此刻」（报表时区），第一次确认时冻结下来，
+      此后一直复用；
+    - ``grainUnit`` 越界 → 明确报错，不静默改成别的粒度。
+    """
+    if not isinstance(definition, dict):
+        raise PreviewContextError("报表定义必须是对象。")
+
+    binding = _definition_binding(definition)
+    resolved_id = str(
+        definition_id or binding.get("definitionId") or "definition"
+    ).strip() or "definition"
+    resolved_version = (
+        definition_version
+        if definition_version is not None
+        else binding.get("definitionVersion")
+    )
+    resolved_version = (
+        int(resolved_version) if resolved_version is not None else 1
+    )
+
+    resolved_tz = str(timezone or "").strip() or _resolve_report_timezone(definition)
+    try:
+        tz = ZoneInfo(resolved_tz)
+    except Exception as exc:  # noqa: BLE001
+        raise PreviewContextError(
+            f"报表时区 {resolved_tz!r} 无法解析，请改成合法的 IANA 时区名。"
+        ) from exc
+
+    resolved_grain = str(
+        grain_unit or _definition_grain_unit(definition) or "DAY"
+    ).strip().upper()
+    if resolved_grain not in PREVIEW_CONTEXT_GRAINS:
+        raise PreviewContextError(
+            f"无法解析的时间粒度：{resolved_grain!r}；"
+            f"合法取值为 {' / '.join(PREVIEW_CONTEXT_GRAINS)}。"
+        )
+
+    anchor = anchor_time or datetime.now(tz)
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=tz)
+    else:
+        anchor = anchor.astimezone(tz)
+    start, end = _window_from_definition(definition, anchor, tz)
+    if end <= start:
+        raise PreviewContextError(
+            f"时间窗非法：windowStart={start.isoformat()} 不早于 windowEnd={end.isoformat()}。"
+        )
+
+    return {
+        "definitionId": resolved_id,
+        "definitionVersion": resolved_version,
+        "timezone": resolved_tz,
+        "anchorTime": anchor.isoformat(),
+        "windowStart": start.isoformat(),
+        "windowEnd": end.isoformat(),
+        "grainUnit": resolved_grain,
+        "generatorVersion": GENERATOR_VERSION,
+    }
+
+
+def preview_context_matches(
+    context: dict[str, Any] | None,
+    definition_id: str,
+    definition_version: int | str,
+) -> bool:
+    """这份上下文是不是**同一个定义版本**留下来的。
+
+    同一定义版本跨天、刷新、重启都必须复用同一份上下文；定义版本变了
+    才作废（防止旧载荷覆盖新模板）。
+    """
+    if not isinstance(context, dict):
+        return False
+    # 八个字段都得在 —— 缺一个就重建，别拿半份上下文接着用。
+    if any(key not in context for key in PREVIEW_CONTEXT_FIELDS):
+        return False
+    if str(context.get("definitionId") or "") != str(definition_id):
+        return False
+    try:
+        same_version = int(context.get("definitionVersion")) == int(definition_version)
+    except (TypeError, ValueError):
+        return False
+    return same_version
+
+
+def resolve_preview_context(
+    definition: dict[str, Any],
+    *,
+    plan: dict[str, Any] | None = None,
+    existing: dict[str, Any] | None = None,
+    anchor_time: datetime | None = None,
+) -> dict[str, Any]:
+    """**复用**同一定义版本的既有上下文，没有才新建一份。
+
+    ``existing`` 通常来自会话快照里的 ``previewContext``。已经存在且
+    定义版本对得上就原样复用 —— 不重新生成、不随日期变化。
+    """
+    binding = _definition_binding(definition)
+    definition_id = str(
+        binding.get("definitionId")
+        or (plan or {}).get("id")
+        or "definition"
+    )
+    definition_version = binding.get("definitionVersion")
+    if definition_version is None:
+        definition_version = (plan or {}).get("revision")
+    if definition_version is None:
+        definition_version = 1
+
+    if preview_context_matches(existing, definition_id, definition_version):
+        return {key: existing[key] for key in PREVIEW_CONTEXT_FIELDS if key in existing}
+
+    return build_preview_context(
+        definition,
+        definition_id=definition_id,
+        definition_version=definition_version,
+        anchor_time=anchor_time,
+    )
+
+
+def _prepare_definition_for_simulation(
+    definition: dict[str, Any], *, plan: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """给**历史定义**补上示意语义描述（只读，不回写原定义）。
+
+    票 03 之后落库的定义自带 ``templateBinding.previewSpec``；更早的
+    定义没有 —— 这里按跨工单契约的顺序（方案指标意图 → 既有指标引用 →
+    既有结构化列信息）只读适配一份，认不出来就给明确标注的 generic。
+    """
+    regions = definition.get("regions")
+    if not isinstance(regions, list):
+        return definition
+    prepared_regions: list[Any] = []
+    for region in regions:
+        if not isinstance(region, dict):
+            prepared_regions.append(region)
+            continue
+        binding = region.get("templateBinding")
+        binding = dict(binding) if isinstance(binding, dict) else {}
+        binding["previewSpec"] = adapt_preview_spec(region, plan=plan)
+        prepared_regions.append({**region, "templateBinding": binding})
+    return {**definition, "regions": prepared_regions}
+
+
+def _payload_with_unit(
+    payload: dict[str, Any],
+    *,
+    component_type: str,
+    spec: dict[str, Any],
+) -> dict[str, Any]:
+    """数值型组件的载荷**一定带单位**。
+
+    图表的 ``unit`` 由并行的 04b 补丁补上；这里对它**容忍缺失**，
+    并兜底从 ``previewSpec.unit`` 取 —— 载荷层保证 ``payload.unit``
+    一定有值（无量纲就是空串，不写错的单位）。
+    """
+    if component_type not in UNIT_BEARING_COMPONENT_TYPES:
+        return payload
+    if payload.get("unit") is None:
+        payload["unit"] = str(spec.get("unit") or "")
+    return payload
+
+
+def build_report_preview_payload(
+    definition: dict[str, Any],
+    preview_context: dict[str, Any],
+    *,
+    plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """按定义生成**报表示意载荷**（草稿阶段就带数字的那一份）。
+
+    结构::
+
+        {
+          "previewContext": {...8 个字段...},
+          "regions": [
+            {"regionId", "name", "role", "componentType", "payload"}, ...
+          ]
+        }
+
+    - ``regions[]`` 与既有公开预览载荷**逐字段同构**，前端复用同一套
+      渲染逻辑；
+    - ``role`` 必须带 —— 前端靠它跳过标题区；
+    - ``role == "REPORT_TITLE"`` 的区域**不出数、不进 regions**；
+    - 数值型组件的 ``payload`` 一定带 ``unit``。
+
+    造数失败（定义非法 / 时间窗推不出来 / 粒度解析不了 / 表格没有列）
+    时抛 :class:`SimulatedDataError` —— **不退回空表、不给半份载荷**。
+    """
+    if not isinstance(definition, dict):
+        raise SimulatedDataError("INVALID_DEFINITION", "报表定义必须是对象。")
+    if not isinstance(preview_context, dict):
+        raise SimulatedDataError("INVALID_CONTEXT", "示意上下文必须是对象。")
+
+    prepared = _prepare_definition_for_simulation(definition, plan=plan)
+    payloads = generate_simulated_data(prepared, preview_context)
+
+    regions: list[dict[str, Any]] = []
+    for region in prepared.get("regions") or []:
+        if not isinstance(region, dict):
+            continue
+        role = str(region.get("role") or "").upper()
+        if role in TITLE_ROLES:
+            # 标题区不出数、不进 regions。
+            continue
+        region_id = str(region.get("id") or "")
+        payload = payloads.get(region_id)
+        if payload is None:
+            raise SimulatedDataError(
+                "INVALID_DEFINITION",
+                f"区域 {region_id!r} 没有生成出模拟数据载荷。",
+            )
+        component_type = str((region.get("component") or {}).get("type") or "")
+        spec = ((region.get("templateBinding") or {}).get("previewSpec")) or {}
+        regions.append(
+            {
+                "regionId": region_id,
+                "name": region.get("name"),
+                "role": role,
+                "componentType": component_type,
+                "payload": _payload_with_unit(
+                    payload, component_type=component_type, spec=spec
+                ),
+            }
+        )
+
+    return {
+        "previewContext": {
+            key: preview_context[key]
+            for key in PREVIEW_CONTEXT_FIELDS
+            if key in preview_context
+        },
+        "regions": regions,
+    }

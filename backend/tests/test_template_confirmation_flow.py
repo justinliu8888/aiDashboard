@@ -145,7 +145,9 @@ def test_confirm_plan_reply_states_actual_title_and_plan_revision(client, monkey
     assert plan["topic"] == "B 机房周报"
     assert "B 机房周报" in payload["reply"]
     assert f"第 {plan['revision']} 版" in payload["reply"]
-    assert "草稿已生成，请在右侧选择下一步" in payload["reply"]
+    # ADR 0004 口径反转：草稿阶段就用模拟业务数据渲染，右侧当场出数。
+    assert "模拟业务数据" in payload["reply"]
+    assert "草稿已生成，请在右侧选择下一步" not in payload["reply"]
 
 
 def test_confirmed_plan_runs_legacy_validation_preview_and_publish_menu(client, monkeypatch):

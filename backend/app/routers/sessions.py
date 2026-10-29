@@ -6,6 +6,7 @@ conversationId 仍是一次请求线程，停止生成时会换新，两者不�
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -21,7 +22,13 @@ from app.schemas.session import (
     UpdateWorkspaceRequest,
     WorkspaceItem,
 )
+from app.services.preview_service import (
+    PreviewContextError,
+    build_report_preview_payload,
+    resolve_preview_context,
+)
 from app.services.session_service import resolve_placeholders, session_service
+from app.services.simulated_data_service import SimulatedDataError
 from app.storage.models import MessageRecord, SessionRecord, WorkspaceRecord
 
 
@@ -100,6 +107,64 @@ def list_sessions(
     )
 
 
+def _with_report_preview_payload(
+    record: SessionRecord, snapshot: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """恢复会话时**重新生成**示意载荷，临时挂在 ``snapshot`` 上。
+
+    ADR 0004 的存储边界：模拟业务数据只在响应与内存里，**不落盘**。
+    所以恢复时按「定义 + 冻结的时间窗」重新生成一遍（确定性种子：
+    同一定义 + 同一窗口 → 数字完全一致），返回给前端；这一份
+    **不写回持久化快照**。
+
+    - 快照里已有 ``previewContext`` → 原样复用（同一定义版本跨天、刷新、
+      重启都复用同一份，数字不跳）；
+    - 历史会话没有上下文 → 用会话**已有的创建时间**只读推导一份，
+      **不自动确认、不迁移、不写回**；
+    - 没有有效定义 → 不返回无关的示意。
+    """
+    if not isinstance(snapshot, dict):
+        return snapshot
+    definition = snapshot.get("definition")
+    if not isinstance(definition, dict) or not definition.get("regions"):
+        # 没有有效定义就不返回无关示意（也不凭空造一份上下文）。
+        return snapshot
+    plan = snapshot.get("reportPlan") if isinstance(snapshot.get("reportPlan"), dict) else None
+    existing = snapshot.get("previewContext")
+    if isinstance(existing, dict):
+        context = resolve_preview_context(
+            definition, plan=plan, existing=existing
+        )
+    else:
+        # 历史会话没有上下文：按**已有的创建时间**只读推导。用创建时间
+        # 而不是「此刻」—— 它是稳定的，推导出的时间窗跨天、跨重启都一样，
+        # 数字不会因为刷新一次就跳。
+        context = resolve_preview_context(
+            definition,
+            plan=plan,
+            existing=None,
+            anchor_time=_session_anchor(record.createdAt),
+        )
+    try:
+        payload = build_report_preview_payload(definition, context, plan=plan)
+    except (SimulatedDataError, PreviewContextError) as exc:
+        logger.warning("[sessions] 恢复会话时示意载荷生成失败：%s", exc)
+        return snapshot
+    result = dict(snapshot)
+    result["reportPreviewPayload"] = payload
+    return result
+
+
+def _session_anchor(created_at: str) -> datetime | None:
+    """会话创建时间（读不出来就 None → 按「此刻」处理）。"""
+    if not created_at:
+        return None
+    try:
+        return datetime.fromisoformat(created_at)
+    except ValueError:
+        return None
+
+
 @router.get("/sessions/{session_id}", response_model=SessionDetail)
 def get_session(session_id: str) -> SessionDetail:
     record = session_service.repository.get_session(session_id)
@@ -119,6 +184,7 @@ def get_session(session_id: str) -> SessionDetail:
         # 返回前解析一次，恢复出来的标题就是成品文本。
         snapshot = dict(snapshot)
         snapshot["definition"] = resolve_placeholders(snapshot["definition"])
+    snapshot = _with_report_preview_payload(record, snapshot)
     return SessionDetail(
         sessionId=record.id,
         title=record.title,
