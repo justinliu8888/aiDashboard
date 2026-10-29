@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>前后端接缝 harness · 真实后端载荷</title>
+<style>
+  body {
+    margin: 0;
+    padding: 16px 20px 40px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f1f5f9;
+    color: #1e293b;
+  }
+  h1 { font-size: 18px; margin: 0 0 6px; color: #0f172a; }
+  .banner {
+    margin: 0 0 14px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid #fcd34d;
+    background: #fffbeb;
+    color: #92400e;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  /* 工作台的关键骨架：让 workbench.js 原样跑起来（不接后端）。 */
+  #workbench-root { display: flex; gap: 12px; align-items: flex-start; }
+  #chat-scroll { width: 340px; min-width: 340px; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; }
+  #preview-root { flex: 1 1 auto; min-width: 320px; }
+  #preview-empty { background: #fff; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 20px; text-align: center; color: #94a3b8; }
+  #draft-badge { display: inline-block; }
+  #session-list { min-height: 20px; }
+  #toast { display: none; }
+</style>
+</head>
+<body>
+
+<h1>前后端接缝 harness · 真实后端载荷</h1>
+
+<div class="banner">
+  <strong>这是测试 harness，不是产品页面。</strong>
+  载荷是<strong>真实后端链路产出</strong>的（真编排 + 真服务 + 真 SQLite，
+  只替换外部模型调用），由
+  <code>backend/tests/test_seam_frontend_backend.py --emit-fixture</code> 生成，
+  落在 <code>frontend/tests/seam_fixture.json</code>。
+  本页<strong>不接后端、不调模型</strong>：fetch 被桩掉（只放行夹具文件），
+  工作台脚本原样加载。
+  <br />
+  走的是<strong>前端真实的那条路</strong>：
+  <code>readReportPreviewPayload → applyReportPreviewPayload → renderReportPanel</code>。
+  接缝断在「被判过期」的话，这一页就是空的 —— 所以本页能验出载荷被丢掉。
+  <br />
+  场景切换：<code>window.__seamDemo('confirm' | 'restore' | 'dropped')</code>
+</div>
+
+<div class="toolbar">
+  <span id="draft-badge" class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-slate-100 text-slate-500 border-slate-200">尚无草稿</span>
+  <span id="state-badge" class="mono">ANALYZING</span>
+  <span id="meta-rev">—</span>
+  <span id="meta-session">—</span>
+  <span id="footer-state">ANALYZING</span>
+  <span id="health-badge" class="hidden"></span>
+</div>
+
+<div id="workbench-root">
+  <div id="chat-scroll">
+    <div id="session-list"></div>
+  </div>
+  <div id="preview-root">
+    <div id="preview-empty">
+      <div data-preview-empty-hint>还没有草稿，试试左侧「生成能耗日报」</div>
+    </div>
+  </div>
+</div>
+
+<!-- 工作台脚本需要的其余骨架元素（不显示，只是不许缺）。 -->
+<div class="hidden">
+  <button id="btn-new-session"></button>
+  <button id="btn-send"></button>
+  <button id="btn-stop"></button>
+  <button id="btn-regenerate"></button>
+  <input id="chat-input" />
+  <input id="session-search" />
+  <button id="btn-jump-bottom"></button>
+  <button data-quick="生成 A 机房昨日能耗日报"></button>
+</div>
+
+<script>
+  // ── 不接后端：除了夹具文件，别的 fetch 都给空结果 ─────────────────
+  // 工作台脚本的其他行为照常。
+  var FIXTURE_URL = "seam_fixture.json";
+  var nativeFetch = window.fetch.bind(window); // 原生那份：放行夹具时要用
+  window.fetch = function (url) {
+    var href = String(url);
+    if (href.indexOf(FIXTURE_URL) >= 0) {
+      return nativeFetch(href); // 放行夹具本身
+    }
+    var isSessionList = href.indexOf("/api/sessions") >= 0;
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: function () { return Promise.resolve(isSessionList ? { items: [] } : {}); },
+      text: function () { return Promise.resolve(""); },
+    });
+  };
+  window.AI_REPORT_API_BASE = window.location.origin;
+
+  // 本机不接 CDN（图表库取不到）：强制走**不依赖 CDN** 的 SVG 渲染路径，
+  // 让本页的断言是确定的（曲线真的画出来了、单位真的写在图上）。
+  try { delete window.echarts; } catch (e) { window.echarts = undefined; }
+</script>
+
+<script src="../pages/workbench_query.js"></script>
+<script src="../pages/workbench_plan.js"></script>
+<script src="../pages/workbench.js" defer></script>
+
+<script>
+  // ── 场景切换 ──────────────────────────────────────────────────────
+  // confirm：第 1 段 —— 确认方案那轮响应顶层的载荷，基准是**草稿定义**。
+  // restore：第 3 段 —— 重新读取会话时重新生成的那份，基准是**已保存的定义**。
+  // dropped：模拟接缝断掉（拿掉 templateBinding）—— 载荷应当被丢弃、页面变空。
+  window.__seamDemo = function (kind) {
+    var fixture = window.__seamFixture;
+    if (!fixture) return "no-fixture";
+
+    var definition;
+    var payload;
+    if (kind === "restore") {
+      definition = fixture.savedDefinition;
+      payload = fixture.stageRestorePayload;
+    } else if (kind === "dropped") {
+      definition = JSON.parse(JSON.stringify(fixture.definition));
+      delete definition.metadata.templateBinding; // 回到旧口径：两条轴混比
+      payload = fixture.payload;
+    } else {
+      definition = fixture.definition;
+      payload = fixture.payload;
+    }
+
+    // 前端真实的那条路：先定义落位，再收载荷（过期就丢）。
+    session.definition = definition;
+    session.baseDefinitionRevision = definition && definition.metadata
+      ? definition.metadata.revision
+      : null;
+    session.state = "ANALYZING";
+    // 新会话：手上还没有载荷。
+    session.reportPreviewPayload = null;
+    var accepted = applyReportPreviewPayload(readReportPreviewPayload({ reportPreviewPayload: payload }));
+    setState(session.state);
+    updateMeta();
+    renderReportPanel();
+
+    document.body.setAttribute("data-seam-accepted", accepted ? "true" : "false");
+    document.body.setAttribute("data-seam-kind", kind);
+    return kind;
+  };
+
+  // ── 给流程用的小工具 ──────────────────────────────────────────────
+  /** 某个区域卡片上的文字。 */
+  window.__seamText = function (regionId) {
+    var card = document.querySelector('#preview-root [data-region-id="' + regionId + '"]');
+    return card ? card.textContent : "";
+  };
+  /** 指标卡上应当显示的数值（与前端 formatMetricValue 同一套口径）。 */
+  window.__seamExpected = function (region) {
+    var p = region.payload || {};
+    var digits = Number.isFinite(Number(p.precision)) ? Number(p.precision) : 1;
+    return Number(p.value).toFixed(Math.max(0, Math.min(6, digits)));
+  };
+  /** 载荷里第一个满足条件的区域。 */
+  window.__seamRegion = function (kind, unit) {
+    var regions = (window.__seamFixture || {}).payload?.regions || [];
+    for (var i = 0; i < regions.length; i += 1) {
+      var r = regions[i];
+      if (r.componentType !== kind) continue;
+      if (unit !== undefined && String(r.payload.unit || "") !== unit) continue;
+      return r;
+    }
+    return null;
+  };
+
+  window.addEventListener("load", function () {
+    fetch(FIXTURE_URL)
+      .then(function (res) { return res.json(); })
+      .then(function (fixture) {
+        window.__seamFixture = fixture;
+        window.__seamDemo("confirm");
+        document.body.setAttribute("data-harness-ready", "true");
+      })
+      .catch(function (err) {
+        document.body.setAttribute("data-harness-error", String(err));
+        document.body.setAttribute("data-harness-ready", "error");
+      });
+  });
+</script>
+
+</body>
+</html>
