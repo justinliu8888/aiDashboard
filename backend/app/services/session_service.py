@@ -119,8 +119,10 @@ def _definition_is_template_mode(definition: Any) -> bool:
 def _payload_is_simulated(payload: Any) -> bool:
     """这份结果载荷自己是不是**模拟数据**（带来源标记）。
 
-    造数器（``simulated_data_service``）产出的载荷在区域载荷上带
-    ``dataSource == "simulated"``。带这个标记的结果一律不落库。
+    造数器（``simulated_data_service``）产出的载荷带 ``dataSource ==
+    "simulated"``：区域级（``regions[].dataSource``）与载荷级
+    （``regions[].payload.dataSource``）两种形态都认。带这个标记的结果
+    一律不落库。
     """
     if not isinstance(payload, dict):
         return False
