@@ -2306,8 +2306,12 @@ class AgentService:
             )
             reply = f"预览已生成（{preview.reportRunId}），按已确认模板的各区域口径展示。"
             if placeholders:
-                reply += f"{placeholders} 个区域仍保留占位与原因，没有替它们生成数值。"
-            reply += "已接数区域使用能耗 Mock 模拟数据，非生产事实表。"
+                # ADR 0004 之后口径反转：草稿阶段就已经用模拟业务数据渲染，
+                # 这里不再说「保留占位、没有替它们生成数值」。
+                reply += (
+                    f"{placeholders} 个区域的能力尚未接通，已标注「能力待接通」。"
+                )
+            reply += "本次试运行同样使用能耗模拟数据，不是生产事实表。"
         return AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.PREVIEW_READY,

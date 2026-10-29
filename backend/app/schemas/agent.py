@@ -287,6 +287,15 @@ class AgentResponse(BaseModel):
     uiActions: list[str] = Field(default_factory=list)
     error: AgentError | None = None
     debug: dict[str, Any] = Field(default_factory=dict)
+    # 报表示意载荷（#51）。草稿阶段就用模拟业务数据渲染的那一份：
+    # 方案确认的**同一轮**响应里就带着它，前端不需要二次请求。
+    #
+    # 结构：``{"previewContext": {...}, "regions": [...]}``，区域载荷与
+    # 既有公开预览载荷逐字段同构。
+    #
+    # **只在响应里**：落库侧按允许列表只写上下文，不写这份载荷
+    # （见 session_service 的快照写入）。
+    reportPreviewPayload: dict[str, Any] | None = None
     # 本轮性质。见 TURN_KIND_ACTION / TURN_KIND_QUERY_ANSWER。
     turnKind: str = TURN_KIND_ACTION
 

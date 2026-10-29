@@ -80,6 +80,40 @@ def _dump_snapshot(value: Any) -> str | None:
         return None
 
 
+def _response_preview_context(response: AgentResponse) -> dict[str, Any] | None:
+    """响应里带的**示意上下文**（没有就 None）。
+
+    上下文只有定义版本、时间窗、粒度这些**结构**，没有业务数值 ——
+    所以它可以落库（ADR 0004 允许保留 previewContext）。
+    """
+    preview_payload = response.reportPreviewPayload
+    if not isinstance(preview_payload, dict):
+        return None
+    context = preview_payload.get("previewContext")
+    return context if isinstance(context, dict) else None
+
+
+def _persisted_response_payload(response: AgentResponse) -> dict[str, Any]:
+    """消息落库用的响应体：**不含模拟业务结果**。
+
+    ADR 0004：模拟业务数据只存在于响应与内存，**不落盘**。这一轮响应
+    里带着 ``reportPreviewPayload``（区域模拟数值），落库时要把数值
+    去掉 —— 但**保留** ``previewContext``（那是上下文：定义版本、时间窗、
+    粒度，不是业务数值），恢复会话时靠它把同样的数重新生成出来。
+
+    注意：这里只动 ``reportPreviewPayload``。既有的 ``previewPayload``
+    （试运行结果）语义不变，那是另一条链路。
+    """
+    payload = response.model_dump(mode="json")
+    preview_payload = payload.get("reportPreviewPayload")
+    if isinstance(preview_payload, dict):
+        context = preview_payload.get("previewContext")
+        payload["reportPreviewPayload"] = (
+            {"previewContext": context} if isinstance(context, dict) else None
+        )
+    return payload
+
+
 def resolve_placeholders(definition: dict[str, Any]) -> dict[str, Any]:
     """把草稿里的 {{roomName}} 之类占位符换成真实值。
 
@@ -176,11 +210,12 @@ class SessionService:
                 )
 
             # 2. assistant 消息：payload 存整个响应，恢复时可直接回放渲染
+            # （模拟业务数值不进库，见 _persisted_response_payload）。
             self._repo.append_message(
                 session_id=session_id,
                 role="assistant",
                 content=response.reply,
-                payload=response.model_dump(mode="json"),
+                payload=_persisted_response_payload(response),
                 clientMsgId=self._reply_msg_id(client_msg_id),
             )
 
@@ -298,6 +333,12 @@ class SessionService:
         for key in ("designPhase", "reportPlan", "templateDesign"):
             if key not in result and key in previous:
                 result[key] = previous[key]
+        # 示意上下文（#51）同样原样带过：冻结下来的时间窗不能因为一轮
+        # 没带载荷的交互就丢掉 —— 丢了就会按新的锚点重新生成，数字会跳。
+        if "previewContext" not in result and isinstance(
+            previous.get("previewContext"), dict
+        ):
+            result["previewContext"] = previous["previewContext"]
         return result
 
     def _commit_query_turn(
@@ -435,12 +476,13 @@ class SessionService:
                 client_msg_id=client_msg_id,
             )
         # assistant 消息：payload 存整个响应，恢复时可直接回放渲染。
+        # 模拟业务数值不进库（见 _persisted_response_payload）。
         self._append_message_inline(
             connection,
             session_id=session_id,
             role="assistant",
             content=response.reply,
-            payload=response.model_dump(mode="json"),
+            payload=_persisted_response_payload(response),
             client_msg_id=self._reply_msg_id(client_msg_id),
         )
 
@@ -545,6 +587,16 @@ class SessionService:
         """组装恢复现场需要的快照。
 
         取值优先级：本次响应的 domainObjects > 请求带回来的 snapshots。
+
+        **按允许列表写入**（ADR 0004 的存储边界）：
+
+        - 写：``definition`` / ``policy`` / ``reportPlan`` /
+          ``templateDesign`` / ``designPhase`` / ``previewContext``，
+          以及既有 ``previewPayload``（**只装试运行结果**，语义不变）；
+        - 不写：``reportPreviewPayload`` —— 模拟业务结果只在响应与内存里。
+
+        注意这里**不是**「按字段名把某些键剔掉」，而是**只写允许的键**：
+        ``previewPayload`` 同时承载试运行结果，按字段名剔除会误伤那条链路。
         """
         snapshot: dict[str, Any] = {}
 
@@ -572,6 +624,12 @@ class SessionService:
             payload = preview_service.get_result_payload(last_run.reportRunId)
             if payload is not None:
                 snapshot["previewPayload"] = payload
+
+        # 示意上下文（#51）：**上下文**，不是业务数值 —— 落库是为了让
+        # 同一定义版本跨天、刷新、重启都复用同一份时间窗，数字不跳。
+        preview_context = _response_preview_context(response)
+        if preview_context is not None:
+            snapshot["previewContext"] = preview_context
 
         editing_target = (response.debug or {}).get("editingTargetRegionId")
         if editing_target is not None:
