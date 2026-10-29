@@ -42,11 +42,71 @@
     cursor: pointer;
   }
   .controls button:hover { border-color: #94a3b8; color: #1e293b; }
-  #plan-root {
+  /* 舞台：左边是「对话区」形态（方案落在这里），右边是报表区（不放方案） */
+  .stage { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  .chat-col {
+    width: 340px;
+    max-width: 340px;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .chat-head {
+    padding: 10px 12px;
+    border-bottom: 1px solid #e2e8f0;
+    font-size: 13px;
+    font-weight: 600;
+    color: #0f172a;
+  }
+  .chat-scroll {
+    padding: 12px;
     background: #f8fafc;
+    max-height: 640px;
+    overflow-y: auto;
+  }
+  /* 与工作台里方案气泡同构：头像 + min-width:0 的正文 */
+  .bubble { display: flex; gap: 10px; margin-top: 10px; }
+  .bubble:first-child { margin-top: 0; }
+  .avatar {
+    width: 32px;
+    height: 32px;
+    flex: 0 0 32px;
+    border-radius: 999px;
+    background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #ffffff;
+    font-size: 11px;
+  }
+  .bubble-body { flex: 1 1 auto; min-width: 0; }
+  .welcome {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 12px;
+    color: #475569;
+    line-height: 1.6;
+  }
+  #plan-root:empty { display: none; }
+  #plan-root > .plan-module {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+  .preview-col {
+    flex: 1 1 320px;
+    min-width: 260px;
+    background: #ffffff;
     border: 1px dashed #cbd5e1;
     border-radius: 10px;
-    padding: 16px;
+    padding: 16px 18px;
+    font-size: 12px;
+    color: #64748b;
+    line-height: 1.7;
   }
   #action-log {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -64,13 +124,16 @@
 </head>
 <body>
 
-<h1>D 模块自检 harness · 方案显示</h1>
+<h1>D 模块自检 harness · 方案显示（左侧对话区形态）</h1>
 
 <div class="banner">
   <strong>这是测试 harness，不是产品页面。</strong>
   页面里的方案是冻结契约 v1 的<strong>共同测试样例</strong>，不是生产数据、不是模板库资产、也不是模型回复。
   本页<strong>不接后端、不调模型、不发任何 HTTP 请求</strong>；「确认方案」只把一个设计意图回调给本页脚本。
   正式的接线与真实后端验证由协调者完成。
+  <br />
+  左侧这一列复刻工作台<strong>最窄（340px）的对话区</strong>：方案卡片作为一条 AI 回复挂在这条气泡里，
+  用来验「窄栏不溢出、不错行」（工单 06 / 规格 #46）。
 </div>
 
 <div class="panel">
@@ -81,13 +144,36 @@
     <button id="btn-case-blocked" type="button">不可确认</button>
     <button id="btn-case-error" type="button">带错误</button>
     <button id="btn-case-updated" type="button">更新方案（版本 2）</button>
+    <button id="btn-case-draft" type="button">草稿阶段（收起）</button>
     <button id="btn-case-clear" type="button">清空</button>
   </div>
 </div>
 
-<div class="panel">
-  <h2>模块渲染区</h2>
-  <div id="plan-root"></div>
+<div class="stage">
+  <!-- 左：对话区（方案落在这里） -->
+  <div class="chat-col">
+    <div class="chat-head">AI 报表助理</div>
+    <div id="chat-scroll" class="chat-scroll">
+      <div class="bubble">
+        <div class="avatar">AI</div>
+        <div class="bubble-body">
+          <div class="welcome">你好，我是 AI 报表助理。描述你的报表需求，我会先给出一份文字方案。</div>
+        </div>
+      </div>
+      <!-- 文字方案：一条 AI 回复里的可折叠块（容器 id 与工作台一致） -->
+      <div class="bubble" data-plan-bubble>
+        <div class="avatar">AI</div>
+        <div class="bubble-body">
+          <div id="plan-root"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右：报表区（工单 06 之后这里只有报表本身，没有文字方案） -->
+  <div class="preview-col">
+    右侧是报表区：方案移走之后，这里只放报表本身（草稿 / 报表示意），<strong>不再出现文字方案</strong>。
+  </div>
 </div>
 
 <div class="panel">
@@ -99,6 +185,8 @@
 <script>
   // ── 测试样例 ──────────────────────────────────────────────
   // 来自冻结契约 v1 的共同测试样例。**不是**生产数据 / 模板库资产 / 模型回复。
+  // 板块上的 displayIntent / selectionReason / columns 来自开发规格
+  // 「跨工单契约」（方案输入与选型 / 栏目与取值键）。
   var SAMPLE_PLAN = {
     id: "plan_example_pue",
     revision: 1,
@@ -110,9 +198,35 @@
       exclusions: ["设备耗电排名"]
     },
     sections: [
-      { id: "section_pue", title: "PUE 总览", metricIntents: ["PUE"], componentType: "metric_card" },
-      { id: "section_trend", title: "PUE 趋势", metricIntents: ["PUE"], componentType: "line_chart" },
-      { id: "section_detail", title: "分区明细", metricIntents: ["PUE", "IT 负载"], componentType: "table" }
+      {
+        id: "section_pue",
+        title: "PUE 总览",
+        metricIntents: ["PUE"],
+        componentType: "metric_card",
+        displayIntent: "total",
+        selectionReason: "看总量，指标卡最直观"
+      },
+      {
+        id: "section_trend",
+        title: "PUE 趋势",
+        metricIntents: ["PUE"],
+        componentType: "line_chart",
+        displayIntent: "trend",
+        selectionReason: "看随时间的变化，用趋势图"
+      },
+      {
+        id: "section_detail",
+        title: "分区明细",
+        metricIntents: ["PUE", "IT 负载"],
+        componentType: "table",
+        displayIntent: "records",
+        selectionReason: "看具体记录与属性，用表格",
+        columns: [
+          { id: "col_device", label: "设备名称", fieldRef: "section_detail.device_name" },
+          { id: "col_time", label: "采集时间", fieldRef: "section_detail.collected_at" },
+          { id: "col_value", label: "IT 负载", fieldRef: "section_detail.it_load" }
+        ]
+      }
     ],
     assumptions: ["PUE 统计口径待核实，数据待连接"],
     suggestions: ["可以再补一个机柜级 PUE 分布的饼图"],
@@ -183,6 +297,11 @@
 
   document.getElementById("btn-case-updated").addEventListener("click", function () {
     render(baseView({ reportPlan: SAMPLE_PLAN_V2 }));
+  });
+
+  // 草稿阶段：方案已确认 → 渲染成默认收起的折叠块
+  document.getElementById("btn-case-draft").addEventListener("click", function () {
+    render(baseView({ designPhase: "DRAFT_READY", canConfirm: false }));
   });
 
   document.getElementById("btn-case-clear").addEventListener("click", function () {

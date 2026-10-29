@@ -76,15 +76,16 @@
     background: #fffbeb;
     box-shadow: 0 0 0 2px #fde68a;
   }
-  /* 文字方案（#19）：方案卡片占位时才占空间 */
+  /* 文字方案（#19 先确认，再生成；#46 移到左侧对话区）：
+     方案卡片是左侧对话流里一条 AI 回复的内容，容器由 workbench.js 建在
+     #chat-scroll 末尾；没有方案时整条气泡不在对话流里（:empty 也不占位）。 */
   #plan-root:empty { display: none; }
   /* 方案卡片套一层工作台的白卡片观感；模块自身用内联样式，互不影响 */
   #plan-root > .plan-module {
     background: #fff;
     border: 1px solid #e2e8f0;
     border-radius: 12px;
-    padding: 16px 18px;
-    margin-bottom: 20px;
+    padding: 14px 16px;
   }
   /* 有方案时，右侧草稿预览的空态不再说「还没有草稿」—— 那会误导 */
   #preview-root.plan-active #preview-empty { display: none; }
@@ -238,9 +239,8 @@
 
   <!-- 右：报表预览区 -->
   <section class="flex-1 min-w-0 overflow-y-auto no-bar bg-slate-100">
-    <!-- 文字方案（#19 先确认，再生成）：与草稿预览并列的独立容器。
-         没有方案时它是空的（:empty 不占位），有方案时显示方案卡片。 -->
-    <div id="plan-root" class="px-5 pt-5"></div>
+    <!-- 这里**只有报表本身**：文字方案已移到左侧对话区（#46 / 工单 06），
+         右侧不再有方案容器，也没有任何对照折叠视图。 -->
     <div id="preview-root" class="p-5 space-y-5">
       <!-- 空态 -->
       <div id="preview-empty" class="bg-white rounded-xl border border-dashed border-slate-300 p-10 text-center text-slate-400">

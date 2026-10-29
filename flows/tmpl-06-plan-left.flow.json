@@ -1,0 +1,87 @@
+{
+  "baseDir": "..",
+  "serve": "..",
+  "outDir": "../.selfcheck/tmpl-06-plan-left",
+  "waitMs": 1500,
+  "timeout": 10000,
+  "ignore": ["modao.cc", "/health", "/api/sessions"],
+  "flows": [
+    {
+      "name": "06-01 工作台：方案挂在左侧对话区（展开/收起 + 确认入口 + 窄栏不溢出）",
+      "path": "/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "assertVisible": "#chat-scroll" },
+        { "assertVisible": "#preview-root" },
+        { "assertVisible": "#chat-input" },
+        { "assertCount": "#preview-root #plan-root", "count": 0, "op": "===" },
+
+        { "eval": "(() => { planState.designPhase = 'PLAN_WAITING_CONFIRM'; planState.reportPlan = { id: 'plan_demo_left', revision: 1, topic: '机房能耗日报', requirements: { metrics: ['总耗电'], subject: '机房 A', timeRange: '最近 7 天', exclusions: [] }, sections: [ { id: 's_total', title: '总耗电概览', metricIntents: ['总耗电'], componentType: 'metric_card', displayIntent: 'total', selectionReason: '看总量，指标卡最直观' }, { id: 's_alarm', title: '当前告警列表', metricIntents: ['告警'], componentType: 'table', displayIntent: 'records', selectionReason: '看具体记录与属性，用表格', columns: [ { id: 'c1', label: '设备名称', fieldRef: 'alarm.device_name' }, { id: 'c2', label: '告警级别', fieldRef: 'alarm.level' } ] } ], assumptions: ['示意数据由系统生成，非真实业务数据'], suggestions: ['可加一个周对比趋势'], referenceTemplates: [] }; planState.busy = false; planState.error = null; renderPlanModule(); appendAiText('以下是方案'); return true; })()" },
+        { "waitFor": "#chat-scroll [data-plan-bubble] .plan-module" },
+        { "wait": 300 },
+        { "eval": "(() => { const kids = Array.from(document.querySelector('#chat-scroll').children); const iPlan = kids.findIndex(el => el.hasAttribute('data-plan-bubble')); const iText = kids.findIndex(el => el.textContent.includes('以下是方案')); return iPlan >= 0 && iText >= 0 && iPlan > iText; })()" },
+        { "assertVisible": "#chat-scroll [data-plan-bubble] .plan-confirm" },
+        { "assertAttr": "#chat-scroll [data-plan-bubble] .plan-confirm", "name": "data-plan-can-confirm", "op": "==", "value": "true" },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] #plan-root') !== null" },
+        { "eval": "document.querySelector('#preview-root').querySelector('#plan-root') === null" },
+        { "assertText": "机房能耗日报" },
+        { "assertText": "看总量，指标卡最直观" },
+        { "assertText": "设备名称" },
+        { "assertText": "告警级别" },
+        { "assertCount": "#chat-scroll [data-plan-bubble] .plan-column", "count": 2, "op": "===" },
+        { "eval": "Array.from(document.querySelectorAll('#chat-scroll [data-plan-bubble] .plan-column')).every(el => el.getBoundingClientRect().height < 24)" },
+
+        { "eval": "(() => { const col = document.querySelector('#chat-scroll').closest('section'); col.style.width = '340px'; col.style.maxWidth = '340px'; col.style.flex = '0 0 340px'; return true; })()" },
+        { "wait": 300 },
+        { "eval": "(() => { const root = document.querySelector('#plan-root'); const col = document.querySelector('#chat-scroll').closest('section'); const cb = col.getBoundingClientRect(); const rb = root.getBoundingClientRect(); const wide = Array.from(root.querySelectorAll('*')).filter(el => el.getBoundingClientRect().right > cb.right + 1); return root.scrollWidth <= root.clientWidth + 1 && wide.length === 0 && rb.right <= cb.right + 1; })()" },
+        { "screenshot": "06-01-左侧对话区方案卡片" },
+
+        { "eval": "(() => { planState.designPhase = 'DRAFT_READY'; renderPlanModule(); return true; })()" },
+        { "wait": 300 },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] details.confirmed-plan-details') !== null" },
+        { "eval": "!document.querySelector('#chat-scroll [data-plan-bubble] details').hasAttribute('open')" },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] details summary').textContent.includes('查看已确认的文字方案')" },
+        { "screenshot": "06-02-草稿阶段收起" },
+        { "click": "#chat-scroll [data-plan-bubble] details summary" },
+        { "wait": 300 },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] details').hasAttribute('open') === true" },
+        { "eval": "document.querySelector('#chat-scroll [data-plan-bubble] details').textContent.includes('设备名称')" },
+        { "screenshot": "06-03-草稿阶段展开" }
+      ]
+    },
+    {
+      "name": "06-02 harness：栏目与选型理由 + 确认回调 + 340px 窄栏不溢出",
+      "path": "/frontend/tests/report_plan_harness.html",
+      "continueOnError": false,
+      "steps": [
+        { "assertVisible": "[data-plan-bubble] #plan-root .plan-module" },
+        { "assertVisible": "[data-plan-bubble] #plan-root .plan-confirm" },
+        { "assertText": "总量" },
+        { "assertText": "看总量，指标卡最直观" },
+        { "assertText": "看具体记录与属性，用表格" },
+        { "assertText": "设备名称" },
+        { "assertText": "采集时间" },
+        { "assertCount": "[data-plan-bubble] .plan-column", "count": 3, "op": "===" },
+        { "eval": "Array.from(document.querySelectorAll('[data-plan-bubble] .plan-column')).every(el => el.getBoundingClientRect().height < 24)" },
+        { "eval": "(() => { const root = document.querySelector('[data-plan-bubble] #plan-root'); const col = document.querySelector('.chat-col'); const cb = col.getBoundingClientRect(); const rb = root.getBoundingClientRect(); const wide = Array.from(root.querySelectorAll('*')).filter(el => el.getBoundingClientRect().right > cb.right + 1); return root.scrollWidth <= root.clientWidth + 1 && wide.length === 0 && rb.right <= cb.right + 1; })()" },
+        { "screenshot": "06-04-harness窄栏方案卡片" },
+
+        { "click": "[data-plan-bubble] #plan-root .plan-confirm" },
+        { "wait": 200 },
+        { "eval": "document.querySelectorAll('#action-log .log-line[data-plan-action]').length === 1" },
+        { "eval": "JSON.parse(document.querySelector('#action-log .log-line[data-plan-action]').textContent).designAction === 'CONFIRM_PLAN'" },
+        { "eval": "JSON.parse(document.querySelector('#action-log .log-line[data-plan-action]').textContent).planId === 'plan_example_pue'" },
+
+        { "click": "#btn-case-draft" },
+        { "wait": 300 },
+        { "eval": "document.querySelector('[data-plan-bubble] details.confirmed-plan-details') !== null" },
+        { "eval": "!document.querySelector('[data-plan-bubble] details').hasAttribute('open')" },
+        { "click": "[data-plan-bubble] details summary" },
+        { "wait": 200 },
+        { "eval": "document.querySelector('[data-plan-bubble] details').hasAttribute('open') === true" },
+        { "eval": "document.querySelector('[data-plan-bubble] details').textContent.includes('设备名称')" },
+        { "screenshot": "06-05-harness草稿阶段展开" }
+      ]
+    }
+  ]
+}
