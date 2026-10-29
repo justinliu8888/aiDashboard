@@ -270,3 +270,197 @@ def test_preview_hourly_trend_points_match_snapshot_values():
     assert [p["energyKwh"] for p in trend["points"]] == [
         p.energyKwh for p in snap.hourlyTrend
     ]
+
+
+# ==================================================== 造数器：窗口与分桶
+#
+# 模拟业务数据必须严格按**输入的时间窗**分桶：左闭右开、单日小时 24 桶、
+# 多日按实际小时数、天粒度每天一桶；夏令时按实际窗口，不写死 24。
+
+from app.services.simulated_data_service import generate_simulated_data  # noqa: E402
+
+
+def _sim_definition(*, timezone="Asia/Shanghai", grain="HOUR"):
+    return {
+        "metadata": {"name": "机房能耗日报"},
+        "defaults": {
+            "scope": {"selectors": {"machineRoomId": ["room_a"]}},
+            "timeWindow": {
+                "type": "CALENDAR",
+                "timezone": timezone,
+                "unit": "DAY",
+                "offset": -1,
+                "count": 1,
+            },
+            "grain": {"unit": grain},
+        },
+        "regions": [
+            {
+                "id": "r_total",
+                "name": "总耗电",
+                "role": "SUMMARY",
+                "component": {
+                    "type": "METRIC_CARD",
+                    "metric": {
+                        "label": "总耗电",
+                        "format": {"kind": "NUMBER", "precision": 1, "unitLabel": "kWh"},
+                    },
+                },
+                "templateBinding": {
+                    "previewSpec": {
+                        "kind": "energy",
+                        "unit": "kWh",
+                        "metrics": [
+                            {
+                                "metricKey": "energy",
+                                "label": "总耗电",
+                                "kind": "energy",
+                                "unit": "kWh",
+                            }
+                        ],
+                    }
+                },
+            },
+            {
+                "id": "r_trend",
+                "name": "耗电趋势",
+                "role": "TREND",
+                "component": {"type": "CHART", "chartKind": "LINE", "encodings": []},
+                "templateBinding": {"previewSpec": {"kind": "energy", "unit": "kWh"}},
+            },
+        ],
+    }
+
+
+def _sim_context(**overrides):
+    context = {
+        "definitionId": "def_tz_gen",
+        "definitionVersion": 1,
+        "timezone": "Asia/Shanghai",
+        "anchorTime": "2026-10-29T00:00:00+08:00",
+        "windowStart": "2026-10-28T00:00:00+08:00",
+        "windowEnd": "2026-10-29T00:00:00+08:00",
+        "grainUnit": "HOUR",
+        "generatorVersion": "simulated-data/1",
+    }
+    context.update(overrides)
+    return context
+
+
+def test_single_day_hour_window_has_24_buckets():
+    payloads = generate_simulated_data(_sim_definition(), _sim_context())
+    trend = payloads["r_trend"]
+    assert len(trend["yValues"]) == 24
+    assert len(trend["xLabels"]) == 24
+    assert trend["grain"] == "HOUR"
+
+
+def test_window_is_left_closed_right_open():
+    """窗口左闭右开：第一个桶从 windowStart 起，最后一个桶止于 windowEnd。"""
+    payloads = generate_simulated_data(_sim_definition(), _sim_context())
+    labels = payloads["r_trend"]["xLabels"]
+    assert labels[0] == "00:00"
+    assert labels[-1] == "23:00"
+    assert len(labels) == 24
+
+
+def test_multi_day_hour_window_expands_to_actual_hours():
+    context = _sim_context(
+        windowStart="2026-10-22T00:00:00+08:00",
+        windowEnd="2026-10-29T00:00:00+08:00",
+    )
+    payloads = generate_simulated_data(_sim_definition(), context)
+    assert len(payloads["r_trend"]["yValues"]) == 7 * 24
+
+
+def test_day_grain_has_one_bucket_per_day():
+    context = _sim_context(
+        windowStart="2026-10-22T00:00:00+08:00",
+        windowEnd="2026-10-29T00:00:00+08:00",
+        grainUnit="DAY",
+    )
+    payloads = generate_simulated_data(_sim_definition(grain="DAY"), context)
+    trend = payloads["r_trend"]
+    assert len(trend["yValues"]) == 7
+    assert trend["xLabels"][0] == "10-22"
+    assert trend["xLabels"][-1] == "10-28"
+
+
+def test_day_grain_buckets_sum_to_the_card_total():
+    context = _sim_context(
+        windowStart="2026-10-22T00:00:00+08:00",
+        windowEnd="2026-10-29T00:00:00+08:00",
+        grainUnit="DAY",
+    )
+    payloads = generate_simulated_data(_sim_definition(grain="DAY"), context)
+    assert round(sum(payloads["r_trend"]["yValues"]), 6) == round(
+        payloads["r_total"]["value"], 6
+    )
+
+
+def test_dst_spring_forward_day_has_23_buckets():
+    """美国夏令时开始日：本地一天只有 23 个真实小时，不能写死 24。"""
+    context = _sim_context(
+        timezone="America/New_York",
+        windowStart="2026-03-08T00:00:00-05:00",
+        windowEnd="2026-03-09T00:00:00-04:00",
+    )
+    payloads = generate_simulated_data(
+        _sim_definition(timezone="America/New_York"), context
+    )
+    assert len(payloads["r_trend"]["yValues"]) == 23
+
+
+def test_dst_fall_back_day_has_25_buckets():
+    """夏令时结束日：本地一天有 25 个真实小时。"""
+    context = _sim_context(
+        timezone="America/New_York",
+        windowStart="2026-11-01T00:00:00-04:00",
+        windowEnd="2026-11-02T00:00:00-05:00",
+    )
+    payloads = generate_simulated_data(
+        _sim_definition(timezone="America/New_York"), context
+    )
+    assert len(payloads["r_trend"]["yValues"]) == 25
+
+
+def test_trend_timestamps_carry_the_report_timezone_offset():
+    payloads = generate_simulated_data(_sim_definition(), _sim_context())
+    points = payloads["r_trend"]["points"]
+    for point in points:
+        stamp = point["timestamp"]
+        assert stamp.endswith("+08:00")
+
+
+def test_generated_numbers_follow_the_input_window_not_today():
+    """跨午夜打开：数字来自**输入窗口**，不是当前日期。"""
+    old = generate_simulated_data(
+        _sim_definition(),
+        _sim_context(
+            windowStart="2026-01-05T00:00:00+08:00",
+            windowEnd="2026-01-06T00:00:00+08:00",
+        ),
+    )
+    recent = generate_simulated_data(
+        _sim_definition(),
+        _sim_context(
+            windowStart="2026-10-28T00:00:00+08:00",
+            windowEnd="2026-10-29T00:00:00+08:00",
+        ),
+    )
+    assert old["r_total"]["value"] != recent["r_total"]["value"]
+    assert old["r_total"]["windowLabel"].startswith("2026-01-05")
+
+
+def test_same_window_in_a_different_timezone_shifts_the_buckets():
+    """同一绝对窗口换报表时区：桶数按**实际窗口**走，时间戳跟着时区走。"""
+    context = _sim_context(
+        timezone="UTC",
+        windowStart="2026-10-27T16:00:00+00:00",
+        windowEnd="2026-10-28T16:00:00+00:00",
+    )
+    payloads = generate_simulated_data(_sim_definition(timezone="UTC"), context)
+    trend = payloads["r_trend"]
+    assert len(trend["yValues"]) == 24
+    for point in trend["points"]:
+        assert point["timestamp"].endswith("+00:00")

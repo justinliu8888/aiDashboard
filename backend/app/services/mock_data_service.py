@@ -50,6 +50,15 @@ def _hash_float(seed: str, lo: float, hi: float) -> float:
     return lo + (hi - lo) * frac
 
 
+def hash_float(seed: str, lo: float, hi: float) -> float:
+    """公开的确定性取值入口：造数器各模块共用**同一种子算法**。
+
+    模拟业务数据的确定性（同一份定义 + 同一时间窗 → 数字恒定）靠的就是它；
+    换模块不换算法，两处造出来的数才不会各算各的。
+    """
+    return _hash_float(seed, lo, hi)
+
+
 @dataclass
 class HourlyPoint:
     timestamp: str
@@ -328,3 +337,16 @@ def room_id_of_definition(definition: dict[str, Any] | None) -> str:
     selectors = scope.get("selectors") or {}
     ids = selectors.get("machineRoomId") or []
     return str(ids[0]) if ids else "room_a"
+
+
+def __getattr__(name: str) -> Any:
+    """把造数器的公开入口也挂在这一层，避免调用方找错模块。
+
+    真正的实现在 :mod:`app.services.simulated_data_service`；这里做**惰性**转发，
+    以免两个模块在导入期互相等待。
+    """
+    if name in ("generate_simulated_data", "SimulatedDataError"):
+        from app.services import simulated_data_service
+
+        return getattr(simulated_data_service, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
