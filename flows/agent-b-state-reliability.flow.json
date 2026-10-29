@@ -20,7 +20,8 @@
         { "eval": "document.getElementById('state-badge').textContent === 'DEFINITION_DRAFT_READY'" },
         { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled).length === 1" },
         { "eval": "Array.from(document.querySelectorAll('.question-select')[0].options).map(o => o.textContent.trim()).join(',') === '请选择,同意,修改,重新开始'" },
-        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "document.getElementById('btn-regenerate').disabled === true" },
         { "assertText": "AI 变更确认" },
 
         { "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId).sort().join(',') === 'region_analysis,region_data_quality,region_device_ranking,region_hourly_trend,region_total_energy'" },
@@ -36,7 +37,8 @@
         },
         { "waitText": "报表已就绪", "timeout": 60000 },
         { "eval": "document.getElementById('state-badge').textContent === 'READY'" },
-        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "document.getElementById('btn-regenerate').disabled === true" },
         { "screenshot": "agentb-02-确认后一路推进到 READY" }
       ]
     },

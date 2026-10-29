@@ -1,0 +1,33 @@
+{
+  "baseDir": "../..",
+  "outDir": "../../.agent-runtime/plan-first-integration/selfcheck",
+  "waitMs": 2500,
+  "ignore": [
+    "modao.cc"
+  ],
+  "pages": [
+    {
+      "name": "workbench-实际工作台",
+      "path": "/playground/pages/workbench.html",
+      "title": "AI 报表生成工作台",
+      "waitMs": 3000,
+      "selectors": [
+        "#chat-input",
+        "#btn-send",
+        "#chat-scroll",
+        "#preview-root",
+        "#session-list",
+        "#btn-new-session"
+      ],
+      "texts": [
+        "AI 报表助理",
+        "云枢数据平台",
+        "新建对话",
+        "还没有草稿"
+      ],
+      "counts": [
+        "#session-list>=1"
+      ]
+    }
+  ]
+}

@@ -35,15 +35,37 @@ from app.schemas.agent import (
     AgentState,
     QuestionOption,
     ToolRequest,
+    TURN_KIND_QUERY_ANSWER,
 )
 from app.schemas.edit_plan import EditIntent, EditPlan
+from app.schemas.fact import RECORDED_STAGE_DISCLOSURE, SessionFacts
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.session import PendingEditPlan
-from app.services.context_engine import RouteDecision, RoutingAction, context_engine
+from app.services import routing_rules
+from app.services.context_engine import (
+    RouteDecision,
+    RoutingAction,
+    UserIntent,
+    context_engine,
+)
 from app.services.definition_save_service import definition_save_service
 from app.services.preview_service import preview_service
+# 边界口径改用共用层（app.schemas.fact），不再从 recorded_progress_service
+# 转述模型自己写的 limitations —— 那仍取决于模型有没有声明边界。
+from app.services.report_design_service import (
+    is_pure_confirmation,
+    is_vague_approval,
+    report_design_service,
+)
+# 判定与兜底策略放在 query_answer_service（回答文本策略的家）。
+from app.services.query_answer_service import (
+    claims_live_progress,
+    recorded_stage_disclosed,
+    recorded_stage_fallback,
+)
 from app.services.request_timeline import log_timeline_step
 from app.services.session_context import bind_session_key, current_session_key
+from app.services.session_fact_service import session_fact_service
 from app.services.session_service import session_service
 from app.services.edit_reference_resolver import resolve_visible_reference
 from app.services.edit_time_resolver import resolve_time_expression
@@ -100,6 +122,14 @@ ORDER_DEPENDENT_REASONS = frozenset({
 })
 
 logger = logging.getLogger(__name__)
+
+#: 答案里编了实时进度、又没法用会话事实换掉时的安全兜底。
+#:
+#: 不给用户看假数字，也不把编造的内容留在屏幕上。
+QUERY_UNSAFE_ANSWER = (
+    "这次查询没有完成，暂时无法确认当前对话的情况。"
+    "草稿和待确认操作都没有变化，可以稍后再问一次。"
+)
 EmitEvent = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
@@ -151,6 +181,239 @@ class AgentService:
                 },
             )
         return response
+
+    def _keep_choice_untouched(self, response: AgentResponse) -> AgentResponse:
+        """只读查询轮：菜单照原样带回，但**不落库**。
+
+        查询不是决定，不能替用户接受、取消或替换计划，也不能顺手
+        「恢复」出一个原本不存在的选择锁（ADR 0002 §6.1：
+        「查询回答后：原菜单、pendingChoice、待确认修改计划、澄清轮次全部不变」）。
+
+        业务轮用 ``_remember_choice`` 落库选择锁；查询轮只把菜单放进响应，
+        让前端照常渲染，剩下的事等用户真的选一项再说。
+        """
+        return response
+
+    # ---------- 只读查询轮（工单 #13 / #14） ----------
+
+    @staticmethod
+    def _pending_choice_required(
+        request: AgentRequest,
+        state: AgentState,
+        question: AgentQuestion,
+    ) -> AgentResponse:
+        """待确认期间收到非只读提问的输入：仍然必须从原菜单里选。
+
+        菜单原样带回，草稿和待确认计划都不动。
+        说不清是提问还是操作时，给一句针对性的澄清，而不是让用户重述。
+        """
+        if routing_rules.has_operation_command(request.message):
+            reply = (
+                "请先从下拉框选择一项再继续操作。"
+                "如果只是想问当前对话的情况（草稿、进度、能力），直接问就行。"
+            )
+        else:
+            reply = (
+                "这句我没太明白：你是想修改这份报表（说清楚改哪一处），"
+                "还是想先问当前对话的情况？"
+                "原来的选择我给你留着，也可以直接从下拉框选。"
+            )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=state,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            questions=[question],
+            uiActions=["selection_required"],
+        )
+
+    def _is_readonly_query_turn(
+        self,
+        request: AgentRequest,
+        route: RouteDecision,
+        pending_guard: tuple[AgentState, AgentQuestion] | None,
+    ) -> bool:
+        """本轮是不是只读查询（查事实、只回答，不推进业务）。"""
+        if request.message == ADVANCE_MESSAGE:
+            # 内部控制消息，永远不是用户提问。
+            return False
+        if route.userIntent is UserIntent.ASK_QUESTION:
+            return True
+        if pending_guard is not None:
+            # 待确认入口：模型没能给出可判定意图时，只有**明确的只读提问**
+            # 才进查询链路；其它输入（操作指令、填选项、含糊话）仍然被拒，
+            # 不能绕过菜单确认约束。
+            return route.userIntent is UserIntent.UNKNOWN and (
+                routing_rules.is_readonly_question(request.message)
+            )
+        if (
+            request.state is AgentState.USER_EDITING_TEMPLATE
+            and request.snapshots.reportDefinition is not None
+        ):
+            # 编辑态跳过了通用路由（避免把模糊编辑误判成闲聊），
+            # 这里用规则层的只读提问判定兜底。
+            return routing_rules.is_readonly_question(request.message)
+        return False
+
+    async def _handle_readonly_query(
+        self,
+        request: AgentRequest,
+        route: RouteDecision,
+        pending_guard: tuple[AgentState, AgentQuestion] | None,
+    ) -> AgentResponse:
+        """只读查询轮：查事实、回答，本轮不推进业务。"""
+        request.queryMode = True
+        handle = getattr(self._agent, "ahandle", None)
+        try:
+            if handle is not None:
+                response = await handle(request)
+            else:
+                response = self._agent.handle(request)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[agent.chat] step=readonly_query_failed conversationId=%s",
+                request.conversationId,
+            )
+            response = self._query_failure_response(request)
+        response.debug = {
+            **(response.debug or {}),
+            "contextEngineStage": route.engineStage or "unknown",
+            "contextEngineIntent": route.userIntent.value,
+            "contextEngineReason": route.reason,
+        }
+        return self._keep_choice_untouched(
+            self._normalize_query_answer(request, response, pending_guard)
+        )
+
+    def _normalize_query_answer(
+        self,
+        request: AgentRequest,
+        response: AgentResponse,
+        pending_guard: tuple[AgentState, AgentQuestion] | None,
+    ) -> AgentResponse:
+        """把查询轮收敛成「不推进业务」的契约。
+
+        这里做的是**服务端强制**，不依赖模型自觉，也不只靠 Prompt：
+            - 状态回到本轮进入时的状态；
+            - 业务对象用服务端可信记录，不回写请求快照；
+            - 原待确认菜单保留，不出现无关生成选项；
+            - 不发起任何执行类工具请求。
+        """
+        response.state = request.state
+        response.turnKind = TURN_KIND_QUERY_ANSWER
+        response.toolRequests = []
+        response.uiActions = ["query_answer"]
+
+        facts = session_fact_service.load(
+            session_id=current_session_key() or request.conversationId,
+            project_id=request.context.projectId,
+            subject_ref=request.context.subjectRef,
+            subject_id=request.context.subjectId,
+            request_has_draft=request.snapshots.reportDefinition is not None,
+        )
+        response.domainObjects = AgentResponseDomainObjects(
+            reportDefinitionDraft=(
+                facts.definition or request.snapshots.reportDefinition
+            ),
+            reportPolicyDraft=facts.policy or request.snapshots.reportPolicy,
+        )
+        response.questions = self._preserved_menu(request, pending_guard)
+        response.debug = {
+            **(response.debug or {}),
+            "queryMode": True,
+            "factStatus": facts.status.value,
+        }
+        self._ensure_recorded_stage_disclosure(request, response, facts)
+        return response
+
+    @staticmethod
+    def _ensure_recorded_stage_disclosure(
+        request: AgentRequest,
+        response: AgentResponse,
+        facts: SessionFacts,
+    ) -> None:
+        """只读答案的边界校正：不说假话，也不漏掉必须说的边界。
+
+        工单 #03：「回答明确是已记录状态，不冒充实时任务监控」；
+        父规格 #12：「数据可能不是实时的，应以用户可理解的方式说明」。
+
+        这条要求不能只靠模型自觉：模型可能把边界写进 ``limitations``
+        （结构化字段，页面不渲染），也可能干脆没写。这里由服务端用
+        **共用层的口径**处理：
+
+            - 编了实时进度（百分比 / 正在跑）：任何查询回答都不能把假数字
+              给用户，也不能靠再补一句否认来抵消 —— 两句话会打架；
+              问进度时用服务端事实换掉整句回答，其它问题走安全兜底；
+            - 问进度时：答案没同时说清「已记录」与「不是实时」，补上共用层
+              的口径句；澄清轮与技术失败轮不补（那不是进度回答）；
+            - 问草稿、问能力不补这条边界（口径不能加错地方）。
+        """
+        reply = response.reply or ""
+        if claims_live_progress(reply):
+            response.reply = (
+                recorded_stage_fallback(facts)
+                if routing_rules.is_progress_question(request.message)
+                else QUERY_UNSAFE_ANSWER
+            )
+            return
+        if not routing_rules.is_progress_question(request.message):
+            return
+        outcome = (response.debug or {}).get("queryOutcome")
+        if outcome in {"clarification", "technical_failure"}:
+            return
+        if recorded_stage_disclosed(reply):
+            return
+        response.reply = (
+            f"{reply.strip()}\n{RECORDED_STAGE_DISCLOSURE}"
+        ).strip()
+
+    def _preserved_menu(
+        self,
+        request: AgentRequest,
+        pending_guard: tuple[AgentState, AgentQuestion] | None,
+    ) -> list[AgentQuestion]:
+        """查询回答之后仍然要能用的原业务菜单。
+
+        只有**原来就有**的菜单才带回。库里没有就不给：
+        ADR 0002 §4.2「questions = 原有待确认菜单；没有菜单时为空」，
+        规格「查询前后保持…待确认选项…不变」。
+
+        凭空造一个 template_edit_confirm 出来，前端会把它渲染成可点的
+        确认按钮，但服务端并没有这把锁 —— 用户点了会落空，
+        而且 pendingChoice 也被查询轮改掉了。
+        """
+        if pending_guard is not None:
+            return [pending_guard[1]]
+        raw = session_service.load_pending_choice(
+            current_session_key() or request.conversationId
+        )
+        if isinstance(raw, dict):
+            try:
+                AgentState(raw["state"])
+                return [AgentQuestion(**raw["question"])]
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "[agent.chat] step=pending_choice_invalid conversationId=%s raw=%s",
+                    request.conversationId,
+                    raw,
+                )
+        return []
+
+    @staticmethod
+    def _query_failure_response(request: AgentRequest) -> AgentResponse:
+        """查询失败：如实说失败，不降级成「请补充生成条件」的引导。"""
+        message = (
+            "这次查询没有完成，暂时无法确认当前对话的情况。"
+            "草稿和待确认操作都没有变化，可以稍后再问一次。"
+        )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=request.state,
+            reply=message,
+            designSessionId=request.context.designSessionId,
+            error=AgentError(code="QUERY_UNAVAILABLE", message=message),
+            debug={"queryMode": True, "queryOutcome": "technical_failure"},
+        )
 
     async def chat(
         self, request: AgentRequest, emit: EmitEvent | None = None
@@ -211,70 +474,95 @@ class AgentService:
         if session_service.load_pending_plan(session_key):
             # 待决计划比旧的其他选择锁更权威；确认不能被迟到的题目覆盖。
             pending = (AgentState.USER_EDITING_TEMPLATE, self._pending_edit_question())
+
+        # 待确认入口（工单 #14）：
+        #
+        #   - 选项值 -> 走原来的确认流程，一行不改；
+        #   - 其它自由输入 -> 先不拒绝，交给路由判定这是不是**只读提问**。
+        #     是只读提问就放行进查询链路，问完原菜单和待确认计划照旧；
+        #     不是只读提问，仍然按原来的「必须从菜单里选」拒绝。
+        #
+        # pending_guard 非空时，本轮**不允许**触发任何执行动作
+        # （接受修改 / 确认报表 / 保存 / 校验 / 预览 / 生成草稿）。
+        pending_guard: tuple[AgentState, AgentQuestion] | None = None
         if pending:
             pending_state, question = pending
-            if request.state != pending_state or request.message not in {
-                option.value for option in question.options
-            } | ({"重新开始"} if question.allowRestart else set()):
-                return AgentResponse(
-                    conversationId=request.conversationId,
-                    state=pending_state,
-                    reply="请先从下拉框选择一项，不能直接输入或跳转。",
-                    designSessionId=request.context.designSessionId,
-                    questions=[question],
-                    uiActions=["selection_required"],
-                )
-            session_service.save_pending_choice(session_key, None)
-            if question.id == EDIT_CHOICE_ID:
-                return self._handle_pending_edit_choice(request, session_key)
-            if question.id.startswith("template_preview_"):
-                result = template_preview_flow.answer(request, question.id)
-                await _emit(emit, "stage", {
-                    "stage": "template_preview_choice",
-                    "choice": question.id,
-                    "responseState": result.state.value,
-                })
-                return self._remember_choice(result)
-            if question.id == "template_edit_confirm":
-                if request.message == CONFIRM_BUTTON_VALUE:
-                    return self._save_placeholder(request, RouteDecision())
-                if request.message == RESTART_BUTTON_VALUE:
-                    return AgentResponse(
-                        conversationId=request.conversationId,
-                        state=AgentState.ANALYZING,
-                        reply="好的，我们重新开始。请描述你想生成的新报表。",
-                        uiActions=["restart_from_template_editing"],
+            if request.state != pending_state:
+                # 客户端状态与服务端的待确认状态不符（客户端过期 / 不同步）。
+                #
+                # 原来是直接拒绝，让客户端回去按菜单选。但「菜单在」这件事
+                # 由服务端说了算，客户端状态过期不该让**只读提问**也被拒：
+                # 只读提问没有任何可绕过的执行权限，放行进查询链路，
+                # 问完原菜单和待确认计划照旧（查询轮不落库选择锁、
+                # 不重建业务对象）。
+                #
+                # 操作指令仍然照旧拒绝 —— 这个口子不能变成绕过确认的入口。
+                if routing_rules.is_readonly_question(request.message):
+                    pending_guard = (pending_state, question)
+                else:
+                    return self._pending_choice_required(
+                        request, pending_state, question
                     )
-                return self._editing_prompt_response(
-                    request,
-                    reply="好的，请描述你想怎样修改当前草稿。",
+            else:
+                allowed_values = {option.value for option in question.options} | (
+                    {"重新开始"} if question.allowRestart else set()
                 )
-            if question.id == "ready_action":
-                if request.message == "继续修改":
-                    if request.snapshots.reportDefinition is None:
+                if request.message not in allowed_values:
+                    pending_guard = (pending_state, question)
+                else:
+                    session_service.save_pending_choice(session_key, None)
+                    if question.id == EDIT_CHOICE_ID:
+                        return self._handle_pending_edit_choice(request, session_key)
+                    if question.id.startswith("template_preview_"):
+                        result = template_preview_flow.answer(request, question.id)
+                        await _emit(emit, "stage", {
+                            "stage": "template_preview_choice",
+                            "choice": question.id,
+                            "responseState": result.state.value,
+                        })
+                        return self._remember_choice(result)
+                    if question.id == "template_edit_confirm":
+                        if request.message == CONFIRM_BUTTON_VALUE:
+                            return self._save_placeholder(request, RouteDecision())
+                        if request.message == RESTART_BUTTON_VALUE:
+                            return AgentResponse(
+                                conversationId=request.conversationId,
+                                state=AgentState.ANALYZING,
+                                reply="好的，我们重新开始。请描述你想生成的新报表。",
+                                uiActions=["restart_from_template_editing"],
+                            )
+                        return self._editing_prompt_response(
+                            request,
+                            reply="好的，请描述你想怎样修改当前草稿。",
+                        )
+                    if question.id == "ready_action":
+                        if request.message == "继续修改":
+                            if request.snapshots.reportDefinition is None:
+                                return self._remember_choice(AgentResponse(
+                                    conversationId=request.conversationId,
+                                    state=AgentState.READY,
+                                    reply="当前报表草稿未随请求带回，无法继续修改。请恢复草稿后重试。",
+                                    designSessionId=request.context.designSessionId,
+                                    questions=self._ready_questions(),
+                                    uiActions=["show_ready_actions"],
+                                ))
+                            return self._editing_prompt_response(
+                                request,
+                                reply="好的，请描述你想怎样修改当前报表。",
+                            )
+                        action = "发布" if request.message == "发布" else "导出 PDF"
                         return self._remember_choice(AgentResponse(
                             conversationId=request.conversationId,
                             state=AgentState.READY,
-                            reply="当前报表草稿未随请求带回，无法继续修改。请恢复草稿后重试。",
+                            reply=f"{action}流程尚未接入（Mock），请继续从下拉框选择。",
                             designSessionId=request.context.designSessionId,
                             questions=self._ready_questions(),
                             uiActions=["show_ready_actions"],
                         ))
-                    return self._editing_prompt_response(
-                        request,
-                        reply="好的，请描述你想怎样修改当前报表。",
-                    )
-                action = "发布" if request.message == "发布" else "导出 PDF"
-                return self._remember_choice(AgentResponse(
-                    conversationId=request.conversationId,
-                    state=AgentState.READY,
-                    reply=f"{action}流程尚未接入（Mock），请继续从下拉框选择。",
-                    designSessionId=request.context.designSessionId,
-                    questions=self._ready_questions(),
-                    uiActions=["show_ready_actions"],
-                ))
 
-        if request.message.strip() in {EDIT_ACCEPT, EDIT_ADJUST, EDIT_CANCEL}:
+        if pending_guard is None and request.message.strip() in {
+            EDIT_ACCEPT, EDIT_ADJUST, EDIT_CANCEL,
+        }:
             return AgentResponse(
                 conversationId=request.conversationId,
                 state=AgentState.USER_EDITING_TEMPLATE,
@@ -286,7 +574,7 @@ class AgentService:
                 ),
             )
 
-        if request.state == AgentState.READY:
+        if pending_guard is None and request.state == AgentState.READY:
             # 单进程重启后待选项可能丢失；仍先恢复必选题，不允许直接路由自由文本。
             return self._remember_choice(AgentResponse(
                 conversationId=request.conversationId,
@@ -297,7 +585,9 @@ class AgentService:
                 uiActions=["show_ready_actions"],
             ))
 
-        if request.message.strip() in {"继续工作", "继续上一条", "继续刚才"}:
+        if pending_guard is None and request.message.strip() in {
+            "继续工作", "继续上一条", "继续刚才",
+        }:
             logger.info(
                 "[agent.chat] step=resume_unavailable conversationId=%s state=%s",
                 request.conversationId,
@@ -310,7 +600,49 @@ class AgentService:
                 uiActions=["resume_unavailable"],
             )
 
-        if template_preview_flow.is_request(request):
+        # 设计流（#19）：新建流程先给文字方案。
+        #
+        # 这里只做两件事：认出「这一轮归设计流程管」，
+        # 以及把「先看模板」提前分流挡在设计流程外面。
+        #
+        #   - 模板流在旧流程里跑在路由之前，所以它会先抢走「先看模板」。
+        #     规格写明这类提前分流必须进入新建流程，所以设计轮不走模板流。
+        #   - 只读提问不能被模板流抢走：模板流遇到表达不了的条件会直接
+        #     BLOCKED_OR_UNSUPPORTED —— 那是用一句提问触发一条执行分支
+        #     （ADR 0002 §6.1 / 规格 #12）。
+        design_state = report_design_service.load_state(request)
+        design_turn = (
+            design_state is not None or report_design_service.is_new_build(request)
+        )
+        readonly_rule = routing_rules.is_readonly_question(request.message)
+        # 「纯确认」与「模糊认可」这两类消息：都不是提问，也不走查询链路。
+        # 服务端自己能认出来（规格 #18），不需要再问一次路由层。
+        design_acknowledgement = is_pure_confirmation(
+            request.message
+        ) or is_vague_approval(request.message)
+        # 这些设计轮**不跑**旧路由：
+        #   - 新建轮：路由结果没有人消费；
+        #   - 纯确认 / 模糊认可：都不是提问，不走查询链路；
+        #   - 没有疑问语气：这一轮是要求，不是提问，路由判定用不上。
+        #
+        # 旧路由是一次真实模型往返（实测 60~150 秒）。在这些轮次里，
+        # 用户要先等一个用不上的结果才看到自己的方案。
+        #
+        # 有疑问语气的轮次仍然跑旧路由：规则层只覆盖「指向报表业务对象」
+        # 的提问，「你能做什么？」这类元问题要靠路由层再判一次，
+        # 免得一句提问平白多出一版方案。
+        design_skips_router = design_turn and (
+            (design_state is None and not readonly_rule)
+            or design_acknowledgement
+            or not routing_rules.looks_like_question(request.message)
+        )
+
+        if (
+            pending_guard is None
+            and not design_turn
+            and not readonly_rule
+            and template_preview_flow.is_request(request)
+        ):
             result = template_preview_flow.start(request)
             await _emit(emit, "stage", {
                 "stage": "template_preview_start",
@@ -321,7 +653,7 @@ class AgentService:
 
         # 节点 6-11 的自动推进：前端收到上一个状态后再发一次 __advance__
         # 跳过 ContextEngine，直接按 state 走对应 handler。
-        if request.message == ADVANCE_MESSAGE:
+        if pending_guard is None and request.message == ADVANCE_MESSAGE:
             auto_started = perf_counter()
             start_stage_by_state = {
                 AgentState.SAVE_DEFINITION_DRAFT: "auto_advance_start",
@@ -370,7 +702,10 @@ class AgentService:
                 )
                 return self._remember_choice(auto)
 
-        template_edit = await self._try_handle_template_edit(request)
+        # 待确认期间不接受自由输入触发的编辑动作：编辑只能从原菜单走。
+        template_edit = None
+        if pending_guard is None:
+            template_edit = await self._try_handle_template_edit(request)
         if template_edit is not None:
             await _emit(
                 emit,
@@ -406,6 +741,23 @@ class AgentService:
                 isTemplateEdit=True,
                 engineStage="template_edit_react",
                 reason="规则无法确定编辑计划，交给受约束 ReAct 查证",
+                collectedInfo=dict(request.collectedInfo),
+            )
+        elif design_skips_router:
+            # 这些设计轮**不跑**旧路由。
+            #
+            # 旧路由是一次真实模型往返，实测 60~150 秒；在这些轮次里它的
+            # 结果没有人消费 —— 等于让用户先等一个用不上的结果，才看到
+            # 自己要的答案。
+            #
+            # 顺带的好处：旧路由会把「昨日」「默认能耗指标」这类默认值
+            # 写进 collectedInfo 落进快照 —— 设计流程没有让用户指定这些，
+            # 不该由默认值无声替代。
+            route = RouteDecision(
+                userIntent=UserIntent.NEW_TASK,
+                routingAction=RoutingAction.CONTINUE_CURRENT,
+                engineStage="design_direct",
+                reason="设计流程：这一轮直接进设计流程，不跑旧路由",
                 collectedInfo=dict(request.collectedInfo),
             )
         else:
@@ -451,6 +803,71 @@ class AgentService:
         )
 
         state_before_apply = request.state.value
+        # 设计流（#19）：这一轮归设计流程管。
+        #
+        # 「提问不改设计版本」是硬要求，所以这里要把**提问**和**修改**分开：
+        #
+        #   - 规则层判定为只读提问 → 直接走旧查询链路；
+        #   - 已经有方案在等确认，而规则层没认出来（规则层只覆盖
+        #     「问当前对话 / 当前产品的事」）→ 问路由层，用与旧流程
+        #     同一套判定，避免一句元问题平白多出一版方案；
+        #   - 其余 → 设计轮（新建或修改）。
+        if design_turn:
+            if request.message == ADVANCE_MESSAGE:
+                # 设计流程不走旧的自动推进。
+                # __advance__ 是旧状态机的内部控制消息，在设计流程里必须
+                # 原样返回 —— 掉下去会被业务 Agent 当成一次生成请求，
+                # 平白生成一份草稿，绕开了「先确认，再生成」。
+                return report_design_service.keep_state_response(
+                    request, design_state
+                )
+            is_question = readonly_rule
+            if (
+                not is_question
+                and design_state is not None
+                # 纯确认 / 模糊认可不是提问，别再问一次路由层。
+                and not design_acknowledgement
+                # 这一轮没跑旧路由（没有疑问语气），路由判定用不上。
+                and not design_skips_router
+            ):
+                is_question = self._is_readonly_query_turn(
+                    request, route, pending_guard
+                )
+            if is_question:
+                response = await self._handle_readonly_query(
+                    request, route, pending_guard
+                )
+                # 查询轮不改设计对象，但要把设计阶段与方案带回响应：
+                # 前端要据此继续显示那份待确认的方案。
+                report_design_service.attach_design_state(response, design_state)
+                return response
+            # 设计轮不把旧路由的收集结果带进快照。
+            #
+            # 旧路由是旧流程的槽位采集器，它会把「昨日」「默认能耗指标」
+            # 这类**系统暂选**写进 collectedInfo。设计会话里方案才是需求的
+            # 权威记录，把这些默认值写进快照，等于让用户没指定的条件
+            # 悄悄顶替 —— 工单 01 验收明确要求「未指定的条件注明假设，
+            # 不被默认值无声替代」。
+            #
+            # 只在这一条（设计轮）清：查询轮的回答要用会话事实，
+            # 旧流程的轮次一个字都不动。
+            request.collectedInfo = {}
+            design_response = await report_design_service.handle(
+                request, emit=emit, state=design_state
+            )
+            if design_response is not None:
+                return design_response
+
+        # 只读查询轮：查事实、回答，不推进业务。
+        # 必须在 _apply_context_route 之前判定 —— 那里的 JUMP_STATE 会真的
+        # 保存草稿，等于绕过待确认菜单。
+        if self._is_readonly_query_turn(request, route, pending_guard):
+            return await self._handle_readonly_query(request, route, pending_guard)
+        if pending_guard is not None:
+            # 不是只读提问：维持原来的约束，必须从菜单里选。
+            return self._pending_choice_required(
+                request, pending_guard[0], pending_guard[1]
+            )
         intercepted = self._apply_context_route(request, route)
         await _emit(
             emit,

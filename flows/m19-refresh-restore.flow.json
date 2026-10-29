@@ -30,7 +30,8 @@
         { "eval": "document.getElementById('state-badge').textContent === 'WAITING_USER_CONFIRM'" },
         { "eval": "!!document.querySelector('.question-select')" },
         { "eval": "!document.querySelector('.question-select').disabled" },
-        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "document.getElementById('btn-regenerate').disabled === true" },
         { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
         { "screenshot": "m19-02-刷新后草稿与确认下拉都恢复" },
 

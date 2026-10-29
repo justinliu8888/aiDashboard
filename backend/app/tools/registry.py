@@ -16,6 +16,7 @@ IS_READ_ONLY / APPLICABLE_STATES / run()；
 from __future__ import annotations
 
 import json
+import logging
 from contextvars import ContextVar
 from typing import Any, Callable
 
@@ -24,8 +25,11 @@ from app.config import get_settings
 from app.tools import (
     build_definition_draft_tool,
     check_capability_tool,
+    check_product_capability_tool,
     get_current_draft_tool,
     get_current_region_tool,
+    get_current_session_status_tool,
+    get_recorded_progress_tool,
     get_validation_result_tool,
     search_catalog_tool,
     search_metric_tool,
@@ -36,12 +40,19 @@ from app.tools import (
     submit_draft_plan_tool,
     submit_edit_plan_tool,
     submit_fix_plan_tool,
+    submit_query_answer_tool,
 )
 from app.tools.base import (
+    IS_QUERY_ONLY_ATTR,
+    QUERY_TERMINAL_TOOLS,
+    SAME_STATE_CONCLUSION,
     TOOL_CONTRACT_VERSION,
     ToolCategory,
     is_conclusion_legal,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 # 工具模块列表（每个模块需提供统一契约，见 app/tools/base.py）
@@ -52,7 +63,11 @@ _TOOLS: list[Any] = [
     check_capability_tool,
     get_current_draft_tool,
     get_current_region_tool,
+    get_current_session_status_tool,
     get_validation_result_tool,
+    # 只读查询的领域事实工具（工单 #15 已记录进度 / #16 实际产品能力）
+    get_recorded_progress_tool,
+    check_product_capability_tool,
     # 确定性组装
     build_definition_draft_tool,
     # 终结工具
@@ -63,6 +78,7 @@ _TOOLS: list[Any] = [
     submit_edit_answer_tool,
     submit_edit_plan_tool,
     submit_fix_plan_tool,
+    submit_query_answer_tool,
 ]
 
 _lookup_failure: ContextVar[dict[str, bool] | None] = ContextVar(
@@ -98,12 +114,30 @@ def tools_for_state(state: AgentState) -> list[Any]:
     """按当前节点筛选可用工具。
 
     ``APPLICABLE_STATES`` 为空表示全节点可用；非空则只有列出的节点可用。
+    只读查询专用的工具（``IS_QUERY_ONLY``）在这里**不出现** ——
+    普通业务轮不该有「提交只读答案」这个出口。
     """
     state_value = state.value
     return [
         tool
         for tool in _TOOLS
-        if not tool.APPLICABLE_STATES or state_value in tool.APPLICABLE_STATES
+        if not getattr(tool, IS_QUERY_ONLY_ATTR, False)
+        and (not tool.APPLICABLE_STATES or state_value in tool.APPLICABLE_STATES)
+    ]
+
+
+def tools_for_query() -> list[Any]:
+    """只读查询模式可用的工具：事实工具 + 查询答案终结工具。
+
+    查询链路在**结构上**就不开放执行权限：组装草稿、保存、校验、预览、
+    应用修改、接受或取消计划都不在这里注册，模型调不到。
+    不能只靠 Prompt 声称「请不要修改」。
+    """
+    terminal_names = set(QUERY_TERMINAL_TOOLS)
+    return [
+        tool
+        for tool in _TOOLS
+        if tool.CATEGORY == ToolCategory.FACT or tool.NAME in terminal_names
     ]
 
 
@@ -136,6 +170,9 @@ def validate_tool_contracts() -> list[str]:
             if state not in valid_states:
                 problems.append(f"{tool.NAME} 的 APPLICABLE_STATES 含非法状态 {state}")
             for conclusion in conclusions:
+                if conclusion == SAME_STATE_CONCLUSION:
+                    # 原地回答：状态保持不变，恒合法。
+                    continue
                 if conclusion not in valid_states:
                     problems.append(
                         f"{tool.NAME} 的 CONCLUSION_STATES 含非法状态 {conclusion}"
@@ -230,10 +267,18 @@ def _make_function_tool(tool, FunctionTool, permission):
         """工具执行入口；返回 dict / str，交由 FunctionTool 转成 ToolChunk。"""
         try:
             result = runner(**kwargs)
-            if tool.CATEGORY == ToolCategory.FACT and isinstance(result, dict) and result.get("error"):
-                slot = _lookup_failure.get()
-                if slot is not None:
-                    slot["failed"] = True
+            if tool.CATEGORY == ToolCategory.FACT:
+                # 事实工具的调用要看得见：只读问答的可信度取决于
+                # 「模型到底查没查」，而不是它自己怎么说。
+                logger.info(
+                    "[tool] fact_called name=%s status=%s",
+                    name,
+                    _fact_status_of(result),
+                )
+                if isinstance(result, dict) and result.get("error"):
+                    slot = _lookup_failure.get()
+                    if slot is not None:
+                        slot["failed"] = True
             return result
         except Exception as exc:  # noqa: BLE001
             # 异常原文可能很长，截断后回给模型，避免占满上下文
@@ -254,6 +299,23 @@ def _make_function_tool(tool, FunctionTool, permission):
     )
 
 
+def _fact_status_of(result: Any) -> str:
+    """事实工具结果的一句话状态，供调用日志用。
+
+    领域模块各有自己的词表（availability / outcome），这里只取一个
+    能一眼看懂的结论：找到了、确认没有、读不到、没权限、还是出错了。
+    """
+    if not isinstance(result, dict):
+        return "OK"
+    if result.get("error"):
+        return "ERROR"
+    for key in ("status", "availability", "outcome"):
+        value = result.get(key)
+        if value:
+            return str(value)
+    return "OK"
+
+
 __all__ = [
     "ToolCategory",
     "bind_lookup_failure",
@@ -263,9 +325,10 @@ __all__ = [
     "export_manifest_json",
     "get_runner",
     "list_tools",
-    "to_agentscope_toolkit_async",
-    "to_openai_tools",
     "take_lookup_failure",
+    "tools_for_query",
     "tools_for_state",
     "validate_tool_contracts",
+    "to_agentscope_toolkit_async",
+    "to_openai_tools",
 ]

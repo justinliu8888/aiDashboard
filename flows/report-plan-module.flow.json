@@ -1,0 +1,78 @@
+{
+  "baseDir": "..",
+  "serveCmd": "python3 -m http.server 8914",
+  "port": 8914,
+  "outDir": "../.selfcheck/flow-report-plan",
+  "waitMs": 1200,
+  "timeout": 8000,
+  "ignore": [],
+  "flows": [
+    {
+      "name": "D-01 方案展示-确认回调-版本递增-忙碌禁用-清空",
+      "path": "/frontend/tests/report_plan_harness.html",
+      "continueOnError": false,
+      "steps": [
+        { "assertVisible": "#plan-root" },
+        { "assertVisible": ".plan-module" },
+        { "assertText": "PUE 专题报表" },
+        { "assertText": "PUE 总览" },
+        { "assertText": "指标卡" },
+        { "assertText": "PUE 统计口径待核实，数据待连接" },
+        { "assertText": "尚未接受" },
+        { "assertCount": ".plan-section", "count": 3, "op": ">=" },
+        { "eval": "document.querySelector('#plan-root .plan-confirm').disabled === false" },
+        { "eval": "document.querySelector('#plan-root .plan-confirm').getAttribute('data-plan-can-confirm') === 'true'" },
+        { "screenshot": "d01-01-方案展示" },
+
+        { "click": "#plan-root .plan-confirm" },
+        { "wait": 200 },
+        { "eval": "document.querySelectorAll('#action-log .log-line[data-plan-action]').length === 1" },
+        { "eval": "JSON.parse(document.querySelector('#action-log .log-line[data-plan-action]').textContent).designAction === 'CONFIRM_PLAN'" },
+        { "eval": "JSON.parse(document.querySelector('#action-log .log-line[data-plan-action]').textContent).planId === 'plan_example_pue'" },
+        { "eval": "JSON.parse(document.querySelector('#action-log .log-line[data-plan-action]').textContent).basePlanRevision === 1" },
+        { "screenshot": "d01-02-确认回调" },
+
+        { "click": "#btn-case-updated" },
+        { "wait": 300 },
+        { "assertText": "已按要求更新" },
+        { "eval": "document.querySelector('#plan-root .plan-confirm').disabled === false" },
+        { "click": "#plan-root .plan-confirm" },
+        { "wait": 200 },
+        { "eval": "document.querySelectorAll('#action-log .log-line[data-plan-action]').length === 2" },
+        { "eval": "JSON.parse(document.querySelectorAll('#action-log .log-line[data-plan-action]')[1].textContent).basePlanRevision === 2" },
+        { "eval": "JSON.parse(document.querySelectorAll('#action-log .log-line[data-plan-action]')[1].textContent).planId === 'plan_example_pue'" },
+        { "screenshot": "d01-03-更新后确认" },
+
+        { "click": "#btn-case-busy" },
+        { "wait": 300 },
+        { "assertText": "处理中" },
+        { "eval": "document.querySelector('#plan-root .plan-confirm').disabled === true" },
+        { "eval": "document.querySelector('#plan-root .plan-confirm').getAttribute('data-plan-can-confirm') === 'false'" },
+        { "eval": "(() => { const b = document.querySelector('#plan-root .plan-confirm'); b.dispatchEvent(new MouseEvent('click', { bubbles: true })); return true; })()" },
+        { "wait": 200 },
+        { "eval": "document.querySelectorAll('#action-log .log-line[data-plan-action]').length === 2" },
+        { "screenshot": "d01-04-忙碌禁用确认" },
+
+        { "click": "#btn-case-blocked" },
+        { "wait": 300 },
+        { "eval": "document.querySelector('#plan-root .plan-confirm').disabled === true" },
+        { "eval": "(() => { const b = document.querySelector('#plan-root .plan-confirm'); b.dispatchEvent(new MouseEvent('click', { bubbles: true })); return true; })()" },
+        { "wait": 200 },
+        { "eval": "document.querySelectorAll('#action-log .log-line[data-plan-action]').length === 2" },
+
+        { "click": "#btn-case-error" },
+        { "wait": 300 },
+        { "assertText": "方案生成失败，请重试" },
+        { "assertVisible": ".plan-error" },
+        { "screenshot": "d01-05-错误态" },
+
+        { "click": "#btn-case-clear" },
+        { "wait": 300 },
+        { "assertHidden": ".plan-module" },
+        { "eval": "document.querySelector('#plan-root').children.length === 0" },
+        { "eval": "document.querySelectorAll('#action-log .log-line[data-plan-action]').length === 2" },
+        { "screenshot": "d01-06-清空" }
+      ]
+    }
+  ]
+}

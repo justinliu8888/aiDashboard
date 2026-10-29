@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>D 模块自检 harness · 方案显示</title>
+<style>
+  body {
+    margin: 0;
+    padding: 20px 24px 40px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: #f1f5f9;
+    color: #1e293b;
+  }
+  h1 { font-size: 18px; margin: 0 0 6px; color: #0f172a; }
+  h2 { font-size: 13px; margin: 0 0 10px; color: #334155; }
+  .banner {
+    margin: 0 0 16px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid #fcd34d;
+    background: #fffbeb;
+    color: #92400e;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .panel {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 14px;
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; }
+  .controls button {
+    padding: 6px 14px;
+    border-radius: 8px;
+    border: 1px solid #cbd5e1;
+    background: #ffffff;
+    color: #475569;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .controls button:hover { border-color: #94a3b8; color: #1e293b; }
+  #plan-root {
+    background: #f8fafc;
+    border: 1px dashed #cbd5e1;
+    border-radius: 10px;
+    padding: 16px;
+  }
+  #action-log {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: #475569;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 10px 12px;
+    min-height: 40px;
+  }
+  .log-line { padding: 2px 0; }
+  .log-empty { color: #94a3b8; }
+</style>
+</head>
+<body>
+
+<h1>D 模块自检 harness · 方案显示</h1>
+
+<div class="banner">
+  <strong>这是测试 harness，不是产品页面。</strong>
+  页面里的方案是冻结契约 v1 的<strong>共同测试样例</strong>，不是生产数据、不是模板库资产、也不是模型回复。
+  本页<strong>不接后端、不调模型、不发任何 HTTP 请求</strong>；「确认方案」只把一个设计意图回调给本页脚本。
+  正式的接线与真实后端验证由协调者完成。
+</div>
+
+<div class="panel">
+  <h2>状态切换（测试用）</h2>
+  <div class="controls">
+    <button id="btn-case-ready" type="button">正常待确认</button>
+    <button id="btn-case-busy" type="button">处理中</button>
+    <button id="btn-case-blocked" type="button">不可确认</button>
+    <button id="btn-case-error" type="button">带错误</button>
+    <button id="btn-case-updated" type="button">更新方案（版本 2）</button>
+    <button id="btn-case-clear" type="button">清空</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>模块渲染区</h2>
+  <div id="plan-root"></div>
+</div>
+
+<div class="panel">
+  <h2>onAction 回调记录（只记录设计意图，不发请求）</h2>
+  <div id="action-log"><div class="log-line log-empty">（还没有回调）</div></div>
+</div>
+
+<script src="../pages/workbench_plan.js"></script>
+<script>
+  // ── 测试样例 ──────────────────────────────────────────────
+  // 来自冻结契约 v1 的共同测试样例。**不是**生产数据 / 模板库资产 / 模型回复。
+  var SAMPLE_PLAN = {
+    id: "plan_example_pue",
+    revision: 1,
+    topic: "PUE 专题报表",
+    requirements: {
+      metrics: ["PUE", "IT 负载"],
+      subject: "机房 A",
+      timeRange: "最近 7 天",
+      exclusions: ["设备耗电排名"]
+    },
+    sections: [
+      { id: "section_pue", title: "PUE 总览", metricIntents: ["PUE"], componentType: "metric_card" },
+      { id: "section_trend", title: "PUE 趋势", metricIntents: ["PUE"], componentType: "line_chart" },
+      { id: "section_detail", title: "分区明细", metricIntents: ["PUE", "IT 负载"], componentType: "table" }
+    ],
+    assumptions: ["PUE 统计口径待核实，数据待连接"],
+    suggestions: ["可以再补一个机柜级 PUE 分布的饼图"],
+    referenceTemplates: []
+  };
+
+  var SAMPLE_PLAN_V2 = {
+    id: "plan_example_pue",
+    revision: 2,
+    topic: "PUE 专题报表（已按要求更新）",
+    requirements: SAMPLE_PLAN.requirements,
+    sections: SAMPLE_PLAN.sections,
+    assumptions: ["PUE 统计口径待核实，数据待连接", "已按要求去掉设备耗电排名相关板块"],
+    suggestions: SAMPLE_PLAN.suggestions,
+    referenceTemplates: [
+      { assetId: "asset_example_1", version: 2, name: "PUE 标准模板（测试样例）", reason: "结构接近" }
+    ]
+  };
+
+  var root = document.getElementById("plan-root");
+  var logBox = document.getElementById("action-log");
+
+  function onAction(payload) {
+    var empty = logBox.querySelector(".log-empty");
+    if (empty) empty.remove();
+    var line = document.createElement("div");
+    line.className = "log-line";
+    line.setAttribute("data-plan-action", payload.designAction);
+    line.setAttribute("data-plan-id", payload.planId);
+    line.setAttribute("data-plan-revision", String(payload.basePlanRevision));
+    line.textContent = JSON.stringify(payload);
+    logBox.appendChild(line);
+  }
+
+  function render(view) {
+    window.WorkbenchPlan.render(root, view, { onAction: onAction });
+  }
+
+  function baseView(extra) {
+    var view = {
+      designPhase: "PLAN_WAITING_CONFIRM",
+      reportPlan: SAMPLE_PLAN,
+      busy: false,
+      error: null,
+      canConfirm: true
+    };
+    for (var key in extra) {
+      if (Object.prototype.hasOwnProperty.call(extra, key)) view[key] = extra[key];
+    }
+    return view;
+  }
+
+  document.getElementById("btn-case-ready").addEventListener("click", function () {
+    render(baseView());
+  });
+
+  document.getElementById("btn-case-busy").addEventListener("click", function () {
+    render(baseView({ busy: true }));
+  });
+
+  document.getElementById("btn-case-blocked").addEventListener("click", function () {
+    render(baseView({ canConfirm: false }));
+  });
+
+  document.getElementById("btn-case-error").addEventListener("click", function () {
+    render(baseView({ error: "方案生成失败，请重试" }));
+  });
+
+  document.getElementById("btn-case-updated").addEventListener("click", function () {
+    render(baseView({ reportPlan: SAMPLE_PLAN_V2 }));
+  });
+
+  document.getElementById("btn-case-clear").addEventListener("click", function () {
+    window.WorkbenchPlan.clear(root);
+  });
+
+  // 初始就渲染「正常待确认」，方便自检脚本直接断言。
+  render(baseView());
+</script>
+
+</body>
+</html>

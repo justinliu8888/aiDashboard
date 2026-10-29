@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import uuid
@@ -29,7 +30,12 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from app.config import get_settings
-from app.schemas.agent import ADVANCE_MESSAGE, AgentRequest, AgentResponse
+from app.schemas.agent import (
+    ADVANCE_MESSAGE,
+    TURN_KIND_QUERY_ANSWER,
+    AgentRequest,
+    AgentResponse,
+)
 from app.schemas.session import (
     CLARIFICATION_COUNT_KEY,
     CLARIFICATION_KEY_KEY,
@@ -64,18 +70,40 @@ CLARIFICATION_ASKED = "asked"
 CLARIFICATION_TECHNICAL_FAILURE = "technical_failure"
 
 
+def _dump_snapshot(value: Any) -> str | None:
+    """把快照 / payload 序列化成 JSON 文本。"""
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):  # pragma: no cover - 极端情况
+        return None
+
+
 def resolve_placeholders(definition: dict[str, Any]) -> dict[str, Any]:
     """把草稿里的 {{roomName}} 之类占位符换成真实值。
 
     前端不认占位符，直接显示会露出 `{{roomName}}`。存快照时统一解析一次，
     恢复会话拿到的就是成品文本；老会话重新落库时也会被顺手修好。
+
+    草稿是**服务端存下来的历史数据**，结构可能已经不对（老版本写的、
+    手工改过的、被截断的）。这里逐层做类型判断：解析不了的那部分跳过，
+    不能因为一个坏区块就让整个会话读不出来 —— 会话读取挂掉时，前端
+    刷新就是一片空白，用户连「无法确认」都看不到。
     """
     room_id = room_id_of_definition(definition)
-    for region in definition.get("regions") or []:
-        content = ((region.get("component") or {}).get("content")) or {}
-        template = content.get("template")
-        if isinstance(template, str) and "{{" in template:
-            content["template"] = render_template(template, room_id)
+    regions = definition.get("regions") or []
+    if not isinstance(regions, list):
+        return definition
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        component = region.get("component")
+        content = component.get("content") if isinstance(component, dict) else None
+        if isinstance(content, dict):
+            template = content.get("template")
+            if isinstance(template, str) and "{{" in template:
+                content["template"] = render_template(template, room_id)
         name = region.get("name")
         if isinstance(name, str) and "{{" in name:
             region["name"] = render_template(name, room_id)
@@ -134,7 +162,7 @@ class SessionService:
             title = self._derive_title(session_id, user_text, is_advance)
             self._repo.upsert_session(
                 session_id=session_id,
-                state=response.state.value,
+                state=self._state_to_store(session_id, response),
                 title=title,
             )
 
@@ -169,6 +197,24 @@ class SessionService:
             logger.exception("[session_service] 落库失败 sessionId=%s", session_id)
             return None
 
+    def _state_to_store(self, session_id: str, response: AgentResponse) -> str:
+        """这一轮要落库的业务状态。
+
+        正常业务轮：落响应里的状态 —— 那是状态机推进的结果。
+
+        只读查询轮：**沿用库里那份**。查询轮的响应状态取的是客户端带来的
+        ``request.state``（为了「本轮不推进」），如果拿它落库，一次提问
+        就能把会话从「待确认」改成「分析中」—— 业务状态是服务端事实，
+        不能被客户端声称的状态改写。库里还没有行时（新会话）才用响应状态，
+        那是在建会话，不是在改状态。
+        """
+        if response.turnKind != TURN_KIND_QUERY_ANSWER:
+            return response.state.value
+        current = self._repo.get_session(session_id)
+        if current is not None and current.state:
+            return current.state
+        return response.state.value
+
     def _commit_session(
         self,
         *,
@@ -181,18 +227,37 @@ class SessionService:
 
         编辑态跨轮状态（待确认计划 / 澄清轮数）在写库前一刻才从库里读出来带回去：
         snapshot 是整块重建的，读早了会被并发的写覆盖掉。
+
+        只读查询轮（``turnKind == "query_answer"``）单独处理：
+        它允许追加聊天消息，但**不重建业务对象** —— 草稿、revision、
+        已保存定义、预览、待确认计划、澄清轮数一概不动，
+        也不能把客户端那份可能过旧的快照写回覆盖服务端最新的草稿。
         """
         with self._lock:
-            snapshot = self._build_snapshot(request, response)
             current = self._repo.get_session(session_id)
-            previous = (current.snapshot or {}).get("definition") if current else None
+            if response.turnKind == TURN_KIND_QUERY_ANSWER:
+                return self._commit_query_turn(
+                    session_id=session_id,
+                    response=response,
+                    request=request,
+                    message_count=message_count,
+                    current=current,
+                )
+            snapshot = self._build_snapshot(request, response)
+            previous_snapshot = (current.snapshot or {}) if current else {}
+            previous = previous_snapshot.get("definition")
             incoming = (snapshot or {}).get("definition")
-            if isinstance(previous, dict) and isinstance(incoming, dict):
+            if isinstance(previous, dict) and not isinstance(incoming, dict):
+                # 本轮没有带回草稿（例如待确认期间的一次提问被拒）：
+                # 保留库里那份，不能因为一次交互就把草稿丢掉。
+                snapshot["definition"] = previous
+            elif isinstance(previous, dict) and isinstance(incoming, dict):
                 previous_revision = int((previous.get("metadata") or {}).get("revision") or 0)
                 incoming_revision = int((incoming.get("metadata") or {}).get("revision") or 0)
                 if previous_revision > incoming_revision:
                     # 迟到的只读/重复确认回复不能把已应用的新草稿回滚。
                     snapshot["definition"] = previous
+            snapshot = self._carry_over_business_objects(snapshot, previous_snapshot)
             # 老会话的待确认计划还躺在 snapshot.pendingPlan 里：
             # snapshot 是整块重建的，不先搬走就会把计划弄丢。
             self._migrate_legacy_pending_plan(session_id)
@@ -208,6 +273,230 @@ class SessionService:
                 snapshot=snapshot,
                 messageCount=message_count,
             )
+
+    @staticmethod
+    def _carry_over_business_objects(
+        snapshot: dict[str, Any] | None, previous: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """本轮没带回的业务对象，沿用库里那份。
+
+        只读问答轮、待确认期间的拒绝回复，都可能不带草稿回传。
+        这时候要把库里的草稿、已保存定义和预览原样带着，
+        不能因为一次交互就让恢复出来的会话少东西。
+
+        设计阶段与文字方案也在其中：一次失败轮、一次提问轮之后，
+        会话详情里那份方案必须还在 —— 恢复不能靠聊天正文。
+        """
+        if not previous:
+            return snapshot
+        result = dict(snapshot or {})
+        for key in ("definition", "policy", "lastReportRun", "previewPayload"):
+            if not isinstance(result.get(key), dict) and isinstance(previous.get(key), dict):
+                result[key] = previous[key]
+        # 设计阶段与方案是**原样带过**，不是「缺了才补」：
+        # 本轮响应没带设计状态时，库里那份就是权威。
+        for key in ("designPhase", "reportPlan"):
+            if key not in result and key in previous:
+                result[key] = previous[key]
+        return result
+
+    def _commit_query_turn(
+        self,
+        *,
+        session_id: str,
+        response: AgentResponse,
+        request: AgentRequest | None,
+        message_count: int,
+        current: SessionRecord | None,
+    ) -> SessionRecord:
+        """只读查询轮落库：只加消息，业务对象原样保留。
+
+        刻意**不用** ``response.domainObjects`` 重建快照：
+        查询轮的响应里带的是服务端可信对象，回退到请求快照就等于
+        用旧客户端快照重建业务状态。
+        """
+        # 老会话的待确认计划还躺在 snapshot.pendingPlan 里，先搬走再读。
+        self._migrate_legacy_pending_plan(session_id)
+        current = self._repo.get_session(session_id) or current
+        snapshot = dict(current.snapshot or {}) if current else {}
+        if request is not None:
+            collected = dict(getattr(request, "collectedInfo", None) or {})
+            if collected:
+                snapshot["collectedInfo"] = collected
+        return self._repo.upsert_session(
+            session_id=session_id,
+            state=current.state if current else response.state.value,
+            designSessionId=None,
+            reportDefinitionId=None,
+            previewRunId=None,
+            snapshot=snapshot,
+            messageCount=message_count,
+        )
+
+    # ---------- 同事务写入（设计流） ----------
+
+    def write_turn_inline(
+        self,
+        connection: Any,
+        *,
+        session_id: str,
+        user_text: str,
+        response: AgentResponse,
+        client_msg_id: str | None = None,
+        request: AgentRequest | None = None,
+    ) -> None:
+        """在**给定连接**上写这一轮，**不自行 commit**。
+
+        设计流（#19）需要「方案 + 阶段 + 操作结果 + 本轮消息」落进
+        **同一笔事务**：要么一起成功，要么一起回滚。
+
+        为什么不能直接用 ``record_turn``：它以及它下面的
+        ``upsert_session`` / ``append_message`` 都会自己 ``commit()``。
+        一旦被调用，事务就提前结束了，同事务提交不再成立 ——
+        就会出现「方案写进去了、消息没写进去」这种半截状态。
+
+        所以这里直接用传入的连接写 SQL，不碰任何会 commit 的旧方法。
+        """
+        import sqlite3
+
+        assert isinstance(connection, sqlite3.Connection)
+        now = datetime.now().isoformat(timespec="seconds")
+        is_advance = user_text.strip() == ADVANCE_MESSAGE
+
+        title = self._derive_title(session_id, user_text, is_advance)
+        state = self._state_to_store(session_id, response)
+        snapshot = self._build_snapshot(request, response) or {}
+        current = self._repo.get_session(session_id)
+        previous_snapshot = (current.snapshot if current else None) or {}
+        snapshot = self._carry_over_business_objects(snapshot, previous_snapshot)
+        snapshot = {**(snapshot or {}), **self._read_edit_state(session_id)}
+
+        existing = connection.execute(
+            "SELECT id FROM sessions WHERE id = ? AND deleted_at IS NULL",
+            (session_id,),
+        ).fetchone()
+        if existing is None:
+            # 已软删的行不能被 UPDATE 复活：先物理清掉再重新建行。
+            connection.execute(
+                "DELETE FROM sessions WHERE id = ? AND deleted_at IS NOT NULL",
+                (session_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO sessions (id, workspace_id, title, state, design_session_id,
+                                      report_definition_id, preview_run_id, message_count,
+                                      snapshot, pending_choice, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    session_id,
+                    None,
+                    title or "新对话",
+                    state,
+                    response.designSessionId,
+                    self._extract_definition_id(response),
+                    self._extract_preview_run_id(response),
+                    0,
+                    _dump_snapshot(snapshot),
+                    now,
+                    now,
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE sessions
+                   SET state = ?, title = COALESCE(?, title),
+                       design_session_id = COALESCE(?, design_session_id),
+                       report_definition_id = COALESCE(?, report_definition_id),
+                       preview_run_id = COALESCE(?, preview_run_id),
+                       snapshot = ?, updated_at = ?
+                 WHERE id = ?
+                """,
+                (
+                    state,
+                    title,
+                    response.designSessionId,
+                    self._extract_definition_id(response),
+                    self._extract_preview_run_id(response),
+                    _dump_snapshot(snapshot),
+                    now,
+                    session_id,
+                ),
+            )
+
+        # user 消息：内部控制消息不入库。
+        if not is_advance:
+            self._append_message_inline(
+                connection,
+                session_id=session_id,
+                role="user",
+                content=user_text,
+                client_msg_id=client_msg_id,
+            )
+        # assistant 消息：payload 存整个响应，恢复时可直接回放渲染。
+        self._append_message_inline(
+            connection,
+            session_id=session_id,
+            role="assistant",
+            content=response.reply,
+            payload=response.model_dump(mode="json"),
+            client_msg_id=self._reply_msg_id(client_msg_id),
+        )
+
+        count = connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE sessions SET message_count = ? WHERE id = ?", (count, session_id)
+        )
+
+    @staticmethod
+    def _append_message_inline(
+        connection: Any,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        payload: dict[str, Any] | None = None,
+        client_msg_id: str | None = None,
+    ) -> None:
+        """写一条消息，不 commit。幂等口径与旧 ``append_message`` 一致。"""
+        now = datetime.now().isoformat(timespec="seconds")
+        if client_msg_id:
+            existing = connection.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND client_msg_id = ?",
+                (session_id, client_msg_id),
+            ).fetchone()
+            if existing is not None:
+                connection.execute(
+                    """
+                    UPDATE messages SET role = ?, content = ?, payload = ?, created_at = ?
+                     WHERE id = ?
+                    """,
+                    (role, content, _dump_snapshot(payload), now, existing["id"]),
+                )
+                return
+        next_seq = connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO messages (session_id, seq, role, content, payload,
+                                  client_msg_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                next_seq,
+                role,
+                content,
+                _dump_snapshot(payload),
+                client_msg_id,
+                now,
+            ),
+        )
 
     @staticmethod
     def _reply_msg_id(client_msg_id: str | None) -> str | None:
@@ -288,9 +577,26 @@ class SessionService:
         if editing_target is not None:
             snapshot["editingTargetRegionId"] = editing_target
 
+        # 设计阶段与文字方案（#19）。恢复不能只依赖聊天正文、debug
+        # 或浏览器本地变量：方案与阶段必须跟着会话一起存下来。
+        if response.designPhase is not None:
+            snapshot["designPhase"] = response.designPhase
+            plan = response.domainObjects.reportPlan
+            if plan is not None:
+                snapshot["reportPlan"] = plan
+
         # 路由层已收集的槽位。下一轮恢复时带回 Deep Route，
         # 避免重新问用户已经答过的问题。
         if request is not None:
+            # 记录这条会话的授权范围。只读查询要按它核对事实来源，
+            # 范围对不上就不能把里面的草稿说出去。
+            if "scope" not in snapshot:
+                snapshot["scope"] = {
+                    "projectId": request.context.projectId,
+                    "subjectRef": request.context.subjectRef,
+                    "subjectId": request.context.subjectId,
+                }
+
             collected = dict(getattr(request, "collectedInfo", None) or {})
             if collected:
                 snapshot["collectedInfo"] = collected

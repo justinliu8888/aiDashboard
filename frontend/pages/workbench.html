@@ -76,6 +76,18 @@
     background: #fffbeb;
     box-shadow: 0 0 0 2px #fde68a;
   }
+  /* 文字方案（#19）：方案卡片占位时才占空间 */
+  #plan-root:empty { display: none; }
+  /* 方案卡片套一层工作台的白卡片观感；模块自身用内联样式，互不影响 */
+  #plan-root [data-plan-module] {
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin-bottom: 20px;
+  }
+  /* 有方案时，右侧草稿预览的空态不再说「还没有草稿」—— 那会误导 */
+  #preview-root.plan-active #preview-empty { display: none; }
 </style>
 </head>
 <body class="h-screen overflow-hidden flex flex-col bg-slate-100 text-slate-800">
@@ -226,6 +238,9 @@
 
   <!-- 右：报表预览区 -->
   <section class="flex-1 min-w-0 overflow-y-auto no-bar bg-slate-100">
+    <!-- 文字方案（#19 先确认，再生成）：与草稿预览并列的独立容器。
+         没有方案时它是空的（:empty 不占位），有方案时显示方案卡片。 -->
+    <div id="plan-root" class="px-5 pt-5"></div>
     <div id="preview-root" class="p-5 space-y-5">
       <!-- 空态 -->
       <div id="preview-empty" class="bg-white rounded-xl border border-dashed border-slate-300 p-10 text-center text-slate-400">
@@ -239,6 +254,9 @@
 <!-- toast -->
 <div id="toast" class="hidden fixed left-1/2 bottom-8 -translate-x-1/2 z-50 bg-slate-900 text-white text-sm px-4 py-2.5 rounded-lg shadow-lg"></div>
 
-<script src="./workbench.js?v=20261022-edit-plan-confirm"></script>
+<script src="./workbench_query.js?v=20261028-readonly-query"></script>
+<!-- 文字方案模块（#19）：先加载它，主工作台再调用 window.WorkbenchPlan -->
+<script src="./workbench_plan.js?v=20261028-plan-first"></script>
+<script src="./workbench.js?v=20261028-readonly-query"></script>
 </body>
 </html>

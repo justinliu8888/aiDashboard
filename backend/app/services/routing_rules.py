@@ -856,6 +856,123 @@ def is_clear_generation_request(message: str) -> bool:
 
 
 # --------------------------------------------------------------------------
+# 只读提问的判定（降级路径用）
+# --------------------------------------------------------------------------
+#
+# 正常路径由 ContextEngine 的模型判定意图（ASK_QUESTION）。这一层只在
+# **模型不可用 / 超时** 的降级路径上兜底：没有模型就没有意图，
+# 「你有未完成的草稿吗」和「把趋势改成折线图」必须还能分开。
+#
+# 判定要求同时满足三条，避免把闲聊和指令吞进来：
+#     1. 有疑问标记；
+#     2. 指向报表业务对象（不是万能聊天）；
+#     3. 没有明确的改动动词（带问号的指令仍然是指令）。
+
+#: 疑问标记。
+_QUESTION_MARKERS: tuple[str, ...] = (
+    "吗", "呢", "？", "?", "什么", "怎么", "哪些", "是否", "有没有",
+    "能不能", "可不可以", "能否", "多少", "几个", "为什么", "咋",
+)
+
+#: 疑问必须指向的报表业务对象。没有它就是闲聊，不属于本产品的问答范围。
+_QUESTION_SUBJECTS: tuple[str, ...] = (
+    "报表", "草稿", "预览", "图表", "卡片", "指标", "数据源", "粒度",
+    "分钟", "成本", "pue", "能耗", "耗电", "进度", "做到哪", "哪一步",
+    "刚才", "之前", "上次", "这份", "那份", "当前", "现在", "支持",
+)
+
+#: 明确的改动动词：出现这些就是在下指令，不是在提问。
+_OPERATION_VERBS: tuple[str, ...] = (
+    "生成", "新建", "创建", "删除", "删掉", "删了", "去掉", "移除",
+    "改成", "改为", "换成", "换为", "调成", "新增", "加一个", "加个",
+    "应用", "保存", "导出", "发布", "接受修改", "继续调整", "重做",
+    "重新开始", "重新生成",
+)
+
+
+def looks_like_question(message: str) -> bool:
+    """这句话有没有**疑问语气**。
+
+    与 :func:`is_readonly_question` 的区别：那个还要求疑问**指向**报表业务
+    对象，这个只看语气。用来回答「这句话有没有可能是提问」——
+
+        比如设计流程里规则层没认出来（没指向业务对象的元问题）时，
+        要不要再请路由层判一次。
+
+    判定要求：
+
+        1. 有疑问标记；
+        2. 没有明确的改动动词（带问号的指令仍然是指令）。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if is_clear_generation_request(text):
+        return False
+    if has_operation_command(text):
+        return False
+    return any(marker in text for marker in _QUESTION_MARKERS)
+
+
+def has_operation_command(message: str) -> bool:
+    """这句话里有没有明确的下指令动词。
+
+    用于把「操作」和「其它」分开：带明确改动动词的输入不能被当成提问，
+    待确认期间也不允许它绕过菜单。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    return any(word in text for word in _OPERATION_VERBS)
+
+
+def is_readonly_question(message: str) -> bool:
+    """这句是不是「只读提问」。
+
+    只用于降级路径和待确认入口的兜底判定。命中意味着：
+    这句话在**问当前对话 / 当前产品**的事，不是在下指令。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if is_clear_generation_request(text):
+        return False
+    if has_operation_command(text):
+        return False
+    if not any(marker in text for marker in _QUESTION_MARKERS):
+        return False
+    # 业务对象表里 PUE 是小写，但用户在句首写大写 PUE 很常见。
+    # 认不出一句提问，后果是「提问」被当成「修改」——
+    # 设计流程里那会平白多出一版方案，所以这里按大小写不敏感匹配。
+    return any(subject in text.lower() for subject in _QUESTION_SUBJECTS)
+
+
+#: 问的是「当前对话已记录的阶段 / 进度」的说法。
+#:
+#: 只收**进度语义**的说法。「预计时间」「百分之」这类词在本产品里另有含义
+#: （时间范围筛选、指标口径），不能拿它们当进度信号，否则能力问题会被
+#: 误判成进度问题。
+_PROGRESS_QUESTION_MARKERS: tuple[str, ...] = (
+    "进度", "做到哪", "到哪一步", "哪一步了", "做到哪儿", "进行到",
+    "跑到多少", "还要多久", "还剩几步", "完了吗", "完成了吗",
+    "进展", "什么状态", "当前状态", "现在状态", "目前状态", "到哪儿了",
+)
+
+
+def is_progress_question(message: str) -> bool:
+    """这句是不是在问「当前对话已记录的业务阶段 / 进度」。
+
+    命中意味着：回答里必须说清「这是已记录的状态，不是实时进度」
+    （工单 #03 / 父规格 #12）。问的是别的事（查草稿、问能力）时不命中 ——
+    给能力回答补一句进度边界，是把口径加错地方。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    return any(marker in text for marker in _PROGRESS_QUESTION_MARKERS)
+
+
+# --------------------------------------------------------------------------
 # 和确定性组装层的对接
 # --------------------------------------------------------------------------
 

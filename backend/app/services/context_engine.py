@@ -111,6 +111,16 @@ STATE_CHANGING_INTENTS: frozenset[UserIntent] = frozenset(
     }
 )
 
+#: 这些意图需要**事实**才能回答，而路由器手里没有事实。
+#:
+#: 草稿、已记录进度、具体能力这三类问题都必须由业务 Agent 用事实工具
+#: 查证后回答；路由器提前给结论就会变成「凭 hasDefinition 猜事实」。
+FACT_DEPENDING_INTENTS: frozenset[UserIntent] = frozenset(
+    {
+        UserIntent.ASK_QUESTION,
+    }
+)
+
 
 def coerce_intent(value: Any, *, default: UserIntent = UserIntent.UNKNOWN) -> Any:
     """把模型输出的 intent 收敛成后端枚举。
@@ -286,6 +296,9 @@ _CONCIERGE_PROMPT = """
 - 任何涉及当前 state 流转、保存、校验、预览、打断流程的句子；
 - 任何你不确定是否会改变业务状态的句子。
 
+**问当前对话的事（草稿 / 进度 / 能力）一律 DEEP_ROUTE**：
+这类问题要有事实才能回答，你手里没有事实，不能直接给结论。
+
 userIntent 只能从下面这 9 个值里选，不要自创：
 CONFIRM / MODIFY / REJECT / ASK_QUESTION / CHITCHAT / CANCEL / NEW_TASK / PROVIDE_INFO / UNKNOWN
 
@@ -345,6 +358,14 @@ _SYSTEM_PROMPT = """
 - ANSWER_IN_PLACE：原地回答，不改变当前业务状态
 - ASK_CLARIFICATION：信息不足，需要追问
 - BLOCK：请求不支持或有风险，需要拦截
+
+**ASK_QUESTION 必须用 CONTINUE_CURRENT**：
+用户在问当前对话的草稿、已记录的进度、当前产品能力这类问题时，
+routingAction 一律填 CONTINUE_CURRENT，交给业务 Agent 用事实工具查证后回答。
+你手里没有草稿内容、没有进度、没有能力清单，所以**不要**在路由层给结论，
+也不要为了"给个说法"提前回答，更不要改问时间范围、粒度这类生成条件。
+用户输入含糊、无法判断是提问还是操作时，也走 CONTINUE_CURRENT，
+后面的查询链路会给一个针对性的澄清。
 
 安全打断示例：
 - WAITING_USER_CONFIRM 下用户说"昨日总耗电删掉" → MODIFY + JUMP_STATE + ANALYZING
@@ -859,9 +880,45 @@ class ContextEngine:
     def _guard_direct_reply(
         concierge: ConciergeDecision, request: AgentRequest
     ) -> ConciergeDecision:
-        """DIRECT_REPLY 不允许绕过会改变状态的意图。"""
+        """DIRECT_REPLY 不允许绕过会改变状态的意图，也不允许提前给事实结论。"""
         if concierge.action != ConciergeAction.DIRECT_REPLY:
             return concierge
+        if concierge.userIntent in FACT_DEPENDING_INTENTS:
+            # 路由器手里没有草稿 / 进度 / 能力的事实，提前回答只能靠猜。
+            logger.info(
+                "[context_engine] step=direct_reply_downgraded conversationId=%s intent=%s reason=fact_required",
+                request.conversationId,
+                concierge.userIntent.value,
+            )
+            return concierge.model_copy(
+                update={
+                    "action": ConciergeAction.DEEP_ROUTE,
+                    "reply": "",
+                    "reason": (
+                        f"intent={concierge.userIntent.value} 需要事实查证，强制深路由"
+                    ),
+                }
+            )
+        if routing_rules.is_readonly_question(request.message):
+            # 模型可能把「你支持做报表吗」判成 CHITCHAT，但这类问题
+            # 同样要事实：答一句「当然支持呀～」不是事实，是猜。
+            # 判定口径用规则层的 ``is_readonly_question`` ——
+            # 它要求「有疑问标记 + 指向报表业务对象 + 没有明确改动动词」
+            # 三条同时成立，普通问候和明确生成请求都排除在外。
+            logger.info(
+                "[context_engine] step=direct_reply_downgraded conversationId=%s intent=%s reason=readonly_question_needs_facts",
+                request.conversationId,
+                concierge.userIntent.value,
+            )
+            return concierge.model_copy(
+                update={
+                    "action": ConciergeAction.DEEP_ROUTE,
+                    "reply": "",
+                    "reason": (
+                        "只读提问需要事实查证，强制深路由"
+                    ),
+                }
+            )
         if concierge.userIntent not in STATE_CHANGING_INTENTS:
             return concierge
         logger.info(
@@ -1176,6 +1233,16 @@ class ContextEngine:
             AgentState.VALIDATING,
             AgentState.PREVIEWING,
         }
+
+        # 只读提问：模型不可用时也要能把「问当前对话的事」和「下指令」分开。
+        # 交给业务 Agent 用事实工具查证后回答，不在路由层给结论。
+        if routing_rules.is_readonly_question(request.message):
+            return RouteDecision(
+                userIntent=UserIntent.ASK_QUESTION,
+                routingAction=RoutingAction.CONTINUE_CURRENT,
+                confidence=0.6,
+                reason=f"fallback: {reason}",
+            )
 
         if any(w in text for w in ("取消", "不做了", "算了", "停止")):
             if state in dangerous_states:

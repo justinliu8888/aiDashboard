@@ -1,0 +1,62 @@
+{
+  "baseDir": "..",
+  "outDir": "../.agent-runtime/plan-first-integration/flow",
+  "waitMs": 2500,
+  "timeout": 10000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "集成-01 实际工作台：新建需求出方案 → 确认入口 → 刷新恢复",
+      "url": "http://127.0.0.1:8910/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "assertVisible": "#chat-input" },
+        { "assertVisible": "#btn-send" },
+        { "assertVisible": "#preview-root" },
+        { "assertVisible": "#session-list" },
+        { "assertText": "AI 报表助理" },
+        { "assertCount": "#plan-root", "count": 1, "op": "===" },
+        { "eval": "document.querySelectorAll('#plan-root .plan-module').length === 0" },
+        { "screenshot": "i01-01-初始工作台" },
+
+        { "type": "#chat-input", "text": "生成 A 机房最近 7 天的 PUE 报表，不要设备耗电排名" },
+        { "click": "#btn-send" },
+
+        { "waitText": "PUE", "timeout": 180000 },
+        { "waitFor": "#plan-root .plan-module", "timeout": 180000 },
+        { "assertVisible": "#plan-root .plan-module" },
+        { "assertVisible": "#plan-root .plan-topic" },
+        { "assertVisible": "#plan-root .plan-requirements" },
+        { "assertVisible": "#plan-root .plan-sections" },
+        { "assertVisible": "#plan-root .plan-confirm" },
+        { "assertText": "PUE" },
+        { "assertText": "指标卡" },
+        { "assertAttr": "#plan-root .plan-confirm", "name": "data-plan-can-confirm", "op": "==", "value": "true" },
+        { "eval": "document.querySelector('#plan-root .plan-confirm').disabled === false" },
+        { "screenshot": "i01-02-文字方案与待确认" },
+
+        { "eval": "document.querySelector('#plan-root .plan-topic').textContent.length > 0" },
+        { "eval": "document.querySelector('#plan-root').textContent.includes('设备耗电排名')" },
+        { "eval": "document.querySelector('#plan-root').textContent.includes('最近7天') || document.querySelector('#plan-root').textContent.includes('最近 7 天')" },
+        { "eval": "document.querySelector('#plan-root').textContent.includes('待核实')" },
+
+        { "click": "#plan-root .plan-confirm" },
+        { "waitText": "还没有接入", "timeout": 120000 },
+        { "assertText": "还没有接入" },
+        { "eval": "document.querySelector('#plan-root .plan-module') !== null" },
+        { "assertAttr": "#plan-root .plan-module", "name": "data-plan-phase", "op": "==", "value": "PLAN_WAITING_CONFIRM" },
+        { "screenshot": "i01-03-确认后仍待确认" },
+
+        { "eval": "location.reload(), true" },
+        { "wait": 3000 },
+        { "waitFor": "#plan-root .plan-module", "timeout": 30000 },
+        { "assertVisible": "#plan-root .plan-module" },
+        { "assertText": "PUE" },
+        { "eval": "document.querySelector('#plan-root .plan-module').getAttribute('data-plan-phase') === 'PLAN_WAITING_CONFIRM'" },
+        { "screenshot": "i01-04-刷新后恢复方案" }
+      ]
+    }
+  ]
+}
