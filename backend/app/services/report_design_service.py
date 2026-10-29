@@ -1573,7 +1573,8 @@ class ReportDesignService:
 
         reply = f"已按第 {plan_revision} 版方案生成模板：{title}。"
         if bound:
-            reply += f"{len(bound)} 个区域已接上当前能取到的数据"
+            # 同 _draft_response：#38 起模板阶段不取数，不能说「已接上数据」。
+            reply += f"{len(bound)} 个区域已绑定指标，数值待试运行产生"
             if placeholders:
                 reply += f"，{len(placeholders)} 个区域保留占位"
             reply += "。"
@@ -1648,7 +1649,10 @@ class ReportDesignService:
             "草稿已生成，请在右侧选择下一步。"
         )
         if bound:
-            reply += f"{len(bound)} 个区域已接上当前能取到的数据"
+            # #38 起，模板阶段只做能力核对、**不取数**：bound 的含义是
+            # 「指标已绑定、能力可用」，数值一律等试运行产生。
+            # 这里不能说「已接上数据」—— 那是不存在的事实。
+            reply += f"{len(bound)} 个区域已绑定指标，数值待试运行产生"
             if placeholders:
                 reply += f"，{len(placeholders)} 个区域保留占位"
             reply += "。"

@@ -591,6 +591,58 @@ def test_confirm_plan_does_not_trigger_save_or_data(client, monkeypatch):
     assert template["planRevision"] == plan["revision"]
     assert template["regions"]
     assert "草稿" in payload["reply"]
+    # #38 起模板阶段不取数 → 回复**不能**说「已接上数据」（那是不存在的事实）。
+    assert "已接上" not in payload["reply"]
+    assert "已接数据" not in payload["reply"]
+    # 回复里的区域计数必须跟模板的实际状态一致，且用词不撒谎。
+    bound = [r for r in template["regions"] if r.get("dataStatus") == "bound"]
+    placeholders = [r for r in template["regions"] if r.get("dataStatus") == "placeholder"]
+    if bound:
+        assert f"{len(bound)} 个区域已绑定指标" in payload["reply"]
+        assert "待试运行" in payload["reply"]
+    if placeholders:
+        assert f"{len(placeholders)} 个区域保留占位" in payload["reply"]
+
+
+def test_confirm_plan_reply_says_bound_regions_are_not_fetched_yet(client, monkeypatch):
+    """有 bound 区域时，回复要说「已绑定指标、数值待试运行产生」，不能说已取到数据。
+
+    工单 #38 起模板阶段只做能力核对、**不取数**：``dataStatus="bound"`` 的含义是
+    「指标已绑定、能力可用」，数值一律等试运行产生。回复文案不能声称数据已经接上。
+    """
+    install_model(monkeypatch, RecordingModel(_candidate(
+        topic="能耗日报",
+        metrics=["总耗电"],
+        sections=[{
+            "id": "section_total",
+            "title": "总耗电概览",
+            "metricIntents": ["总耗电"],
+            "componentType": "metric_card",
+        }],
+    )))
+
+    built = _post(client, "生成能耗日报", message_id="msg_1").json()
+    plan = built["domainObjects"]["reportPlan"]
+
+    payload = _post(
+        client,
+        "确认",
+        message_id="msg_2",
+        context={
+            "designAction": "CONFIRM_PLAN",
+            "planId": plan["id"],
+            "basePlanRevision": plan["revision"],
+        },
+    ).json()
+
+    template = payload["domainObjects"]["templateDesign"]
+    bound = [r for r in template["regions"] if r.get("dataStatus") == "bound"]
+    assert bound, "这条用例要有一个 bound 区域才有意义"
+    reply = payload["reply"]
+    assert f"{len(bound)} 个区域已绑定指标" in reply
+    assert "待试运行" in reply
+    assert "已接上" not in reply
+    assert "已接数据" not in reply
 
 
 def test_confirm_plan_with_stale_revision_is_rejected(client, monkeypatch):
