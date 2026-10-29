@@ -2210,14 +2210,32 @@ function readPayloadUnit(region, payload, defRegion) {
 }
 
 /**
- * 「能力待接通」标注要说明的具体项。
+ * 「待接通」标注要说明的具体项（**按类别分组**，每类一条）。
  *
- * 契约：区域带 capabilityPending（布尔）；多指标区域在 metrics[] 里逐项带
- * capabilityPending / pendingReason（载荷与定义的 previewSpec 都可能带）。
+ * 契约（**两个来源都支持**）：
+ *   - 区域级：region.capabilityPending（布尔）—— 区域整体待接通。
+ *     真实后端目前还没产出这个字段（标记落在 payload.metrics[] 里），
+ *     但规格要求区域级也带能力标记，所以两个来源都要认。
+ *   - 逐项级：payload.metrics[] 与定义 previewSpec.metrics[] 里的
+ *     capabilityPending / pendingReason —— 哪几项待接通、为什么。
+ * 两处**合并**（不是二选一）：逐项说明永远保留；区域级标记在没有逐项说明时
+ * 自己出一条 —— 不因为某一处缺失就丢掉另一处的信息。
+ *
+ * 类别（规格《模拟语义与能力》：能力待接通 / 范围授权 / 既有绑定三态相互独立，
+ * **不把所有占位原因都标为能力缺失**）：
+ *   - 统计对象**不在授权范围内**是授权问题，不是能力缺失 → 角标「不在授权范围」；
+ *   - 其余（能力没接通）→ 角标「能力待接通」；
+ *   - 原因文本为空 → 按「能力待接通」兜底（没写原因就分不出是不是授权问题）。
+ * 判类别用**关键词**（授权 / 权限 / 越权 / 范围），不写死整句 ——
+ * 后端正在并行改这几条文案，句子会变，关键词稳。
+ *
  * 这里只如实说明**哪个指标还没接通、为什么**，不承诺计算口径或公式。
  */
 function readCapabilityNotes(region, payload, defRegion) {
-  const notes = [];
+  const SCOPE_KEYWORDS = ["授权", "权限", "越权", "范围"];
+  const KIND_LABELS = { capability: "能力待接通", scope: "不在授权范围" };
+
+  const groups = new Map(); // 类别 → 该类别的具体项
   const seen = new Set();
   const collect = (metrics) => {
     if (!Array.isArray(metrics)) return;
@@ -2228,13 +2246,85 @@ function readCapabilityNotes(region, payload, defRegion) {
       if (!label || seen.has(label)) continue;
       seen.add(label);
       const reason = String(metric.pendingReason || "").trim();
-      notes.push(reason ? `${label}（${reason}）` : label);
+      const kind = !reason
+        ? "capability"
+        : SCOPE_KEYWORDS.some((kw) => reason.includes(kw))
+          ? "scope"
+          : "capability";
+      if (!groups.has(kind)) groups.set(kind, []);
+      groups.get(kind).push(reason ? `${label}（${reason}）` : label);
     }
   };
   collect(payload?.metrics);
   collect(defRegion?.templateBinding?.previewSpec?.metrics);
-  if (!notes.length && region?.capabilityPending === true) notes.push("该指标尚未接通");
-  return notes;
+  // 区域级标记：逐项说明已经说清楚时不再重复说；没有逐项说明时它自己出一条。
+  if (!groups.size && region?.capabilityPending === true) groups.set("capability", ["该指标尚未接通"]);
+  // 每个类别一条：角标文案按类别分清楚，不把所有原因都写成「能力待接通」。
+  return [...groups.entries()].map(([kind, items]) => `${KIND_LABELS[kind]}：${items.join("、")}`);
+}
+
+/**
+ * 这块板**只绑了一个**指标时的指标键。
+ * 绑了多个就分不清哪个是主量 —— 返回空（不猜）。
+ */
+function readBoundMetricKey(defRegion) {
+  const refs = defRegion?.templateBinding?.metricRefs;
+  if (Array.isArray(refs) && refs.length === 1) {
+    const key = String(refs[0] || "").trim();
+    if (key) return key;
+  }
+  const specMetrics = defRegion?.templateBinding?.previewSpec?.metrics;
+  if (Array.isArray(specMetrics) && specMetrics.length === 1) {
+    const key = String(specMetrics[0]?.metricKey || "").trim();
+    if (key) return key;
+  }
+  return "";
+}
+
+/**
+ * 指标卡的主量对应 metrics[] 里的**哪一条**。
+ *
+ * 真实载荷里 payload.label 是**区域名**（「总电费概览」），
+ * metrics[].label 是**目录里的指标名**（「能耗成本」）—— 两者不同名。
+ * 所以「label 相等」判不出主量（主量会在「其它指标」清单里再出现一次）。
+ *
+ * 判定依据（用**值**与**键**，不用名）：
+ *   1. **值 + 单位**：主量的值与单位原样放在卡片顶层（payload.value / payload.unit），
+ *      值相同、单位不冲突的那一条就是主量 —— 与名字无关；
+ *   2. **指标键**：定义侧只绑了一个指标键时，它就是主量；值相同时用它定夺候选；
+ *   3. **位置**：载荷没给数值时取 metrics[] 第一条 —— 造数器把主量排在最前。
+ *
+ * 都不命中 → null：主量不在清单里，清单里**全部**都是「其它指标」（不猜、不丢）。
+ */
+function readPrimaryMetric(metrics, payload, defRegion) {
+  const list = Array.isArray(metrics) ? metrics.filter((m) => m && typeof m === "object") : [];
+  if (!list.length) return null;
+  const p = payload || {};
+  const boundKey = readBoundMetricKey(defRegion);
+
+  const sameValue = list.filter((m) => {
+    const mv = Number(m.value);
+    const pv = Number(p.value);
+    if (!Number.isFinite(mv) || !Number.isFinite(pv) || mv !== pv) return false;
+    const mu = String(m.unit ?? "").trim();
+    const pu = String(p.unit ?? "").trim();
+    return !mu || !pu || mu === pu; // 单位没写就算没冲突，不拿别的单位顶替
+  });
+  if (sameValue.length) {
+    if (boundKey) {
+      const byKey = sameValue.find((m) => String(m.metricKey || "") === boundKey);
+      if (byKey) return byKey;
+    }
+    return sameValue[0];
+  }
+  if (boundKey) {
+    const byKey = list.find((m) => String(m.metricKey || "") === boundKey);
+    if (byKey) return byKey;
+  }
+  // 载荷没给数值：造数器把主量排在 metrics[] 最前。
+  if (!Number.isFinite(Number(p.value))) return list[0];
+  // 载荷的数值在清单里找不到：主量不在清单里，清单里全是「其它指标」。
+  return null;
 }
 
 /** 载荷里的总量卡片（按单位索引）：表格勾稽要用它。 */
@@ -2490,13 +2580,14 @@ function renderRegionCard(region, definition, payload, totalsByUnit) {
       </div>`;
   }
 
-  // 「能力待接通」：角标之外额外写明哪些指标还没接通、为什么。
-  // 不承诺计算口径或公式 —— 那不是前端能说的事。
+  // 「能力待接通 / 不在授权范围」：角标之外额外写明哪些指标还没接通、为什么。
+  // 文案按原因分好类（授权类不是能力缺失）—— 不承诺计算口径或公式，
+  // 那不是前端能说的事。
   if (capabilityNotes.length) {
     const note = document.createElement("div");
     note.className = "region-capability-note text-[11px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-2";
     note.dataset.regionCapability = "pending";
-    note.textContent = "能力待接通：" + capabilityNotes.join("、");
+    note.textContent = capabilityNotes.join("；");
     card.appendChild(note);
   }
 
@@ -2560,12 +2651,18 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
   if (type === "METRIC_CARD") {
     const metrics = Array.isArray(p.metrics) ? p.metrics.filter((m) => m && typeof m === "object") : [];
     // 主量已经在大卡片上显示了，其余指标单独列出来（多指标区域不能只剩一个数）。
-    const others = metrics.filter((m) => !(String(m.label || "") === String(p.label || "") && Number(m.value) === Number(p.value)));
+    // 主量**只画一次**：它就是那个大数字，不能再出现在「其它指标」清单里。
+    const primary = readPrimaryMetric(metrics, p, ctx.defRegion);
+    const others = metrics.filter((m) => m !== primary);
+    // 大数字上方的说明用**主量指标名**（metrics[].label）：卡片标题已经是区域名
+    // （region.name），再写一遍区域名等于没写；指标名才说清这个数是什么量。
+    // 判不出主量时退回载荷给的 label。
+    const mainLabel = String(primary?.label || p.label || "指标");
     const yoy = Number(p.yoyPercent);
     const showYoy = p.comparisonAvailable !== false && p.yoyPercent != null && Number.isFinite(yoy);
     container.innerHTML = `
       <div class="rounded-lg border border-slate-200 bg-slate-50 px-5 py-4 inline-block">
-        <div class="text-[11px] text-slate-500">${esc(p.label || "指标")}</div>
+        <div class="text-[11px] text-slate-500">${esc(mainLabel)}</div>
         <div class="text-3xl font-semibold text-slate-900 mt-1">${esc(formatMetricValue(p.value, p.precision))}<span class="text-sm font-normal text-slate-400 ml-1">${esc(unit)}</span></div>
         ${showYoy ? `<div class="text-[11px] mt-1 ${yoy >= 0 ? "text-rose-600" : "text-emerald-600"}">${yoy >= 0 ? "↑" : "↓"} ${Math.abs(yoy)}% 较上一周期</div>` : ""}
         ${p.windowLabel ? `<div class="text-[11px] text-slate-400 mt-1">${esc(p.windowLabel)}</div>` : ""}
