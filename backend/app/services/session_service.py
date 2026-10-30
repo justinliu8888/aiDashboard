@@ -66,9 +66,13 @@ EDIT_STATE_KEYS = (
     CLARIFICATION_QUESTION_KEY,
 )
 
-# 澄清轮次的两种结果。只有「asked」占用户澄清轮次。
+# 澄清轮次的三种结果。只有「asked」占用户澄清轮次。
 CLARIFICATION_ASKED = "asked"
 CLARIFICATION_TECHNICAL_FAILURE = "technical_failure"
+#: 这一轮**没有真的把追问抛出去**，但事项的键变了（例如这一轮把目标
+#: 解析出来了）—— 键跟着更新，**轮次照旧带着**，不因换键归零。
+#: 契约表 §7.4：「只有真的问出去了才算消耗」。
+CLARIFICATION_KEY_UPDATED = "key_updated"
 
 
 def _dump_snapshot(value: Any) -> str | None:
@@ -1113,6 +1117,8 @@ class SessionService:
 
         outcome=asked             真的把具体追问抛给了用户，轮次 +1
         outcome=technical_failure 工具或模型故障，不占用户澄清轮次，计数不动
+        outcome=key_updated       这一轮**没有真的追问**，但事项的键变了：
+                                  键跟着更新，轮次照旧带着（不因换键归零）
 
         换 key 表示换了一项待定修改（新需求），轮次从零重新计数。
         """
@@ -1123,6 +1129,26 @@ class SessionService:
             # 故障不算用户澄清：不动计数，也不改 key。
             current = self.load_clarification(session_id)
             return current or EditClarification(key=key, rounds=0)
+
+        if outcome == CLARIFICATION_KEY_UPDATED:
+            # 这一轮没有真的把追问抛出去 → 轮次不 +1；但这一轮可能把
+            # 目标解析出来了 → 键要跟着更新。轮次**照旧带着**，
+            # 不能因为键变了就归零（那会让同一件事重新获得一整轮额度）。
+            def mutate_key_only(snapshot: dict[str, Any]) -> dict[str, Any]:
+                snapshot[CLARIFICATION_KEY_KEY] = key
+                snapshot[CLARIFICATION_COUNT_KEY] = int(
+                    snapshot.get(CLARIFICATION_COUNT_KEY) or 0
+                )
+                if question:
+                    snapshot[CLARIFICATION_QUESTION_KEY] = question
+                return snapshot
+
+            snapshot = self._mutate_snapshot(session_id, mutate_key_only)
+            return EditClarification(
+                key=key,
+                rounds=int(snapshot.get(CLARIFICATION_COUNT_KEY) or 0),
+                lastQuestion=str(snapshot.get(CLARIFICATION_QUESTION_KEY) or ""),
+            )
 
         def mutate(snapshot: dict[str, Any]) -> dict[str, Any]:
             same_item = snapshot.get(CLARIFICATION_KEY_KEY) == key

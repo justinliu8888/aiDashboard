@@ -22,6 +22,7 @@ from app.schemas.session import (
 )
 from app.services.session_service import (
     CLARIFICATION_ASKED,
+    CLARIFICATION_KEY_UPDATED,
     CLARIFICATION_TECHNICAL_FAILURE,
     SessionService,
 )
@@ -272,6 +273,48 @@ def test_technical_failure_does_not_reset_other_item_counter(service: SessionSer
     state = service.load_clarification("sess_1")
     assert state.rounds == 2
     assert state.key == "change_region_2"
+
+
+def test_key_updated_changes_the_key_without_consuming_a_round(service: SessionService):
+    """键变了但**没有真的追问** → 轮次照旧带着，不因换键归零。
+
+    契约表 §7.4：「只有真的问出去了才算消耗」。额度用尽时把这一轮解析
+    出来的目标写回额度键，靠的就是这一种结果。
+    """
+    service.record_clarification("sess_1", key="CHANGE_VISUALIZATION:", question="改哪张？")
+
+    updated = service.record_clarification(
+        "sess_1",
+        key="CHANGE_VISUALIZATION:region_hourly_trend",
+        outcome=CLARIFICATION_KEY_UPDATED,
+    )
+
+    assert updated.key == "CHANGE_VISUALIZATION:region_hourly_trend"
+    assert updated.rounds == 1, "没有真的追问，轮次不该 +1"
+    state = service.load_clarification("sess_1")
+    assert state.key == "CHANGE_VISUALIZATION:region_hourly_trend"
+    assert state.rounds == 1, "换键不该把轮次归零"
+    # 换键之后，同一件事不再能追问（额度已经用完）。
+    assert service.can_ask_clarification(
+        "sess_1", key="CHANGE_VISUALIZATION:region_hourly_trend"
+    ) is False
+    # 换另一张卡片 → 另一件事 → 仍能追问一轮。
+    assert service.can_ask_clarification(
+        "sess_1", key="CHANGE_VISUALIZATION:region_total_energy"
+    ) is True
+
+
+def test_key_updated_keeps_the_last_asked_question(service: SessionService):
+    """没有新的追问 → 「上次追问的问题」仍然是上一次那句。"""
+    service.record_clarification("sess_1", key="CHANGE_VISUALIZATION:", question="改哪张？")
+
+    updated = service.record_clarification(
+        "sess_1",
+        key="CHANGE_VISUALIZATION:region_hourly_trend",
+        outcome=CLARIFICATION_KEY_UPDATED,
+    )
+
+    assert updated.lastQuestion == "改哪张？"
 
 
 def test_can_ask_clarification_stops_after_one_round(service: SessionService):
