@@ -22,6 +22,11 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.schemas.agent import ValidationIssue, ValidationResult
+from app.services.data_source_mode import (
+    DEFAULT_SOURCE_MODE,
+    SOURCE_MODE_KEY,
+    normalize_source_mode,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -126,6 +131,78 @@ def _is_template_row_key_column(region: dict[str, Any]) -> bool:
     return bool(spec.get("columns"))
 
 
+def _validate_source_modes(
+    definition_draft: dict[str, Any], issues: list[ValidationIssue]
+) -> None:
+    """来源模式（``sourceMode``）的一致性校验。
+
+    契约表 §1：来源模式是**服务端记录的一等事实**，三处同名同类型 ——
+    定义级 ``metadata.sourceMode``（权威）、区域级
+    ``templateBinding.sourceMode``、区域级 ``templateBinding.previewSpec.sourceMode``。
+
+    两条规则：
+
+    1. 记下来的值必须是合法取值（``simulated`` / ``user_json``）——
+       认不出来的来源模式**不许**混进定义；
+    2. 区域级与定义级**不得不同**（不同即校验失败）：一份报表不混两种来源
+       的数字（规格 US51）。
+
+    老定义没有记录 → 按默认口径（模拟示例，ADR 0004）处理，不因此失败。
+    """
+    metadata = definition_draft.get("metadata") or {}
+    definition_mode = normalize_source_mode(metadata.get(SOURCE_MODE_KEY))
+    if SOURCE_MODE_KEY in metadata and definition_mode is None:
+        issues.append(
+            _issue(
+                "FIELD",
+                "SOURCE_MODE_INVALID",
+                f"报表定义的来源模式 {metadata.get(SOURCE_MODE_KEY)!r} 不是合法取值。",
+                path=f"/metadata/{SOURCE_MODE_KEY}",
+                suggestion="改成 simulated 或 user_json。",
+            )
+        )
+    effective = definition_mode or DEFAULT_SOURCE_MODE
+
+    for idx, region in enumerate(definition_draft.get("regions") or []):
+        if not isinstance(region, dict):
+            continue
+        binding = region.get("templateBinding")
+        binding = binding if isinstance(binding, dict) else {}
+        candidates = [
+            (binding.get(SOURCE_MODE_KEY), f"/regions/{idx}/templateBinding/{SOURCE_MODE_KEY}"),
+            (
+                (binding.get("previewSpec") or {}).get(SOURCE_MODE_KEY),
+                f"/regions/{idx}/templateBinding/previewSpec/{SOURCE_MODE_KEY}",
+            ),
+        ]
+        for value, path in candidates:
+            if value is None:
+                continue
+            mode = normalize_source_mode(value)
+            if mode is None:
+                issues.append(
+                    _issue(
+                        "FIELD",
+                        "SOURCE_MODE_INVALID",
+                        f"区域 {region.get('id') or idx + 1} 的来源模式 {value!r} 不是合法取值。",
+                        path=path,
+                        suggestion="改成 simulated 或 user_json。",
+                    )
+                )
+                continue
+            if mode != effective:
+                issues.append(
+                    _issue(
+                        "FIELD",
+                        "SOURCE_MODE_MISMATCH",
+                        f"区域 {region.get('id') or idx + 1} 的来源模式是 {mode}，"
+                        f"与报表定义的 {effective} 不一致。",
+                        path=path,
+                        suggestion="一份报表只用一种来源：让区域与定义保持一致。",
+                    )
+                )
+
+
 def _grain_of(node: dict[str, Any]) -> str | None:
     """从一个**容器**节点里取它声明的粒度（node["grain"]）。"""
     if not isinstance(node, dict):
@@ -180,6 +257,9 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                 suggestion="至少定义一个数据集。",
             )
         )
+
+    # ---- 来源模式层：定义级与区域级必须一致 ----
+    _validate_source_modes(definition_draft, issues)
 
     # ---- 权限层：scope 必须在授权范围内 ----
     scope = (definition_draft.get("defaults") or {}).get("scope") or {}
