@@ -370,6 +370,33 @@ def test_json_error_position_points_at_the_broken_object(diagnostics_dir) -> Non
     assert text[record["jsonOffset"] : record["jsonOffset"] + 1] == "{"
 
 
+def test_json_offset_is_relative_to_the_original_text(diagnostics_dir) -> None:
+    """输出前面带空白时：偏移落在**原文**里真正断掉的那个字符上。
+
+    偏移、行列一律相对**原始返回文本**（含前导空白），
+    不是相对「去空白后的文本」—— 否则会指错字符。
+    """
+    text = "\n\n这是说明\n```json\n{\n  \"kind\": \"x\"\n"
+
+    asyncio.run(
+        generate_candidate(
+            message="生成报表",
+            current_plan=None,
+            history=[],
+            model_call=_model_returning(text),
+        )
+    )
+
+    record = _read_records(diagnostics_dir)[0]
+    assert record["parseStatus"] == "PARSE_NOT_JSON"
+    # 偏移指向原文里那个没写完的对象的起始 '{'。
+    assert record["jsonOffset"] == text.index("{")
+    assert text[record["jsonOffset"] : record["jsonOffset"] + 1] == "{"
+    # 行列也是 1 起、相对原文：第 5 行第 1 列。
+    assert record["jsonLine"] == 5
+    assert record["jsonColumn"] == 1
+
+
 # --------------------------------------------------------------------------
 # AC5：三个事件分别记录；不声称 final 已被客户端接收
 # --------------------------------------------------------------------------

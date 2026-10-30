@@ -407,10 +407,17 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     - 失败分类：不是 JSON → ``PARSE_NOT_JSON``；是 JSON 但不是对象 →
       ``PARSE_STRUCTURE_INVALID``；
     - JSON 位置：偏移与行列，指向**原文**里解析断掉的地方。
+
+    解析用的是**去空白后的文本**（与改动前逐字一致），但记位置时会把
+    **前导空白的长度**加回去 —— 偏移与行列一律相对**原始返回文本**。
     """
-    raw = (text or "").strip()
+    original = text or ""
+    raw = original.strip()
     if not raw:
         raise _InvalidOutput("模型没有返回内容", parse_status=PARSE_NOT_JSON)
+
+    # 前导空白的长度：记位置时加回去，位置才是相对**原文**的。
+    lead = len(original) - len(original.lstrip())
 
     parsed, error = _try_json(raw)
     if isinstance(parsed, dict):
@@ -444,10 +451,15 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     # - 否则用解析器放弃的那个位置（截断时正好指向末尾）。
     if error is not None and scan_error is not None and error.pos < scan_error.pos:
         error = scan_error
+    # 上面两个位置都是相对**去空白后的文本**的：换算回**原文**，
+    # 行列也跟着换算（行列由 JSONDecodeError 按 doc + pos 算）。
+    located = error or scan_error
+    if located is not None:
+        located = _shift_error(located, original, lead)
     raise _InvalidOutput(
         "模型输出不是 JSON 对象",
         parse_status=PARSE_NOT_JSON,
-        json_error=error or scan_error,
+        json_error=located,
     )
 
 
