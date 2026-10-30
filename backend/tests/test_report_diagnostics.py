@@ -163,6 +163,19 @@ def _model_call_records(caplog) -> list[dict[str, Any]]:
     return out
 
 
+def _request_ids(caplog, marker: str) -> list[str]:
+    """取出带指定标记的日志行里的 requestId。"""
+    out: list[str] = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if marker not in message:
+            continue
+        for token in message.split():
+            if token.startswith("requestId="):
+                out.append(token.partition("=")[2])
+    return out
+
+
 # --------------------------------------------------------------------------
 # AC2：元信息齐全（模型、提示词、阶段、序号、耗时、长度、分类）
 # --------------------------------------------------------------------------
@@ -479,6 +492,93 @@ def test_router_logs_business_final_and_stream_end_separately(client, caplog) ->
 # --------------------------------------------------------------------------
 
 
+def test_real_adapter_and_diagnostic_record_share_the_request_id(
+    caplog, diagnostics_dir
+) -> None:
+    """走**真实适配层**（假上游）：日志行与诊断记录的 requestId 是同一个。"""
+    caplog.set_level(logging.INFO, logger="app")
+    client = _client_with(_FakeResponse("模型这次没给 JSON：机房温湿度异常"))
+
+    result = asyncio.run(
+        generate_candidate(
+            message="生成报表",
+            current_plan=None,
+            history=[],
+            model_call=client,
+        )
+    )
+    assert result["code"] == "MODEL_OUTPUT_INVALID"
+
+    records = _read_records(diagnostics_dir)
+    assert len(records) == 1
+    record = records[0]
+
+    # 适配层那一行（模型调用）、解析层那一行、诊断记录：同一个 requestId。
+    call_ids = _request_ids(caplog, "step=model_call")
+    parse_ids = _request_ids(caplog, "step=model_parse")
+    assert len(call_ids) == 1
+    assert len(parse_ids) == 1
+    assert record["requestId"] == call_ids[0]
+    assert record["requestId"] == parse_ids[0]
+
+
+def test_concurrent_requests_keep_their_own_identifiers(
+    caplog, diagnostics_dir
+) -> None:
+    """3 个并发请求交错 await：标识各归各位，一个都不串。"""
+    caplog.set_level(logging.INFO, logger="app")
+
+    async def _one(index: int) -> None:
+        conversation_id = f"conv_conc_{index}"
+        message_id = f"msg_conc_{index}"
+        diagnostics.begin_request_context(
+            conversation_id=conversation_id, message_id=message_id
+        )
+        client = _client_with(_FakeResponse("模型这次没给 JSON"))
+        # 交错 await：三个协程真的互相让路，不是一个接一个跑完。
+        await asyncio.sleep(0.01 * index)
+        await generate_candidate(
+            message=f"第 {index} 轮",
+            current_plan=None,
+            history=[],
+            model_call=client,
+        )
+        await asyncio.sleep(0.01 * (3 - index))
+
+    async def _run() -> None:
+        await asyncio.gather(*(_one(index) for index in range(3)))
+
+    asyncio.run(_run())
+
+    call_ids = _request_ids(caplog, "step=model_call")
+    parse_ids = _request_ids(caplog, "step=model_parse")
+    assert len(call_ids) == 3
+    assert len(parse_ids) == 3
+    # 三个请求的标识互不相同。
+    assert len(set(call_ids)) == 3
+    # 解析层拿到的就是适配层那一个。
+    assert set(parse_ids) == set(call_ids)
+
+    # 会话标识没串：日志行里的会话与诊断记录里的会话一一对上。
+    call_conversations = {
+        record.get("conversationId") for record in _model_call_records(caplog)
+    }
+    assert call_conversations == {
+        "conv_conc_0",
+        "conv_conc_1",
+        "conv_conc_2",
+    }
+
+    records = _read_records(diagnostics_dir)
+    assert len(records) == 3
+    for record in records:
+        # 每条诊断记录都挂在自己那一轮的会话上。
+        assert record["requestId"] in call_ids
+        assert record["conversationId"] in call_conversations
+    assert len({record["requestId"] for record in records}) == 3
+    assert len({record["conversationId"] for record in records}) == 3
+
+
 def test_diagnostic_record_is_masked_and_independent(caplog, diagnostics_dir) -> None:
     """诊断记录落独立文件，内容脱敏，不含用户原话与业务数值。"""
     caplog.set_level(logging.INFO, logger="app")
@@ -562,29 +662,92 @@ def test_default_diagnostics_dir_is_outside_the_repository() -> None:
 
 
 def test_diagnostic_record_is_not_in_the_session_database(
-    diagnostics_dir, tmp_path
+    client, diagnostics_dir
 ) -> None:
-    """诊断记录不进会话库：库里没有 diagnosticId。"""
-    db_path = tmp_path / "sessions.db"
+    """诊断记录不进会话库：**真的跑一轮会话**，再查会话库的表与行。
+
+    之前的写法是新建一个空 SQLite 文件、从没往里写过东西，然后断言
+    诊断标识不在里面 —— 那个断言恒真，测不到任何东西。这里跑真实的
+    会话流程：会话库确实写进了消息，再检查库里没有诊断内容。
+    """
     import sqlite3
 
-    connection = sqlite3.connect(db_path)
-    connection.execute("CREATE TABLE IF NOT EXISTS t (x TEXT)")
-    connection.commit()
-    connection.close()
+    from app.services.report_design_service import report_design_service
+    from app.services.session_service import session_service
 
-    asyncio.run(
-        generate_candidate(
-            message="生成报表",
-            current_plan=None,
-            history=[],
-            model_call=_model_returning("不是 JSON"),
-        )
-    )
-    records = _read_records(diagnostics_dir)
-    assert records
-    blob = db_path.read_bytes()
-    assert records[0]["diagnosticId"].encode("utf-8") not in blob
+    report_design_service.reset_for_tests()
+    try:
+
+        async def _bad_model(messages: list[dict[str, Any]]) -> str:
+            return "模型这次没给 JSON，给了一段说明：机房温湿度异常"
+
+        report_design_service.reset_for_tests(model_call=_bad_model)
+        payload = {
+            "agentProtocolVersion": "1.0",
+            "conversationId": "conv_sessdbcheck",
+            "sessionId": "sess_sessdbcheck",
+            "messageId": "msg_sessdbcheck",
+            "state": "ANALYZING",
+            "message": "生成一份机房能耗报表",
+            "context": {
+                "projectId": "project_001",
+                "subjectRef": "machine_room",
+                "subjectId": "room_a",
+            },
+        }
+        response = client.post("/api/agent/chat", json=payload)
+        assert response.status_code == 200
+
+        # 诊断记录确实产生了。
+        records = _read_records(diagnostics_dir)
+        assert records
+        diagnostic_id = records[0]["diagnosticId"]
+        request_id = records[0]["requestId"]
+
+        # 会话库真的写进了东西（否则下面的断言又是空的）。
+        db_path = Path(session_service._repo._db_path)
+        assert db_path.exists()
+        connection = sqlite3.connect(db_path)
+        try:
+            tables = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            ]
+            assert "messages" in tables
+            # 把**所有表的所有行**摊平成文本：诊断内容不该出现在任何一处。
+            dumped: list[str] = []
+            for table in tables:
+                for row in connection.execute(f'SELECT * FROM "{table}"'):
+                    dumped.append(json.dumps(row, ensure_ascii=False, default=str))
+            assert dumped, "这一轮会话应该往库里写了数据"
+        finally:
+            connection.close()
+        joined = "\n".join(dumped)
+
+        # 先证明这个库**确实**写进了这一轮（否则下面的断言会是空的）。
+        assert "生成一份机房能耗报表" in joined
+        # 会话库的表与行里没有诊断标识，也没有诊断正文。
+        assert diagnostic_id not in joined
+        assert request_id not in joined
+        assert "diag_" not in joined
+        assert "req_" not in joined
+        assert "机房温湿度异常" not in joined
+
+        # 落到磁盘上的字节也一样没有（WAL 模式下数据在 -wal 文件里，
+        # 两个文件都要看）。
+        blob = db_path.read_bytes()
+        wal = db_path.with_name(db_path.name + "-wal")
+        if wal.exists():
+            blob += wal.read_bytes()
+        assert diagnostic_id.encode("utf-8") not in blob
+        assert request_id.encode("utf-8") not in blob
+        assert b"diag_" not in blob
+        assert b"req_" not in blob
+        assert "机房温湿度异常".encode("utf-8") not in blob
+    finally:
+        report_design_service.reset_for_tests()
 
 
 # --------------------------------------------------------------------------
