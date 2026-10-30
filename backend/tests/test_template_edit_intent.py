@@ -723,3 +723,209 @@ def test_object_names_that_also_look_like_complaints_are_not_issue_feedback(
 
     assert intent is not UserIntent.ISSUE_FEEDBACK
     assert intent is UserIntent.MODIFY
+
+
+# ==========================================================================
+# P2 粒度新值的来源：与时间窗同口径（契约表 §7 / AC4）
+# ==========================================================================
+#
+# 独立验收实测到的两条失败：
+#   「把小时趋势的标题改一下」 → intent=CHANGE_COMPILATION_GRAIN grain=HOUR
+#   「小时趋势太单调了」        → intent=CHANGE_COMPILATION_GRAIN grain=HOUR
+#
+# 根因：粒度侧还留着**整句回退**（没有改动动词时整句都当诉求），
+# 并且守卫把卡片名里的「小时」也算成粒度话题。
+#
+# 下面这段用例补的正是**没有改动动词**的句式 —— #58 自带的粒度用例
+# 只测了有改动动词的句式，整句回退那一支一直没被覆盖。
+
+#: 没有改动动词的句子：粒度新值不能来自整句。
+NO_CHANGE_VERB_MESSAGES = (
+    "把小时趋势的标题改一下",
+    "小时趋势太单调了",
+    "小时趋势这张卡片不太行",
+)
+
+
+@pytest.mark.parametrize("message", NO_CHANGE_VERB_MESSAGES)
+def test_card_name_grain_word_without_change_verb_is_not_a_grain_change(
+    definition, message
+):
+    """卡片名里的「小时」是卡片名，不是要写进去的粒度。
+
+    没有改动动词 ⇒ 没有新值：这句话既不该改粒度，也不该带出粒度值。
+    """
+    plan = template_edit_engine.parse(
+        message=message,
+        definition=definition,
+        selected_region_id=None,
+        scope=SCOPE,
+    )
+
+    assert plan.intent != EditIntent.CHANGE_COMPILATION_GRAIN
+    assert plan.operation.grain is None
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_grain"),
+    [
+        ("把粒度改成按小时", "HOUR"),
+        ("改成按天粒度", "DAY"),
+        ("把小时趋势的粒度改成按小时粒度", "HOUR"),
+    ],
+)
+def test_explicit_grain_naming_still_produces_a_grain_change(
+    definition, message, expected_grain
+):
+    """明确点名的写法仍然是粒度新值 —— 收紧没有把正常的路堵死。"""
+    plan = template_edit_engine.parse(
+        message=message,
+        definition=definition,
+        selected_region_id="region_hourly_trend",
+        scope=SCOPE,
+    )
+
+    assert plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN
+    assert plan.operation.grain["unit"] == expected_grain
+
+
+def test_unsupported_grain_gives_capability_limit(definition):
+    """数据源不支持该粒度时给能力限制，不静默改。"""
+    plan = template_edit_engine.parse(
+        message="把粒度改成按分钟粒度",
+        definition=definition,
+        selected_region_id="region_hourly_trend",
+        scope=SCOPE,
+    )
+
+    assert plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN
+    assert plan.needsClarification is True
+    assert "不支持" in plan.clarificationQuestion
+
+
+def test_unknown_grain_name_gives_capability_limit(definition):
+    """目录里没有的粒度（「按秒」）走粒度话题 + 能力限制，不硬造一个粒度。"""
+    plan = template_edit_engine.parse(
+        message="把粒度改成按秒",
+        definition=definition,
+        selected_region_id="region_hourly_trend",
+        scope=SCOPE,
+    )
+
+    assert plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN
+    assert plan.operation.grain is None
+    assert plan.needsClarification is True
+    assert "粒度" in plan.clarificationQuestion
+
+
+def test_asking_which_grains_are_supported_has_no_new_value(definition):
+    """「能按哪些粒度看？」是粒度话题，但**没有新值** —— 不硬造一个粒度。"""
+    plan = template_edit_engine.parse(
+        message="能按哪些粒度看？",
+        definition=definition,
+        selected_region_id="region_hourly_trend",
+        scope=SCOPE,
+    )
+
+    assert plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN
+    assert plan.operation.grain is None
+    assert plan.needsClarification is True
+    assert "粒度" in plan.clarificationQuestion
+
+
+def test_clarification_answer_whole_sentence_is_the_new_value(definition):
+    """澄清答案：整句就是新值（「按小时」→ HOUR）。
+
+    澄清答案由调用方把整句塞进 ``change_value``，走的是「有改动片段」
+    这一档（与时间窗同口径），不受整句回退收紧的影响。
+    """
+    plan = template_edit_engine.parse(
+        message="按小时",
+        definition=definition,
+        selected_region_id="region_hourly_trend",
+        scope=SCOPE,
+        change_value="按小时",
+    )
+
+    assert plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN
+    assert plan.operation.grain["unit"] == "HOUR"
+
+
+def test_bare_word_clarification_answer_is_not_a_new_value(definition):
+    """裸词「小时」按 ``explicit_only`` 的既有口径：**不是新值**。
+
+    裸词与卡片名里的「小时」分不开，只认明确点名的写法；
+    宁可再问一次，也不硬写一个粒度。
+    """
+    plan = template_edit_engine.parse(
+        message="小时",
+        definition=definition,
+        selected_region_id="region_hourly_trend",
+        scope=SCOPE,
+        change_value="小时",
+    )
+
+    assert plan.operation.grain is None
+    assert plan.intent != EditIntent.CHANGE_COMPILATION_GRAIN
+
+
+def test_time_range_command_is_not_hijacked_by_grain_logic(definition):
+    """「把时间范围改成最近 7 天」仍是时间窗修改，不被粒度逻辑误伤。"""
+    plan = template_edit_engine.parse(
+        message="把时间范围改成最近 7 天",
+        definition=definition,
+        selected_region_id="region_hourly_trend",
+        scope=SCOPE,
+    )
+
+    assert plan.intent == EditIntent.CHANGE_TIME_RANGE
+    assert plan.operation.timeWindow is not None
+    assert plan.operation.grain is None
+
+
+def test_delete_command_is_not_hijacked_by_grain_logic(definition):
+    """「删除某个卡片」仍是删除，不受影响。"""
+    plan = template_edit_engine.parse(
+        message="删除某个卡片",
+        definition=definition,
+        selected_region_id="region_hourly_trend",
+        scope=SCOPE,
+    )
+
+    assert plan.intent == EditIntent.DELETE_SECTION
+    assert plan.operation.grain is None
+
+
+def test_complaint_about_hourly_trend_produces_no_pending_edit_plan(
+    post_chat, definition
+):
+    """端到端：抱怨「小时趋势太单调了」不产生待接受计划，也不改草稿。"""
+    payload = _post(post_chat, definition, "小时趋势太单调了")
+
+    assert payload["domainObjects"]["pendingEditPlan"] is None
+    assert payload["domainObjects"]["changeSet"] is None
+    assert "pending_edit_plan" not in payload["uiActions"]
+    assert definition.metadata["revision"] == 0
+
+
+def test_clarification_answer_lands_the_grain_end_to_end(post_chat, definition):
+    """端到端：追问粒度之后从菜单里选粒度，仍然落地 HOUR。
+
+    追问是**单选菜单**，答案就是菜单项的值（「按小时粒度」——
+    明确点名的写法），走的是「有改动片段」这一档，不受整句回退收紧影响。
+    """
+    first = _post(post_chat, definition, "把小时趋势的粒度调一下")
+
+    assert first["domainObjects"]["pendingEditPlan"] is None
+    question = first["questions"][0]
+    assert question["id"] == "compilation_grain"
+    values = [option["value"] for option in question["options"]]
+    assert "按小时粒度" in values
+
+    second = _post(post_chat, definition, "按小时粒度")
+
+    plan = second["domainObjects"]["pendingEditPlan"]
+    assert plan is not None
+    assert plan["operations"][0]["intent"] == "CHANGE_COMPILATION_GRAIN"
+    assert plan["operations"][0]["operation"]["grain"]["unit"] == "HOUR"
+    assert definition.metadata["revision"] == 0
