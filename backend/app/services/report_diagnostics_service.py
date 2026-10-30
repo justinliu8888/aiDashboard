@@ -269,6 +269,19 @@ def format_token_usage(usage: Any) -> str:
 # --------------------------------------------------------------------------
 
 
+def _safe_warning(message: str, *args: Any) -> None:
+    """写一条告警日志。
+
+    **日志器自己抛错也不许让业务请求失败**（契约表 §6.5）。
+    故障处理路径上已经在 ``except`` 里了，日志再抛错会把原始异常盖掉，
+    一路穿出到业务请求 —— 那一轮就直接失败了。
+    """
+    try:
+        logger.warning(message, *args)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def log_model_call(state: ModelCallState) -> None:
     """记一次模型调用的元信息。
 
@@ -574,7 +587,9 @@ def write_diagnostic_record(
         )
         return diagnostic_id
     except Exception as exc:  # noqa: BLE001
-        logger.warning("写诊断记录失败：%s", type(exc).__name__)
+        # 这里已经在处理异常了：日志再抛错会把原始异常盖掉并穿出到
+        # 业务请求（契约表 §6.5：写日志 / 写诊断失败不得让业务请求失败）。
+        _safe_warning("写诊断记录失败：%s", type(exc).__name__)
         return None
 
 

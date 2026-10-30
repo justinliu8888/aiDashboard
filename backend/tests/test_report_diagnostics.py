@@ -990,6 +990,42 @@ def test_log_write_failure_does_not_fail_the_request(monkeypatch) -> None:
     assert result["code"] == "MODEL_OUTPUT_INVALID"
 
 
+def test_diagnostic_write_failure_plus_log_failure_still_returns(
+    tmp_path, monkeypatch
+) -> None:
+    """诊断写失败**且**日志器自己也抛错：业务请求照常返回。
+
+    故障处理路径上日志再抛错，会把原始异常盖掉并穿出到业务请求 ——
+    那一轮就直接失败了。契约表 §6.5：写日志 / 写诊断失败不得让业务请求失败。
+    """
+    from app.agents import report_plan_agent
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("日志盘满了")
+
+    settings = get_settings()
+    blocked = tmp_path / "blocked"
+    blocked.write_text("这不是目录", encoding="utf-8")
+    monkeypatch.setattr(settings, "diagnostics_dir", blocked)
+    monkeypatch.setattr(settings, "diagnostics_enabled", True)
+    # 诊断侧的日志器：常规日志与「写诊断失败」的告警都抛错。
+    monkeypatch.setattr(diagnostics.logger, "info", _boom)
+    monkeypatch.setattr(diagnostics.logger, "warning", _boom)
+    # 解析层在故障处理路径上的告警也抛错。
+    monkeypatch.setattr(report_plan_agent.logger, "warning", _boom)
+
+    result = asyncio.run(
+        generate_candidate(
+            message="生成报表",
+            current_plan=None,
+            history=[],
+            model_call=_model_returning("不是 JSON"),
+        )
+    )
+
+    assert result["code"] == "MODEL_OUTPUT_INVALID"
+
+
 def test_diagnostic_log_lines_go_through_the_existing_rotating_file(tmp_path) -> None:
     """诊断日志走**现有**的轮转文件，不另起一套。"""
     from app.logging_config import configure_app_file_logging

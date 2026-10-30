@@ -811,6 +811,19 @@ async def _fail(
     return _failure(code, message)
 
 
+def _safe_warning(message: str, *args: Any) -> None:
+    """写一条告警日志。
+
+    **日志器自己抛错也不许让业务请求失败**（契约表 §6.5）：
+    故障处理路径上已经在 ``except`` 里了，日志再抛错会把原始异常盖掉，
+    一路穿出到业务请求 —— 那一轮就直接失败了。
+    """
+    try:
+        logger.warning(message, *args)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _notify(emit: Emit | None, event: dict[str, Any]) -> None:
     """进度回调。回调自身出错不影响本轮结论。"""
     if emit is None:
@@ -820,7 +833,7 @@ async def _notify(emit: Emit | None, event: dict[str, Any]) -> None:
         if inspect.isawaitable(result):
             await result
     except Exception as exc:  # noqa: BLE001
-        logger.warning("方案设计进度回调失败：%s", exc)
+        _safe_warning("方案设计进度回调失败：%s", exc)
 
 
 def _record_parse_outcome(
@@ -919,7 +932,7 @@ async def generate_candidate(
         state = diagnostics.ensure_model_call_state()
         state.error_type = type(exc).__name__
         diagnostics.log_model_parse(state, reason=FAILURE_MODEL_CALL_FAILED)
-        logger.warning("方案设计模型调用失败：%s", type(exc).__name__)
+        _safe_warning("方案设计模型调用失败：%s", type(exc).__name__)
         return await _fail(
             emit, FAILURE_MODEL_CALL_FAILED, "模型调用失败，请稍后重试"
         )
