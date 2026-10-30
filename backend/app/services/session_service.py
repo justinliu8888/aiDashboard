@@ -939,6 +939,35 @@ class SessionService:
 
     # ---------- 编辑态：待确认计划 ----------
 
+    @staticmethod
+    def _with_base_combination(plan: PendingEditPlan) -> PendingEditPlan:
+        # 把计划所基于的**生效组合快照**放到契约表 §4.2 声明的那个字段上。
+        #
+        # 编辑引擎产出计划时把组合快照写在 ``EditPlan.baseCombination`` 上
+        # （``template_edit_engine.parse``），它随计划一起进了
+        # ``PendingEditPlan.model_extra["editPlan"]``。这里把它**提上来**。
+        #
+        # 为什么值得提：契约表 §4.2 声明的落点就是
+        # ``PendingEditPlan.baseCombination``，之前它一直空着。而空组合按
+        # 契约表 §4.2 的「旧数据默认行为」读作「只按 ``draftRevision``
+        # 比」—— 读的人分不出「**没记**」与「记了但对得上」。
+        #
+        # 真正生效的校验仍然是接受时逐字段比那份快照（见
+        # ``template_edit_engine._stale_reason``）；这里只是让**存下来的**
+        # 那份计划**看得出**它基于哪一份组合。行为不变。
+        extra = plan.model_extra or {}
+        edit_plan = extra.get("editPlan")
+        combination = (
+            edit_plan.get("baseCombination")
+            if isinstance(edit_plan, dict)
+            else None
+        )
+        if not isinstance(combination, dict) or not combination:
+            return plan
+        if plan.baseCombination:
+            return plan
+        return plan.model_copy(update={"baseCombination": dict(combination)})
+
     def save_pending_plan(
         self, session_id: str, plan: PendingEditPlan
     ) -> PendingEditPlan:
@@ -949,6 +978,7 @@ class SessionService:
         """
         if not plan.planId.strip():
             raise ValueError("待确认计划必须有 planId")
+        plan = self._with_base_combination(plan)
         if not plan.createdAt:
             plan = plan.model_copy(
                 update={"createdAt": datetime.now().isoformat(timespec="seconds")}
@@ -983,6 +1013,7 @@ class SessionService:
         """
         if not plan.planId.strip():
             raise ValueError("待确认计划必须有 planId")
+        plan = self._with_base_combination(plan)
         if not plan.createdAt:
             plan = plan.model_copy(
                 update={"createdAt": datetime.now().isoformat(timespec="seconds")}

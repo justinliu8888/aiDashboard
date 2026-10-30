@@ -566,6 +566,65 @@ def test_rejected_json_returns_actionable_hint_and_stores_nothing():
         assert not any(broken in text for text in texts)
 
 
+def test_pending_plan_carries_its_base_combination(post_chat):
+    """待确认计划带着它所基于的**生效组合快照**（契约表 §4.2 的字段）。
+
+    空组合按契约表 §4.2 的旧数据默认行为读作「只按 ``draftRevision``
+    比」—— 读的人分不出「**没记**」与「记了但对得上」。所以这一项要
+    真的记上。
+    """
+    definition = _definition()
+
+    post_chat(
+        "报表名称改成新日报",
+        state="USER_EDITING_TEMPLATE",
+        snapshots=_snap(definition),
+    )
+
+    pending = session_service.load_pending_plan("conv_test")
+    assert pending is not None
+    assert pending.baseCombination, "待确认计划没有带生效组合快照"
+    # 组合是契约表 §2.1 固定的那 9 键。
+    assert set(pending.baseCombination) == {
+        "planId",
+        "planRevision",
+        "definitionId",
+        "definitionVersion",
+        "sourceMode",
+        "inputId",
+        "inputVersion",
+        "fieldMapping",
+        "processingRules",
+    }
+
+
+def test_json_mode_is_marked_on_the_definition_after_confirm():
+    """JSON 模式在服务端有**明确依据**：确认方案后定义上写着来源模式。
+
+    前端要标「用户提供的数据，未经业务核验」，依据就是这里的
+    ``metadata.sourceMode == "user_json"`` 与生效组合里绑着的
+    ``inputId`` / ``inputVersion`` —— 不宣称已连接真实业务库。
+    """
+    rows = [{"ts": "2024-01-01", "device": "机柜1", "energy": 1.5}]
+    message = "这是我的记录：" + json.dumps(rows, ensure_ascii=False) + " 帮我做个日报"
+
+    with acceptance_harness(session_id="sess_66a_json_ref") as harness:
+        plan = harness.request_plan(message)
+        harness.confirm_plan(plan)
+
+        snapshot = harness.read_session()["snapshot"]
+        definition = snapshot["definition"]
+        metadata = definition["metadata"]
+
+        assert metadata["sourceMode"] == "user_json"
+        combination = metadata["effectiveCombination"]
+        assert combination["sourceMode"] == "user_json"
+        assert combination["inputId"].startswith("inp_")
+        assert combination["inputVersion"] == 1
+        # 「未经业务核验」：字段映射没绑上的列被如实列出来，不假装绑上了。
+        assert metadata["jsonInputIssues"]["unmappedColumns"]
+
+
 @pytest.mark.parametrize(
     ("payload", "code"),
     [
