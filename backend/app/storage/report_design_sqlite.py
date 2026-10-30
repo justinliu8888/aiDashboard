@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import uuid
@@ -58,6 +59,41 @@ logger = logging.getLogger(__name__)
 
 # 失败文案入库前截断：安全错误不该把长文本带进库里。
 _MAX_ERROR_LENGTH = 2000
+
+# 失败原因的安全文案表。
+#
+# 操作记录的原因字段是**持久化**的，也是会读回给用户看的（重复认领时
+# 直接当作回复文案）。上游异常原文绝不能落进去 —— 但错误码要留着，
+# 排查要靠它。所以：原因文案按「错误码」查表，查不到就用通用文案；
+# 调用方传进来的自由文本**一律不落盘**（#61）。
+#
+# 查表而不是「过滤」的原因：靠形状猜「这是不是异常原文」不可靠 ——
+# 中文异常消息一样可能带用户数据。查表是确定的：库里只可能出现下面
+# 这些我们自己写的文案。
+_SAFE_ERROR_MESSAGES: dict[str, str] = {
+    "revision_conflict": "操作基于的版本已经变了，请重新发起一次。",
+    "TEMPLATE_REVISION_CONFLICT": "模板已经变了，请重新确认一次。",
+    "TEMPLATE_CONFIRM_FAILED": "这次模板没有确认成功，请重试。",
+    "TEMPLATE_BUILD_FAILED": "这次草稿没有生成出来，请重试。",
+    "TEMPLATE_COMMIT_REJECTED": "这次草稿没有通过校验，请调整后重试。",
+    "TEMPLATE_COMMIT_FAILED": "这次草稿没有保存下来，请重试。",
+    "PLAN_MODEL_FAILED": "这次方案没有生成出来，请重试。",
+    "PLAN_OUTPUT_INVALID": "这次生成的方案无法识别，请重试。",
+    "PLAN_INVALID_STRUCTURE": "这次生成的方案没有通过校验，请修改后重试。",
+    "PLAN_COLUMNS_UNRESOLVED": "这次没能确定表格要展示哪些栏目，请重试。",
+    "PLAN_COMPONENT_TYPE_INVALID": "方案里的组件类型不被支持，请修改后重试。",
+    "PLAN_COMMIT_REJECTED": "这次方案没有通过校验，请调整后重试。",
+    "PLAN_COMMIT_FAILED": "这次方案没有保存下来，请重试。",
+    "PLAN_CLARIFICATION_EMPTY": "这次澄清的内容是空的，请再说一遍。",
+    "PLAN_CLARIFICATION_FAILED": "这次澄清没有提交成功，请重试。",
+}
+
+# 错误码查不到时用的通用文案。
+_DEFAULT_ERROR_MESSAGE = "这次操作没有完成，请重试。"
+
+# 错误码的形状：字母开头，只含字母数字下划线，最长 64 字。
+# 形状对不上的当 unknown —— 错误码也是从外面传进来的。
+_SAFE_ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
 _SCHEMA = """
@@ -1050,6 +1086,9 @@ class SqliteReportDesignRepository:
         """把操作标记为失败。
 
         上一成功方案不受影响：这里只写操作行，不碰设计状态。
+
+        ``safe_error`` 里的自由文本**不落盘**（#61）：原因文案按错误码
+        查表，错误码本身按标识形状过滤。上游异常原文不进持久化的原因字段。
         """
         code, message = _normalize_safe_error(safe_error)
         with self._lock:
@@ -1514,17 +1553,28 @@ class SqliteReportDesignRepository:
         conn.execute("BEGIN IMMEDIATE")
 
 
+def _safe_error_code(code: Any) -> str:
+    """错误码：只放行「一眼就是标识」的形状，其余一律 unknown。"""
+    text = str(code or "").strip()
+    if _SAFE_ERROR_CODE.match(text):
+        return text
+    return "unknown"
+
+
 def _normalize_safe_error(safe_error: str | Mapping[str, Any]) -> tuple[str, str]:
     """安全错误归一化成 (code, message)。
 
     只保留可辨识的短码和安全文案，不落客户原始数据。
+
+    **原因文案按错误码查表**（#61）：调用方传进来的自由文本不落盘 ——
+    上游异常原文可能带用户数据或凭据，而这个字段是持久化的、
+    而且会读回给用户看。
     """
     if isinstance(safe_error, Mapping):
-        code = str(safe_error.get("code") or "unknown")[:64]
-        message = str(safe_error.get("message") or "")
+        code = _safe_error_code(safe_error.get("code"))
     else:
         code = "unknown"
-        message = str(safe_error)
+    message = _SAFE_ERROR_MESSAGES.get(code, _DEFAULT_ERROR_MESSAGE)
     return code, message
 
 
