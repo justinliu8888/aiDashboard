@@ -97,6 +97,13 @@ ALLOWED_RULE_PARAMS: tuple[str, ...] = (
 #: 温度、PUE、累计电表读数、编号这类值求和没有业务意义 ——
 #: 求出来的数会误导人。命中这些字段时**不生成求和/平均规则**，
 #: 改用明细展示，并把原因写进数据问题说明。
+#:
+#: 判据是**词段精确匹配**（见 :func:`_non_summable_token`），不是裸子串。
+#: 因此「累计电表读数」这一族要用**能落到独立词段**的写法收口：
+#:
+#: - ``meter`` —— 覆盖 ``meter`` / ``meterTotal`` / ``total_meter`` /
+#:   ``meter_total`` / ``electricity_meter``（驼峰与下划线切开后的**词段**）；
+#: - ``电表`` —— 覆盖 ``电表`` / ``电表累计``（中文按子串判）。
 NON_SUMMABLE_FIELD_TOKENS: tuple[str, ...] = (
     "temperature",
     "temp",
@@ -105,9 +112,11 @@ NON_SUMMABLE_FIELD_TOKENS: tuple[str, ...] = (
     "pue",
     "累计电表读数",
     "电表读数",
+    "电表",
     "累计读数",
     "meterreading",
     "meterreadingtotal",
+    "meter",
     "cumulative",
     "energyreadings",
     "总表读数",
@@ -133,9 +142,11 @@ NON_SUMMABLE_REASON_LABELS: dict[str, str] = {
     "pue": "PUE 类指标",
     "累计电表读数": "累计电表读数",
     "电表读数": "累计电表读数",
+    "电表": "累计电表读数",
     "累计读数": "累计电表读数",
     "meterreading": "累计电表读数",
     "meterreadingtotal": "累计电表读数",
+    "meter": "累计电表读数",
     "cumulative": "累计电表读数",
     "energyreadings": "累计电表读数",
     "总表读数": "累计电表读数",
@@ -837,6 +848,10 @@ def _non_summable_token(field_key: str) -> str | None:
     2. 字段名里的**某一段**就是这个词：``device_id`` → ``id``、
        ``deviceCode`` → ``Code``；
     3. 中文没有词边界（``温度值`` / ``累计电表读数``）：按子串判。
+
+    「累计电表读数」这一族靠 ``meter`` 与 ``电表`` 两个词收口：
+    ``meterTotal`` / ``total_meter`` / ``electricity_meter`` 的**词段**里有
+    ``meter``，``电表累计`` 里有 ``电表``。
     """
     normalized = normalize_field_key(field_key)
     if not normalized:
