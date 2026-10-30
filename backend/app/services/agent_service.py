@@ -190,6 +190,58 @@ async def _emit(
         await emit(event, data)
 
 
+#: 连要改什么都说不清时的固定额度键（仍然只问一轮）。
+UNRESOLVED_CLARIFICATION_KEY = "edit:unresolved"
+
+
+def _derive_clarification_key(
+    *,
+    intent: str,
+    target: str,
+    prior_key: str | None,
+    prior_pending: bool,
+) -> str:
+    """澄清额度的键怎么来（契约表 §7.4）。
+
+    键 = 「意图:目标卡片」，额度按**事项**计：同一件事只问一轮，换一件事
+    轮次从 0 起。
+
+    规则（判定只有这一份）：
+
+    1. 键**由当前这一轮**的「意图 + 目标卡片」推导，**不沿用**上一轮的旧键
+       —— 否则一轮澄清用完后，用户换任何一件新的修改都会被挡住
+       （契约表 §7.4 v1.4.1；那是 v1.4.1 之前的老 bug）。
+    2. **例外之一**：这一轮认不出意图与目标（多半是用户在**回答上一轮的
+       追问**，例如只回了一个指代词）→ 沿用上一轮的键。
+    3. **例外之二**（契约表 §7.4 v1.11.0 统筹裁定）：上一轮存在针对
+       **同一意图**的待澄清追问，且这一轮把目标补上了 → **目标由「未知」
+       变成「已知」是同一事项的延续，不是新事项** → 沿用上一轮的键，
+       轮次接着算。
+    4. 意图变了、或目标换了**另一张卡片** → 仍是新事项，轮次从 0 起。
+
+    ``prior_pending`` 表示「上一轮确实抛出过一个待澄清追问，用户正在
+    续接它」；``prior_key`` 是那一轮记下的键。两个条件一起成立，才谈得上
+    「同一事项的延续」。
+    """
+    derived = f"{intent}:{target}" if intent != "UNKNOWN" or target else ""
+    if not derived:
+        # 这一轮认不出「意图 + 目标卡片」：多半是用户在**回答上一轮的追问**
+        # （例如只回了一个指代词）。事项还没换，沿用上一轮的键，
+        # 免得同一件事被反复追问。
+        if prior_key and prior_pending:
+            return prior_key
+        # 连要改什么都说不清 → 固定的「未定位」键，仍然只问一轮。
+        return UNRESOLVED_CLARIFICATION_KEY
+    if prior_key and prior_pending and intent != "UNKNOWN":
+        prior_intent, _, prior_target = prior_key.partition(":")
+        if prior_intent == intent and not prior_target and target:
+            # 目标由「未知」变成「已知」：用户在**补全上一轮的追问**，
+            # 不是提出新要求 —— 同一事项的延续，额度键沿用上一轮，
+            # 轮次接着算（契约表 §7.4 v1.11.0）。
+            return prior_key
+    return derived
+
+
 def _build_agent():
     """按配置选择 Agent 实现。"""
     impl = get_settings().agent_impl
@@ -1493,27 +1545,12 @@ class AgentService:
         intent = (response.debug or {}).get("editingIntent") or "UNKNOWN"
         target = (response.debug or {}).get("editingTargetRegionId") or ""
         current = session_service.load_clarification(session_key)
-        # 额度按「事项」计（契约表 §7.2、§7.4）：键 = 「意图:目标卡片」，
-        # 而且**由当前这一轮推导**，不沿用上一轮的键。
-        #   - 键变了 → 换了一件事 → 自然重开，轮次从 0 起
-        #     （``record_clarification`` 发现键不同即重新计数）；
-        #   - 键没变 → 还是那一件事 → 轮次接着算，第二轮被额度上限挡住。
-        #
-        # 之前这里写的是「上一轮追问过就把键钉死在旧键上」，结果**换一件事
-        # 也被上一件事挡住**：追问额度用完后，用户再提任何一件新的修改都被
-        # 回成「这项修改我已经追问过 1 轮」—— 与契约 §7.4「新事项自然重开」
-        # 矛盾，也与回复里「③ 换一个对象重新提一次修改要求」自相矛盾。
-        derived = f"{intent}:{target}" if intent != "UNKNOWN" or target else ""
-        if derived:
-            key = derived
-        elif prior and current:
-            # 这一轮认不出「意图 + 目标卡片」：多半是用户在**回答上一轮的追问**
-            # （例如只回了一个指代词）。事项还没换，沿用上一轮的键，
-            # 免得同一件事被反复追问。
-            key = current.key
-        else:
-            # 连要改什么都说不清 → 固定的「未定位」键，仍然只问一轮。
-            key = "edit:unresolved"
+        key = _derive_clarification_key(
+            intent=intent,
+            target=target,
+            prior_key=current.key if current else None,
+            prior_pending=bool(prior),
+        )
         if not session_service.can_ask_clarification(session_key, key=key):
             # 一轮之后仍缺安全目标（规格第 18 条）：保留当前报告，给**非阻塞**
             # 说明与可选替代 —— 不猜目标、不造空计划、不继续循环强制询问。

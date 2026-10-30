@@ -203,3 +203,130 @@ def test_graph_wording_with_change_verb_still_edits(post_chat):
 
     assert payload["debug"].get("contextEngineIntent") != "ASK_QUESTION"
     assert payload["uiActions"] != ["query_answer"]
+
+
+# ==========================================================================
+# 🟡-3 澄清额度键：「目标由未知变已知」算同一件事
+# ==========================================================================
+
+
+def test_target_becoming_known_continues_the_same_item(post_chat):
+    """第一轮没说改哪一块 → 第二轮把目标补上 → **同一件事**，不再追问。
+
+    契约表 §7.4（v1.11.0 统筹裁定）：「目标由『未知』变成『已知』，
+    是同一事项的延续，不是新事项」—— 额度键沿用上一轮的键，轮次接着算。
+
+    修之前：第二轮的键从 `CHANGE_VISUALIZATION:` 变成
+    `CHANGE_VISUALIZATION:region_hourly_trend` → 按「键变了 = 新事项」
+    轮次从 0 起 → 又问了一轮，规格第 23 条守不住。
+    """
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    first = _post(post_chat, definition, "改成柱状图")
+
+    # 第一轮真的抛出了追问，额度记在「意图:目标为空」的键上。
+    assert "你想把哪个 section" in first["reply"]
+    assert first["uiActions"] != ["template_edit_clarification_limit"]
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_VISUALIZATION:"
+    assert state.rounds == 1
+
+    second = _post(post_chat, definition, "把小时趋势改成柱状图")
+
+    # 第二轮把目标补上了 → 同一件事 → 额度接着算 → 不再追问。
+    assert second["uiActions"] == ["template_edit_clarification_limit"]
+    assert "追问过 1 轮" in second["reply"]
+    assert second["questions"] == []
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_VISUALIZATION:", "额度键应沿用上一轮"
+    assert state.rounds == 1, "轮次接着算，不该重开"
+
+
+def test_a_different_intent_can_still_be_asked_once(post_chat):
+    """换一件事（意图变了）→ 仍能重新追问一轮。
+
+    契约表 §7.4：这**不**放宽「换一件事要能重新追问」。
+    """
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    first = _post(post_chat, definition, "改成柱状图")
+    assert "你想把哪个 section" in first["reply"]
+
+    second = _post(post_chat, definition, "把粒度改成按月")
+
+    assert second["uiActions"] != ["template_edit_clarification_limit"], (
+        "新事项被上一事项的澄清额度挡住了"
+    )
+    assert "追问过 1 轮" not in second["reply"]
+    assert second["questions"], "新事项应该重新被追问"
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_COMPILATION_GRAIN:"
+    assert state.rounds == 1
+
+
+def test_a_different_target_card_is_a_new_item(post_chat):
+    """目标换了**另一张卡片** → 仍是新事项 → 仍能重新追问一轮。
+
+    契约表 §7.4 v1.11.0：「意图变了、或目标换了另一张卡片，都是新事项，
+    轮次照旧从 0 起」。
+    """
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    first = _post(post_chat, definition, "把小时趋势改成柱状图")
+    assert first["uiActions"] != ["template_edit_clarification_limit"]
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_VISUALIZATION:region_hourly_trend"
+
+    second = _post(post_chat, definition, "把总耗电改成柱状图")
+
+    assert second["uiActions"] != ["template_edit_clarification_limit"], (
+        "换了一张卡片却被上一张卡片的额度挡住了"
+    )
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_VISUALIZATION:region_total_energy"
+    assert state.rounds == 1
+
+
+def test_the_same_item_with_a_known_target_is_still_blocked(post_chat):
+    """同一张卡片重复要求 → 仍然只问一轮（既有行为不许被改坏）。"""
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    first = _post(post_chat, definition, "把小时趋势改成柱状图")
+    assert first["uiActions"] != ["template_edit_clarification_limit"]
+
+    second = _post(post_chat, definition, "把小时趋势改成柱状图")
+
+    assert second["uiActions"] == ["template_edit_clarification_limit"]
+    assert "追问过 1 轮" in second["reply"]
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_VISUALIZATION:region_hourly_trend"
+    assert state.rounds == 1
+
+
+def test_a_new_item_is_not_blocked_by_an_exhausted_one(post_chat):
+    """上一件事的额度用完了，也不能挡住**下一件事**。
+
+    这是 v1.4.1 之前的老 bug（「把键钉死在旧键上」），修的时候不许带回来。
+    """
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    _post(post_chat, definition, "改成柱状图")
+    _post(post_chat, definition, "把小时趋势改成柱状图")
+    assert session_service.load_clarification("conv_test").rounds == 1
+
+    other = _post(post_chat, definition, "把粒度改成按月")
+
+    assert other["uiActions"] != ["template_edit_clarification_limit"]
+    assert "追问过 1 轮" not in other["reply"]
+    assert other["questions"], "新事项应该重新被追问"
+
+
+def test_consultation_still_does_not_consume_the_quota(post_chat):
+    """咨询轮不占额度（契约表 §7.4）—— 这条既有行为不许被改坏。"""
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    for _ in range(3):
+        payload = _post(post_chat, definition, "这个图是什么意思")
+        assert payload["uiActions"] == ["query_answer"]
+
+    assert session_service.load_clarification("conv_test") is None
