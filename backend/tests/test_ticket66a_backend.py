@@ -631,10 +631,14 @@ def test_json_mode_is_marked_on_the_definition_after_confirm():
         ('{"device": "机柜1"}', "JSON_NOT_ARRAY"),
         ('[{"a":{"b":1}}]', "JSON_NESTED_NOT_SUPPORTED"),
         ('[{"a":1}, 2]', "JSON_ROW_NOT_OBJECT"),
+        ('{"data": {"a": [{"x": 1}], "b": [{"y": 2}]}}', "JSON_ARRAY_PATH_AMBIGUOUS"),
     ],
 )
 def test_other_json_failures_return_their_own_code(payload: str, code: str):
-    """失败码**不合并**：各是各的，前端能据此给出对应的提示。"""
+    """失败码**不合并**：各是各的，前端能据此给出对应的提示。
+
+    含「报文里有多个数组时服务端**不替用户挑**」那一条（契约表 §4.3）。
+    """
     with acceptance_harness(session_id="sess_66a_json_codes") as harness:
         result = harness.send("帮我看看这些数据：" + payload)
         assert result["error"]["code"] == code
