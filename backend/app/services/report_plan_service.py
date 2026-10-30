@@ -43,6 +43,10 @@ from app.schemas.report_plan import (
     ReportPlan,
     validate_section_contract,
 )
+from app.services.simulated_field_semantics import (
+    SEMANTIC_KIND_VALUES,
+    VALUE_TYPE_VALUES,
+)
 from app.services.report_rule_library import (
     COMPONENT_TYPE_LABEL,
     RuleContext,
@@ -316,6 +320,11 @@ class ColumnSpec:
     fieldRef: str | None = None
     #: 列的展示格式（精度、单位标注）。模型没声明就是 None。
     format: dict[str, Any] | None = None
+    #: 列的**语义描述**（可选）。模型声明了就照着写进定稿列，
+    #: 服务端据此写 ``previewSpec.columns[]`` 的语义类别 / 值形态
+    #: （契约表 §3.1）。没声明就是 None，由服务端按兜底链解析。
+    semanticKind: str | None = None
+    valueType: str | None = None
 
 
 @dataclass(frozen=True)
@@ -711,6 +720,18 @@ def normalize_column_format(raw: Any) -> dict[str, Any] | None:
     return out or None
 
 
+def _declared_enum(raw: Any, allowed: tuple[str, ...]) -> str | None:
+    """栏目声明的**可选语义字段**：域内取值照用，域外的当没声明。
+
+    与 ``schemas.report_plan`` 的口径一致：模型写错一个枚举值不把整轮
+    方案作废（这一列的语义允许「没声明」，契约表 §3.4 的 ⑤ 级）。
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip().lower()
+    return text if text in allowed else None
+
+
 def resolve_table_columns(
     section: Mapping[str, Any], *, request_text: str = ""
 ) -> ColumnResolution:
@@ -749,6 +770,10 @@ def resolve_table_columns(
                     else None
                 ),
                 format=normalize_column_format(item.get("format")),
+                semanticKind=_declared_enum(
+                    item.get("semanticKind"), SEMANTIC_KIND_VALUES
+                ),
+                valueType=_declared_enum(item.get("valueType"), VALUE_TYPE_VALUES),
             )
         )
     if specs:
@@ -977,9 +1002,22 @@ def finalize_columns(
             column_format = (
                 matched.format.model_dump(mode="json") if matched.format else None
             )
+        # 语义描述同理：模型这次声明了就用这次的；没声明就沿用上一版的
+        # （列的身份没换，语义就不该自己变）。
+        semantic_kind = spec.semanticKind
+        if semantic_kind is None and matched is not None:
+            semantic_kind = matched.semanticKind
+        value_type = spec.valueType
+        if value_type is None and matched is not None:
+            value_type = matched.valueType
         columns.append(
             PlanColumn(
-                id=column_id, label=label, fieldRef=field_ref, format=column_format
+                id=column_id,
+                label=label,
+                fieldRef=field_ref,
+                format=column_format,
+                semanticKind=semantic_kind,
+                valueType=value_type,
             )
         )
 
