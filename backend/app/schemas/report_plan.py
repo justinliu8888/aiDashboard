@@ -724,12 +724,48 @@ class PlanCandidate(_PlanModel):
         return [_require_text(item) for item in value]
 
 
+class PlanSelectionEvidence(_PlanModel):
+    """一条**命中依据**：这个板块是被哪条规则、按什么前提定稿的。
+
+    它跟方案一起持久化（工单 #60）。下次打开同一份方案时，靠它就能看出
+    当时的理由来自哪一版规则的哪一条，而不是重新猜一次 —— 规则版本变了
+    也不会无声改型。
+
+    - ``sectionId``：板块 ID。
+    - ``ruleId``：命中的规则稳定 ID。
+    - ``componentType``：定稿结果。
+    - ``detail``：命中依据（具体是哪个词、哪个前提成立的）。
+    """
+
+    sectionId: str
+    ruleId: str
+    componentType: ComponentType
+    detail: str
+
+    @field_validator("sectionId", "ruleId")
+    @classmethod
+    def _check_key(cls, value: str) -> str:
+        return _require_key(value)
+
+    @field_validator("detail")
+    @classmethod
+    def _check_detail(cls, value: str) -> str:
+        return _require_text(value)
+
+
 class ReportPlan(_PlanModel):
     """一份可提交的简短文字方案。
 
     序列化字段与冻结契约一一对应：``id``、``revision``、``topic``、
     ``requirements``、``sections``、``assumptions``、``suggestions``、
-    ``referenceTemplates``。
+    ``referenceTemplates``，另加工单 #60 的 ``ruleVersion`` 与
+    ``selectionEvidence``。
+
+    - ``ruleVersion``：定稿这份方案时用的**规则库版本**。规则库升版不会
+      追溯改写历史方案已经给出的理由 —— 历史方案记着自己那版。
+    - ``selectionEvidence``：每个板块的命中依据（规则 ID + 命中细节）。
+
+    两个新字段都可空：没有它们的是旧方案，仍然读得懂（老数据不迁移）。
     """
 
     id: str
@@ -740,10 +776,22 @@ class ReportPlan(_PlanModel):
     assumptions: list[str] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
     referenceTemplates: list[ReferenceTemplate] = Field(default_factory=list)
+    #: 定稿这份方案时用的规则库版本。None = 这份方案没有记录规则版本
+    #: （旧方案）。
+    ruleVersion: str | None = None
+    #: 命中依据：每个板块是被哪条规则、按什么前提定稿的。
+    selectionEvidence: list[PlanSelectionEvidence] = Field(default_factory=list)
 
     @field_validator("id", "topic")
     @classmethod
     def _check_text(cls, value: str) -> str:
+        return _require_text(value)
+
+    @field_validator("ruleVersion")
+    @classmethod
+    def _check_rule_version(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         return _require_text(value)
 
     @field_validator("assumptions", "suggestions")

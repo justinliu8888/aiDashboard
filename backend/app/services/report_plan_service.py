@@ -38,9 +38,23 @@ from app.schemas.report_plan import (
     PlanRevisionConflictError,
     PlanSection,
     PlanSectionCandidate,
+    PlanSelectionEvidence,
     PlanValidationError,
     ReportPlan,
     validate_section_contract,
+)
+from app.services.display_rule_library import (
+    COMPONENT_TYPE_LABEL,
+    RuleContext,
+    RuleHit,
+    explicit_hit_for_type,
+    match_column_preset,
+    match_display_intent,
+    match_explicit_component_type,
+    match_grain,
+    rule_library_version,
+    select_component_type,
+    split_clauses,
 )
 
 
@@ -256,33 +270,11 @@ def drop_unaccepted_suggestion_sections(
 # 这一段是**服务端**的确定性规则：模型给语义候选，服务端定稿。
 # 模型适配层（report_plan_agent）与领域层（本模块）共用同一份规则，
 # 两边不会各判各的。
+#
+# 规则本身住在 ``app.services.display_rule_library``（工单 #60）：每条规则
+# 带稳定 ID、适用条件、建议展示、禁用条件、优先级与解释模板。本模块只负责
+# **取用**命中结果，不自己再抄一份映射表 —— 优先级也不再靠元组顺序隐含。
 # --------------------------------------------------------------------------
-
-#: 展示目的 → 组件类型（需求稿 3.3 的对应关系）。
-_DISPLAY_INTENT_COMPONENT: dict[DisplayIntent, ComponentType] = {
-    DisplayIntent.TOTAL: ComponentType.METRIC_CARD,
-    DisplayIntent.TREND: ComponentType.LINE_CHART,
-    DisplayIntent.COMPARISON: ComponentType.BAR_CHART,
-    DisplayIntent.COMPOSITION: ComponentType.PIE_CHART,
-    DisplayIntent.RECORDS: ComponentType.TABLE,
-}
-
-_COMPONENT_TYPE_LABEL: dict[ComponentType, str] = {
-    ComponentType.METRIC_CARD: "指标卡",
-    ComponentType.LINE_CHART: "折线图",
-    ComponentType.BAR_CHART: "柱状图",
-    ComponentType.PIE_CHART: "占比图",
-    ComponentType.TABLE: "表格",
-    ComponentType.TEXT: "文字板块",
-}
-
-_DISPLAY_INTENT_LABEL: dict[DisplayIntent, str] = {
-    DisplayIntent.TOTAL: "看总量",
-    DisplayIntent.TREND: "看随时间的变化",
-    DisplayIntent.COMPARISON: "比较不同对象",
-    DisplayIntent.COMPOSITION: "看构成占比",
-    DisplayIntent.RECORDS: "看具体记录",
-}
 
 #: 服务端自己写的假设统一用这些前缀开头。下一版方案里按前缀整条替换，
 #: 不跟模型写的假设混在一起，也不越滚越多。
@@ -291,119 +283,9 @@ COLUMNS_NOTE_PREFIX = "栏目："
 GRAIN_NOTE_PREFIX = "粒度："
 _AUTO_NOTE_PREFIXES = (SELECTION_REASON_PREFIX, COLUMNS_NOTE_PREFIX, GRAIN_NOTE_PREFIX)
 
-#: 展示目的关键词 → 展示目的。顺序即优先级：先匹配到的赢。
-_DISPLAY_INTENT_KEYWORDS: tuple[tuple[tuple[str, ...], DisplayIntent], ...] = (
-    (("占比", "构成", "比例", "分布", "组成"), DisplayIntent.COMPOSITION),
-    (("对比", "比较", "排名", "排行", "排序", "高低"), DisplayIntent.COMPARISON),
-    (("趋势", "走势", "变化", "随时间", "逐时", "逐日"), DisplayIntent.TREND),
-    (("列表", "明细", "清单", "记录", "台账", "逐条"), DisplayIntent.RECORDS),
-    (("总量", "总数", "合计", "汇总", "总览"), DisplayIntent.TOTAL),
-)
-
-#: 用户明确指定的组件类型关键词（长的先匹配）。
-_TYPE_KEYWORDS: tuple[tuple[str, ComponentType], ...] = (
-    ("指标卡", ComponentType.METRIC_CARD),
-    ("kpi", ComponentType.METRIC_CARD),
-    ("折线图", ComponentType.LINE_CHART),
-    ("曲线图", ComponentType.LINE_CHART),
-    ("趋势图", ComponentType.LINE_CHART),
-    ("柱状图", ComponentType.BAR_CHART),
-    ("条形图", ComponentType.BAR_CHART),
-    ("环形图", ComponentType.PIE_CHART),
-    ("饼图", ComponentType.PIE_CHART),
-    ("占比图", ComponentType.PIE_CHART),
-    ("表格", ComponentType.TABLE),
-    ("折线", ComponentType.LINE_CHART),
-    ("柱图", ComponentType.BAR_CHART),
-)
-
-#: 指令词：出现在类型词前面不远处，才算「用户明确指定」。
-#: 「不要柱状图」「用户想…」不算指令，所以有否定与量词的排除。
-_DIRECTIVE_RE = re.compile(
-    r"(?:改用|改成|换成|做成|画成|变成|呈现为|显示为|表示为|展示为|使用|采用|画"
-    r"|(?<![不别户使适利运])用"
-    r"|(?<![不别])要"
-    r"|以)"
-    r"[^，,。；;！!？?\n]{0,4}$"
-)
-
-#: 句子切分：指令、栏目提示、展示目的都按句子看。
-_CLAUSE_SPLIT_RE = re.compile(r"[，,。；;！!？?\n]")
-
 #: 「第一个」「第 2 块」这类序号指代。
 _ORDINAL_RE = re.compile(r"第\s*([一二三四五六七八九十\d]+)\s*(?:个|块|项|条|部分|板块)?")
 _ORDINAL_VALUES = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-
-
-@dataclass(frozen=True)
-class _PresetColumn:
-    """预设补齐的**一列**：列名 + 可选的单位与精度。
-
-    单位只给**数值型**列（负载率、耗电量）。名称、状态、时间这类离散列
-    没有单位 —— 给它们硬塞单位，表头就会出现莫名其妙的括号。
-    """
-
-    label: str
-    #: 单位标注（``%`` / ``kWh`` …）。None = 这一列不是数值列，不带单位。
-    unit: str | None = None
-    #: 显示精度（小数位数）。None = 不限定精度。
-    precision: int | None = None
-
-    def format(self) -> dict[str, Any] | None:
-        """这一列的展示格式。非数值列没有格式（也就没有单位标注）。"""
-        if self.unit is None:
-            return None
-        out: dict[str, Any] = {"kind": "NUMBER", "unitLabel": self.unit}
-        if self.precision is not None:
-            out["precision"] = self.precision
-        return out
-
-
-#: 表格栏目的补齐模板（按板块标题与指标意图判断）。
-#: 第一条来自需求稿 4.1：「告警列表」建议设备名称、时间、告警级别；
-#: 第二条来自 ADR 0004 §3：「机柜运行状态」对应成套机柜、状态、负载率。
-#:
-#: 补出来的列必须是**能被渲染出合理内容**的列（规格 US47）。「机房」曾经
-#: 在能耗与设备两类预设里，但造数器没有机房列的值类型，它会落进兜底的
-#: 「示例值 69」—— 占位观感的列不算合理的列，所以拿掉。
-#:
-#: 数值列自带单位（规格《契约缺口补充》A2）：载荷的
-#: ``payload.columns[].format.unitLabel`` 要有单位，表头才读得出量纲。
-_TABLE_COLUMN_PRESETS: tuple[tuple[tuple[str, ...], tuple[_PresetColumn, ...]], ...] = (
-    (
-        ("告警", "alarm"),
-        (_PresetColumn("设备名称"), _PresetColumn("时间"), _PresetColumn("告警级别")),
-    ),
-    (
-        ("机柜", "cabinet"),
-        (
-            _PresetColumn("机柜名称"),
-            _PresetColumn("状态"),
-            _PresetColumn("负载率", unit="%", precision=1),
-        ),
-    ),
-    (
-        ("能耗", "耗电", "用电", "energy"),
-        (_PresetColumn("设备名称"), _PresetColumn("耗电量", unit="kWh", precision=1)),
-    ),
-    (
-        ("设备", "device"),
-        (_PresetColumn("设备名称"), _PresetColumn("状态")),
-    ),
-)
-
-#: 用户在需求里点名栏目的说法。
-_COLUMN_HINT_MARKERS = ("栏目", "字段", "列", "包含", "含有", "要有")
-
-#: 时间粒度关键词 → 粒度。与时间范围的单位无关：范围是「最近 7 天」，
-#: 粒度是「按天」。
-_GRAIN_KEYWORDS: tuple[tuple[tuple[str, ...], GrainUnit], ...] = (
-    (("分钟", "分粒"), GrainUnit.MINUTE),
-    (("小时", "逐时", "时点"), GrainUnit.HOUR),
-    (("按天", "每天", "天粒", "日粒", "逐日"), GrainUnit.DAY),
-    (("按周", "每周", "周粒"), GrainUnit.WEEK),
-    (("按月", "每月", "月粒"), GrainUnit.MONTH),
-)
 
 
 # ---------- 解析结果 ----------
@@ -419,6 +301,10 @@ class SectionSelection:
     reason: str
     #: 给用户看的完整理由，进板块的 ``selectionReason``。
     selection_reason: str
+    #: 定稿这条的**规则 ID**（命中依据随方案一起持久化）。
+    rule_id: str = ""
+    #: 命中依据：具体是哪个词、哪个前提成立的。
+    rule_detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -457,6 +343,8 @@ class ExplicitTypeResolution:
     """用户明确指定的组件类型 → 落到哪几块板块。"""
 
     by_index: dict[int, ComponentType] = field(default_factory=dict)
+    #: 命中依据：每块板块是被哪条规则定下来的。
+    hits_by_index: dict[int, RuleHit] = field(default_factory=dict)
     question: str | None = None
 
 
@@ -475,8 +363,8 @@ class PlanResolution:
 # ---------- 文本工具 ----------
 
 def _split_clauses(text: str) -> list[str]:
-    """按标点切句，空白句子丢掉。"""
-    return [clause.strip() for clause in _CLAUSE_SPLIT_RE.split(text or "") if clause.strip()]
+    """按标点切句，空白句子丢掉。切句规则住在规则库里，两边共用一份。"""
+    return split_clauses(text)
 
 
 def _bigrams(text: str) -> set[str]:
@@ -522,34 +410,26 @@ def _find_ordinal(clause: str) -> int | None:
     return _ORDINAL_VALUES.get(token)
 
 
-def _find_explicit_type(clause: str) -> ComponentType | None:
-    """句子里有没有用户**明确指定**的组件类型。
+def _find_explicit_type(clause: str) -> RuleHit | None:
+    """句子里用户**明确指定**的组件类型（规则库命中）。
 
     只有类型词前面不远处有指令词才算 —— 「用柱状图」是明确指定，
     「能耗柱状图」是板块标题，不是指定。模型自己选的类型不算。
+    被否定的写法（「不要柱状图」）也不算 —— 那是规则表里的禁用条件。
     """
-    lowered = clause.lower()
-    best: tuple[int, ComponentType] | None = None
-    for keyword, component_type in _TYPE_KEYWORDS:
-        needle = keyword.lower()
-        index = lowered.find(needle)
-        while index >= 0:
-            if _DIRECTIVE_RE.search(clause[:index]):
-                if best is None or index < best[0]:
-                    best = (index, component_type)
-                break
-            index = lowered.find(needle, index + 1)
-    return best[1] if best else None
+    return match_explicit_component_type(clause)
 
 
-def _infer_intent_from_text(text: str) -> DisplayIntent | None:
-    """从一段话里看出展示目的。"""
-    lowered = (text or "").lower()
-    for keywords, intent in _DISPLAY_INTENT_KEYWORDS:
-        for keyword in keywords:
-            if keyword in lowered:
-                return intent
-    return None
+def _infer_intent_from_text(
+    text: str, *, context: RuleContext | None = None
+) -> RuleHit | None:
+    """从一段话里看出展示目的（规则库命中）。
+
+    命中的是优先级最高的那条展示目的规则；命中多条时优先级高的赢。
+    ``context`` 带着板块的模型候选类型 —— 纯说明板块由规则表里的禁用
+    条件挡掉。
+    """
+    return match_display_intent(text, context=context)
 
 
 #: 「改成 X」这类动词：指的是**已有**的那块板块，不是新加的。
@@ -632,10 +512,12 @@ def resolve_explicit_component_types(
         return ExplicitTypeResolution()
 
     by_index: dict[int, ComponentType] = {}
+    hits_by_index: dict[int, RuleHit] = {}
     for clause in _split_clauses(request_text):
-        component_type = _find_explicit_type(clause)
-        if component_type is None:
+        hit = _find_explicit_type(clause)
+        if hit is None:
             continue
+        component_type = hit.payload
         pool = _target_pool(clause, sections, previous_sections)
         targets = _resolve_instruction_targets(clause, sections, pool)
         if targets is None:
@@ -646,14 +528,16 @@ def resolve_explicit_component_types(
         if targets == "all":
             for index in range(len(sections)):
                 by_index[index] = component_type
+                hits_by_index[index] = hit
             continue
         if len(targets) == 1:
             by_index[targets[0]] = component_type
+            hits_by_index[targets[0]] = hit
             continue
         return ExplicitTypeResolution(
             question=_ambiguous_type_question(clause, sections, targets)
         )
-    return ExplicitTypeResolution(by_index=by_index)
+    return ExplicitTypeResolution(by_index=by_index, hits_by_index=hits_by_index)
 
 
 def match_previous_sections(
@@ -694,17 +578,20 @@ def _resolve_display_intent(
     *,
     sections: Sequence[Mapping[str, Any]],
     request_text: str,
-) -> DisplayIntent | None:
-    """这块板块要看什么。
+) -> tuple[DisplayIntent | None, RuleHit | None]:
+    """这块板块要看什么，以及是**哪条规则**判出来的。
 
     顺序：模型给的语义候选 → 请求里点到这块板块的那句话 → 整份方案只有
     一块板块时请求里唯一的展示目的。都看不出来就是 null（此时沿用模型
     选的组件类型）。
+
+    模型给的 ``displayIntent`` 只是**语义候选** —— 它不决定用哪种图，
+    那是服务端按规则定稿的事。
     """
     declared = section.get("displayIntent")
     if isinstance(declared, str) and declared.strip():
         try:
-            return DisplayIntent(declared.strip())
+            return DisplayIntent(declared.strip()), None
         except ValueError:
             pass
 
@@ -713,9 +600,9 @@ def _resolve_display_intent(
         model_type = ComponentType(str(getattr(raw_type, "value", raw_type)))
     except ValueError:
         model_type = ComponentType.TEXT
-    if model_type == ComponentType.TEXT:
-        # 纯说明板块没有展示目的：不要拿请求里的话去猜它是哪张图。
-        return None
+    # 纯说明板块不适用展示目的规则（规则表里的禁用条件）：不要拿请求里
+    # 的话去猜它是哪张图。这里只把模型候选类型交给规则，由规则自己判。
+    context = RuleContext(model_component_type=model_type)
 
     clauses = _split_clauses(request_text)
     mentioned = [
@@ -725,84 +612,51 @@ def _resolve_display_intent(
         and sum(1 for other in sections if _section_matches_clause(other, clause)) == 1
     ]
     for clause in mentioned:
-        intent = _infer_intent_from_text(clause)
-        if intent is not None:
-            return intent
+        hit = _infer_intent_from_text(clause, context=context)
+        if hit is not None:
+            return hit.payload, hit
 
     if len(sections) == 1:
-        intents = {
-            intent
-            for intent in (_infer_intent_from_text(clause) for clause in clauses)
-            if intent is not None
-        }
-        if len(intents) == 1:
-            return intents.pop()
-    return None
+        hits: dict[DisplayIntent, RuleHit] = {}
+        for clause in clauses:
+            hit = _infer_intent_from_text(clause, context=context)
+            if hit is not None:
+                hits[hit.payload] = hit
+        if len(hits) == 1:
+            only = next(iter(hits))
+            return only, hits[only]
+    return None, None
 
 
 def _select_component_type(
     *,
-    explicit: ComponentType | None,
+    explicit: RuleHit | None,
     display_intent: DisplayIntent | None,
     model_type: ComponentType,
-) -> tuple[ComponentType, str, str]:
-    """定稿组件类型，返回 (类型, 核心理由, 完整理由)。
+) -> RuleHit:
+    """定稿组件类型，返回命中的那条规则。
 
-    优先级：**用户明确指定且合法 > 按展示目的映射 > 模型原选**。
+    优先级是**显式**的：**用户明确指定 300 > 按展示目的映射 200 > 模型
+    原选 100**。每一层都还要满足规则自己的前提条件 —— 被禁用的规则
+    不参与定稿。理由由命中的规则渲染，不是事后编的。
     """
-    if explicit is not None:
-        label = _COMPONENT_TYPE_LABEL[explicit]
-        return explicit, "你明确指定", f"你明确指定用{label}。"
-    if display_intent is not None:
-        mapped = _DISPLAY_INTENT_COMPONENT.get(display_intent)
-        if mapped is not None:
-            intent_label = _DISPLAY_INTENT_LABEL[display_intent]
-            return (
-                mapped,
-                f"按展示目的「{intent_label}」",
-                f"按展示目的「{intent_label}」选{_COMPONENT_TYPE_LABEL[mapped]}。",
-            )
-    if model_type == ComponentType.TEXT:
-        # 没有展示目的的板块保持纯说明：模型说了它是文字板块。
-        return ComponentType.TEXT, "纯说明板块", "纯说明板块保持文字。"
-    return (
-        model_type,
-        "模型给出的选择",
-        f"沿用模型给出的{_COMPONENT_TYPE_LABEL[model_type]}。",
+    return select_component_type(
+        explicit_hit=explicit,
+        display_intent=display_intent,
+        model_component_type=model_type,
     )
-
-
-def _column_hints_from_request(request_text: str) -> list[str]:
-    """用户在需求里点名的栏目（「包含设备名称和时间」）。"""
-    hints: list[str] = []
-    for clause in _split_clauses(request_text):
-        for marker in _COLUMN_HINT_MARKERS:
-            index = clause.find(marker)
-            if index < 0:
-                continue
-            tail = clause[index + len(marker) :]
-            tokens = [
-                token.strip()
-                for token in re.split(r"[、,，;；/]|和|以及|还有|加上", tail)
-                if token.strip()
-            ]
-            tokens = [token for token in tokens if len(token) <= 12]
-            if len(tokens) < 2:
-                continue
-            for token in tokens:
-                if token not in hints:
-                    hints.append(token)
-            break
-    return hints
 
 
 def _infer_columns(
     section: Mapping[str, Any], *, request_text: str = ""
-) -> list[_PresetColumn]:
-    """系统补齐栏目：先按板块语义，再按用户点名的栏目。
+) -> RuleHit | None:
+    """系统补齐栏目的**依据**（规则库命中）：先按板块语义，再按用户点名的栏目。
 
     预设的列自带单位（数值列）；用户点名的列**不知道是什么量**，一律
     不带单位 —— 不写错的单位。
+
+    补不出来（既没有预设命中，用户也没点名栏目）就返回 None，由调用方
+    去追问用户 —— 不猜列。
     """
     title = str(section.get("title") or "")
     intents = [
@@ -811,10 +665,11 @@ def _infer_columns(
         if isinstance(intent, str)
     ]
     haystack = " ".join([title, *intents]).lower()
-    for keywords, columns in _TABLE_COLUMN_PRESETS:
-        if any(keyword in haystack for keyword in keywords):
-            return list(columns)
-    return [_PresetColumn(label) for label in _column_hints_from_request(request_text)]
+    return match_column_preset(
+        haystack,
+        context=RuleContext(section_title=title),
+        request_text=request_text,
+    )
 
 
 def normalize_column_format(raw: Any) -> dict[str, Any] | None:
@@ -893,14 +748,14 @@ def resolve_table_columns(
         )
 
     inferred = _infer_columns(section, request_text=request_text)
-    if inferred:
-        note = f"系统为「{title}」补齐了栏目：{'、'.join(c.label for c in inferred)}。"
+    if inferred is not None:
+        columns = list(inferred.payload)
         return ColumnResolution(
             kind="inferred",
             specs=tuple(
-                ColumnSpec(label=c.label, format=c.format()) for c in inferred
+                ColumnSpec(label=c.label, format=c.format()) for c in columns
             ),
-            note=note,
+            note=inferred.explain,
         )
 
     return ColumnResolution(
@@ -958,9 +813,14 @@ def resolve_plan(
             else None
         )
         explicit_type = explicit.by_index.get(index)
+        explicit_hit = explicit.hits_by_index.get(index)
         if explicit_type is None and previous is not None:
             # 修改未涉及的板块：保留上一版用户明确指定过的类型。
             explicit_type = _previous_explicit_type(previous)
+            if explicit_type is not None:
+                explicit_hit = explicit_hit_for_type(
+                    explicit_type, detail="沿用上一版用户明确指定的类型"
+                )
 
         raw_model_type = section.get("componentType")
         try:
@@ -968,21 +828,24 @@ def resolve_plan(
         except ValueError:
             model_type = ComponentType.TEXT
 
-        display_intent = _resolve_display_intent(
+        display_intent, _intent_hit = _resolve_display_intent(
             section, sections=sections, request_text=request_text
         )
-        component_type, reason, selection_reason = _select_component_type(
-            explicit=explicit_type,
+        hit = _select_component_type(
+            explicit=explicit_hit,
             display_intent=display_intent,
             model_type=model_type,
         )
+        component_type = hit.payload
         selections.append(
             SectionSelection(
                 componentType=component_type,
                 displayIntent=display_intent,
                 explicitComponentType=explicit_type,
-                reason=reason,
-                selection_reason=selection_reason,
+                reason=hit.reason,
+                selection_reason=hit.explain,
+                rule_id=hit.rule_id,
+                rule_detail=hit.detail,
             )
         )
 
@@ -1110,17 +973,17 @@ def infer_grain_unit(
     """时间粒度：用户说了就用，用户没说就推定，并把推定写明。
 
     返回 (粒度, 假设文案)。文案为 None 表示用户明确说过，不用写假设。
+    粒度由规则库判定，文案是命中规则的解释 —— 不是事后编的。
     """
     if declared:
         try:
             return GrainUnit(declared.strip().upper()), None
         except ValueError:
             pass
-    for keywords, unit in _GRAIN_KEYWORDS:
-        for keyword in keywords:
-            if keyword in (request_text or ""):
-                return unit, f"时间粒度按 {unit.value} 处理。"
-    return GrainUnit.DAY, f"未指定时间粒度，按 {GrainUnit.DAY.value} 处理。"
+    hit = match_grain(request_text or "", context=RuleContext())
+    if hit is None:
+        return GrainUnit.DAY, f"未指定时间粒度，按 {GrainUnit.DAY.value} 处理。"
+    return hit.payload, hit.explain
 
 
 def _request_text(original_request: str | None, current_request: str | None) -> str:
@@ -1153,7 +1016,7 @@ def _build_assumptions(
         and not text.startswith(GRAIN_NOTE_PREFIX)
     ]
     for section, selection in zip(sections, resolution.selections):
-        label = _COMPONENT_TYPE_LABEL[selection.componentType]
+        label = COMPONENT_TYPE_LABEL[selection.componentType]
         kept.append(
             f"{SELECTION_REASON_PREFIX}「{section.title}」采用{label}（{selection.reason}）。"
         )
@@ -1167,6 +1030,28 @@ def _build_assumptions(
         if text not in unique:
             unique.append(text)
     return unique
+
+
+def _build_selection_evidence(
+    sections: list[PlanSection],
+    resolution: PlanResolution,
+) -> list[PlanSelectionEvidence]:
+    """命中依据：每个板块是被**哪条规则**、按**什么前提**定稿的。
+
+    它跟方案一起持久化。下次打开同一份方案时，靠它就能看出当时的理由
+    来自哪一版规则，而不是重新猜一次。
+    """
+    evidence: list[PlanSelectionEvidence] = []
+    for section, selection in zip(sections, resolution.selections):
+        evidence.append(
+            PlanSelectionEvidence(
+                sectionId=section.id,
+                ruleId=selection.rule_id,
+                componentType=selection.componentType,
+                detail=selection.rule_detail,
+            )
+        )
+    return evidence
 
 
 def apply_candidate(
@@ -1289,6 +1174,8 @@ def apply_candidate(
                 template.model_copy(deep=True)
                 for template in candidate_plan.referenceTemplates
             ],
+            ruleVersion=rule_library_version(),
+            selectionEvidence=_build_selection_evidence(sections, resolution),
         )
 
     sections = _build_sections(kept_sections, previous_sections, resolution)
@@ -1306,4 +1193,6 @@ def apply_candidate(
             template.model_copy(deep=True)
             for template in candidate_plan.referenceTemplates
         ],
+        ruleVersion=rule_library_version(),
+        selectionEvidence=_build_selection_evidence(sections, resolution),
     )
