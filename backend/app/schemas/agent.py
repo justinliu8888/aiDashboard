@@ -51,6 +51,27 @@ LOCKED_INPUT_MENU_PROMPT = "请选择下一步操作："
 # 「待确认修改计划」这一阶段的菜单身份（契约表 §5.2）。
 PENDING_EDIT_MENU_QUESTION_ID = "pending_edit_plan_confirm"
 
+# --------------------------------------------------------------------------
+# 方案版本身份（契约表 §4.1.2，工单 #66）
+# --------------------------------------------------------------------------
+#
+# 「本次响应带的是哪一版方案」的稳定 ID 落在 ``AgentResponse.debug`` 的
+# 这个键上。
+#
+# 为什么落在 ``debug`` 而不是 ``domainObjects.reportPlan``：
+#
+#   - ``debug`` 是**既有字段**，往里加一个键不新增顶层字段、不改
+#     ``AGENT_PROTOCOL_VERSION``（工单 #66 的硬边界）；
+#   - ``domainObjects.reportPlan`` 是**方案正文**，而方案结构是**字段封闭**
+#     的（``ReportPlan`` 用 ``extra="forbid"``）—— 往正文里塞一个不是方案
+#     字段的键，等于悄悄改了方案契约；
+#   - ``debug`` 里本来就并排放着 ``planId`` / ``planRevision``
+#     （设计流程的方案就绪响应），版本 ID 放在它们旁边是同一口径。
+#
+# 这个 ID 与版本序列里的 ``versionId`` **同源同值**（都从「会话 + 方案 +
+# 版本」派生），所以前端拿响应里的 ID 与恢复出来的版本序列直接比就行。
+PLAN_VERSION_ID_KEY = "planVersionId"
+
 
 def derive_lock_scope(question_id: str, prompt: str) -> str:
     """按契约表 §5.2 的阶段判据推出输入锁范围。
@@ -392,6 +413,20 @@ class AgentResponse(BaseModel):
     def isQueryAnswer(self) -> bool:
         """本轮是不是只读查询回答（不推进业务）。"""
         return self.turnKind == TURN_KIND_QUERY_ANSWER
+
+    @property
+    def planVersionId(self) -> str | None:
+        """本轮响应带出的方案版本稳定 ID（工单 #66）。
+
+        没有带方案的那一轮返回 None。前端按它去重：重复响应、乱序
+        响应与重连不重复追加同一份方案。
+
+        它是读出来的便捷视图，不是协议字段 —— 真正的落点是
+        debug.planVersionId（见 PLAN_VERSION_ID_KEY）。
+        """
+        value = (self.debug or {}).get(PLAN_VERSION_ID_KEY)
+        text = str(value).strip() if value else ""
+        return text or None
 
     @property
     def turnPersisted(self) -> bool:

@@ -22,6 +22,7 @@ from app.schemas.session import (
     UpdateWorkspaceRequest,
     WorkspaceItem,
 )
+from app.services.plan_version_service import plan_version_service
 from app.services.preview_service import (
     PreviewContextError,
     build_report_preview_payload,
@@ -185,6 +186,28 @@ def _session_anchor(created_at: str) -> datetime | None:
 
 @router.get("/sessions/{session_id}", response_model=SessionDetail)
 def get_session(session_id: str) -> SessionDetail:
+    # 恢复会话时带上**这一版一版的方案版本序列**（契约表 §4.1.2）。
+    #
+    # 以前方案是「整份覆盖」写进会话的：旧版正文只残留在历史消息的响应
+    # 载荷里，既查不到也还原不回来。前端要的「底部追加最新方案」「旧卡片
+    # 留原地当历史」「刷新后按真实保存顺序还原」都靠这条序列。
+    #
+    # 序列按**真实保存顺序**（``sequence``）排，不按时间戳排 —— 时间戳只到
+    # 秒，两版可能同秒。
+    #
+    # 老会话没有版本历史时，读取层按**实际存储**恢复当前那一版并标
+    # ``recovered``；**不伪造**过去的版本（不会凭空多出「第 1 版、第 2 版」）。
+    #
+    # 这一份是**读时组装**的：版本记录本来就在自己的表里，不往会话快照
+    # 里再抄一份（抄了就会有两份可能对不上的真相）。
+    try:
+        plan_versions = plan_version_service.list_versions(session_id)
+    except Exception:  # noqa: BLE001
+        # 读不出来不能把整个会话读挂：版本序列读不到只是「没有历史卡片」，
+        # 别的内容（草稿、当前方案、消息）照常返回。
+        logger.warning("[sessions] 读方案版本序列失败 sessionId=%s", session_id)
+        plan_versions = None
+
     record = session_service.repository.get_session(session_id)
     if record is None:
         raise HTTPException(status_code=404, detail="会话不存在")
@@ -207,6 +230,13 @@ def get_session(session_id: str) -> SessionDetail:
     # 读会话时按**内存里**的运行结果挂回响应 —— 响应里可以有模拟数据，
     # 持久化快照里不行。非模板态的既有链路原样保留库里那份。
     snapshot = session_service.restore_trial_preview_payload(snapshot)
+    if plan_versions is not None:
+        # 版本序列挂在响应里（读时组装，不落库）。
+        if snapshot is None:
+            snapshot = {"planVersions": plan_versions}
+        else:
+            snapshot = dict(snapshot)
+            snapshot["planVersions"] = plan_versions
     return SessionDetail(
         sessionId=record.id,
         title=record.title,
