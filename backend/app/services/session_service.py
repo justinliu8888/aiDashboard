@@ -32,6 +32,7 @@ from pydantic import ValidationError
 from app.config import get_settings
 from app.schemas.agent import (
     ADVANCE_MESSAGE,
+    PLAN_VERSION_ID_KEY,
     TURN_KIND_QUERY_ANSWER,
     AgentRequest,
     AgentResponse,
@@ -232,6 +233,41 @@ class SessionService:
 
     # ---------- 落库 ----------
 
+    def _attach_plan_version_identity(
+        self, session_id: str, response: AgentResponse
+    ) -> None:
+        # 给这一轮响应补上「本次提交的是哪一版方案」的稳定 ID。
+        #
+        # 前端按它去重：重复响应、乱序响应与重连**不重复追加**同一份方案
+        # （工单 #66 AC4）。ID 落在 ``debug.planVersionId`` —— 既有字段，
+        # 不新增顶层字段、不改协议版本（见 ``PLAN_VERSION_ID_KEY``）。
+        #
+        # 派生口径与版本记录的写路径**完全一致**（``plan_version_id``），
+        # 所以响应里带的 ID 与会话恢复时版本序列里的 ``versionId`` 对得上：
+        # 前端拿两处的 ID 直接比就行，不用各自再推一遍。
+        #
+        # 这一步**不能抛**：它只是给响应补一个元信息，补不上就让这一轮
+        # 照常走完（落库、返回），不能因此把对话弄挂。
+        plan = getattr(response.domainObjects, "reportPlan", None)
+        if not isinstance(plan, dict):
+            return
+        try:
+            from app.services.plan_version_service import response_plan_version_id
+
+            version_id = response_plan_version_id(session_id, plan)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[session_service] 推方案版本身份失败 sessionId=%s", session_id
+            )
+            return
+        if not version_id:
+            return
+        debug = response.debug
+        if not isinstance(debug, dict):
+            debug = {}
+            response.debug = debug
+        debug[PLAN_VERSION_ID_KEY] = version_id
+
     def record_turn(
         self,
         *,
@@ -243,6 +279,9 @@ class SessionService:
     ) -> SessionRecord | None:
         """把一轮对话写入存储。返回落库后的会话记录。"""
         is_advance = user_text.strip() == ADVANCE_MESSAGE
+        # 先给这一轮补上方案版本身份：落库的消息体与返回给前端的响应
+        # 都带着它，前端据此去重（工单 #66 AC4）。
+        self._attach_plan_version_identity(session_id, response)
         try:
             # 0. 先确保会话行存在（消息表有指向会话行的外键）
             title = self._derive_title(session_id, user_text, is_advance)
@@ -471,6 +510,9 @@ class SessionService:
         assert isinstance(connection, sqlite3.Connection)
         now = datetime.now().isoformat(timespec="seconds")
         is_advance = user_text.strip() == ADVANCE_MESSAGE
+        # 同 ``record_turn``：先给这一轮补上方案版本身份，快照与消息体
+        # 都带着它（工单 #66 AC4）。
+        self._attach_plan_version_identity(session_id, response)
 
         title = self._derive_title(session_id, user_text, is_advance)
         state = self._state_to_store(session_id, response)
@@ -897,6 +939,35 @@ class SessionService:
 
     # ---------- 编辑态：待确认计划 ----------
 
+    @staticmethod
+    def _with_base_combination(plan: PendingEditPlan) -> PendingEditPlan:
+        # 把计划所基于的**生效组合快照**放到契约表 §4.2 声明的那个字段上。
+        #
+        # 编辑引擎产出计划时把组合快照写在 ``EditPlan.baseCombination`` 上
+        # （``template_edit_engine.parse``），它随计划一起进了
+        # ``PendingEditPlan.model_extra["editPlan"]``。这里把它**提上来**。
+        #
+        # 为什么值得提：契约表 §4.2 声明的落点就是
+        # ``PendingEditPlan.baseCombination``，之前它一直空着。而空组合按
+        # 契约表 §4.2 的「旧数据默认行为」读作「只按 ``draftRevision``
+        # 比」—— 读的人分不出「**没记**」与「记了但对得上」。
+        #
+        # 真正生效的校验仍然是接受时逐字段比那份快照（见
+        # ``template_edit_engine._stale_reason``）；这里只是让**存下来的**
+        # 那份计划**看得出**它基于哪一份组合。行为不变。
+        extra = plan.model_extra or {}
+        edit_plan = extra.get("editPlan")
+        combination = (
+            edit_plan.get("baseCombination")
+            if isinstance(edit_plan, dict)
+            else None
+        )
+        if not isinstance(combination, dict) or not combination:
+            return plan
+        if plan.baseCombination:
+            return plan
+        return plan.model_copy(update={"baseCombination": dict(combination)})
+
     def save_pending_plan(
         self, session_id: str, plan: PendingEditPlan
     ) -> PendingEditPlan:
@@ -907,6 +978,7 @@ class SessionService:
         """
         if not plan.planId.strip():
             raise ValueError("待确认计划必须有 planId")
+        plan = self._with_base_combination(plan)
         if not plan.createdAt:
             plan = plan.model_copy(
                 update={"createdAt": datetime.now().isoformat(timespec="seconds")}
@@ -941,6 +1013,7 @@ class SessionService:
         """
         if not plan.planId.strip():
             raise ValueError("待确认计划必须有 planId")
+        plan = self._with_base_combination(plan)
         if not plan.createdAt:
             plan = plan.model_copy(
                 update={"createdAt": datetime.now().isoformat(timespec="seconds")}

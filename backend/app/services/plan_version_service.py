@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from app.services.session_service import session_service
@@ -45,6 +46,31 @@ IS_CURRENT_KEY = "isCurrent"
 CONFIRMED_KEY = "confirmed"
 #: 版本序列里「这一版是从会话当前方案恢复出来的」的标记键。
 RECOVERED_KEY = "recovered"
+
+
+def response_plan_version_id(
+    session_id: str, plan: Mapping[str, Any] | None
+) -> str | None:
+    """从**响应里那份方案正文**推出它这一版的稳定 ID。
+
+    聊天响应要能说出「本次提交的是哪一版」—— 前端按这个 ID 去重
+    （工单 #66 AC4：重复响应、乱序响应与重连**不重复追加**同一份方案）。
+
+    派生口径与写路径**完全一致**（``plan_version_id``）：同一版方案
+    永远是同一个 ID —— 响应里带的与版本序列里那条对得上，前端拿两处
+    的 ID 直接比就行，不用再各自推一遍。
+
+    读不出 ``id`` / ``revision`` 就返回 ``None``：**不猜、不编**。
+    """
+    if not session_id or not isinstance(plan, Mapping):
+        return None
+    plan_id = str(plan.get("id") or "")
+    revision = plan.get("revision")
+    if not plan_id:
+        return None
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        return None
+    return plan_version_id(session_id, plan_id, revision)
 
 
 class PlanVersionService:
@@ -226,3 +252,11 @@ class PlanVersionService:
             )
             return False
         return confirmation is not None
+
+
+#: 进程内共用的版本序列读取方。
+#:
+#: 跟随会话存储的**同一条连接、同一把锁**（见 ``PlanVersionService.repository``），
+#: 所以「会话当前方案」与「版本序列」读到的是同一份数据 —— 恢复出来的
+#: 最新一版与库里当前那一版对得上。
+plan_version_service = PlanVersionService()
