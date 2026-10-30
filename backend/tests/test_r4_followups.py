@@ -176,9 +176,61 @@ def test_change_commands_mentioning_graph_are_not_consultations():
 
 
 def test_unrelated_graph_words_are_not_business_objects():
-    """「图书」「地图」这类无关词里的「图」不是报表业务对象。"""
-    for message in ("这本图书是什么意思", "这张地图是什么意思"):
+    """含「图」但与报表无关的词，整词都**不**是报表业务对象。
+
+    复核 F-2：单字「图」的子串匹配把「图腾」「意图」「图案」「版图」
+    判成了咨询 —— 用户问与报表毫无关系的事，系统却当成「问当前报表」
+    的咨询，答出一段关于报表草稿的话。
+    """
+    for message in (
+        "这本图书是什么意思",
+        "这张地图是什么意思",
+        "图腾是什么意思",
+        "意图是什么",
+        "图案是什么意思",
+        "版图是什么意思",
+        "这个图标是什么意思",
+        "这张图片是什么意思",
+        "这个蓝图是什么意思",
+        "这个企图是什么意思",
+        "这张图纸是什么意思",
+        "这个图章是什么意思",
+        "这个图钉是什么意思",
+        "这个构图是什么意思",
+    ):
         assert routing_rules.is_readonly_question(message) is False, message
+
+
+def test_every_excluded_graph_word_is_not_a_business_object():
+    """排除词表里**每一个**词都钉住。
+
+    这张表是**封闭词表**（需随产品词表同步）—— 漏掉一个词就有漏网，
+    所以这里直接遍历表本身，不写死一份拷贝。
+    """
+    for word in routing_rules._NON_REPORT_GRAPH_WORDS:
+        message = f"这个{word}是什么意思"
+        assert routing_rules.is_readonly_question(message) is False, message
+
+
+def test_graph_business_objects_are_still_consultations():
+    """加了排除词不许把**真·报表对象**一起打掉（复核 F-2 的另一半）。
+
+    不能改成「独立成词」的正则判定：「这张图」的「图」前面是量词「张」，
+    独立成词会把刚修好的形状打回去。
+    """
+    for message in (
+        "这个图是什么意思",
+        "这张图有什么问题",
+        "这张图的数据怎么来的",
+        "图书库存那张图是什么意思",
+        "这个图表是什么意思",
+    ):
+        assert routing_rules.is_readonly_question(message) is True, message
+        assert (
+            classify_message_intent(
+                message, subject_required=False
+            ) is UserIntent.ASK_QUESTION
+        ), message
 
 
 def test_graph_wording_answers_without_touching_the_draft(post_chat):
