@@ -49,12 +49,19 @@ STATUS_OUT_OF_CATALOG = "out_of_catalog"
 # 「增加一个电脑耗电率」里要新增的指标是「电脑耗电率」。抽的是**用户
 # 原话** —— 系统不替用户改写口径（规格第 6 条）。
 
+#: 句子开头的客套话（剥掉之后才看是不是新增请求）。
+_LEADING_FILLERS: tuple[str, ...] = (
+    "帮我", "麻烦", "请", "我想", "我要", "给我", "再",
+)
+
 #: 「要加一个 X」的说法前缀。抽指标意图时先把它剥掉。
+#:
+#: 只在**句首**命中才算新增请求 —— 句中的「加个两度」不是新增指标。
 _ADD_PREFIXES: tuple[str, ...] = (
     "再加一个", "再加个", "增加一个", "增加个", "补充一个", "补充个",
     "添加一个", "添加个", "新增一个", "新增个",
     "加一个", "加个", "加张", "加条", "加块",
-    "新增", "增加", "添加", "补充", "加",
+    "新增", "增加", "添加", "补充",
 )
 
 #: 指标意图**前面**的量词 —— 不是指标名的一部分。
@@ -117,10 +124,20 @@ def split_metric_intent(
     value = _strip_quotes(str(text or "").strip())
     value = value.strip(" 　：:，,。.；;！!？?、")
     if strip_add_prefix:
-        for prefix in _ADD_PREFIXES:
-            if value.startswith(prefix):
-                value = value[len(prefix):]
+        # 句首的客套话先剥掉（「帮我加个冰箱明细」也是新增请求）。
+        for filler in _LEADING_FILLERS:
+            if value.startswith(filler):
+                value = value[len(filler):].strip()
                 break
+        # 「要加一个 X」的说法得**出现在句首**才算是新增请求。
+        # 句中的「加个两度」不是新增指标 —— 按句首判定才不会把
+        # 「把温度加个两度」变成一个叫「两度」的新板块。
+        matched = next(
+            (prefix for prefix in _ADD_PREFIXES if value.startswith(prefix)), ""
+        )
+        if not matched:
+            return "", ""
+        value = value[len(matched):]
     value = value.strip(" 　：:，,。.；;！!？?、")
     for counter in _LEADING_COUNTERS:
         if value.startswith(counter) and len(value) > len(counter):

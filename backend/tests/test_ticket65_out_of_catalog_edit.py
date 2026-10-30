@@ -131,6 +131,21 @@ def test_clarification_answer_resolves_the_out_of_catalog_metric(definition):
     assert plan.operation.metricCandidate["status"] == "out_of_catalog"
 
 
+def test_add_phrase_in_the_middle_is_not_a_new_metric(definition):
+    """句中的「加个两度」不是新增指标 —— 不会凭空多出一块「两度」。"""
+    plan = parse(definition, "把温度加个两度")
+
+    assert plan.operation.metricIntent is None
+
+
+def test_leading_filler_still_counts_as_an_add_request(definition):
+    """「帮我加个冰箱明细」也是新增请求。"""
+    plan = parse(definition, "帮我加个冰箱明细")
+
+    assert plan.operation.metricIntent == "冰箱明细"
+    assert plan.needsClarification is False
+
+
 def test_change_metric_to_an_out_of_catalog_metric_is_not_rejected(definition):
     """换成一个目录外指标同样不再以「未登记」拒绝。"""
     plan = parse(
