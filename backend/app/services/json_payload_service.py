@@ -7,7 +7,10 @@
 三条口径贯穿这一层：
 
 - **null、缺失与 0 分开**：缺失渲染成「（缺失）」，null 渲染成 ``null``，
-  0 就是 0 —— 报表不骗人（规格第 34 条）；
+  0 就是 0 —— 报表不骗人（规格第 34 条）。
+  **明细表**这样区分；**指标卡不是表格** —— 它只有一个值，
+  **没有值就是没有值** → ``None``（前端渲染成「—」），
+  不拿表格那套 ``"null"`` / ``"（缺失）"`` 的写法去填指标值；
 - **不编值**：没有日期就不画趋势，没有单位就不写单位，
   无效日期或混合类型降级明细展示并说明数据问题（规格第 24 / 52 条）；
 - **默认直接展示输入值**：求和 / 分组 / 占比只在方案声明了对应展示意图
@@ -422,37 +425,77 @@ def _aggregate_value(
     processed: Sequence[Mapping[str, Any]],
     field_key: str,
     operation: str,
-) -> tuple[Any, bool]:
+) -> tuple[Any, str]:
     """汇总规则的**实际结果** —— 指标卡能显示的那个数。
 
-    - 求和 / 平均：整块数据被压成**一行**，那个值就是指标值；
-    - 分组 / 占比：结果是**多个值**（每组一个 / 每行一个），**没有单一
-      合计** —— 不许拿第一行 / 第一组冒充。
+    返回 ``(值, 状态)``，状态三档：
 
-    返回 ``(值, 认不认得出)``；认不出时值是 ``None``（不编值）。
+    - ``"ok"``：算出了**一个数**，值就是它；
+    - ``"no_value"``：规则执行了，但**这一列没有可求和的数值**
+      （求和 / 平均遇到一列文字，结果是「没有数」）—— 不是「0」，是「没有数」；
+    - ``"no_single_value"``：结果**不是一个单独的数值**
+      （分组 / 占比是多个值；或者结果的形状认不出来）。
+
+    认不出时值是 ``None``（不编值）—— **指标卡不是表格**，
+    不拿表格单元格那套 ``"null"`` / ``"（缺失）"`` 的写法来填指标值。
     """
     if operation in (OP_GROUP_BY, OP_RATIO):
-        return None, False
+        return None, "no_single_value"
     if len(processed) != 1:
-        return None, False
+        return None, "no_single_value"
     row = processed[0]
     if field_key not in row:
-        return None, False
-    return render_cell(row.get(field_key), present=True), True
+        return None, "no_single_value"
+    value = row.get(field_key)
+    if value is None:
+        return None, "no_value"
+    return value, "ok"
+
+
+def _metric_cell_value(value: Any, *, present: bool) -> Any:
+    """指标卡的值 —— **不是表格单元格**。
+
+    表格单元格用「（缺失）」/ ``null`` 区分「没这一列」与「这一格是 null」
+    （:func:`render_cell`）；**指标卡不是表格**：它只有一个值，
+    **没有值就是没有值** → ``None``（前端渲染成「—」）。
+    不许出现英文的 ``"null"``，也不许拿表格那套写法来填指标值。
+    """
+    if not present:
+        return None
+    if value is None:
+        return None
+    return value
 
 
 def _no_single_value_note(rule: Mapping[str, Any], caliber_note: str) -> str:
-    """分组 / 占比口径下**没有单一数值**时的说明。"""
+    """结果**不是一个单独的数值**时的说明。
+
+    措辞按**实际规则**说：分组 / 占比各说各的；求和 / 平均这类
+    **不许**被说成「占比」—— 说明文字也不许说错口径。
+
+    另外，求和 / 平均**没算出一个数**时，「按求和展示（……用户已确认）」
+    这句**不成立**（那是把没做的事说成做了），所以不带上它。
+    """
     operation = str(rule.get("operation") or "")
-    params = rule.get("params") or {}
     if operation == OP_GROUP_BY:
-        subject = "分组的结果是每组一个值"
+        head = f"{caliber_note}分组的结果是每组一个值，这不是一个单独的数值；"
+    elif operation == OP_RATIO:
+        head = f"{caliber_note}占比的结果是每行一个比例，这不是一个单独的数值；"
     else:
-        subject = "占比的结果是每行一个比例"
+        head = "这条汇总口径算不出一个单独的数值；"
     return (
-        f"{caliber_note}{subject}，不是一个单独的数值；"
+        f"{head}"
         "这个指标卡不显示数值（没有拿第一行 / 第一组冒充总量），"
         "分项数值请看明细表或图表。"
+    )
+
+
+def _no_numeric_value_note(operation: str) -> str:
+    """规则执行了，但**这一列没有可求和的数值**时的说明。"""
+    caliber = "方案声明了平均口径" if operation == OP_AVG else "方案声明了求和口径"
+    return (
+        f"{caliber}，但这一列没有可求和的数值，没有编合计值；"
+        "要逐行看数值请看明细表。"
     )
 
 
@@ -467,6 +510,8 @@ def _metric_value(
     """指标的值与**实话**口径说明。返回 ``(值, 说明列表)``。
 
     - **有生效的汇总规则** → 值就是那条规则算出来的结果；
+    - 规则执行了但**算不出数** → 值留空，说明写「这一列没有可求和的数值，
+      没有编合计值」（不写「按求和展示…用户已确认」）；
     - **没有生效的汇总口径** → 单行输入直接显示那一行的值；多行输入
       **不编合计值**，说明里写清「没有编合计值，要逐行看数值请看明细表」。
     """
@@ -475,11 +520,15 @@ def _metric_value(
     skipped = _rule_skipped_reason(rule)
     if rule is not None and not skipped:
         operation = str(rule.get("operation") or "")
-        value, readable = _aggregate_value(processed, field_key, operation)
-        if readable:
+        value, status = _aggregate_value(processed, field_key, operation)
+        if status == "ok":
+            # 真的求出了数 → 这时才写「按求和展示（……用户已确认）」。
             notes.append(_describe_rules(rules, field_key))
             return value, notes
-        # 规则生效了，但结果**不是一个单独的数值**（分组 / 占比）。
+        if status == "no_value":
+            notes.append(_no_numeric_value_note(operation))
+            return None, notes
+        # 结果**不是一个单独的数值**（分组 / 占比 / 形状认不出来）。
         notes.append(_no_single_value_note(rule, _describe_rules(rules, field_key)))
         return None, notes
     # 没有生效的汇总口径。
@@ -491,9 +540,11 @@ def _metric_value(
     if record_count <= 1:
         row = source_rows[0] if source_rows else {}
         present = field_key in row
-        value = render_cell(row.get(field_key), present=present)
+        value = _metric_cell_value(row.get(field_key), present=present)
         if not present:
-            notes.append(f"字段「{field_key}」在数据里缺失。")
+            notes.append(f"字段「{field_key}」在数据里缺失，没有值可显示。")
+        elif value is None:
+            notes.append(f"字段「{field_key}」的值是 null，没有值可显示。")
         else:
             notes.append(f"按输入值直接展示：当前数据只有 1 行，{reason}。")
         return value, notes
