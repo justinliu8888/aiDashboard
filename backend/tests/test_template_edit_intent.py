@@ -486,21 +486,37 @@ def test_clarification_quota_is_one_round_per_item(post_chat, definition):
     assert session_service.load_clarification("conv_test").rounds == 1
 
 
-def test_out_of_catalog_add_does_not_produce_a_plan(post_chat, definition):
-    """目录外新增不静默映射到已有指标，也不产生待接受计划。
+def test_out_of_catalog_add_reaches_the_edit_fast_path(post_chat, definition):
+    """目录外新增**不再被意图门挡在编辑快路之外**（工单 #65）。
 
-    这一轮被意图门分流到**通用路径**（不是确定性编辑快路）：
-    通用模拟策略由来源模式那一票（#59）接上。
+    工单 #65 把目录外候选层实现**在编辑引擎里**；意图门一旦跳过快路，
+    候选层就永远走不到，「不再以「未登记」拒绝」这条 AC 对最典型的说法
+    就不成立。
+
+    这里断言的是**用户看得见的行为**：目录外新增说出的是一份**待接受
+    的修改计划**（不是拒绝、不是空白），计划里的指标是**模拟候选**。
     """
     payload = _post(post_chat, definition, "新增一个设备温度指标")
 
-    assert payload["domainObjects"]["pendingEditPlan"] is None
+    # 这句话确实被判成目录外新增（规则层）：否则下面那份候选无从谈起。
+    assert classify_message_intent(
+        "新增一个设备温度指标",
+        known_metrics=["总耗电", "设备耗电", "能耗成本", "PUE"],
+    ) is UserIntent.OUT_OF_CATALOG_ADD
+
+    plan = payload["domainObjects"]["pendingEditPlan"]
+    assert plan is not None, "目录外新增必须产出待接受的修改计划，而不是被拒绝"
+    assert payload["uiActions"] == ["pending_edit_plan"]
+    # 接受之前草稿一个字节都没动。
     assert payload["domainObjects"]["changeSet"] is None
     assert definition.metadata["revision"] == 0
-    assert (
-        payload["debug"]["contextEngineIntent"]
-        == UserIntent.OUT_OF_CATALOG_ADD.value
-    )
+
+    operation = plan["operations"][0]["operation"]
+    # operation 落进计划时是 exclude_none 掉的：metricRef 没有就是没有。
+    assert operation.get("metricRef") is None, "目录外指标不伪造 metricRef"
+    assert operation["metricIntent"] == "设备温度"
+    assert operation["metricCandidate"]["status"] == "out_of_catalog"
+    assert "未登记" not in payload["reply"]
 
 
 # ==========================================================================

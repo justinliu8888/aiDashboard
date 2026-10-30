@@ -828,8 +828,15 @@ class AgentService:
         #
         # 工单 #58：意图识别排在**任何会产生编辑候选的规则之前**。
         # 这一道门同时覆盖确定性编辑快路（下面这一行）与模型编辑支路
-        # （后面的 template_edit_react）：咨询、问题反馈、目录外新增三类
-        # 都不产生待接受的修改计划，也不改定义。
+        # （后面的 template_edit_react）：咨询与问题反馈两类**只追加聊天**，
+        # 不产生待接受的修改计划，也不改定义。
+        #
+        # 工单 #65：目录外新增**也走**确定性编辑快路 —— 目录外候选层
+        # （template_edit_engine → out_of_catalog_candidate）就长在编辑
+        # 引擎里，挡住快路等于让候选层永远走不到。
+        #
+        # 快路是**追加**一次尝试，不是替换原有分支：它认不出来时返回
+        # ``None``，流程照旧落到模型支路（下面那段）。
         template_edit = None
         classified_intent: UserIntent | None = None
         if pending_guard is None:
@@ -854,8 +861,7 @@ class AgentService:
                     },
                 )
                 return intent_response
-            if intent is not UserIntent.OUT_OF_CATALOG_ADD:
-                template_edit = await self._try_handle_template_edit(request)
+            template_edit = await self._try_handle_template_edit(request)
         if template_edit is not None:
             await _emit(
                 emit,
@@ -1082,7 +1088,9 @@ class AgentService:
                 code="EDIT_VERIFICATION_UNAVAILABLE",
             )
             # 工单 #58：把这一轮判出的意图带进调试信息，观测时能看出
-            # 「目录外新增」这类请求是被意图门分流到通用路径的。
+            # 这一轮判成了什么意图。工单 #65 之后，目录外新增**不再**被
+            # 意图门分流到通用路径 —— 它走确定性编辑快路出候选；快路认不
+            # 出来时才落到下面这段通用路径。
             notice.debug = {**self._build_debug(route), **(notice.debug or {})}
             return notice
 
@@ -1914,8 +1922,12 @@ class AgentService:
         """意图识别门：排在任何会产生编辑候选的规则之前。
 
         工单 #58（规格第 45 条）：这一道门必须同时覆盖**确定性编辑快路**
-        与**模型编辑支路**。咨询、问题反馈、目录外新增三类都不产生
-        待接受的修改计划，也不改定义。
+        与**模型编辑支路**。咨询与问题反馈两类**只追加聊天** —— 不产生
+        待接受的修改计划，也不改定义（契约表 §7.3）。
+
+        工单 #65：目录外新增**不再**被这道门挡在快路之外 —— 目录外候选
+        层就长在编辑引擎里，挡住快路等于让候选层永远走不到。目录外新增
+        由编辑引擎产出**可澄清**或**带显式假设**的模拟候选。
 
         只在会产生编辑候选的编辑态生效（WAITING_USER_CONFIRM /
         USER_EDITING_TEMPLATE）。新建流程（文字方案阶段）有自己的意图
