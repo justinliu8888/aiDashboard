@@ -33,9 +33,8 @@ from app.services.catalog_mock_service import (
 )
 from app.services.data_source_mode import source_mode_of_definition
 from app.services.effective_combination import (
-    combination_of,
-    combinations_match,
-    record_combination,
+    combination_matches,
+    combination_of_definition,
 )
 from app.services.edit_time_resolver import (
     STATUS_RESOLVED,
@@ -398,6 +397,24 @@ def _bump_revision(definition: ReportDefinitionDraft) -> None:
     definition.metadata["revision"] = int(definition.metadata.get("revision") or 0) + 1
 
 
+def _current_combination(definition: ReportDefinitionDraft) -> dict[str, Any]:
+    """这份定义当前**生效**的组合（契约表 §2.1，固定 9 键）。
+
+    读 #64 的规范实现（``metadata.effectiveCombination``），再把**当前
+    来源模式**对齐：组合里记的是它被写下时的快照，而渲染真正依据的是
+    定义上的 ``metadata.sourceMode``。两者不一致 = 来源换了
+    （模拟示例 ⇄ 用户 JSON），接受候选时必须拒。
+
+    **只读**：编辑链路不改写这个键 —— 它由定义构建路径统一写入，
+    这里只拿来比对。
+    """
+    combination = combination_of_definition(definition.model_dump(mode="json"))
+    live_mode = source_mode_of_definition(definition.model_dump(mode="json")).mode
+    if combination.get("sourceMode") != live_mode:
+        combination = {**combination, "sourceMode": live_mode}
+    return combination
+
+
 def _default_dataset_source_ref(definition: ReportDefinitionDraft) -> str | None:
     datasets = definition.datasets or {}
     for ds in datasets.values():
@@ -652,7 +669,7 @@ class TemplateEditEngine:
         # 这份计划所基于的**生效组合快照**（契约表 §2.1 / §4.2）：
         # 接受时逐字段比对，对不上就拒绝。
         if definition is not None:
-            plan.baseCombination = combination_of(definition.model_dump(mode="json"))
+            plan.baseCombination = _current_combination(definition)
         text = (message or "").strip()
         if not text or definition is None:
             plan.intent = EditIntent.UNKNOWN
@@ -1064,11 +1081,13 @@ class TemplateEditEngine:
             )
 
         _bump_revision(updated)
-        # 修改形成了新一版 → 这一版**关联自己的生效组合**（契约表 §2.1）。
-        # 旧版本的迟到结果按这个组合对不上，会被拒绝，不会覆盖新版本。
-        record_combination(
-            updated.metadata, combination_of(updated.model_dump(mode="json")),
-        )
+        # 修改形成了新一版 → 这一版**沿用同一份生效组合**（契约表 §2.1）。
+        #
+        # 生效组合**不重建、不改写**：它由定义构建路径（#64）统一写入，
+        # 里面记着用户 JSON 的输入 ID 与版本、字段映射、处理规则。
+        # 编辑链路只**读**它（接受时逐字段比对，见 ``_stale_reason``），
+        # 原样带过去 —— 重建会把用户 JSON 的输入绑定弄丢，渲染就会
+        # 因为「没有绑定输入」而失败。
         return EditResult(
             plan=plan,
             draftBeforeEdit=before,
@@ -1106,8 +1125,8 @@ class TemplateEditEngine:
         base_combination = plan.baseCombination
         if base_combination is None:
             return None
-        if not combinations_match(
-            base_combination, combination_of(definition.model_dump(mode="json")),
+        if not combination_matches(
+            base_combination, _current_combination(definition),
         ):
             return (
                 "这份修改所依据的生效组合已经变了（来源或输入换了），"

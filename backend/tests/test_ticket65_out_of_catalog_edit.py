@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 from app.schemas.edit_plan import EditIntent
-from app.services.effective_combination import combination_of
+from app.services.effective_combination import COMBINATION_KEYS
 from app.services.preview_service import (
     build_preview_context,
     build_report_preview_payload,
@@ -339,16 +339,71 @@ def test_definition_stays_free_of_business_numbers(definition):
 # ==========================================================================
 
 
-def test_new_version_carries_its_own_effective_combination(definition):
-    """修改形成新一版 → 这一版关联自己的生效组合。"""
+def _user_json_metadata() -> dict[str, Any]:
+    """一份**用户 JSON 模式**的 metadata（#64 写进来的样子）。"""
+    return {
+        "sourceMode": "user_json",
+        "effectiveCombination": {
+            "planId": "rplan_ticket65",
+            "planRevision": 1,
+            "definitionId": "rdef_ticket65",
+            "definitionVersion": 1,
+            "sourceMode": "user_json",
+            "inputId": "json_input_ticket65",
+            "inputVersion": 2,
+            "fieldMapping": [
+                {
+                    "regionId": "region_1",
+                    "columnId": "col_1",
+                    "inputFieldKey": "energyKwh",
+                    "inputFieldPath": None,
+                }
+            ],
+            "processingRules": [],
+        },
+        "jsonInputIssues": {
+            "unmappedColumns": [{"regionId": "region_2", "columnId": "col_9"}],
+            "dataIssues": [{"columnId": "col_3", "reason": "值缺失"}],
+        },
+    }
+
+
+def test_new_version_preserves_the_effective_combination(definition):
+    """修改形成新一版 → 生效组合**原样带过去**，不被重建。
+
+    生效组合由定义构建路径（#64）统一写入：里面记着用户 JSON 的输入
+    ID 与版本、字段映射、处理规则。编辑链路只读它，不改写它。
+    """
+    metadata = dict(definition.metadata or {})
+    metadata.update(_user_json_metadata())
+    definition.metadata = metadata
+
     result = apply(definition, "加个冰箱明细")
     updated = result.draftAfterEdit.model_dump(mode="json")
 
-    combination = updated["metadata"]["effectiveCombination"]
-    assert combination["definitionVersion"] == updated["metadata"]["revision"]
-    assert combination["sourceMode"] == "simulated"
-    assert combination["inputId"] is None
-    assert combination["fieldMapping"] == []
+    assert updated["metadata"]["revision"] == 1
+    assert updated["metadata"]["effectiveCombination"] == metadata["effectiveCombination"]
+    assert updated["metadata"]["effectiveCombination"]["inputId"] == "json_input_ticket65"
+    assert updated["metadata"]["effectiveCombination"]["inputVersion"] == 2
+
+
+def test_edit_keeps_json_input_issues_and_user_json_binding(definition):
+    """编辑接受后，``metadata.jsonInputIssues`` 与用户 JSON 的输入绑定都在。
+
+    这两个键不在编辑链路上重建—— 丢了的话，用户 JSON 模式预览会因为
+    「没有绑定输入」而失败（#64 刻意设计的失败：宁可不渲染，
+    也不用模拟数字冒充用户数据）。
+    """
+    metadata = dict(definition.metadata or {})
+    metadata.update(_user_json_metadata())
+    definition.metadata = metadata
+
+    result = apply(definition, "加个冰箱明细")
+    updated = result.draftAfterEdit.model_dump(mode="json")
+
+    assert updated["metadata"]["jsonInputIssues"] == metadata["jsonInputIssues"]
+    assert updated["metadata"]["sourceMode"] == "user_json"
+    assert updated["metadata"]["effectiveCombination"]["inputId"] == "json_input_ticket65"
 
 
 def test_plan_records_the_combination_it_was_based_on(definition):
@@ -356,7 +411,9 @@ def test_plan_records_the_combination_it_was_based_on(definition):
     plan = parse(definition, "加个冰箱明细")
 
     assert plan.baseCombination is not None
-    assert plan.baseCombination == combination_of(definition.model_dump(mode="json"))
+    # 固定 9 键（契约表 §2.1），一个不多一个不少。
+    assert set(plan.baseCombination) == set(COMBINATION_KEYS)
+    assert plan.baseCombination["sourceMode"] == "simulated"
 
 
 def test_definition_is_unchanged_before_acceptance(definition):
