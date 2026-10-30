@@ -448,6 +448,25 @@ def test_new_region_passes_the_definition_validation(definition):
     assert outcome.passed is True, outcome.issues
 
 
+def test_out_of_catalog_trend_gives_multiple_points(definition):
+    """目录外指标看趋势：给的是**多个时间点**，不是孤零零一个点。
+
+    规格的用户故事 16：「希望能给目录外的指标生成多个时间点以便看趋势」。
+    """
+    result = apply(definition, "加个电脑耗电率趋势图 耗电量")
+    updated = result.draftAfterEdit.model_dump(mode="json")
+    payload = preview(updated)
+
+    before_ids = {item["id"] for item in definition.regions}
+    region = next(
+        item for item in payload["regions"] if item["regionId"] not in before_ids
+    )
+    assert region["componentType"] == "CHART"
+    assert len(region["payload"]["points"]) > 1
+    assert region["payload"]["unit"] == "kWh"
+    assert all(isinstance(value, (int, float)) for value in region["payload"]["yValues"])
+
+
 # ==========================================================================
 # 接口层主缝：真实 POST /api/agent/chat 编排（真实服务 + 真实会话库）
 # ==========================================================================
