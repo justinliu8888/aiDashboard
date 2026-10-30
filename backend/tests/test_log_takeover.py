@@ -62,11 +62,6 @@ def test_safe_reason_returns_exception_type_not_message():
     assert SECRET_USER not in safety.safe_reason(exc)
 
 
-def test_omitted_texts_keep_only_length():
-    assert SECRET_USER not in safety.omitted_user_text(SECRET_USER)
-    assert f"长度={len(SECRET_USER)}" in safety.omitted_user_text(SECRET_USER)
-
-
 def test_model_text_shape_keeps_no_content_and_caps_length():
     """形状级摘要：一个字的内容都不留，且按上限截断。"""
     shape = safety.model_text_shape('{"action":"GENERATE_REPORT"}')

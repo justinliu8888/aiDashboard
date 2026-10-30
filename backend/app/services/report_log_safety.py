@@ -47,11 +47,6 @@ def safe_reason(exc: BaseException | None) -> str:
     return type(exc).__name__
 
 
-def omitted_user_text(text: str | None) -> str:
-    """用户原话 → 只留长度。日志里看不到用户说了什么。"""
-    return f"[用户原话已省略，长度={len(text or '')}]"
-
-
 def model_text_shape(text: str | None, *, limit: int = MAX_REASON_CHARS) -> str:
     """模型返回原文 → 形状级摘要（字符类别图），并按上限截断。
 
