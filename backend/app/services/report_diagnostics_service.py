@@ -377,6 +377,19 @@ _CREDENTIAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 #: 只保留「像字段名」的键；其余（可能是用户原话）一律掩掉。
 _KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-]{0,31}$")
 
+#: **键名本身**长得像凭据的形状：AWS access key id、``sk-`` 前缀、JWT、
+#: 长十六进制串等。这类键原样保留就等于把凭据写进了诊断正文。
+#:
+#: 复用正文那一套凭据形状 —— 正文里认得出来的凭据，键名里也认得出来。
+_CREDENTIAL_KEY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    pattern for pattern, _ in _CREDENTIAL_PATTERNS
+)
+
+
+def _looks_like_credential(text: str) -> bool:
+    """这个键名本身是不是一个凭据（而不是一个字段名）。"""
+    return any(pattern.search(text) for pattern in _CREDENTIAL_KEY_PATTERNS)
+
 
 def _scrub_credentials(text: str) -> str:
     """抹掉凭据样式的片段。"""
@@ -417,10 +430,20 @@ def mask_text_shape(text: str) -> str:
 
 
 def _safe_key(key: Any) -> str:
+    """把键名变成可以写进诊断正文的形式。
+
+    - 像字段名、又不像凭据 → **原样保留**（``energyKwh``、``deviceName``
+      仍然可读，便于排查时对上模型给的字段）；
+    - 像凭据（AWS access key id、``sk-`` 前缀、JWT、长十六进制串…）
+      → 降级成 ``«key:N»``：键名本身就是凭据，留着就等于把凭据落盘；
+    - 不像字段名（可能是用户原话，含中文等）→ 降级成 ``«key:N»``。
+    """
     text = str(key)
-    if _KEY_PATTERN.match(text):
-        return text
-    return f"«key:{len(text)}»"
+    if not _KEY_PATTERN.match(text):
+        return f"«key:{len(text)}»"
+    if _looks_like_credential(text):
+        return f"«key:{len(text)}»"
+    return text
 
 
 def _render_value(value: Any, depth: int, max_depth: int) -> str:

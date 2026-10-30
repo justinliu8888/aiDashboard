@@ -508,6 +508,32 @@ def test_diagnostic_record_is_masked_and_independent(caplog, diagnostics_dir) ->
     assert "12345" not in raw
 
 
+def test_credential_shaped_keys_are_not_written_into_the_body() -> None:
+    """键名本身像凭据的：不写进诊断正文；正常字段名仍然可读。"""
+    rendered = diagnostics.render_structure(
+        {
+            "AKIAIOSFODNN7EXAMPLE": "x",
+            "sk-abcdefgh12345678": "y",
+            "normalKey": "z",
+            "energyKwh": 1,
+            "deviceName": "UPS",
+            "机房温湿度": "机房温湿度",
+        }
+    )
+    # 键名就是凭据的：不能原样落盘。
+    assert "AKIAIOSFODNN7EXAMPLE" not in rendered
+    assert "sk-abcdefgh12345678" not in rendered
+    # 正常字段名仍然可读：排查时能对上模型给了哪些字段。
+    assert "normalKey" in rendered
+    assert "energyKwh" in rendered
+    assert "deviceName" in rendered
+    # 中文键照旧降级成 «key:N»。
+    assert "机房温湿度" not in rendered
+    # 值、数字一直都没有漏。
+    assert "«str:1»" in rendered
+    assert "«num»" in rendered
+
+
 def test_diagnostic_file_is_private_to_the_current_user(diagnostics_dir) -> None:
     """诊断目录 0700、诊断文件 0600。"""
     asyncio.run(
