@@ -861,10 +861,13 @@ def _safe_warning(message: str, *args: Any) -> None:
 
 
 def _safe_failure(message: str, exc: BaseException) -> None:
-    """写一条失败日志：**只留原因类型，不留异常原文**。
+    """写一条失败日志：**只留原因类型与调用栈，不留异常原文**。
 
     和 :func:`_safe_warning` 一样不许抛错；区别是这里把异常对象换成
     它的类型 —— 上游异常原文可能带用户数据（#61）。
+
+    调用栈留着（能看出哪一行炸的），口径与路由层一致：
+    ``exc_info=(类型, None, 栈)``。
     """
     try:
         logger.warning(
@@ -995,7 +998,12 @@ async def generate_candidate(
         state = diagnostics.ensure_model_call_state()
         state.error_type = type(exc).__name__
         diagnostics.log_model_parse(state, reason=FAILURE_MODEL_CALL_FAILED)
-        _safe_warning("方案设计模型调用失败：%s", type(exc).__name__)
+        # 留调用栈：口径与路由层一致（``exc_info=(类型, None, 栈)``）——
+        # 异常对象被换掉，异常消息不进日志，栈里只有代码位置，
+        # 排查的人能看出「炸在哪一行」。与 :func:`_safe_warning` 的区别就在这。
+        _safe_failure(
+            f"方案设计模型调用失败 requestId={state.request_id}", exc
+        )
         return await _fail(
             emit, FAILURE_MODEL_CALL_FAILED, "模型调用失败，请稍后重试"
         )

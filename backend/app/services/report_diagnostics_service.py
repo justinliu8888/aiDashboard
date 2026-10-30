@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import uuid
 from contextvars import ContextVar
@@ -329,12 +330,54 @@ def _safe_warning(message: str, *args: Any) -> None:
         pass
 
 
-def log_model_call(state: ModelCallState) -> None:
+def _failure_stack(
+    state: ModelCallState, exc: BaseException | None
+) -> tuple[Any, Any, Any] | None:
+    """失败时的调用栈：**只有代码位置，没有异常消息**。
+
+    返回 ``(异常类型, None, traceback)`` —— 与路由层留栈的口径一致
+    （``routers/agent.py``）：异常对象被换掉，所以**异常消息不会进日志**。
+
+    异常对象从哪儿来（拿不到就**不写栈** —— 宁可少写，也不写错的那一条）：
+
+    1. 调用方显式传进来的 ``exc``；
+    2. 当前**正在处理**的异常（``sys.exc_info()``）—— 模型适配层在
+       ``except`` 里调用 ``log_model_call``，那里拿到的就是同一个异常。
+
+    第 2 条只在「这次调用确实失败了」（``error_type`` 有值）且
+    「正在处理的异常类型与 ``error_type`` 一致」时才用 —— 免得把
+    无关异常的栈挂到这次调用上。
+    """
+    if exc is not None:
+        return (type(exc), None, exc.__traceback__)
+    if state.error_type is None:
+        return None
+    exc_type, _value, exc_tb = sys.exc_info()
+    if exc_type is None or exc_tb is None:
+        return None
+    if exc_type.__name__ != state.error_type:
+        return None
+    return (exc_type, None, exc_tb)
+
+
+def log_model_call(
+    state: ModelCallState, *, exc: BaseException | None = None
+) -> None:
     """记一次模型调用的元信息。
 
     **不写**用户原话、模型返回原文、上游异常原文、凭据与业务数值。
     写日志失败不影响业务请求。
+
+    **失败时留调用栈**：口径与路由层完全一致 —— ``exc_info=(类型, None, 栈)``。
+    异常对象被换掉，所以异常消息（可能带用户数据、凭据）不进日志；
+    栈里只有代码位置，排查的人能直接看出「炸在哪一行」。
+
+    ``exc`` 允许调用方显式把异常递进来（只用来取栈，消息不会被写出去）；
+    不传时按 :func:`_failure_stack` 的规则从当前正在处理的异常里取。
     """
+    error_type = state.error_type
+    if error_type is None and exc is not None:
+        error_type = type(exc).__name__
     try:
         logger.info(
             "step=model_call requestId=%s attempt=%s conversationId=%s messageId=%s "
@@ -355,7 +398,8 @@ def log_model_call(state: ModelCallState) -> None:
             state.finish_reason,
             format_token_usage(state.token_usage),
             state.response_id,
-            state.error_type,
+            error_type,
+            exc_info=_failure_stack(state, exc),
         )
     except Exception:  # noqa: BLE001
         # 日志本身出问题也不能让业务请求失败。
