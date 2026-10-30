@@ -301,6 +301,18 @@ IDENTITY_MATCHABLE_IDENTITIES: frozenset[str] = frozenset(
 #: 用（报表草稿、指标口径）的那些列名（总耗电量 / 本月用电量 / 峰值功率 /
 #: 电费 / 日增长率…）。每一项都能在 :data:`CANONICAL_FIELD_CATALOG` 里查到
 #: 对应的规范字段身份 —— **不是「看着像」**。
+#:
+#: **准入规则（只做加法）**：一个显示名要进这张表，得**同时**满足两条 ——
+#:
+#: 1. **产品自己登记过这个名字**（指标别名表 / 意图模式表 / 派生列标签表 /
+#:    指标 label / 产品自己的板块形态）—— 不是我们替产品起名字；
+#: 2. **量口径唯一且确定** —— 这个名字在产品里就指向**一个**量纲
+#:    （kWh 的耗电量 / 元的电费 / kW 的功率 / 百分比 / PUE），
+#:    **不会与别的量混淆**。
+#:
+#: 两条缺一不可：只有 (1) 而量口径不明（光一个「设备」「机柜」），
+#: 补进去就是猜；只有 (2) 而产品没登记过（我们自己编的名字），
+#: 补进去就是替产品造口径。两条都满足 → 这才是「补齐内容」，不是「放宽匹配」。
 PRODUCT_COLUMN_VOCABULARY: dict[str, str] = {
     # 设备与机柜
     "设备名称": "deviceName",
@@ -329,19 +341,44 @@ PRODUCT_COLUMN_VOCABULARY: dict[str, str] = {
     "用电量": "energyKwh",
     "设备能耗": "energyKwh",
     "前一日耗电": "energyKwh",
+    # —— 产品自己登记的耗电措辞（指标别名表 / 意图模式表）——
+    # 每一个在产品里都指向**同一个量**：区间电量（kWh）。
+    "设备耗电": "energyKwh",
+    "设备耗电量": "energyKwh",
+    "设备用电": "energyKwh",
+    "单机耗电": "energyKwh",
+    "分设备耗电": "energyKwh",
+    "总用电": "energyKwh",
+    "总用电量": "energyKwh",
+    "总能耗": "energyKwh",
+    "总电量": "energyKwh",
+    "耗电总量": "energyKwh",
+    "电量汇总": "energyKwh",
+    "整体能耗": "energyKwh",
+    "机房能耗": "energyKwh",
+    "每日耗电": "energyKwh",
+    "能耗": "energyKwh",
     # 成本
     "电费": "costYuan",
     "能耗成本": "costYuan",
+    "电费成本": "costYuan",
     # 功率
     "峰值功率": "powerKw",
     "平均功率": "powerKw",
     "待机功率": "powerKw",
+    # 裸「功率」：产品自己的板块形态「实时功率」量纲是 kW（契约表 §3.2 的
+    # power），澄清口径里也是这一个量。
+    "功率": "powerKw",
     # 比例
     "负载率": "load",
     "日增长率": "percent",
     "占机房总耗电比例": "percent",
+    # 裸「占比」：产品的派生列规则（SHARE_OF_TOTAL）就按「占比」认，
+    # 落到的是百分比量纲（产品的派生列标签是「占机房总耗电比例 (%)」）。
+    "占比": "percent",
     # 其它量
     "PUE": "pueValue",
+    "pue": "pueValue",
     "电能使用效率": "pueValue",
     "温度": "temperature",
     "电压": "voltage",
