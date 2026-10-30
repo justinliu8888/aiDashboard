@@ -20,6 +20,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from app.services.simulated_field_semantics import (
+    SEMANTIC_KIND_VALUES,
+    VALUE_TYPE_VALUES,
+)
+
 
 class ComponentType(str, Enum):
     """首波支持的六种占位组件类型（冻结契约枚举）。"""
@@ -287,6 +292,19 @@ def _require_key(value: str) -> str:
     if not _KEY_PATTERN.match(text):
         raise ValueError("不能包含空白字符")
     return text
+
+
+def _optional_enum(value: Any, allowed: tuple[str, ...]) -> str | None:
+    """可选枚举字段：域内取值照用，域外的**当没声明**。
+
+    模型偶尔会写错一个枚举值。让整份方案因此失败太重（这一列的语义本来
+    就允许「没声明」，契约表 §3.4 的 ⑤ 级），所以域外的取值直接丢掉，
+    不当成硬错误。
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text if text in allowed else None
 
 
 # ---------- 危险执行内容 ----------
@@ -581,6 +599,12 @@ class PlanColumnCandidate(_PlanModel):
     fieldRef: str | None = None
     #: 列的展示格式（精度、单位标注）。模型不给就没有单位标注。
     format: PlanColumnFormat | None = None
+    #: 列的**语义类别**（可选）。模型认得这一列是哪一类业务量时才写。
+    #: 取值域见契约表 §3.2；域外的值**当没声明**（不当硬错误）。
+    semanticKind: str | None = None
+    #: 列的**值形态**（可选）。模型认得这一列的值长什么样时才写。
+    #: 取值域见契约表 §3.2；域外的值**当没声明**（不当硬错误）。
+    valueType: str | None = None
 
     @field_validator("id", "fieldRef")
     @classmethod
@@ -594,6 +618,16 @@ class PlanColumnCandidate(_PlanModel):
     def _check_label(cls, value: str) -> str:
         return _require_text(value)
 
+    @field_validator("semanticKind", mode="before")
+    @classmethod
+    def _check_semantic_kind(cls, value: Any) -> Any:
+        return _optional_enum(value, SEMANTIC_KIND_VALUES)
+
+    @field_validator("valueType", mode="before")
+    @classmethod
+    def _check_value_type(cls, value: Any) -> Any:
+        return _optional_enum(value, VALUE_TYPE_VALUES)
+
 
 class PlanColumn(_PlanModel):
     """定稿栏目：稳定身份 + 显示名 + 行对象取值键。
@@ -604,12 +638,17 @@ class PlanColumn(_PlanModel):
       造数器按它造行，渲染层按它读单元格。
     - ``format``：列的展示格式（精度、单位标注）。可空 —— 没声明就没有
       单位标注，不写错的单位。
+    - ``semanticKind`` / ``valueType``：列的**语义描述**（可选）。模型认得
+      这一列是什么量时才写；服务端照它写进 ``previewSpec.columns[]``
+      （契约表 §3.1）。没写就由服务端按兜底链解析。
     """
 
     id: str
     label: str
     fieldRef: str
     format: PlanColumnFormat | None = None
+    semanticKind: str | None = None
+    valueType: str | None = None
 
     @field_validator("id", "fieldRef")
     @classmethod
@@ -620,6 +659,16 @@ class PlanColumn(_PlanModel):
     @classmethod
     def _check_label(cls, value: str) -> str:
         return _require_text(value)
+
+    @field_validator("semanticKind", mode="before")
+    @classmethod
+    def _check_semantic_kind(cls, value: Any) -> Any:
+        return _optional_enum(value, SEMANTIC_KIND_VALUES)
+
+    @field_validator("valueType", mode="before")
+    @classmethod
+    def _check_value_type(cls, value: Any) -> Any:
+        return _optional_enum(value, VALUE_TYPE_VALUES)
 
 
 class ReferenceTemplate(_PlanModel):

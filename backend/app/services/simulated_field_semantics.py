@@ -28,6 +28,8 @@
 **语义与值形态从哪来（优先级从高到低）**
 
 1. ``declared``   —— 列自己**显式声明**了 ``valueType`` / ``semanticKind``；
+   只声明 ``semanticKind`` 时按语义类别**推导**对应值形态
+   （``energy`` → ``energy``、``cost`` → ``cost``…），不再先判「未声明」；
 2. ``unit``       —— 列**声明了单位**（``format.unitLabel``），单位决定值形态；
 3. ``identity``   —— 列的**字段身份**命中规范字段目录（``energyKwh`` / ``deviceName``…）；
 4. ``vocabulary`` —— 列的**显示名**精确命中产品栏目词表（封闭词表，不是模糊匹配）；
@@ -39,6 +41,16 @@
 没有的名字一律落到第 5 条。老定义没有 ``semanticKind`` / ``valueType`` 时
 按 ``generic`` / ``text`` 处理，**不回退到按列名猜**。
 
+**两条切分 / 查表的细则（都只做「切」与「查」，不做「猜」）**
+
+- **③ 的末段切分同时支持点号与下划线**：行键有**两套独立生成器**
+  （ADR 0004 §7.4）—— 方案层点号 ``section_1.col_1``、转换层补列下划线
+  ``section_1_col_1``。两套都要能切出末段去查规范字段目录，否则生产路径
+  的取值键永远切不出字段身份（``section_1_col_energy`` 的末段是 ``energy``）。
+- **④ 查词表前只剥离「已知单位」的括号标注**：显示名末尾的 ``(kWh)`` /
+  ``（%）`` 是**单位标注**（系统另有单位字段记录它），不是口径名的一部分。
+  剥掉之后**仍然必须精确命中封闭词表** —— 任何子串匹配都不做。
+
 **指标语义（目录外指标）**
 
 目录外指标**默认走通用模拟策略**（``generic``）：不静默映射到「总耗电」这类
@@ -48,6 +60,7 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -142,6 +155,26 @@ SEMANTIC_KIND_BY_VALUE_TYPE: dict[str, str] = {
     VALUE_TYPE_POWER: SEMANTIC_KIND_POWER,
 }
 
+#: 语义类别 → 值形态。**只声明了语义类别**时按它推导值形态
+#: （契约表 §3.4 的 ① 级：``columns[].valueType`` / ``columns[].semanticKind``
+#: 都算「显式声明」）。
+#:
+#: 推导依据是**语义类别自己的含义**，不是猜：
+#:
+#: - 能耗 / 电费 / PUE / 功率：量纲唯一（kWh / 元 / 无量纲 / kW）；
+#: - ``alarms`` → ``level``：告警块里唯一有固定取值域的列是**告警级别**；
+#: - ``cabinet_status`` → ``status``：机柜状态块的列形态就是状态；
+#: - ``generic`` → ``text``：认不出业务口径 → 明确记成文本占位。
+VALUE_TYPE_BY_SEMANTIC_KIND: dict[str, str] = {
+    SEMANTIC_KIND_ENERGY: VALUE_TYPE_ENERGY,
+    SEMANTIC_KIND_COST: VALUE_TYPE_COST,
+    SEMANTIC_KIND_PUE: VALUE_TYPE_PUE,
+    SEMANTIC_KIND_POWER: VALUE_TYPE_POWER,
+    SEMANTIC_KIND_ALARMS: VALUE_TYPE_LEVEL,
+    SEMANTIC_KIND_CABINET_STATUS: VALUE_TYPE_STATUS,
+    SEMANTIC_KIND_GENERIC: VALUE_TYPE_TEXT,
+}
+
 
 # ---------------------------------------------------------------- 绑定与作用域
 
@@ -160,6 +193,17 @@ SCOPE_VALUES = (SCOPE_REGION, SCOPE_METRIC_FAMILY)
 #
 # **字段身份** → 值形态。产品自己的数据集字段与默认栏目都落在这些身份上，
 # 所以「身份 → 值形态」是一张**目录**，不是猜测。
+#
+# 目录的准入规则（两条，缺一不可）：
+#
+# 1. **精确查表**：键就是**字段身份**（列 ``id`` / 取值键 ``fieldRef`` 本身
+#    或它的末段），命不中就是命不中 —— 不做子串匹配、不做关键词猜测；
+# 2. **不与产品栏目词表打架**：③ 身份级**优先于**④ 词表级，所以一个比
+#    词表更**笼统**的身份 token 不能进目录（否则「设备编号」列会因为身份
+#    叫 ``col_device`` 而显示成设备**名**）。因此目录里只有**量**类 token
+#    （``energy`` / ``cost`` / ``power``…）与**具体实体身份**
+#    （``deviceName`` / ``cabinetName``…），没有 ``device`` / ``name``
+#    这种笼统的实体词 —— 那一类交给④ 封闭词表。
 
 CANONICAL_FIELD_CATALOG: dict[str, dict[str, str]] = {
     "timestamp": {"valueType": VALUE_TYPE_TIME},
@@ -173,6 +217,8 @@ CANONICAL_FIELD_CATALOG: dict[str, dict[str, str]] = {
     "deviceId": {"valueType": VALUE_TYPE_DEVICE_ID},
     "deviceName": {"valueType": VALUE_TYPE_DEVICE_NAME},
     "deviceType": {"valueType": VALUE_TYPE_DEVICE_TYPE},
+    "cabinetName": {"valueType": VALUE_TYPE_DEVICE_NAME},
+    "cabinetStatus": {"valueType": VALUE_TYPE_STATUS},
     "level": {"valueType": VALUE_TYPE_LEVEL},
     "status": {"valueType": VALUE_TYPE_STATUS},
     "description": {"valueType": VALUE_TYPE_DESCRIPTION},
@@ -184,6 +230,14 @@ CANONICAL_FIELD_CATALOG: dict[str, dict[str, str]] = {
     "current": {"valueType": VALUE_TYPE_CURRENT},
     # 机柜负载率：产品里这一列的身份就叫 load，量纲是百分比。
     "load": {"valueType": VALUE_TYPE_PERCENT, "unit": "%"},
+    # —— 量类通用 token（③ 身份级末段切分后落在这几个 token 上）——
+    # 这些 token 的量纲唯一，不会与④ 词表里的任何栏目词冲突。
+    "energy": {"valueType": VALUE_TYPE_ENERGY, "unit": "kWh"},
+    "cost": {"valueType": VALUE_TYPE_COST, "unit": "元"},
+    "power": {"valueType": VALUE_TYPE_POWER, "unit": "kW"},
+    "kwh": {"valueType": VALUE_TYPE_ENERGY, "unit": "kWh"},
+    "kw": {"valueType": VALUE_TYPE_POWER, "unit": "kW"},
+    "yuan": {"valueType": VALUE_TYPE_COST, "unit": "元"},
 }
 
 
@@ -192,18 +246,58 @@ CANONICAL_FIELD_CATALOG: dict[str, dict[str, str]] = {
 #: 封闭词表、**精确匹配**：产品自己那几套预设栏目（告警列表、机柜状态、
 #: 设备能耗）用的就是这几个名字。命中不了的显示名一律落到「语义未声明」，
 #: 绝不按子串猜。
+#:
+#: 词表里装的是**产品真实的栏目名**：既包括既有预设栏目，也包括产品自己在
+#: 用（报表草稿、指标口径）的那些列名（总耗电量 / 本月用电量 / 峰值功率 /
+#: 电费 / 日增长率…）。每一项都能在 :data:`CANONICAL_FIELD_CATALOG` 里查到
+#: 对应的规范字段身份 —— **不是「看着像」**。
 PRODUCT_COLUMN_VOCABULARY: dict[str, str] = {
+    # 设备与机柜
     "设备名称": "deviceName",
+    "设备": "deviceName",
     "机柜名称": "deviceName",
+    "机柜": "cabinetName",
     "设备编号": "deviceId",
     "设备类型": "deviceType",
+    # 时间
     "时间": "timestamp",
+    "日期": "timestamp",
     "告警时间": "timestamp",
+    # 告警与状态
     "告警级别": "level",
+    "告警描述": "description",
     "状态": "status",
     "运行状态": "status",
-    "负载率": "load",
+    "备注": "description",
+    "描述": "description",
+    # 用电量（产品总量口径）
     "耗电量": "energyKwh",
+    "耗电": "energyKwh",
+    "总耗电": "energyKwh",
+    "总耗电量": "energyKwh",
+    "本月用电量": "energyKwh",
+    "用电量": "energyKwh",
+    "设备能耗": "energyKwh",
+    "前一日耗电": "energyKwh",
+    # 成本
+    "电费": "costYuan",
+    "能耗成本": "costYuan",
+    # 功率
+    "峰值功率": "powerKw",
+    "平均功率": "powerKw",
+    "待机功率": "powerKw",
+    # 比例
+    "负载率": "load",
+    "日增长率": "percent",
+    "占机房总耗电比例": "percent",
+    # 其它量
+    "PUE": "pueValue",
+    "电能使用效率": "pueValue",
+    "温度": "temperature",
+    "电压": "voltage",
+    "电流": "current",
+    "数量": "count",
+    "持续时长": "duration",
 }
 
 
@@ -230,6 +324,15 @@ UNIT_VALUE_TYPES: dict[str, str] = {
     "小时": VALUE_TYPE_DURATION,
     "h": VALUE_TYPE_DURATION,
 }
+
+
+#: 显示名末尾的**单位标注**：``耗电 (kWh)`` / ``日增长率 (%)``。
+#:
+#: 查封闭词表前先剥掉它 —— 单位是**标注**，不是口径名的一部分。剥掉之后
+#: 仍然必须**精确命中**词表，所以这不是「按标题猜」。
+_UNIT_SUFFIX_PATTERN = re.compile(
+    r"^(?P<name>.+?)\s*[（(]\s*(?P<unit>[^（()）]+?)\s*[）)]$"
+)
 
 
 # ---------------------------------------------------------------- 描述
@@ -274,6 +377,24 @@ def _declared_unit(column: Mapping[str, Any]) -> str:
     return ""
 
 
+def _identity_tails(value: str) -> list[str]:
+    """字段身份的候选：整串、**点号末段**、**下划线末段**。
+
+    行键有**两套独立生成器**（ADR 0004 §7.4）：方案层点号
+    ``section_1.col_1``、转换层补列下划线 ``section_1_col_1``。两套都要能
+    切出末段去查规范字段目录 —— 只切点号的话，生产路径的下划线取值键
+    永远切不出字段身份（``section_1_col_energy`` 的末段是 ``energy``）。
+    """
+    tails: list[str] = [value]
+    dot_tail = value.rsplit(".", 1)[-1]
+    if dot_tail and dot_tail != value:
+        tails.append(dot_tail)
+    split_tail = re.split(r"[._]", value)[-1]
+    if split_tail and split_tail not in tails:
+        tails.append(split_tail)
+    return tails
+
+
 def _canonical_identities(column: Mapping[str, Any]) -> list[str]:
     """列的**身份**候选：栏目 id、取值键、取值键的末段。"""
     identities: list[str] = []
@@ -281,11 +402,30 @@ def _canonical_identities(column: Mapping[str, Any]) -> list[str]:
         value = str(column.get(key) or "").strip()
         if not value:
             continue
-        identities.append(value)
-        tail = value.rsplit(".", 1)[-1]
-        if tail and tail != value:
-            identities.append(tail)
+        for candidate in _identity_tails(value):
+            if candidate and candidate not in identities:
+                identities.append(candidate)
     return identities
+
+
+def _vocabulary_keys(label: str) -> list[str]:
+    """查封闭词表用的**候选显示名**：原样，以及剥掉末尾单位标注之后的样子。
+
+    显示名末尾的 ``(kWh)`` / ``（%）`` 是**单位标注**（系统另有单位字段记录
+    它），不是口径名的一部分 —— 查词表前先剥掉，剥完**仍然必须精确命中**
+    封闭词表。只剥离**单位表里认识**的单位；不认识的一律原样留着。
+    """
+    text = str(label or "").strip()
+    keys: list[str] = []
+    if text:
+        keys.append(text)
+    match = _UNIT_SUFFIX_PATTERN.match(text)
+    if match:
+        unit = match.group("unit").strip()
+        name = match.group("name").strip()
+        if name and name not in keys and unit.lower() in UNIT_VALUE_TYPES:
+            keys.append(name)
+    return keys
 
 
 def _declared_value_type(column: Mapping[str, Any]) -> str:
@@ -317,6 +457,13 @@ def describe_simulated_field(
     value_type = _declared_value_type(column)
     source = "declared"
 
+    if not value_type and semantic_kind:
+        # ① 列只声明了**语义类别**：按语义类别推导对应值形态。
+        #    （契约表 §3.4 的 ① 级：valueType 与 semanticKind 都算显式声明；
+        #    只声明 semanticKind 时不能先判「未声明」，否则语义类别与值形态
+        #    会自相矛盾 —— semanticKind=energy 却给出 valueType=text。）
+        value_type = VALUE_TYPE_BY_SEMANTIC_KIND.get(semantic_kind, "")
+
     if not value_type:
         # 2. 声明的单位
         kind_by_unit = UNIT_VALUE_TYPES.get(unit.strip().lower())
@@ -335,12 +482,14 @@ def describe_simulated_field(
             else:
                 # 4. 产品栏目词表（精确命中）
                 label = str(column.get("label") or "").strip()
-                canonical = PRODUCT_COLUMN_VOCABULARY.get(label)
-                entry = CANONICAL_FIELD_CATALOG.get(canonical or "")
-                if entry:
-                    value_type = entry["valueType"]
-                    unit = unit or entry.get("unit", "")
-                    source = "vocabulary"
+                for key in _vocabulary_keys(label):
+                    canonical = PRODUCT_COLUMN_VOCABULARY.get(key)
+                    entry = CANONICAL_FIELD_CATALOG.get(canonical or "")
+                    if entry:
+                        value_type = entry["valueType"]
+                        unit = unit or entry.get("unit", "")
+                        source = "vocabulary"
+                        break
                 else:
                     # 5. 语义未声明：明确记成 generic / text，**不猜**。
                     value_type = VALUE_TYPE_TEXT

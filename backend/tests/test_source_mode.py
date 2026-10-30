@@ -176,7 +176,11 @@ def test_column_without_description_defaults_to_generic_text():
 
 
 def test_declared_value_type_wins_over_everything_else():
-    """显式声明的值形态优先：描述说了算，标题不算数。"""
+    """显式声明的值形态优先：描述说了算，标题不算数。
+
+    断言里带上 ``semanticSource``：只断言结果值的话，① 级一旦被破坏，
+    ③ 身份级可能**碰巧**给出同一个值形态，用例仍然是绿的（假绿）。
+    """
     description = describe_simulated_field(
         {
             "id": "col_energy", "label": "神秘列", "fieldRef": "col_energy",
@@ -184,6 +188,7 @@ def test_declared_value_type_wins_over_everything_else():
         }
     )
 
+    assert description.semanticSource == "declared"
     assert description.valueType == VALUE_TYPE_ENERGY
     assert description.semanticKind == "energy"
 
