@@ -29,7 +29,7 @@ ContextEngine 依赖模型输出，但模型输出不稳（枚举不匹配、JSO
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Iterable
 
 from app.data.machine_room_energy import DEVICE_TYPE_ALIASES
 from app.services.catalog_mock_service import match_source_by_alias
@@ -785,19 +785,7 @@ def detect_unknown_metric(
     if detect_metric_refs(text):
         return None
 
-    candidates: list[str] = []
-    for match in _RE_QUOTED.finditer(text):
-        token = match.group(1).strip()
-        if not token or token in _QUOTED_STOPWORDS:
-            continue
-        if any(hint in token for hint in _METRIC_WORD_HINTS):
-            candidates.append(token)
-    for match in _RE_METRIC_SUFFIX.finditer(text):
-        token = match.group(0)
-        if any(hint in token for hint in _RE_DERIVED_HINTS):
-            continue
-        if any(hint in token for hint in _METRIC_WORD_HINTS):
-            candidates.append(token)
+    candidates = _metric_candidates(text)
     if not candidates:
         return None
 
@@ -945,6 +933,129 @@ def is_readonly_question(message: str) -> bool:
     # 认不出一句提问，后果是「提问」被当成「修改」——
     # 设计流程里那会平白多出一版方案，所以这里按大小写不敏感匹配。
     return any(subject in text.lower() for subject in _QUESTION_SUBJECTS)
+
+
+# --------------------------------------------------------------------------
+# 问题反馈与目录外新增（#58）
+# --------------------------------------------------------------------------
+#
+# 这两类都不在既有的九类意图里，但必须落在**同一个**意图体系上扩展，
+# 不能另起一套平行判定。它们各自解决一个具体误判：
+#
+#   - 问题反馈：「好丑啊，一个点……」没有疑问标记，:func:`is_readonly_question`
+#     的四条判据（疑问标记 + 业务对象 + 无改动动词 + 非生成请求）不成立，
+#     于是直接掉进编辑快路，被当成「明确修改」。
+#   - 目录外新增：用户要加一个目录里没有的指标，走通用模拟策略，
+#     不能静默映射到「总耗电」这类已有指标。
+
+#: 对当前这份产出不满的表达。
+#:
+#: 只收**评价当前结果**的说法。用户如果同时给了改动动词
+#: （「好丑，改成柱状图」），那是明确修改，不走这里。
+_ISSUE_FEEDBACK_MARKERS: tuple[str, ...] = (
+    "好丑", "太丑", "难看", "不好看",
+    "不满意", "失望", "离谱", "莫名其妙", "奇怪",
+    "不合理", "看不懂", "不明白",
+    "一个点", "只有一个点", "就一个点", "一个数据点",
+    "点太少", "太少点", "就一个", "只有一个",
+    "没出来", "没显示", "不显示", "空白",
+    "重叠", "不清晰", "不直观", "看不出趋势", "看不出变化",
+)
+
+#: 「就 2 个点」这类数量异常的说法。
+#:
+#: 「点级」「点位」不是数据点（那是粒度），排除掉。
+_RE_ISSUE_POINT_COUNT = re.compile(
+    r"(?:\d+|[一二三四五六七八九十两])\s*个?\s*(?:数据)?点(?!级|位)"
+)
+
+#: 「加一个 / 新增」这类新增请求的说法。
+_ADD_REQUEST_WORDS: tuple[str, ...] = (
+    "加一个", "加个", "再加一个", "再加个", "新增", "增加", "添加",
+    "补充一个", "补充一个", "加张", "加个板块", "加个卡片",
+)
+
+
+def _has_issue_marker(text: str) -> bool:
+    """句子里有没有「对当前结果不满」的信号。"""
+    if any(marker in text for marker in _ISSUE_FEEDBACK_MARKERS):
+        return True
+    return bool(_RE_ISSUE_POINT_COUNT.search(text))
+
+
+def detect_issue_feedback(message: str, *, subject_required: bool = True) -> bool:
+    """这句话是不是「对当前这份报表的问题反馈」。
+
+    与 :func:`is_readonly_question` 的关键区别：**不要求疑问标记**。
+    「昨日能耗趋势好丑啊，一个点……」一个问号都没有，但它既不是
+    提问也不是指令 —— 它是在说当前这份结果哪里不对劲。
+
+    判据：
+
+        1. 不是生成请求；
+        2. 没有明确改动动词（带改动动词的仍然是明确修改）；
+        3. 有「不满 / 数量异常」的表达；
+        4. 指向报表业务对象 —— ``subject_required=False`` 时跳过，
+           因为编辑态里「对象」就是当前这张草稿（规格第 51 条）。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if is_clear_generation_request(text):
+        return False
+    if has_operation_command(text):
+        return False
+    if not _has_issue_marker(text):
+        return False
+    if not subject_required:
+        return True
+    return any(subject in text.lower() for subject in _QUESTION_SUBJECTS)
+
+
+def _metric_candidates(text: str) -> list[str]:
+    """从句子里抽出「像指标名」的候选词。"""
+    candidates: list[str] = []
+    for match in _RE_QUOTED.finditer(text):
+        token = match.group(1).strip()
+        if not token or token in _QUOTED_STOPWORDS:
+            continue
+        if any(hint in token for hint in _METRIC_WORD_HINTS):
+            candidates.append(token)
+    for match in _RE_METRIC_SUFFIX.finditer(text):
+        token = match.group(0)
+        if any(hint in token for hint in _RE_DERIVED_HINTS):
+            continue
+        if any(hint in token for hint in _METRIC_WORD_HINTS):
+            candidates.append(token)
+    return candidates
+
+
+def detect_out_of_catalog_add(
+    message: str, *, known_metrics: Iterable[str] | None = None
+) -> bool:
+    """这句话是不是「要新增一个目录里没有的指标」。
+
+    目录外新增按通用模拟策略走（规格第 6 条）：要么先澄清，要么
+    标成显式假设后给候选，**不能**静默映射到已有指标。
+
+    ``known_metrics`` 传当前授权范围内已登记的指标名（label 或 alias）。
+    没有它就判不了 —— 返回 False，交给既有流程按普通新增处理。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if not any(word in text for word in _ADD_REQUEST_WORDS):
+        return False
+    if not _RE_REPORT_REQUEST.search(text):
+        return False
+    candidates = _metric_candidates(text)
+    if not candidates:
+        return False
+    known = {str(item).strip().lower() for item in (known_metrics or [])}
+    if not known:
+        return False
+    name = max(candidates, key=len)
+    return name.lower() not in known
 
 
 #: 问的是「当前对话已记录的阶段 / 进度」的说法。

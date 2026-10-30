@@ -30,6 +30,11 @@ from app.services.catalog_mock_service import (
     list_catalogs,
     match_source_by_alias,
 )
+from app.services.edit_time_resolver import (
+    STATUS_RESOLVED,
+    extract_change_value,
+    resolve_time_expression,
+)
 from app.services.metric_mock_service import list_metrics, match_metric_by_alias
 from app.services.scope_service import filter_visible
 from app.services.validation_service import fixed_interval_error
@@ -64,18 +69,22 @@ CHART_KIND_MAP = {
 }
 TABLE_WORDS = ("表格", "明细表", "数据表")
 
-TIME_RANGE_MAP: list[tuple[re.Pattern[str], str, dict[str, Any]]] = [
-    (re.compile(r"(最近|近)\s*7\s*天"), "最近 7 天",
-     {"type": "CALENDAR", "unit": "DAY", "offset": -7, "count": 7}),
-    (re.compile(r"(最近|近)\s*30\s*天"), "最近 30 天",
-     {"type": "CALENDAR", "unit": "DAY", "offset": -30, "count": 30}),
-    (re.compile(r"(昨日|昨天)"), "昨日",
-     {"type": "CALENDAR", "unit": "DAY", "offset": -1, "count": 1}),
-    (re.compile(r"(本周|这周|当周)"), "本周",
-     {"type": "CALENDAR", "unit": "WEEK", "offset": 0, "count": 1}),
-    (re.compile(r"(本月|这月|当月)"), "本月",
-     {"type": "CALENDAR", "unit": "MONTH", "offset": 0, "count": 1}),
-]
+#: 「可以怎么展示」的各种说法。
+#:
+#: 旧表只认「怎么展示 / 可以展示 / 展示方式 / 展示形式」，用户说
+#: 「可以用其他展示方法吗？」时一个都不命中，结果是既没回答也没产出
+#: 候选，只能回一句「你想改哪个 section 的展示方式？」（工单 #58）。
+SUGGEST_VISUALIZATION_WORDS = (
+    "怎么展示", "可以展示", "展示方式", "展示形式",
+    "展示方法", "其它展示", "其他展示", "别的展示", "换个展示",
+)
+
+#: 时间窗词表**不再自带一份**。
+#:
+#: 工单 #58：编辑态有两个时间表达解析器（这里与 ``edit_time_resolver``），
+#: 两边各带一张表就会各说各话 —— 「昨日」在一处是无锚点裸词、在另一处
+#: 是日锚点。现在统一走 ``edit_time_resolver.resolve_time_expression``，
+#: 同一套锚点规则、同一份标签。
 
 
 GRAIN_FROM_TEXT = {
@@ -99,11 +108,16 @@ GRAIN_FROM_TEXT = {
 GRAIN_EXPLICIT_FROM_TEXT = {
     "按分钟": "MINUTE",
     "分钟级": "MINUTE",
+    "分钟粒度": "MINUTE",
     "按小时": "HOUR",
     "小时级": "HOUR",
+    "小时粒度": "HOUR",
     "按天": "DAY",
     "天级": "DAY",
+    "天粒度": "DAY",
     "日级": "DAY",
+    "日粒度": "DAY",
+    "按日": "DAY",
 }
 
 TREND_GRAIN_TITLES = {
@@ -285,6 +299,20 @@ def _region_label(region: dict[str, Any]) -> str:
     )
 
 
+#: 角色 → 用户的口语说法。
+#:
+#: 按**角色**给别名，不写死具体卡片名：用户说「明细」指的是明细类板块，
+#: 说「趋势」指的是趋势类板块。这样「冰箱耗电明细可以用其他展示方法吗？」
+#: 能定位到当前那张明细卡片，而不是落空（工单 #58）。
+ROLE_ALIASES: dict[str, tuple[str, ...]] = {
+    "DETAIL": ("明细", "明细表"),
+    "TREND": ("趋势", "趋势图", "曲线"),
+    "SUMMARY": ("总览", "概览"),
+    "QUALITY": ("数据质量",),
+    "ANALYSIS": ("分析说明",),
+}
+
+
 def _region_aliases(region: dict[str, Any]) -> list[str]:
     component = region.get("component") if isinstance(region.get("component"), dict) else {}
     metric = component.get("metric") if isinstance(component.get("metric"), dict) else {}
@@ -295,6 +323,8 @@ def _region_aliases(region: dict[str, Any]) -> list[str]:
         component.get("title"),
         metric.get("label"),
     ]
+    role = str(region.get("role") or "").strip().upper()
+    aliases.extend(ROLE_ALIASES.get(role, ()))
     if region.get("id") == "region_total_energy":
         aliases.extend(["总耗电", "昨日总耗电", "总用电", "昨日总用电量"])
     if region.get("id") == "region_device_ranking":
@@ -405,6 +435,22 @@ class TemplateEditEngine:
         )
 
     # ===== 对外接口 =====
+
+    def resolve_target_region(
+        self,
+        *,
+        message: str,
+        definition: ReportDefinitionDraft,
+        selected_region_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """定位用户说的那张卡片。
+
+        供意图识别与问题分析使用：**只定位对象，不解析要改什么**。
+        卡片名里的时间 / 指标 / 图表类型在这里只用来认出「是哪一张」。
+        """
+        return self._find_region(
+            definition.regions or [], message, selected_region_id
+        )
 
     def plan_source_and_grain_change(
         self,
@@ -539,8 +585,14 @@ class TemplateEditEngine:
         definition: ReportDefinitionDraft | None,
         selected_region_id: str | None,
         scope: ToolScope | None = None,
+        change_value: str | None = None,
     ) -> EditPlan:
-        """从用户消息解析出 EditPlan。规则优先，匹配不到交给 UNKNOWN。"""
+        """从用户消息解析出 EditPlan。规则优先，匹配不到交给 UNKNOWN。
+
+        ``change_value`` 是**新值片段**：时间窗、粒度、数据源、指标的新值
+        只从这里取。调用方可以传自己算好的片段（澄清答案整句就是新值的
+        情况）；不传就从消息里按「明确的改动动词」取。片段为空 = 没有新值。
+        """
         plan = EditPlan(isTemplateEdit=True, confidence=0.0)
         text = (message or "").strip()
         if not text or definition is None:
@@ -552,6 +604,12 @@ class TemplateEditEngine:
             )
             return plan
         catalogs, metrics = self._visible_items(scope)
+
+        # 新值片段：调用方算好的优先，否则按「明确的改动动词」从消息里取。
+        # 片段为空 = 这句话没有给出任何新值（规格第 48 条）。
+        if change_value is None:
+            change_value = self._extract_change_value(text)
+        new_value = (change_value or "").strip()
 
         # 定位目标 region
         regions = definition.regions or []
@@ -622,7 +680,7 @@ class TemplateEditEngine:
 
         # ===== 4. 改数据源 =====
         if ("数据源" in text and ("换" in text or "改" in text)) or re.search(r"换成.+(明细|汇总|数据)", text):
-            source_ref = match_source_by_alias(self._extract_change_value(text), set(catalogs))
+            source_ref = match_source_by_alias(new_value, set(catalogs))
             plan.intent = EditIntent.CHANGE_DATA_SOURCE
             plan.confidence = 0.85
             plan.operation = EditOperation(
@@ -671,7 +729,7 @@ class TemplateEditEngine:
             return plan
 
         # 查看可展示方式
-        if "怎么展示" in text or "可以展示" in text or "展示方式" in text or "展示形式" in text:
+        if any(word in text for word in SUGGEST_VISUALIZATION_WORDS):
             plan.intent = EditIntent.SUGGEST_VISUALIZATION
             plan.confidence = 0.85
             if target_region is None:
@@ -689,7 +747,11 @@ class TemplateEditEngine:
 
         # ===== 6. 改时间范围 =====
         # 时间范围必须先于粒度判断，否则“最近 7 天”会被误识别为 DAY 粒度。
-        time_window, label = self._parse_time_range(self._extract_change_value(text))
+        #
+        # 新值只来自**明确的改动动词片段**（规格第 48 条）：卡片名里的
+        # 「昨日」「最近 7 天」只用来定位对象，不是要写进去的时间窗。
+        # 没有改动动词就没有新值 —— 这里拿到的是空串，不会命中任何时间表达。
+        time_window, label = self._parse_time_range(new_value)
         if time_window:
             plan.intent = EditIntent.CHANGE_TIME_RANGE
             plan.confidence = 0.88
@@ -703,7 +765,15 @@ class TemplateEditEngine:
             return plan
 
         # ===== 7. 改 compilation 粒度 =====
-        grain_unit = self._parse_grain(text)
+        #
+        # 粒度新值同样只来自**明确的改动动词片段**，且只认明确点名的写法
+        # （按小时 / 小时级 / 按天）：裸词「小时」「天」经常来自卡片名
+        # （「小时趋势」），那是用来定位对象的，不是新值。
+        if new_value:
+            grain_unit = self._parse_grain(new_value, explicit_only=True)
+        else:
+            # 没有改动动词：用户在问「能不能按 X 粒度看」，整句都是诉求。
+            grain_unit = self._parse_grain(text)
         if grain_unit or any(w in text for w in GRAIN_WORDS):
             plan.intent = EditIntent.CHANGE_COMPILATION_GRAIN
             plan.confidence = 0.85
@@ -743,7 +813,7 @@ class TemplateEditEngine:
 
         # ===== 8. 改指标 =====
         if "指标" in text or re.search(r"换成.+(耗电|电费|成本|pue|用电)", text, re.IGNORECASE):
-            metric_ref = match_metric_by_alias(self._extract_change_value(text), set(metrics))
+            metric_ref = match_metric_by_alias(new_value, set(metrics))
             plan.intent = EditIntent.CHANGE_METRIC
             plan.confidence = 0.8
             plan.operation = EditOperation(
@@ -1245,14 +1315,17 @@ class TemplateEditEngine:
         return "", ""
 
     @staticmethod
-    def _parse_grain(text: str) -> str | None:
+    def _parse_grain(text: str, *, explicit_only: bool = False) -> str | None:
         """解析粒度。
 
         先看明确点名（按天粒度 / 天级）的说法，取最后出现的那次：
         用户自己刚说的选择，要盖过句子里顺带出现的词，
         也盖过卡片名里的字（「小时趋势」里的「小时」不算要改粒度）。
+
+        ``explicit_only=True`` 时**只认明确点名**的写法：改动片段里的
+        裸词「小时」「天」多半来自卡片名，不是新值（规格第 48 条）。
         """
-        lowered = text.lower()
+        lowered = (text or "").lower()
         explicit: list[tuple[int, str]] = []
         for word, grain in GRAIN_EXPLICIT_FROM_TEXT.items():
             index = lowered.find(word)
@@ -1260,6 +1333,8 @@ class TemplateEditEngine:
                 explicit.append((index, grain))
         if explicit:
             return max(explicit)[1]
+        if explicit_only:
+            return None
         for word, grain in GRAIN_FROM_TEXT.items():
             if word in lowered:
                 return grain
@@ -1267,18 +1342,20 @@ class TemplateEditEngine:
 
     @staticmethod
     def _parse_time_range(text: str) -> tuple[dict[str, Any] | None, str]:
-        for pattern, label, body in TIME_RANGE_MAP:
-            if pattern.search(text):
-                window = {
-                    "mode": "REPLACE",
-                    "value": {
-                        "timezone": "Asia/Shanghai",
-                        "anchor": {"type": "CONTEXT", "path": "runtime.logicalTime"},
-                        **body,
-                    },
-                }
-                return window, label
-        return None, ""
+        """解析时间窗新值。
+
+        与编辑态的另一个时间表达解析器**共用同一口径**
+        （``edit_time_resolver.resolve_time_expression``）：同一套锚点
+        规则、同一份标签、同一套窗口结构。这里不再自带一份词表 ——
+        两边各带一张表就会各说各话（「昨日」在一处是无锚点裸词）。
+        """
+        fragment = (text or "").strip()
+        if not fragment:
+            return None, ""
+        resolution = resolve_time_expression(fragment)
+        if resolution.status != STATUS_RESOLVED or not resolution.timeWindow:
+            return None, ""
+        return resolution.timeWindow, resolution.label
 
     @staticmethod
     def _extract_rename_title(text: str) -> str | None:
@@ -1300,11 +1377,13 @@ class TemplateEditEngine:
 
     @staticmethod
     def _extract_change_value(text: str) -> str:
-        """优先从“换成/改为”后的片段识别新值，避免命中目标的旧指标。"""
-        for word in ("换成", "换为", "改成", "改为"):
-            if word in text:
-                return text.rsplit(word, 1)[1].strip() or text
-        return text
+        """取「明确的改动动词」之后的新值片段。
+
+        没有改动动词就返回**空串** —— 旧实现回退成整句，于是
+        「昨日能耗趋势好丑啊，一个点……」里的「昨日」被当成要写进去的
+        时间窗（工单 #58）。卡片名里的时间词只用来定位对象。
+        """
+        return extract_change_value(text)
 
     @staticmethod
     def _extract_add_title(text: str) -> str | None:

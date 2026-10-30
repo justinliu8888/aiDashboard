@@ -4,7 +4,7 @@
     - 纯提问只作答，不产候选计划、不改草稿、不占澄清轮次（Q19）
     - 候选计划 -> 用户接受 -> 确定性落草稿；接受前草稿不变（Q11）
     - 组合修改一次接受、原子生效，不做一半（Q11）
-    - 同一项修改最多追问三轮（Q18）
+    - 同一项修改最多追问一轮（Q18；规格第 13 条把三轮收紧到一轮）
     - 草稿版本变了以后，旧计划必须被拦住（Q17）
 """
 from __future__ import annotations
@@ -72,7 +72,7 @@ def test_readonly_question_without_target_does_not_turn_into_edit(post_chat, def
 def test_readonly_question_does_not_consume_clarification_rounds(
     post_chat, definition
 ):
-    """纯提问不占「同一项修改最多三轮」的澄清轮次。"""
+    """纯提问不占「同一项修改最多一轮」的澄清轮次。"""
     for _ in range(4):
         response = post_chat(
             "这个能按分钟看吗？",
@@ -81,7 +81,8 @@ def test_readonly_question_does_not_consume_clarification_rounds(
             selectedRegionId="region_hourly_trend",
         ).json()
         assert response["domainObjects"]["pendingEditPlan"] is None
-        assert "三轮" not in response["reply"]
+        # 追问上限提示语说明这一轮已经用完了额度；纯提问不该触发它。
+        assert "追问过" not in response["reply"]
     assert session_service.load_clarification("conv_test") is None
 
     # 轮次没被占掉：真的提出修改要求时仍然能正常追问。
@@ -328,8 +329,8 @@ def test_stale_plan_is_blocked_after_draft_changed(post_chat, definition):
 # ---------- Q18：追问轮次上限 ----------
 
 
-def test_same_edit_is_clarified_at_most_three_rounds(post_chat, definition):
-    """同一项修改最多追问三轮，之后说清卡点，不猜着改。"""
+def test_same_edit_is_clarified_at_most_one_round(post_chat, definition):
+    """同一项修改最多追问一轮（规格第 13 条收紧），之后说清卡点，不猜着改。"""
     replies = []
     for _ in range(4):
         response = post_chat(
@@ -339,5 +340,8 @@ def test_same_edit_is_clarified_at_most_three_rounds(post_chat, definition):
         ).json()
         replies.append(response["reply"])
 
-    assert "三轮" in replies[-1]
-    assert replies[-1] != replies[-2]
+    assert "追问过 1 轮" in replies[-1]
+    # 额度用完后只给非阻塞说明，不再重复追问；草稿始终没变。
+    assert "草稿没有修改" in replies[-1]
+    assert definition.metadata["revision"] == 0
+    assert session_service.load_clarification("conv_test").rounds == 1

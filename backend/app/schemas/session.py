@@ -11,8 +11,15 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 
-# 同一项待定修改最多具体追问三轮（方案 §二 Q3 / §五）。
-MAX_CLARIFICATION_ROUNDS = 3
+# 一次生成或调整意图最多主动澄清**一轮**（规格第 13 条）。
+#
+# 收紧前是三轮。按规格收紧到一轮后，「一项修改问了三轮」会变成
+# 「问一轮即给非阻塞说明与可选替代」—— 这是产品口径变化。
+#
+# 额度按「事项」而不是按「会话」计：同一件事的补充回答不重置，
+# 换一件事才重开；咨询不计入；技术失败不计入（见
+# ``session_service.record_clarification``）。
+MAX_CLARIFICATION_ROUNDS = 1
 
 # 会话状态里存放编辑态跨轮字段的键名。
 # 沿用 06_ReAct改造方案 §6.2 的 SessionStore 字段名（pendingPlan / clarificationCount）；
