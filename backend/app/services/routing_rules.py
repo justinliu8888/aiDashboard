@@ -863,10 +863,24 @@ _QUESTION_MARKERS: tuple[str, ...] = (
 )
 
 #: 疑问必须指向的报表业务对象。没有它就是闲聊，不属于本产品的问答范围。
+#:
+#: 「图」是**单字**业务对象：「这个图是什么意思」问的就是报表里那张图，
+#: 少了它这句话就指不到业务对象，掉进普通流程、被当成改稿指令。
 _QUESTION_SUBJECTS: tuple[str, ...] = (
     "报表", "草稿", "预览", "图表", "卡片", "指标", "数据源", "粒度",
     "分钟", "成本", "pue", "能耗", "耗电", "进度", "做到哪", "哪一步",
     "刚才", "之前", "上次", "这份", "那份", "当前", "现在", "支持",
+    "图",
+)
+
+#: 上面那张表是**子串匹配**，单字「图」会误伤这些**与报表无关**的词
+#: （「图书」「地图」里的「图」不是报表对象）。
+#:
+#: 命中它们时先把词从句子里去掉，再按同一张表匹配 —— 这样
+#: 「图书库存那张图是什么意思」里的「图」仍然算业务对象，
+#: 「这本图书是什么意思」里的「图」不算。
+_NON_REPORT_GRAPH_WORDS: tuple[str, ...] = (
+    "图书", "地图", "图标", "图片", "蓝图", "企图",
 )
 
 #: 明确的改动动词：出现这些就是在下指令，不是在提问。
@@ -914,6 +928,21 @@ def has_operation_command(message: str) -> bool:
     return any(word in text for word in _OPERATION_VERBS)
 
 
+def mentions_report_object(message: str) -> bool:
+    """这句话有没有指向**报表业务对象**。
+
+    判定口径只有这一份（:data:`_QUESTION_SUBJECTS` 的子串匹配）——
+    只读提问与问题反馈两处都用它，不各写一遍。
+
+    「图」是单字业务对象，子串匹配会误伤「图书」「地图」这类与报表无关的
+    词：先把这几个无关词从句子里去掉，再按同一张表匹配。
+    """
+    text = (message or "").strip().lower()
+    for word in _NON_REPORT_GRAPH_WORDS:
+        text = text.replace(word, "")
+    return any(subject in text for subject in _QUESTION_SUBJECTS)
+
+
 def is_readonly_question(message: str) -> bool:
     """这句是不是「只读提问」。
 
@@ -932,7 +961,7 @@ def is_readonly_question(message: str) -> bool:
     # 业务对象表里 PUE 是小写，但用户在句首写大写 PUE 很常见。
     # 认不出一句提问，后果是「提问」被当成「修改」——
     # 设计流程里那会平白多出一版方案，所以这里按大小写不敏感匹配。
-    return any(subject in text.lower() for subject in _QUESTION_SUBJECTS)
+    return mentions_report_object(text)
 
 
 # --------------------------------------------------------------------------
@@ -1091,7 +1120,7 @@ def detect_issue_feedback(message: str, *, subject_required: bool = True) -> boo
         return False
     if not subject_required:
         return True
-    return any(subject in text.lower() for subject in _QUESTION_SUBJECTS)
+    return mentions_report_object(text)
 
 
 def _metric_candidates(text: str) -> list[str]:
