@@ -345,22 +345,109 @@ function isBusy() {
   return !!activeRequest || advanceTimers.size > 0;
 }
 
+// --------------------------------------------------------------------------
+// 输入锁（契约表 §5「有效菜单与输入锁」）
+// --------------------------------------------------------------------------
+//
+// 锁的范围由服务端菜单上的 lockScope 决定，取值固定三档：
+//
+//   none            不锁
+//   menu_only       只锁下拉框与快捷入口；输入框与发送按钮保持可用
+//   input_and_menu  输入框 + 发送按钮 + Enter + 快捷入口 + 下拉框全锁
+//
+// 「模板已生成、等待下一步操作选择」这一阶段服务端写 input_and_menu；
+// 老会话的菜单没有这个键 → 按 menu_only 处理（等于今天的行为）。
+const LOCK_SCOPE_NONE = "none";
+const LOCK_SCOPE_MENU_ONLY = "menu_only";
+const LOCK_SCOPE_INPUT_AND_MENU = "input_and_menu";
+
+// 锁住时的界面提示（规格第 76 条）。
+const INPUT_LOCK_HINT = "请先选择下一步操作";
+
+/** 这份菜单当前锁到哪一层。 */
+function lockScopeOf(question) {
+  const scope = question?.lockScope;
+  if (
+    scope === LOCK_SCOPE_NONE ||
+    scope === LOCK_SCOPE_MENU_ONLY ||
+    scope === LOCK_SCOPE_INPUT_AND_MENU
+  ) {
+    return scope;
+  }
+  // 老数据没有这个字段：按 menu_only 处理（契约表 §5.3）。
+  return LOCK_SCOPE_MENU_ONLY;
+}
+
+/** 这一份菜单是不是把输入框也锁住了。 */
+function isInputLocked(question) {
+  return lockScopeOf(question) === LOCK_SCOPE_INPUT_AND_MENU;
+}
+
+/**
+ * 输入区各控件的可用状态与提示文案。
+ *
+ * 单独抽成一个纯函数：界面锁定只是**引导**（规格第 56 条），
+ * 真正的边界在后端对确认与权限的校验。这里只决定「看起来能不能打字」。
+ */
+function inputControlState(lockedChoice, busy) {
+  const scope = lockScopeOf(lockedChoice);
+  const locked = scope === LOCK_SCOPE_INPUT_AND_MENU;
+  return {
+    scope,
+    inputLocked: locked,
+    inputDisabled: Boolean(busy) || locked,
+    sendDisabled: Boolean(busy) || locked,
+    quickDisabled: Boolean(busy) || Boolean(lockedChoice),
+    placeholder: locked
+      ? INPUT_LOCK_HINT
+      : lockedChoice
+        ? "可以先问只读问题，或从上方下拉框选择"
+        : "描述报表需求，或输入修改要求…",
+    hint: locked ? INPUT_LOCK_HINT : "",
+  };
+}
+
+// 锁住时在输入框下面挂一条**看得见**的提示。
+// 输入框是禁用状态，placeholder 会被浏览器淡化；这条提示让用户明确知道
+// 为什么现在不能打字（规格第 76 条）。
+let inputLockHintEl = null;
+
+function syncInputLockHint(controls) {
+  const input = $("chat-input");
+  const host = input?.parentElement;
+  if (!input || !host) return;
+  if (!inputLockHintEl) {
+    inputLockHintEl = document.createElement("div");
+    inputLockHintEl.className = "mt-1.5 text-[11px] text-amber-700";
+    inputLockHintEl.setAttribute("data-input-lock-hint", "");
+    (host.parentElement || host).appendChild(inputLockHintEl);
+  }
+  inputLockHintEl.textContent = controls.hint;
+  inputLockHintEl.classList.toggle("hidden", !controls.hint);
+}
+
 function syncInputControls() {
   const busy = isBusy();
+  const controls = inputControlState(lockedChoice, busy);
   const input = $("chat-input");
   // 待确认菜单存在时**不锁输入**：只读提问要能发出去（工单 02 / 规格 #12）。
   // 旧版本在这里把输入整个锁死，用户在待确认期间问一句都问不了。
   // 执行侧的约束由后端负责——自由输入不能绕过接受修改 / 确认报表。
-  input.disabled = busy;
-  input.placeholder = lockedChoice
-    ? "可以先问只读问题，或从上方下拉框选择"
-    : "描述报表需求，或输入修改要求…";
-  $("btn-send").disabled = busy;
-  $("btn-send").classList.toggle("opacity-50", busy);
+  //
+  // 例外只有一个：服务端说「现在正等下一步操作选择」（lockScope=
+  // input_and_menu）时，输入框、发送按钮与 Enter 一起锁住，并提示
+  // 「请先选择下一步操作」（规格第 74~76 条）。
+  input.disabled = controls.inputDisabled;
+  input.placeholder = controls.placeholder;
+  const send = $("btn-send");
+  send.disabled = controls.sendDisabled;
+  send.classList.toggle("opacity-50", controls.sendDisabled);
+  send.title = controls.hint;
   $("btn-stop").classList.toggle("hidden", !busy);
+  syncInputLockHint(controls);
   document.querySelectorAll("[data-quick], #btn-regenerate").forEach((button) => {
     // 快捷生成 / 重新生成是**操作**，不是提问：待确认菜单没选完之前仍然不给点。
-    button.disabled = busy || !!lockedChoice;
+    button.disabled = controls.quickDisabled;
   });
   const selects = document.querySelectorAll(".question-select");
   // 优先启用与当前锁对应的那一个（恢复历史会话时页面上可能有多个下拉框）。
@@ -905,6 +992,8 @@ function normalizeConfirmQuestion(question) {
     expects: question.expects || "SINGLE_CHOICE",
     selectionOnly: true,
     allowRestart: !!question.allowRestart,
+    // 锁的范围跟着菜单一起走（契约表 §5）：归一化不能把锁弄丢。
+    lockScope: question.lockScope,
     options,
   };
 }
@@ -1423,6 +1512,21 @@ function isRepeatedPlan(plan) {
   );
 }
 
+/**
+ * 待确认修改计划对应的那份菜单对象。
+ *
+ * 锁的范围（lockScope）由服务端那份菜单决定并原样带过来：
+ * 待确认修改计划出现时要**恢复选择锁**（契约表 §5.2）。
+ */
+function pendingEditMenuQuestion(question, options) {
+  return {
+    id: question?.id || "pending_edit_plan_confirm",
+    selectionOnly: true,
+    options,
+    lockScope: question?.lockScope,
+  };
+}
+
 // 渲染「待确认的修改」：具体摘要 + 接受 / 继续调整 / 取消。
 // 这张卡只描述计划，不动草稿；真正写草稿由后端收到「接受修改」后做。
 // 返回值：这份计划对应的业务菜单（过期计划没有可选菜单，返回 null）。
@@ -1518,7 +1622,7 @@ function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
     }
   });
 
-  const menuQuestion = { id: questionId, selectionOnly: true, options };
+  const menuQuestion = pendingEditMenuQuestion(question, options);
   if (lock) setChoiceLock(menuQuestion);
   else businessMenuReplayed = true;
   return menuQuestion;
@@ -1577,6 +1681,17 @@ async function postAgentStream(body, debugCard, signal) {
 
 async function sendMessage(text, { fromChoice = false, designAction = null } = {}) {
   if (!text || activeRequest || advanceTimers.size) return;
+  if (
+    !fromChoice &&
+    !designAction &&
+    text !== "__advance__" &&
+    isInputLocked(lockedChoice)
+  ) {
+    // 界面锁定只是**引导**（规格第 56 条）：这里挡的是「误发自由输入」，
+    // 真正的边界在后端 —— 直接调接口在等待选择期间同样不能绕过确认。
+    toast(INPUT_LOCK_HINT);
+    return;
+  }
   if (lockedChoice && fromChoice) {
     // 从菜单里选的必须是菜单自己的选项。
     // 自由输入不再被前端拦（只读提问要走这条路），执行约束由后端把关。
@@ -3213,7 +3328,12 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   if (pending) setChoiceLock(pending);
   else {
     const openMenu = WorkbenchQuery.resolveOpenMenuAfterReplay(replayEvents);
-    if (openMenu) setChoiceLock(openMenu);
+    // 回放兜底出来的菜单**不是**服务端当前的有效菜单：
+    // 刷新后按服务端阶段恢复锁或不锁，不按历史消息推断（规格第 60 条、
+    // 契约表 §5.2）。所以这里只把菜单摆出来，不锁输入。
+    if (openMenu) {
+      setChoiceLock({ ...openMenu, lockScope: LOCK_SCOPE_MENU_ONLY });
+    }
   }
 
   await renderSessionList();
@@ -3373,7 +3493,14 @@ document.querySelector("[data-quick]").addEventListener("click", (event) => {
 $("btn-send").addEventListener("click", () => {
   // 待确认菜单存在时也允许发送：只读提问要走这条路（工单 02）。
   // 执行操作的约束由后端把关，这里不再拦自由输入。
+  //
+  // 例外：服务端说「正等下一步操作选择」时，发送按钮是锁住的，
+  // 这里再挡一次 —— 免得 DOM 被绕过时把自由输入发出去（规格第 75 条）。
   if (activeRequest || advanceTimers.size) return;
+  if (isInputLocked(lockedChoice)) {
+    toast(INPUT_LOCK_HINT);
+    return;
+  }
   const text = $("chat-input").value.trim();
   if (!text) return;
   $("chat-input").value = "";
@@ -3384,6 +3511,11 @@ $("btn-send").addEventListener("click", () => {
 $("chat-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
+    // Enter 发送与输入框、发送按钮一起锁（规格第 75 条）。
+    if (isInputLocked(lockedChoice)) {
+      toast(INPUT_LOCK_HINT);
+      return;
+    }
     $("btn-send").click();
   }
 });

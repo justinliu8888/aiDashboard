@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from .change_set import ChangeSet
 from .report_definition import ReportDefinitionDraft
@@ -28,6 +28,48 @@ ADVANCE_MESSAGE = "__advance__"
 # 不能只看 state 就再推一次。
 TURN_KIND_ACTION = "action"
 TURN_KIND_QUERY_ANSWER = "query_answer"
+
+
+# --------------------------------------------------------------------------
+# 输入锁范围（契约表 §5「有效菜单与输入锁」）
+# --------------------------------------------------------------------------
+#
+#   none            不锁
+#   menu_only       只锁下拉框与快捷入口；输入框与发送按钮保持可用
+#   input_and_menu  输入框 + 发送按钮 + Enter + 快捷入口 + 下拉框全锁
+#
+# 权威落点是 ``sessions.pending_choice.question.lockScope`` —— 既有列里的
+# **新增键**，不另开表、不另开列（契约表 §5.1、§5.3）。
+LOCK_SCOPE_NONE = "none"
+LOCK_SCOPE_MENU_ONLY = "menu_only"
+LOCK_SCOPE_INPUT_AND_MENU = "input_and_menu"
+LOCK_SCOPES = (LOCK_SCOPE_NONE, LOCK_SCOPE_MENU_ONLY, LOCK_SCOPE_INPUT_AND_MENU)
+
+# 「模板已生成、等待下一步操作选择」这一阶段的菜单身份（契约表 §5.2）。
+LOCKED_INPUT_MENU_QUESTION_ID = "template_edit_confirm"
+LOCKED_INPUT_MENU_PROMPT = "请选择下一步操作："
+# 「待确认修改计划」这一阶段的菜单身份（契约表 §5.2）。
+PENDING_EDIT_MENU_QUESTION_ID = "pending_edit_plan_confirm"
+
+
+def derive_lock_scope(question_id: str, prompt: str) -> str:
+    """按契约表 §5.2 的阶段判据推出输入锁范围。
+
+    判据只看**服务端当前这一份有效菜单**的身份，不看历史消息：
+
+    - ``pending_edit_plan_confirm``（待确认修改计划）→ 锁输入；
+    - ``template_edit_confirm`` 且提示语是「请选择下一步操作：」
+      （模板已生成、等待下一步操作选择）→ 锁输入；
+    - 其余（历史菜单、确认态、编辑态的普通提示）→ 只锁菜单，不锁输入。
+    """
+    if question_id == PENDING_EDIT_MENU_QUESTION_ID:
+        return LOCK_SCOPE_INPUT_AND_MENU
+    if (
+        question_id == LOCKED_INPUT_MENU_QUESTION_ID
+        and prompt == LOCKED_INPUT_MENU_PROMPT
+    ):
+        return LOCK_SCOPE_INPUT_AND_MENU
+    return LOCK_SCOPE_MENU_ONLY
 
 
 class AgentState(str, Enum):
@@ -233,6 +275,32 @@ class AgentQuestion(BaseModel):
     relatesTo: str | None = None
     selectionOnly: bool = False
     allowRestart: bool = False
+    # 输入锁范围（契约表 §5.1）。缺省按 "menu_only" 处理。
+    lockScope: str = LOCK_SCOPE_MENU_ONLY
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_lock_scope(cls, data: Any) -> Any:
+        """没给 lockScope 时，按契约表 §5.2 的阶段判据推导。
+
+        为什么放在模型里推导：同一份菜单对象**既要进响应、又要进
+        ``sessions.pending_choice``**（契约表 §5.3「同一个菜单对象既有响应
+        又有落库副本，不允许两处各拼一份」）。推导放在模型里，两份副本
+        天然一致 —— 生产者（设计服务、编辑服务）不必各写一遍。
+
+        调用方**显式**给了 lockScope 时不推导：
+
+        - 存量的老记录没有这个键 → 按 "menu_only" 处理（契约表 §5.3
+          「旧数据的默认行为」），由读回菜单的那一处显式补上；
+        - 「已选继续调整 / 修改」这类明确不锁的场景 → 写 "none"。
+        """
+        if isinstance(data, dict) and "lockScope" not in data:
+            derived = derive_lock_scope(
+                str(data.get("id") or ""), str(data.get("prompt") or "")
+            )
+            if derived != LOCK_SCOPE_MENU_ONLY:
+                return {**data, "lockScope": derived}
+        return data
 
 
 class AgentBlock(BaseModel):
