@@ -508,3 +508,32 @@ def test_confirmed_version_is_marked_without_rewriting_body(store, versions, con
     record = versions.list_versions("sess_1")[0]
     assert record["confirmed"] is True
     assert record["reportPlan"] == PLAN_V1
+
+
+def test_a_version_id_collision_raises_instead_of_dropping_a_version(
+    store, versions, monkeypatch
+):
+    """version_id 撞车必须**报错**，不能静默丢掉另一条版本记录。
+
+    「会话 + 方案 + 版本」这条主键冲突才是幂等（同一版重复提交不重复追加）；
+    稳定 ID ``version_id`` 另有一条唯一索引，它撞车说明 ID 派生出了问题 ——
+    这时候若像 ``INSERT OR IGNORE`` 那样把冲突一起吞掉，那一条**合法的版本
+    记录会被无声丢掉**（行数变少、正文丢失），失效模式正是 AC1。
+    """
+    from app.storage import report_design_sqlite as storage_module
+
+    monkeypatch.setattr(
+        storage_module, "plan_version_id", lambda *_args, **_kwargs: "planver_deadbeef0000"
+    )
+
+    _commit(store, "sess_1", "msg_1", PLAN_V1)
+    assert len(versions.list_versions("sess_1")) == 1
+
+    # 换一个会话与方案，但 version_id 相同 —— 主键不冲突、唯一索引冲突。
+    other_plan = {**PLAN_V1, "id": "rplan_other_example"}
+    with pytest.raises(sqlite3.IntegrityError):
+        _commit(store, "sess_2", "msg_2", other_plan)
+
+    # 撞车的那条**没有**被写进去，原有那条也还在。
+    assert len(versions.list_versions("sess_1")) == 1
+    assert len(versions.list_versions("sess_2")) == 0

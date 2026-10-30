@@ -1252,10 +1252,14 @@ class SqliteReportDesignRepository:
         )
         conn.execute(
             """
-            INSERT OR IGNORE INTO report_design_plan_versions
+            INSERT INTO report_design_plan_versions
                 (version_id, session_id, plan_id, plan_revision, operation_id,
                  sequence, plan_json, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            -- 只有「会话 + 方案 + 版本」这条主键冲突才算幂等（同一版重复
+            -- 提交不重复追加）；version_id 撞车必须**报错**，不能静默丢弃
+            -- 另一条版本记录（那是数据丢失，且失效模式正是 AC1）。
+            ON CONFLICT (session_id, plan_id, plan_revision) DO NOTHING
             """,
             (
                 plan_version_id(session_id, plan_id, revision),
@@ -1286,10 +1290,14 @@ class SqliteReportDesignRepository:
         revision = int(data["revision"])
         conn.execute(
             """
-            INSERT OR IGNORE INTO report_design_plan_versions
+            INSERT INTO report_design_plan_versions
                 (version_id, session_id, plan_id, plan_revision, operation_id,
                  sequence, plan_json, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            -- 只有「会话 + 方案 + 版本」这条主键冲突才算幂等（同一版重复
+            -- 提交不重复追加）；version_id 撞车必须**报错**，不能静默丢弃
+            -- 另一条版本记录（那是数据丢失，且失效模式正是 AC1）。
+            ON CONFLICT (session_id, plan_id, plan_revision) DO NOTHING
             """,
             (
                 plan_version_id(session_id, plan_id, revision),
