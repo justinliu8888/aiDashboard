@@ -423,7 +423,8 @@ function appendPlanCard(version, options = {}) {
   // 挪到本轮回复的下面（延到这一轮渲染结束）。
   anchorPlanBubble();
   // 用户不在底部时**不强行滚动**，给一个可点的提示。
-  followLatestPlan();
+  // 恢复会话时（follow=false）不跟：整段历史一次性铺开，最后统一贴底。
+  if (options.follow !== false) followLatestPlan();
   return true;
 }
 
@@ -511,7 +512,11 @@ function renderPlanModule() {
     card.designPhase = planState.designPhase;
     card.reportPlan = planState.reportPlan;
     card.summaryLine = planState.summaryLine;
-    card.version = { versionId: planState.versionId, planRevision: planState.reportPlan?.revision ?? null };
+    card.version = {
+      versionId: planState.versionId,
+      planId: planState.reportPlan?.id || "",
+      planRevision: planState.reportPlan?.revision ?? null,
+    };
   }
   if (fresh) anchorPlanBubble();
 }
@@ -558,6 +563,22 @@ function firstSentence(text, limit = 80) {
 }
 
 /** 从一次响应里同步方案状态。 */
+/**
+ * 两份版本是不是**同一版**。
+ *
+ * 按去重键比（versionId 与「方案身份 + 版本号」两个别名都算），
+ * 不比字符串：两个来源给的键名不一样时也要能认出是同一版。
+ */
+function isSamePlanVersion(left, right) {
+  const api = window.WorkbenchPlan;
+  if (!api || !left || !right) return false;
+  const leftKeys = api.versionAliasKeys(left);
+  const rightKeys = api.versionAliasKeys(right);
+  if (!leftKeys.length || !rightKeys.length) return false;
+  return leftKeys.some((key) => rightKeys.includes(key));
+}
+
+/** 从一次响应里同步方案状态。 */
 function syncPlanFromResponse(data) {
   if (!data) return;
   const phase = data.designPhase || null;
@@ -568,15 +589,15 @@ function syncPlanFromResponse(data) {
 
   // 这一轮有没有带来**新的一版**方案？
   const known = version ? findPlanCard(version) : null;
-  const currentVersion = planCards.current ? planCards.current.version : null;
+  const currentCard = planCards.current;
+  const currentVersion = currentCard ? currentCard.version : null;
   const isNewVersion = !!version && !known && isNewerPlanVersion(version, currentVersion);
 
   // 当前这张卡的内容先记下来：它马上要降级成历史卡，原文要留在原地。
-  const card = planCards.current;
-  if (card && isNewVersion) {
-    card.designPhase = planState.designPhase;
-    card.reportPlan = planState.reportPlan;
-    card.summaryLine = planState.summaryLine;
+  if (currentCard && isNewVersion) {
+    currentCard.designPhase = planState.designPhase;
+    currentCard.reportPlan = planState.reportPlan;
+    currentCard.summaryLine = planState.summaryLine;
   }
 
   if (isNewVersion) {
@@ -593,8 +614,18 @@ function syncPlanFromResponse(data) {
     return;
   }
 
-  planState.designPhase = phase || planState.designPhase;
-  if (plan) planState.reportPlan = plan;
+  // 不是新的一版。
+  //
+  // **迟到的旧版响应不夺取确认资格**：当前卡上那一版比它新，就不拿它覆盖 ——
+  // 覆盖了就等于让旧版把当前待确认的那一版顶下去（工单 #66）。
+  const sameAsCurrent = isSamePlanVersion(version, currentVersion);
+  const aboutPlan = !!(plan || version);
+  if (!aboutPlan || sameAsCurrent) {
+    planState.designPhase = phase || planState.designPhase;
+  }
+  if (plan && (sameAsCurrent || (!known && !currentCard))) {
+    planState.reportPlan = plan;
+  }
   // 出错时展示错误条；成功时清掉上一次的错误。
   //
   // 失败**不**把错误写进方案卡：失败时上一版方案仍然有效（工单 #66），
@@ -964,6 +995,8 @@ chatScroll.addEventListener("scroll", () => {
   if (atBottom !== chatStickToBottom) {
     chatStickToBottom = atBottom;
     updateJumpButton();
+    // 用户自己回到底部了：「有最新方案」提示就没用了。
+    if (chatStickToBottom) hideLatestPlanHint();
   }
 }, { passive: true });
 
@@ -2180,9 +2213,20 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
   syncPlanFromResponse(data);
   if (fromChoice) clearChoiceLock();
   if (data.error) {
+    // JSON 输入被拒：面板里也摆一份**可修正**的提示（哪里不对、怎么改）。
+    showJsonPasteErrorHint(data.error);
     // 失败原因要看得见：对话区一条 AI 回复（与恢复会话那处同一套写法）。
     appendAgentError(data.error);
+    // 失败**不**更新方案：上一版仍然有效（工单 #66）。
+    appendPlanFailureNotice();
     return;
+  }
+
+  // JSON 输入被收下：说清这份数据的来路（契约表 §1.1）。
+  if (data.debug?.jsonInput?.accepted === true) {
+    appendJsonSourceNote();
+    closeJsonPastePanel();
+    clearJsonPasteInputs();
   }
 
   // 只读问答：不推进业务。
@@ -2695,6 +2739,38 @@ function appendAgentError(error) {
   const text = formatAgentError(error);
   if (!text) return;
   appendAiText(text);
+}
+
+/**
+ * 失败时补一句：本次没更新，上一版仍然有效（工单 #66）。
+ *
+ * 失败**不**生成假装改好的方案、不出现成功摘要；屏上那张卡原样留着，
+ * 仍然可确认（真正的边界在后端的版本校验 —— 契约表 §8 不变量 6）。
+ * 屏上还没有方案时没什么「上一版」可保，就不说这句。
+ */
+function appendPlanFailureNotice() {
+  if (!planState.reportPlan) return;
+  appendAiText("本次未更新，上一版仍有效。");
+}
+
+/**
+ * JSON 输入被拒：面板里也摆一份**可修正**的提示（哪里不对、怎么改）。
+ *
+ * 不是 JSON 失败就什么都不做 —— 别的失败原因由对话区说。
+ */
+function showJsonPasteErrorHint(error) {
+  const code = String((error && error.code) || "");
+  if (!WorkbenchQuery.isJsonErrorCode(code)) return;
+  showJsonPasteHint(error);
+}
+
+/**
+ * JSON 输入被收下时，在对话区说清这份数据的来路（契约表 §1.1）。
+ *
+ * 只说「用户提供的数据，未经业务核验」—— **不宣称已连接真实业务库**。
+ */
+function appendJsonSourceNote() {
+  appendAiText("这份数据的来源：" + WorkbenchQuery.USER_JSON_SOURCE_LABEL + "。");
 }
 
 /**
@@ -3720,6 +3796,8 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   businessMenuReplayed = false;
   destroyCharts();
   chatScroll.innerHTML = "";
+  // 对话区清空了：屏上的方案卡片（含历史卡）与去重登记一并清掉。
+  clearPlanCards();
   previewRoot.innerHTML = "";
 
   session.sessionId = detail.sessionId;
@@ -3941,19 +4019,117 @@ function startNewSession() {
   chatScroll.innerHTML = "";
   previewRoot.innerHTML = "";
   previewRoot.appendChild(previewEmpty);
-  // 新对话没有方案：清掉上一条对话的方案卡片。
+  // 新对话没有方案：清掉上一条对话的方案卡片（含历史卡与去重登记）。
+  clearPlanCards();
   planState.designPhase = null;
   planState.reportPlan = null;
   planState.busy = false;
   planState.error = null;
   planState.planExpanded = false;
+  planState.cardExpanded = true;
+  planState.versionId = "";
+  planState.summaryLine = "";
   renderPlanModule();
   setState("ANALYZING");
   updateMeta();
   renderSessionList();
 }
 
+// --------------------------------------------------------------------------
+// JSON 粘贴入口（#66）
+//
+// 左侧对话区要给用户一个**明确**的入口：把记录数组贴进来，并附一句自然语言。
+// 服务端已经在既有 POST /api/agent/chat 上认 JSON 段（routing_rules.detect_json_payload），
+// 前端不新增端点、不新增协议。
+//
+// 客户端先自查一遍是为了**当场**给出「哪里不对、怎么改」；
+// 服务端仍然是唯一的边界（契约表 §8 不变量 6）。
+// --------------------------------------------------------------------------
+
+/** 打开 / 收起 JSON 粘贴面板。 */
+function toggleJsonPastePanel(open) {
+  const panel = $("json-paste-panel");
+  if (!panel) return;
+  const show = open === undefined ? panel.classList.contains("hidden") : Boolean(open);
+  panel.classList.toggle("hidden", !show);
+  if (show) {
+    const data = $("json-paste-data");
+    if (data && typeof data.focus === "function") data.focus();
+  }
+}
+
+/** 关掉 JSON 粘贴面板。 */
+function closeJsonPastePanel() {
+  toggleJsonPastePanel(false);
+}
+
+/** 在粘贴面板里摆一条**可修正**的提示。 */
+function showJsonPasteHint(error) {
+  const hint = $("json-paste-hint");
+  if (!hint) return;
+  const text = WorkbenchQuery.jsonErrorHint(error);
+  hint.textContent = text;
+  hint.classList.toggle("hidden", !text);
+}
+
+/** 清掉粘贴面板里的提示。 */
+function clearJsonPasteHint() {
+  const hint = $("json-paste-hint");
+  if (!hint) return;
+  hint.textContent = "";
+  hint.classList.add("hidden");
+}
+
+/** 清掉粘贴框里的内容（服务端收下之后才清）。 */
+function clearJsonPasteInputs() {
+  const data = $("json-paste-data");
+  const note = $("json-paste-note");
+  if (data) data.value = "";
+  if (note) note.value = "";
+  clearJsonPasteHint();
+}
+
+/**
+ * 把粘贴的 JSON 发出去。
+ *
+ * 先自查：本地不通过就**当场**给出「哪里不对、怎么改」，不发给服务端；
+ * 本地通过才发（服务端还会再校验一遍）。
+ */
+function submitJsonPaste() {
+  const dataEl = $("json-paste-data");
+  const noteEl = $("json-paste-note");
+  const raw = dataEl ? String(dataEl.value || "") : "";
+  const note = noteEl ? String(noteEl.value || "") : "";
+  const verdict = WorkbenchQuery.parseJsonPaste(raw);
+  if (!verdict.ok) {
+    showJsonPasteHint(verdict.error);
+    return;
+  }
+  clearJsonPasteHint();
+  const message = WorkbenchQuery.buildJsonPasteMessage(note, raw);
+  if (!message.trim()) {
+    showJsonPasteHint({ code: "JSON_INPUT_EMPTY", message: "请把记录数组贴进来再试。" });
+    return;
+  }
+  sendMessage(message);
+}
+
 // -------- 事件绑定 --------
+$("btn-json-paste")?.addEventListener("click", () => toggleJsonPastePanel());
+$("btn-json-paste-cancel")?.addEventListener("click", () => {
+  clearJsonPasteHint();
+  closeJsonPastePanel();
+});
+$("btn-json-paste-send")?.addEventListener("click", () => submitJsonPaste());
+
+// 「有最新方案」：用户在上方读历史时点它跳到底部（不强行拽）。
+$("btn-latest-plan")?.addEventListener("click", () => {
+  chatStickToBottom = true;
+  chatScroll.scrollTop = chatScroll.scrollHeight;
+  updateJumpButton();
+  hideLatestPlanHint();
+});
+
 document.querySelector("[data-quick]").addEventListener("click", (event) => {
   sendMessage(event.currentTarget.dataset.quick);
 });

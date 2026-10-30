@@ -138,8 +138,10 @@
   };
 
   /**
-   * 「版本记录」可能挂在来源对象的哪些位置。
-   * 一次聊天响应里它可能在顶层，也可能在 domainObjects 下。
+   * 「版本记录」可能挂在来源对象的哪些位置（**对象**形态）。
+   *
+   * A 段给本轮响应定的是**版本 ID**（字符串形态，见 VERSION_ID_PATHS）；
+   * 这里留的是「整条记录」的读法，兜住别的形状。
    */
   const VERSION_SOURCE_PATHS = [
     ["planVersion"],
@@ -150,8 +152,20 @@
     ["domainObjects", "reportPlanVersion"],
   ];
 
-  /** 会话快照里「版本序列」可能用的键。 */
-  const VERSION_SEQUENCE_KEYS = ["planVersions", "reportPlanVersions", "planVersionSequence"];
+  /**
+   * 「版本 ID」可能挂在来源对象的哪些位置（**字符串**形态）。
+   *
+   * A 段定的落点：`AgentResponse.debug.planVersionId`；
+   * 顶层 `AgentResponse.planVersionId` 是等价读法。
+   * 它与版本序列里的 `versionId` **同源同值** —— 两处直接比就行。
+   */
+  const VERSION_ID_PATHS = [
+    ["debug", "planVersionId"],
+    ["planVersionId"],
+  ];
+
+  /** 会话快照里「版本序列」的位置：A 段定的是 `snapshot.planVersions`。 */
+  const VERSION_SEQUENCE_KEYS = ["planVersions"];
 
   // ---------------------------------------------------------------- 样式
   // 用内联样式而不是外部 CSS：本模块不引入样式表、不改宿主页面，
@@ -316,17 +330,36 @@
    */
   function readPlanVersion(source) {
     if (!isPlainObject(source)) return null;
+    // 整条记录的读法（对象形态）。
     for (const path of VERSION_SOURCE_PATHS) {
       const found = normalizeVersionRecord(pick(source, path));
       if (found) return found;
     }
-    // 响应没带版本记录，但带了方案本身：按「方案身份 + 版本号」当这一版的身份。
+    // 版本 ID 的读法（字符串形态）：A 段定的落点是 debug.planVersionId，
+    // 顶层 planVersionId 是等价读法。
+    const plan = readPlanBody(source);
+    for (const path of VERSION_ID_PATHS) {
+      const versionId = safeText(pick(source, path));
+      if (!versionId) continue;
+      return normalizeVersionRecord({
+        versionId,
+        planId: safeText(pick(source, ["debug", "planId"])) || (plan ? safeText(plan.id) : ""),
+        planRevision: pick(source, ["debug", "planRevision"]) ?? (plan ? plan.revision : null),
+        reportPlan: plan,
+      });
+    }
+    // 响应没带版本 ID，但带了方案本身：按「方案身份 + 版本号」当这一版的身份。
     // 契约表 §4.1：方案身份是 (plan.id, plan.revision)；§4.1.2 的 versionId
     // 正是从「会话 + 方案 + 版本」派生的，两者一一对应。
-    const domainObjects = isPlainObject(source.domainObjects) ? source.domainObjects : null;
-    const plan = domainObjects && isPlainObject(domainObjects.reportPlan) ? domainObjects.reportPlan : null;
     if (plan) return normalizeVersionRecord({ reportPlan: plan });
     return null;
+  }
+
+  /** 来源对象里的方案正文（domainObjects.reportPlan）。 */
+  function readPlanBody(source) {
+    const domainObjects = isPlainObject(source.domainObjects) ? source.domainObjects : null;
+    const plan = domainObjects && isPlainObject(domainObjects.reportPlan) ? domainObjects.reportPlan : null;
+    return plan;
   }
 
   /**
@@ -990,10 +1023,9 @@
     // 新流程下后端仍可能把内部模板作为只读中间产物带回响应里，
     // 拿它做判据会让模板态以另一种形式复活。
     //
-    // 卡片自带折叠外壳时（#66），外壳就是那一份折叠视图：
-    // 不再往里套第二层 <details>，免得出现「点开一层还有一层」。
-    const isDraftPhase = view.designPhase === PHASE_DRAFT_READY;
-    if (isDraftPhase && !view.collapsible) {
+    // 这一层折叠视图**一直都在**（#66 的卡片外壳是外面那一层，不替代它）：
+    // 已确认的方案收起来，右侧的草稿才是主角。
+    if (view.designPhase === PHASE_DRAFT_READY) {
       body.appendChild(renderConfirmedPlanDetails(doc, view));
       return body;
     }
@@ -1005,9 +1037,7 @@
     body.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
     body.appendChild(renderSuggestions(doc, view));
     body.appendChild(renderReferences(doc, view));
-    if (!isDraftPhase) {
-      body.appendChild(renderActions(doc, view, state));
-    }
+    body.appendChild(renderActions(doc, view, state));
     return body;
   }
 

@@ -212,11 +212,36 @@
       <button id="btn-jump-bottom" class="hidden absolute bottom-3 right-4 z-10 flex items-center gap-1 rounded-full border border-slate-200 bg-white/95 shadow-md px-2.5 py-1.5 text-[11px] text-slate-600 hover:text-blue-700 hover:border-blue-300 transition">
         <iconify-icon class="text-sm" icon="mdi:chevron-double-down"></iconify-icon>回到底部
       </button>
+
+      <!-- 有新方案但用户在上方读历史：不强行滚动，给一个可点的提示（#66） -->
+      <button id="btn-latest-plan" class="hidden absolute bottom-12 right-4 z-10 flex items-center gap-1 rounded-full border border-blue-200 bg-white/95 shadow-md px-2.5 py-1.5 text-[11px] text-blue-700 hover:border-blue-300 transition">
+        <iconify-icon class="text-sm" icon="mdi:new-box"></iconify-icon>有最新方案
+      </button>
     </div>
 
-    <!-- 快捷入口 -->
+    <!-- 快捷入口 + JSON 粘贴入口（#66） -->
     <div class="shrink-0 border-t border-slate-200 bg-white px-4 pt-3">
-      <button data-quick="生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析" class="rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">生成能耗日报</button>
+      <div class="flex items-center gap-2 flex-wrap">
+        <button data-quick="生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析" class="rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">生成能耗日报</button>
+        <button id="btn-json-paste" class="rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">
+          <iconify-icon class="text-xs" icon="mdi:code-json"></iconify-icon>粘贴 JSON 数据
+        </button>
+        <span class="text-[11px] text-slate-400">把记录数组贴进来，并附一句你想做什么报表</span>
+      </div>
+    </div>
+
+    <!-- JSON 粘贴面板：记录数组 + 一句自然语言（#66） -->
+    <div id="json-paste-panel" class="hidden shrink-0 border-t border-slate-200 bg-slate-50 px-4 py-3">
+      <div class="text-[11px] text-slate-600 mb-1">记录数组（JSON）</div>
+      <textarea id="json-paste-data" rows="4" class="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-[11px] font-mono outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-100" placeholder='[{"设备名称":"A-1","耗电量":120.5}]'></textarea>
+      <div class="text-[11px] text-slate-600 mt-2 mb-1">想做什么报表（自然语言，可选）</div>
+      <textarea id="json-paste-note" rows="2" class="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-[11px] outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-100" placeholder="例如：按设备汇总耗电量并做趋势图"></textarea>
+      <div id="json-paste-hint" class="hidden mt-2 text-[11px] text-rose-700 leading-relaxed"></div>
+      <div class="flex items-center gap-2 mt-2 flex-wrap">
+        <button id="btn-json-paste-send" class="rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-[11px] font-medium px-3 py-1.5">发送</button>
+        <button id="btn-json-paste-cancel" class="rounded-lg border border-slate-200 bg-white text-slate-600 text-[11px] px-3 py-1.5">取消</button>
+        <span class="text-[10px] text-slate-400">数据来自你粘贴的 JSON，未经业务核验</span>
+      </div>
     </div>
 
     <!-- 输入 -->
