@@ -1249,9 +1249,19 @@ class ReportDesignService:
 
         # ---- 生成模板（事务外） ----
         try:
+            # 来源模式按**服务端记录**判定（模拟示例 / 用户 JSON）：会话里提交过
+            # JSON 就是用户 JSON 模式。不传就落默认口径（模拟示例），区域的
+            # ``pendingReason`` 会说成「模拟业务数据」—— 在用户 JSON 模式下
+            # 那是**说反话**（那块数值是用户自己的数据）。
+            #
+            # 判据与本模块的回复口径（``_reply_source_mode``）**同一套**，
+            # 也与转换层（``build_template_definition`` 自己解析会话 JSON
+            # 输入）一致 → 回复、区域文案、定义记录三处口径不会漂。
+            source_mode = _reply_source_mode(plan=current_plan).mode
             template = build_template_design(
                 current_plan,
                 subject_id=request.context.subjectId,
+                source_mode=source_mode,
             )
         except Exception as exc:  # noqa: BLE001
             log_failure(logger, "[report_design] 生成模板失败", exc)
