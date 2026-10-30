@@ -942,7 +942,8 @@ def mentions_report_object(message: str) -> bool:
     只读提问与问题反馈两处都用它，不各写一遍。
 
     「图」是单字业务对象，子串匹配会误伤「图书」「地图」这类与报表无关的
-    词：先把这几个无关词从句子里去掉，再按同一张表匹配。
+    词：先把这几个无关词（:data:`_NON_REPORT_GRAPH_WORDS`，**封闭词表**，
+    需随产品词表同步）从句子里去掉，再按同一张表匹配。
     """
     text = (message or "").strip().lower()
     for word in _NON_REPORT_GRAPH_WORDS:
