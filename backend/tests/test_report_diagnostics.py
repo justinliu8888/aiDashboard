@@ -793,6 +793,139 @@ def test_diagnostic_never_reaches_the_api_response(
         report_design_service.reset_for_tests()
 
 
+def test_stream_cancelled_is_logged_separately(caplog, monkeypatch) -> None:
+    """客户端断开 = 取消：记「流被取消」，不记「流结束」。
+
+    直接驱动 ASGI 应用再把请求取消掉：TestClient 会把流读完，
+    断不开，拿不到这个分支。
+    """
+    import asyncio as _asyncio
+
+    from app.main import app
+    from app.schemas.agent import AgentResponse, AgentState
+    from app.services.agent_service import agent_service
+
+    caplog.set_level(logging.INFO, logger="app")
+
+    async def _slow_chat(request, emit=None):
+        # 故意慢一点：让取消真的落在等待模型/业务结果的那一步。
+        await _asyncio.sleep(5)
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.ANALYZING,
+            reply="慢",
+        )
+
+    monkeypatch.setattr(agent_service, "chat", _slow_chat)
+
+    body = json.dumps(
+        {
+            "conversationId": "conv_diag_cancel",
+            "state": "ANALYZING",
+            "message": "帮我看看机房",
+            "context": {
+                "projectId": "project_001",
+                "subjectRef": "machine_room",
+                "subjectId": "room_a",
+            },
+        }
+    ).encode("utf-8")
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "path": "/api/agent/chat/stream",
+        "raw_path": b"/api/agent/chat/stream",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("utf-8")),
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+
+    async def receive() -> dict[str, Any]:
+        # 第一次交请求体，之后告诉服务端「客户端断了」。
+        if not delivered:
+            delivered.append(True)
+            return {"type": "http.request", "body": body, "more_body": False}
+        await _asyncio.sleep(0.3)
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        return None
+
+    delivered: list[bool] = []
+
+    async def main() -> None:
+        try:
+            await _asyncio.wait_for(app(scope, receive, send), timeout=15)
+        except (TimeoutError, _asyncio.TimeoutError):
+            pass
+        await _asyncio.sleep(0.3)
+
+    _asyncio.run(main())
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "event=stream_cancelled" in text
+    assert "event=stream_finished" not in text
+
+
+def test_log_write_failure_does_not_fail_the_request(monkeypatch) -> None:
+    """日志写不出去时，业务请求照常返回。"""
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("日志盘满了")
+
+    monkeypatch.setattr(diagnostics.logger, "info", _boom)
+    monkeypatch.setattr(diagnostics.logger, "warning", _boom)
+
+    result = asyncio.run(
+        generate_candidate(
+            message="生成报表",
+            current_plan=None,
+            history=[],
+            model_call=_model_returning("不是 JSON"),
+        )
+    )
+    assert result["code"] == "MODEL_OUTPUT_INVALID"
+
+
+def test_diagnostic_log_lines_go_through_the_existing_rotating_file(tmp_path) -> None:
+    """诊断日志走**现有**的轮转文件，不另起一套。"""
+    from app.logging_config import configure_app_file_logging
+
+    path = tmp_path / "backend.log"
+    logger = logging.getLogger("app")
+    previous = set(logger.handlers)
+    configure_app_file_logging(path)
+    new_handlers = set(logger.handlers) - previous
+    try:
+        asyncio.run(
+            generate_candidate(
+                message="生成报表",
+                current_plan=None,
+                history=[],
+                model_call=_model_returning("不是 JSON"),
+            )
+        )
+    finally:
+        for handler in new_handlers:
+            logger.removeHandler(handler)
+            handler.close()
+
+    content = path.read_text(encoding="utf-8")
+    assert "step=model_parse" in content
+    assert "parseStatus=PARSE_NOT_JSON" in content
+    # 同一个文件、同一套轮转与权限。
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
 # --------------------------------------------------------------------------
 # AC11：不改模型行为
 # --------------------------------------------------------------------------
