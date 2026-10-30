@@ -41,6 +41,7 @@ from app.services.json_input_service import (
     find_field_key_in_text,
     is_date_field,
     is_summable_field,
+    non_summable_reason,
     normalize_field_key,
 )
 from app.services.report_draft_service import build_definition_draft
@@ -727,16 +728,21 @@ def _build_json_processing_rules(
     plan_sections: list[Any],
     mapping: list[dict[str, Any]],
     binding: _JsonBinding,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     """JSON 模式下的**受控处理规则**。
 
     默认**直接展示输入值**（``PASSTHROUGH``）。求和 / 分组 / 占比只在
     **方案声明了对应展示意图**（用户确认过的那份方案）时才生成，
     并且：温度、PUE、累计电表读数、编号这类字段**不默认求和**
     （规格第 25 条）—— 命中就退回明细展示。
+
+    第二个返回值是**数据问题说明**：命中「不默认求和」时把原因记下来
+    （写进 ``metadata.jsonInputIssues.dataIssues``）—— 用户得知道
+    「这个字段为什么没被求和」，否则会把第一行的值当成总量。
     """
     types = _field_types(binding.schema)
     rules: list[dict[str, Any]] = []
+    reasons: list[str] = []
     for index, region in enumerate(regions):
         region_id = str(region.get("id") or "")
         section = plan_sections[index] if index < len(plan_sections) else {}
@@ -755,12 +761,15 @@ def _build_json_processing_rules(
             column_id = str(item.get("columnId") or "")
             operation = OP_PASSTHROUGH
             params: dict[str, Any] = {}
-            if (
-                intent == "total"
-                and field_key == value_key
-                and is_summable_field(field_key)
-            ):
-                operation = OP_SUM
+            if intent == "total" and field_key == value_key:
+                if is_summable_field(field_key):
+                    operation = OP_SUM
+                else:
+                    # 不默认求和：这一条按明细展示，不做汇总 ——
+                    # **并把原因写进数据问题说明**（用户要知道为什么）。
+                    reason = non_summable_reason(field_key)
+                    if reason and reason not in reasons:
+                        reasons.append(reason)
             elif (
                 intent in ("comparison", "composition")
                 and field_key == value_key
@@ -777,7 +786,7 @@ def _build_json_processing_rules(
                     "params": params,
                 }
             )
-    return rules
+    return rules, reasons
 
 
 def _first_text_field(
@@ -1087,7 +1096,7 @@ def build_template_definition(
             binding=json_binding,
             plan_sections=list(plan.get("sections") or []),
         )
-        rules = _build_json_processing_rules(
+        rules, non_summable_notes = _build_json_processing_rules(
             regions=regions,
             plan_sections=list(plan.get("sections") or []),
             mapping=mapping,
@@ -1105,9 +1114,10 @@ def build_template_definition(
             processing_rules=rules,
         )
         # 绑不上的列：不编值、不丢行 —— 记下来，渲染时降级明细展示并说明。
+        # 「不默认求和」的字段也记在这里：用户得知道那个字段为什么没汇总。
         seed.metadata["jsonInputIssues"] = {
             "unmappedColumns": unmapped,
-            "dataIssues": _json_data_issues(json_binding),
+            "dataIssues": _json_data_issues(json_binding) + list(non_summable_notes),
         }
     seed.metadata["pendingNotes"] = list(current.pendingNotes)
     seed.dependencies["metricRefs"] = [

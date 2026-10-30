@@ -24,7 +24,9 @@ from app.services.json_input_service import (
     OP_PASSTHROUGH,
     OP_RATIO,
     OP_SUM,
+    PROCESSING_OPERATIONS,
     apply_processing_rules,
+    build_rule_id,
     parse_datetime_value,
     render_cell,
 )
@@ -49,18 +51,89 @@ def _mapping_by_region(
     return result
 
 
+def _rule_region_index(
+    mapping: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    """规则 ID → 区域 ID 的**反查表**。
+
+    规则 ID 的文法是 ``rule_<regionId>_<columnId>_<operation>``
+    （见 :func:`build_rule_id`）。**regionId 与 columnId 里都可能带下划线**
+    —— 列 id 取自用户输入的字段名（``total_energy`` / ``device_id``），
+    所以**不能靠拆字符串猜**两者的边界：拆出来的区域可能根本不存在
+    （「幻影区域」），规则会被静默丢掉，汇总口径不生效也没有提示。
+
+    这里改成**显式枚举**：字段映射里每条 ``(regionId, columnId)``
+    都能按文法列出全部可能的规则 ID（操作是受控枚举），建成反查表。
+    """
+    index: dict[str, str] = {}
+    for item in mapping:
+        region_id = str(item.get("regionId") or "")
+        column_id = str(item.get("columnId") or "")
+        if not region_id or not column_id:
+            continue
+        for operation in PROCESSING_OPERATIONS:
+            index.setdefault(build_rule_id(region_id, column_id, operation), region_id)
+    return index
+
+
+def _resolve_rule_region(
+    rule_id: str,
+    index: Mapping[str, str],
+    region_ids: Sequence[str],
+) -> str | None:
+    """这条规则属于哪个区域；认不出来返回 ``None``（**不猜**）。
+
+    1. **显式反查表**：字段映射里 ``(regionId, columnId)`` 按文法列出的
+       规则 ID —— 精确命中，不拆字符串。
+    2. **兜底**：映射里没有这条规则时，在**已知区域**里找能作为前缀的
+       那个（**最长**优先，免得 ``region_1`` 抢走 ``region_10``），
+       再确认尾部那个是**受控操作**。
+    3. 都认不出来 → ``None``：这条规则**不落到任何区域** ——
+       更不会落到「幻影区域」。
+    """
+    normalized = str(rule_id or "").strip().lower()
+    if not normalized:
+        return None
+    region_id = index.get(normalized)
+    if region_id:
+        return region_id
+    prefix = "rule_"
+    if not normalized.startswith(prefix):
+        return None
+    rest = normalized[len(prefix):]
+    for candidate in sorted(region_ids, key=len, reverse=True):
+        marker = f"{candidate.strip().lower()}_"
+        if not rest.startswith(marker):
+            continue
+        head = rest[len(marker):]
+        for operation in PROCESSING_OPERATIONS:
+            if head.endswith(f"_{operation.lower()}"):
+                return candidate
+    return None
+
+
 def _rules_by_region(
     combination: Mapping[str, Any],
+    *,
+    region_ids: Sequence[str] = (),
 ) -> dict[str, list[dict[str, Any]]]:
-    """生效组合里的处理规则：``regionId → 规则列表``。"""
+    """生效组合里的处理规则：``regionId → 规则列表``。
+
+    规则归属**显式解析**（契约表 §2.1 的处理规则条目里只有 ``ruleId``，
+    没有单独的 ``regionId`` 键，所以归属要靠 ``ruleId`` 的文法还原），
+    **不靠拆字符串猜** —— 见 :func:`_resolve_rule_region`。
+    """
+    normalized = normalize_combination(combination)
+    mapping = list(normalized.get("fieldMapping") or [])
+    index = _rule_region_index(mapping)
     result: dict[str, list[dict[str, Any]]] = {}
-    for rule in normalize_combination(combination).get("processingRules") or []:
-        rule_id = str(rule.get("ruleId") or "")
-        # 规则 ID 形如 ``rule_<regionId>_<columnId>_<operation>``。
-        parts = rule_id.split("_")
-        if len(parts) < 3:
+    for rule in normalized.get("processingRules") or []:
+        region_id = _resolve_rule_region(
+            str(rule.get("ruleId") or ""), index, region_ids
+        )
+        if not region_id:
+            # 认不出归属 → 不执行，也**不落到幻影区域**。
             continue
-        region_id = "_".join(parts[1:-2]) if len(parts) > 4 else parts[1]
         result.setdefault(region_id, []).append(dict(rule))
     return result
 
@@ -419,7 +492,12 @@ def build_user_json_payloads(
     """
     normalized = normalize_combination(combination)
     mapping_by_region = _mapping_by_region(normalized)
-    rules_by_region = _rules_by_region(normalized)
+    region_ids = [
+        str(region.get("id") or "")
+        for region in definition.get("regions") or []
+        if isinstance(region, Mapping) and region.get("id")
+    ]
+    rules_by_region = _rules_by_region(normalized, region_ids=region_ids)
     shared_issues = [str(item) for item in (issues or []) if item]
     record_count = len(rows)
     result: dict[str, dict[str, Any]] = {}
