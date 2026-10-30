@@ -88,7 +88,6 @@ class RequestContext:
     stage: str | None = None
     prompt_version: str | None = None
     prompt_digest: str | None = None
-    attempts: int = 0
 
 
 _request_context: ContextVar[RequestContext | None] = ContextVar(
@@ -187,12 +186,22 @@ def begin_model_call(*, model_id: str | None = None) -> ModelCallState:
 
     **每次调用一个全新的 ``requestId``**；重试是「新标识 + 递增的 attempt」，
     上一轮的标识不被覆盖（契约表 §6.2）。
+
+    attempt 的算法：同一次请求（同一会话 + 同一消息）里接着调，序号加一；
+    换了请求就从 1 重新起。序号跟着**这一轮请求**走，不跨轮累加。
     """
     context = _ensure_context()
-    context.attempts += 1
+    previous = _current_model_call.get()
+    attempt = 1
+    if (
+        previous is not None
+        and previous.conversation_id == context.conversation_id
+        and previous.message_id == context.message_id
+    ):
+        attempt = previous.attempt + 1
     state = ModelCallState(
         request_id=new_request_id(),
-        attempt=context.attempts,
+        attempt=attempt,
         conversation_id=context.conversation_id,
         message_id=context.message_id,
         operation_id=context.operation_id,
@@ -248,6 +257,13 @@ def token_usage_or_unknown(usage: Any) -> Any:
     return numbers or UNKNOWN
 
 
+def format_token_usage(usage: Any) -> str:
+    """把 token 用量写成日志友好的 ``k=v,k=v``。"""
+    if not isinstance(usage, dict) or not usage:
+        return UNKNOWN
+    return ",".join(f"{key}={value}" for key, value in usage.items())
+
+
 # --------------------------------------------------------------------------
 # 常规日志：只写标识与元信息
 # --------------------------------------------------------------------------
@@ -277,7 +293,7 @@ def log_model_call(state: ModelCallState) -> None:
             state.duration_ms,
             state.output_length,
             state.finish_reason,
-            state.token_usage,
+            format_token_usage(state.token_usage),
             state.response_id,
             state.error_type,
         )
@@ -579,12 +595,25 @@ def _append_line(
         handle.write(line + "\n")
     os.chmod(path, 0o600)
     _cleanup(
-        directory, retention_days=retention_days, max_total_bytes=max_total_bytes
+        directory,
+        retention_days=retention_days,
+        max_total_bytes=max_total_bytes,
+        keep=path,
     )
 
 
-def _cleanup(directory: Path, *, retention_days: int, max_total_bytes: int) -> None:
-    """到期自动清理：先按保留期限删旧文件，再按总容量删最旧的。"""
+def _cleanup(
+    directory: Path,
+    *,
+    retention_days: int,
+    max_total_bytes: int,
+    keep: Path | None = None,
+) -> None:
+    """到期自动清理：先按保留期限删旧文件，再按总容量删最旧的。
+
+    ``keep`` 是刚写下的那一份：容量不够时也不删它 ——
+    宁可暂时超容量，也不能把这一轮的诊断弄丢。
+    """
     try:
         files = sorted(
             directory.glob(f"{_FILE_PREFIX}*{_FILE_SUFFIX}"),
@@ -596,6 +625,8 @@ def _cleanup(directory: Path, *, retention_days: int, max_total_bytes: int) -> N
     if retention_days > 0:
         deadline = now - retention_days * 86400
         for path in files:
+            if keep is not None and path == keep:
+                continue
             try:
                 if path.stat().st_mtime < deadline:
                     path.unlink()
@@ -613,6 +644,8 @@ def _cleanup(directory: Path, *, retention_days: int, max_total_bytes: int) -> N
     for path in files:
         if total <= max_total_bytes:
             break
+        if keep is not None and path == keep:
+            continue
         try:
             size = path.stat().st_size
             path.unlink()
