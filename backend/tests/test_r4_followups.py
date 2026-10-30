@@ -140,3 +140,66 @@ def test_issue_analysis_does_not_rebuild_business_objects(post_chat):
     assert payload["domainObjects"]["pendingEditPlan"] is None
     # 只读咨询 / 问题反馈不进入澄清流程（契约表 §7.4）。
     assert session_service.load_clarification("conv_test") is None
+
+
+# ==========================================================================
+# 🟡-2 「这个图是什么意思」要能指向业务对象
+# ==========================================================================
+
+#: 带改动动词的说法 —— 它们**是指令**，不是提问。
+CHANGE_COMMANDS = ("改成柱状图", "新建一张图", "把图删掉")
+
+
+def test_graph_wording_is_treated_as_a_business_object():
+    """「图」能指向报表业务对象 → 这句话是咨询。"""
+    assert routing_rules.is_readonly_question("这个图是什么意思") is True
+    assert (
+        classify_message_intent(
+            "这个图是什么意思", subject_required=False
+        ) is UserIntent.ASK_QUESTION
+    )
+
+
+def test_change_commands_mentioning_graph_are_not_consultations():
+    """带改动动词的说法仍然**不是**咨询（既有四条规则挡着）。
+
+    钉住这一点：给业务对象词表补了「图」之后，不能把
+    「改成柱状图」「新建一张图」「把图删掉」也变成咨询。
+    """
+    for message in CHANGE_COMMANDS:
+        assert routing_rules.is_readonly_question(message) is False, message
+        assert (
+            classify_message_intent(
+                message, subject_required=False
+            ) is not UserIntent.ASK_QUESTION
+        ), message
+
+
+def test_unrelated_graph_words_are_not_business_objects():
+    """「图书」「地图」这类无关词里的「图」不是报表业务对象。"""
+    for message in ("这本图书是什么意思", "这张地图是什么意思"):
+        assert routing_rules.is_readonly_question(message) is False, message
+
+
+def test_graph_wording_answers_without_touching_the_draft(post_chat):
+    """「这个图是什么意思」→ 只读回答：不动草稿、不产生计划、不占额度。"""
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    payload = _post(post_chat, definition, "这个图是什么意思")
+
+    assert payload["debug"]["contextEngineIntent"] == "ASK_QUESTION"
+    assert payload["uiActions"] == ["query_answer"]
+    assert payload["turnKind"] == "query_answer"
+    assert payload["domainObjects"].get("pendingEditPlan") is None
+    # 咨询不占澄清额度（契约表 §7.4）。
+    assert session_service.load_clarification("conv_test") is None
+
+
+def test_graph_wording_with_change_verb_still_edits(post_chat):
+    """带改动动词的说法仍然走编辑流程，不被当成咨询。"""
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    payload = _post(post_chat, definition, "把图删掉")
+
+    assert payload["debug"].get("contextEngineIntent") != "ASK_QUESTION"
+    assert payload["uiActions"] != ["query_answer"]
