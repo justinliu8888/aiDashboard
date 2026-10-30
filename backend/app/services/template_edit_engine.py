@@ -1675,16 +1675,14 @@ class TemplateEditEngine:
         是**子串**，「设备耗电率」包含别名「设备耗电」—— 但用户问的是
         比率，不是 kWh 的耗电量。口径对不上就**不静默映射**到已登记指标。
         """
-        intent, answer = split_metric_intent(text, strip_add_prefix=strip_add_prefix)
-        candidate = (
-            resolve_out_of_catalog_candidate(intent, answer=answer)
-            if intent else None
+        candidate = TemplateEditEngine._resolve_out_of_catalog(
+            text, strip_add_prefix=strip_add_prefix,
         )
         metric_ref = match_metric_by_alias(text, set(metrics))
         if not metric_ref or candidate is None:
             # 没提到已登记指标 → 目录外候选；抽不出指标意图 → 照既有口径走。
             return (None, candidate) if candidate is not None else (metric_ref, None)
-        if _intent_names_registered_metric(intent, metric_ref, metrics):
+        if _intent_names_registered_metric(candidate.intent, metric_ref, metrics):
             return metric_ref, None
         # 口径对不上 → 目录外候选，**不静默映射**到已登记指标。
         return None, candidate
