@@ -752,9 +752,16 @@ class AgentService:
         #
         # 校验通过后**不自己出报表**：交给设计流程出方案（模型看的是字段
         # 结构与有上限的样本），方案确认后才把输入、映射与规则原子切生效。
+        #
+        # ``json_input_marker`` 是这一轮的出参：本轮消费了用户 JSON 输入
+        # 时，来源标记写进去，由设计轮把响应带上（工单 #66E 缺口一）。
+        json_input_marker: dict[str, Any] = {}
         if pending_guard is None:
             json_response = await self._handle_json_input_turn(
-                request, session_key, design_turn=design_turn
+                request,
+                session_key,
+                design_turn=design_turn,
+                json_input_marker=json_input_marker,
             )
             if json_response is not None:
                 return json_response
@@ -999,6 +1006,7 @@ class AgentService:
                 # 查询轮不改设计对象，但要把设计阶段与方案带回响应：
                 # 前端要据此继续显示那份待确认的方案。
                 report_design_service.attach_design_state(response, design_state)
+                self._attach_json_input_marker(response, json_input_marker)
                 return response
             # 设计轮不把旧路由的收集结果带进快照。
             #
@@ -1015,6 +1023,10 @@ class AgentService:
                 request, emit=emit, state=design_state
             )
             if design_response is not None:
+                # 出方案的这一轮也要带上「用户 JSON 模式」——
+                # 以前这里把来源标记丢掉了，前端在这一轮看不出数据是
+                # 用户给的（工单 #66E 缺口一）。
+                self._attach_json_input_marker(design_response, json_input_marker)
                 return design_response
 
         # 只读查询轮：查事实、回答，不推进业务。
@@ -1822,9 +1834,14 @@ class AgentService:
         return names
 
     async def _handle_json_input_turn(
-        self, request: AgentRequest, session_key: str, *, design_turn: bool
+        self,
+        request: AgentRequest,
+        session_key: str,
+        *,
+        design_turn: bool,
+        json_input_marker: dict[str, Any] | None = None,
     ) -> AgentResponse | None:
-        """用户 JSON 输入这一轮（工单 #64）。
+        """用户 JSON 输入这一轮（工单 #64，JSON 入口补漏见工单 #66E）。
 
         返回 ``None`` 表示「这一轮不是 JSON 输入」，交给后面的流程。
 
@@ -1838,12 +1855,30 @@ class AgentService:
            落库的聊天消息里不留完整数组（规格第 21 条）。
 
         校验不通过时**什么都不存**，也不调用模型：明确告诉用户哪里不对。
+
+        ``json_input_marker`` 是个**出参**：本轮通过了 JSON 校验时，把
+        来源标记（``accepted`` + 引用）写进去。设计轮的响应不是这里产的，
+        调用方拿它把标记挂到出方案的那一轮上（工单 #66E 缺口一）。
         """
+        # 认 JSON 段。两条路径互不干扰：
+        #
+        #   1. **含引号**的片段 —— 老判据，逐字不变；
+        #   2. 没引号、但**明显是数据**的方括号数组（``[]``、``[1,2,3]``）——
+        #      这类以前根本进不了 JSON 输入轮：用户粘了数据，服务端却当
+        #      普通需求处理，给了一份**模拟示例**方案，界面一句提示都没有
+        #      （工单 #66E 缺口二）。
         payload = routing_rules.detect_json_payload(request.message)
         if payload is None:
-            return None
+            payload = routing_rules.detect_data_array_payload(request.message)
         array_path = routing_rules.extract_array_path(request.message)
-        note = routing_rules.strip_json_payload(request.message)
+        if payload is None:
+            # 有「用户想给 JSON」的**登记在案**信号（契约表 §4.3 的数组
+            # 位置标记），却没给记录数组 → 明确告诉用户「没收到数据」，
+            # 而不是给一份凑出来的报表（规格第 30 条）。
+            if not routing_rules.has_json_input_intent(request.message):
+                return None
+            payload = ""
+        note = routing_rules.strip_detected_json(request.message, payload)
         record, error = user_json_service.submit(
             session_id=session_key, text=payload, array_path=array_path
         )
@@ -1875,6 +1910,11 @@ class AgentService:
         request.message = "\n".join(part for part in (note, summary) if part)
         reference = user_json_service.reference(record)
         issues = user_json_service.data_issues(record)
+        if json_input_marker is not None:
+            # 来源标记交给调用方：设计轮的响应是设计流程产的，这里出不了，
+            # 但出方案的那一轮也得带上「用户 JSON 模式」（工单 #66E 缺口一）。
+            # 形状与非设计轮**完全一致**：只有引用，没有原始数组。
+            json_input_marker.update({"accepted": True, **reference})
         logger.info(
             "[agent.chat] step=json_input_accepted conversationId=%s inputId=%s "
             "version=%d rows=%d",
@@ -1886,6 +1926,9 @@ class AgentService:
         if design_turn:
             # 设计流程接管：模型只看字段结构、缺失与类型统计与有上限的样本，
             # 方案由用户确认后才把输入、映射与规则原子切生效。
+            #
+            # 来源标记已经交出去了（json_input_marker），出方案的那一轮
+            # 会带上它 —— 以前这一轮把标记丢掉了，前端看不出数据是用户给的。
             return None
         reply = f"已收到你的 JSON 数据并保存：{summary}。"
         if issues:
@@ -1898,6 +1941,23 @@ class AgentService:
             designSessionId=request.context.designSessionId,
             debug={"jsonInput": {"accepted": True, **reference}},
         )
+
+    @staticmethod
+    def _attach_json_input_marker(
+        response: AgentResponse, marker: dict[str, Any] | None
+    ) -> AgentResponse:
+        """把「用户 JSON 模式」的来源标记挂到响应上（工单 #66E 缺口一）。
+
+        挂进**既有的** ``debug`` 对象（与 ``debug.planVersionId`` 同一思路）：
+        不新增顶层响应字段、不改协议版本。形状与非设计轮**完全一致** ——
+        ``accepted`` + 引用，**没有原始数组**。
+
+        没有 JSON 输入的轮次：响应里**不多出**这个键。
+        """
+        if not marker:
+            return response
+        response.debug = {**(response.debug or {}), "jsonInput": dict(marker)}
+        return response
 
     def _classify_intent(self, request: AgentRequest) -> UserIntent:
         """编辑态的规则层意图判定（工单 #58）。

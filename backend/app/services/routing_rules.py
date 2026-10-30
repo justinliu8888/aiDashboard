@@ -1383,6 +1383,11 @@ def detect_json_payload(message: str) -> str | None:
     返回**原文片段**（调用方负责校验与存储）；没有 JSON 段时返回 ``None``。
 
     宁可漏判不可误判：普通中文消息里带方括号的，不当成 JSON 输入。
+
+    这条判据**只认含引号的片段** —— 判据与取舍理由见
+    :func:`_looks_like_json`。没引号但明显是数据的那类（``[]``、
+    ``[1,2,3]``）由 :func:`detect_data_array_payload` 单独认，
+    两条路径互不干扰。
     """
     text = message or ""
     for index, char in enumerate(text):
@@ -1394,6 +1399,128 @@ def detect_json_payload(message: str) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------
+# 没引号、但明显是数据的方括号数组（工单 #66E）
+# --------------------------------------------------------------------------
+
+#: 「用户想给 JSON」的**登记在案**的信号：契约表 §4.3 的数组位置标记。
+#:
+#: 契约里登记的 JSON 输入写法就这两种（``数组位置: data.records`` /
+#: ``@arrayPath data.records``），消息里有它就说明用户想给 JSON。
+#:
+#: 只认**独立成行**的标记（与 :func:`extract_array_path` 同一口径）：
+#: 标记后面**还写了别的字**就不认 —— 那是聊天，不是标记。
+#: 「只写标记、不写路径」也算（说明用户想给数据，只是没说清位置）。
+_BARE_ARRAY_PATH_MARKER = re.compile(
+    r"^[ \t]*(?:@arrayPath|arrayPath)[ \t]*[:：]?[ \t]*$"
+    r"|^[ \t]*数组位置[ \t]*[:：]?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: 一串数字（可带小数与指数），或什么都没有 —— 方括号里**只可能是数据**的内容。
+_NUMBER_TOKEN = r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
+_NUMERIC_ARRAY_BODY = re.compile(
+    rf"^\s*(?:{_NUMBER_TOKEN}\s*(?:,\s*{_NUMBER_TOKEN}\s*)*)?$"
+)
+
+#: 片段之后允许跟的**句末**内容：空白与中英文句读。
+#: 粘数据的习惯是「说明 + 数据」，数据后面通常只有标点。
+_TRAILING_PUNCTUATION = re.compile(r"^[\s。，、；：！？,.;:!?]*$")
+
+
+def _bracket_spans(text: str) -> list[tuple[int, int, str]]:
+    """消息里所有**完整**的 ``[...]`` 片段（起止位置与原文）。
+
+    扫到一段就跳过整段，所以嵌套的方括号不会被单独当成一段。
+    """
+    spans: list[tuple[int, int, str]] = []
+    index = 0
+    while index < len(text):
+        if text[index] != "[":
+            index += 1
+            continue
+        fragment, closed = _scan_json_span(text, index)
+        if not closed:
+            break
+        spans.append((index, index + len(fragment), fragment))
+        index += len(fragment)
+    return spans
+
+
+def detect_data_array_payload(message: str) -> str | None:
+    """认出「没有引号、但明显是数据」的方括号数组（工单 #66E）。
+
+    为什么要有它：:func:`detect_json_payload` 要求片段**含引号**，于是
+    ``[]``、``[1,2,3]`` 这类输入**根本不会被当成 JSON 输入轮** ——
+    用户粘了数据，服务端却当普通需求处理，给了一份**模拟示例**方案，
+    界面一句提示都没有（规格第 30 条要避免的正是这件事）。
+
+    判据保守（宁可漏判不可误判 —— 与 :func:`_looks_like_json` 同一条原则）：
+
+    1. 片段是**完整的** ``[...]``，内容**只可能是数字**（或空的）——
+       ``[重要]``、``[a,b]`` 这种不是数据，不认；
+    2. 消息里**只有这一处**这样的片段 —— 有两处就分不清用户指的是哪一段，
+       **不猜**（与契约表 §4.3「服务端不替用户挑数组」同一条道理）；
+    3. 这一段在**消息末尾**（后面只剩空白或句读）—— 粘数据的习惯是
+       「说明 + 数据」，数据放在最后（前端 JSON 粘贴入口也是这个顺序）。
+
+    返回原文片段（调用方负责校验与存储）。
+    """
+    text = message or ""
+    candidates: list[tuple[int, int, str]] = []
+    for start, end, fragment in _bracket_spans(text):
+        if not (fragment.startswith("[") and fragment.endswith("]")):
+            continue
+        if not _NUMERIC_ARRAY_BODY.match(fragment[1:-1]):
+            continue
+        candidates.append((start, end, fragment))
+    if len(candidates) != 1:
+        return None
+    _start, end, fragment = candidates[0]
+    if not _TRAILING_PUNCTUATION.match(text[end:]):
+        return None
+    return fragment
+
+
+#: 「路径」长得像路径：ASCII 词或点分路径（``data.records`` / ``records``）。
+_PATH_TOKEN = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*")
+
+
+def has_json_input_intent(message: str) -> bool:
+    """消息里有没有「用户想给 JSON」的**登记在案**的信号。
+
+    契约表 §4.3 登记的数组位置标记只出现在 JSON 输入里 —— 消息里有它，
+    就说明用户想给 JSON。
+
+    认的是**独立成行**的标记（``数组位置: data.records`` /
+    ``@arrayPath data.records``，或者只写标记不写路径），与
+    :func:`extract_array_path` 同一口径：标记后面还写了别的字就不认
+    （那是聊天，不是标记）。
+
+    路径还得**长得像路径**（``data.records`` / ``records``）：
+    「数组位置怎么填」这种问句里也带标记字样，但后面跟的是中文，
+    不是路径 —— 那是在聊天，不是在给数据。
+    """
+    text = message or ""
+    path = extract_array_path(text)
+    if path is not None and _PATH_TOKEN.fullmatch(path):
+        return True
+    return bool(_BARE_ARRAY_PATH_MARKER.search(text))
+
+
+def strip_detected_json(message: str, payload: str) -> str:
+    """把消息里**已经认出来的那一段** JSON 去掉，只留人话部分。
+
+    与 :func:`strip_json_payload` 同一套口径，但「认哪一段」由调用方决定 ——
+    聊天入口认出来的可能是含引号的片段，也可能是不含引号的数组形状
+    （工单 #66E）。
+    """
+    if not payload:
+        return (message or "").strip()
+    text = (message or "").replace(payload, " ")
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
 def strip_json_payload(message: str) -> str:
     """把消息里的 JSON 段去掉，只留人话部分。
 
@@ -1401,7 +1528,4 @@ def strip_json_payload(message: str) -> str:
     落库的用户消息里不留完整数组。
     """
     fragment = detect_json_payload(message)
-    if not fragment:
-        return (message or "").strip()
-    text = message.replace(fragment, " ")
-    return re.sub(r"\s{2,}", " ", text).strip()
+    return strip_detected_json(message, fragment or "")
