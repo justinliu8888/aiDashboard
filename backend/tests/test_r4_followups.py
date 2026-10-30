@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.schemas.fact import RECORDED_STAGE_DISCLOSURE
 from app.services import routing_rules
 from app.services.context_engine import UserIntent, classify_message_intent
 from app.services.report_draft_service import build_definition_draft
@@ -143,6 +144,82 @@ def test_issue_analysis_does_not_rebuild_business_objects(post_chat):
 
 
 # ==========================================================================
+# 🟠-5 的第二道边界：阶段边界校正（`_ensure_recorded_stage_disclosure`）
+# ==========================================================================
+
+#: 反馈路径上「问进度 + 说不满」的组合形状。
+#:
+#: 这个形状是**真**会触发那道校正的（不是造出来的假场景）：
+#:   - `detect_issue_feedback` 命中（「好丑」是不满表达）→ 走问题分析；
+#:   - `is_progress_question` 命中（「到哪一步」）→ 该说清边界；
+#:   - 分析结论里没有编实时进度 → 走「补上口径句」这一支；
+#:   - `queryOutcome` 既不是澄清也不是技术失败 → 这一支不提前返回。
+PROGRESS_ISSUE_MESSAGE = "进度到哪一步了？看起来好丑"
+
+#: 纯咨询形状：同样在问进度，走咨询路径。
+PROGRESS_CONSULT_MESSAGE = "进度到哪一步了？"
+
+
+def test_issue_analysis_path_also_gets_the_recorded_stage_disclosure(post_chat):
+    """问题反馈路径上，`_ensure_recorded_stage_disclosure` **真的生效**。
+
+    ADR 0002 §4.2：「**问进度时**，reply 必须同时说清两件事：这是**已记录**
+    的状态、**不是实时进度**……服务端在模型漏说时补上 —— 不能只靠模型
+    自觉」。
+
+    复核 F-3：这条以前**没有任何用例钉住** —— 把反馈路径上的这道校正
+    摘掉，全绿（测试盲区）。
+    """
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    payload = _post(post_chat, definition, PROGRESS_ISSUE_MESSAGE)
+
+    # 先确认这一轮**走的是反馈路径**（不是咨询路径，也不是编辑路径）。
+    assert payload["debug"].get("userIntent") == "ISSUE_FEEDBACK", (
+        f"这一轮没走问题反馈路径：debug={payload['debug']}"
+    )
+    assert payload["debug"].get("editOutcome") == "issue_analysis"
+    assert payload["turnKind"] == "query_answer"
+    assert payload["uiActions"] == ["query_answer"]
+
+    # 边界校正生效：服务端补上了「已记录 / 不是实时进度」这句口径。
+    assert RECORDED_STAGE_DISCLOSURE in payload["reply"], (
+        "问题反馈路径上没有做阶段边界校正"
+    )
+
+
+def test_consultation_path_gets_the_same_recorded_stage_disclosure(post_chat):
+    """咨询路径上的同一道校正 —— 两条路径共用同一份实现。"""
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    payload = _post(post_chat, definition, PROGRESS_CONSULT_MESSAGE)
+
+    assert payload["debug"].get("userIntent") != "ISSUE_FEEDBACK", (
+        "这一轮没走咨询路径"
+    )
+    assert RECORDED_STAGE_DISCLOSURE in payload["reply"], (
+        "咨询路径上没有做阶段边界校正"
+    )
+
+
+def test_the_recorded_stage_disclosure_is_not_added_where_it_does_not_belong(post_chat):
+    """问的不是进度 → **不补**这句边界（口径不能加错地方）。
+
+    ``_ensure_recorded_stage_disclosure`` 的第三个边界：问草稿、问能力
+    不补这条边界。这条断言同时把「校正的作用条件」钉住 —— 不是
+    「凡是只读轮都补一句」。
+    """
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    payload = _post(post_chat, definition, ISSUE_MESSAGE)
+
+    assert payload["debug"].get("userIntent") == "ISSUE_FEEDBACK"
+    assert RECORDED_STAGE_DISCLOSURE not in payload["reply"], (
+        "不是问进度的一轮不该补进度边界"
+    )
+
+
+# ==========================================================================
 # 🟡-2 「这个图是什么意思」要能指向业务对象
 # ==========================================================================
 
@@ -200,12 +277,22 @@ def test_unrelated_graph_words_are_not_business_objects():
     ):
         assert routing_rules.is_readonly_question(message) is False, message
 
+    # 词表的**内容**也要钉住 —— 只遍历表本身的话，从表里删掉一个词
+    # 没人拦（遍历会跟着变短，看起来还是绿的）。
+    for word in (
+        "图书", "地图", "图标", "图片", "蓝图", "企图",
+        "图腾", "图案", "版图", "意图",
+        "图纸", "图章", "图钉", "构图",
+    ):
+        assert word in routing_rules._NON_REPORT_GRAPH_WORDS, word
+
 
 def test_every_excluded_graph_word_is_not_a_business_object():
-    """排除词表里**每一个**词都钉住。
+    """排除词表里**每一个**词都钉住 —— 以后新收进来的词自动覆盖。
 
-    这张表是**封闭词表**（需随产品词表同步）—— 漏掉一个词就有漏网，
-    所以这里直接遍历表本身，不写死一份拷贝。
+    这张表是**封闭词表**（需随产品词表同步）。表的内容由
+    ``test_unrelated_graph_words_are_not_business_objects`` 逐条钉住；
+    这里遍历表本身，保证新收进来的词也不会把无关句判成咨询。
     """
     for word in routing_rules._NON_REPORT_GRAPH_WORDS:
         message = f"这个{word}是什么意思"
