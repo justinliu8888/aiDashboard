@@ -201,6 +201,52 @@ def test_prompt_digest_is_stable_and_content_sensitive() -> None:
     assert first != other
 
 
+def test_prompt_file_carries_no_version_marker_but_version_still_resolves() -> None:
+    """提示词文件里**不许**有版本标记 —— 它的字节就是发给模型的字节。
+
+    版本号改由**代码常量**提供：提示词里没标记就回落到常量，
+    ``promptVersion`` 仍然有值，提示词文件保持与改动前逐字节一致。
+    """
+    from app.agents.report_plan_agent import (
+        _PROMPT_VERSION,
+        _load_prompt,
+        _prompt_version,
+    )
+
+    prompt_text = _load_prompt()
+    assert "prompt-version" not in prompt_text.lower()
+    # 版本号来自代码常量，不是从提示词文件里读出来的。
+    assert _PROMPT_VERSION
+    assert _prompt_version(prompt_text) == _PROMPT_VERSION
+    # 提示词里的显式标记仍然优先（将来要显式覆盖时仍能生效）。
+    assert _prompt_version("prompt-version: v9") == "v9"
+
+
+def test_prompt_version_reaches_the_log_line(caplog) -> None:
+    """promptVersion 不会恒为空：模型调用那一行带着版本号。"""
+    caplog.set_level(logging.INFO, logger="app")
+    client = _client_with(_FakeResponse("不是 JSON"))
+
+    asyncio.run(
+        generate_candidate(
+            message="生成报表",
+            current_plan=None,
+            history=[],
+            model_call=client,
+        )
+    )
+
+    versions = {
+        token.partition("=")[2]
+        for record in caplog.records
+        for token in record.getMessage().split()
+        if token.startswith("promptVersion=")
+    }
+    assert versions
+    assert all(value for value in versions)
+    assert "None" not in versions
+
+
 # --------------------------------------------------------------------------
 # AC3：上游没给就写「未知」，不靠耗时或文本猜截断
 # --------------------------------------------------------------------------

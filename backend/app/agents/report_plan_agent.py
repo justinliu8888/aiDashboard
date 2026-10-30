@@ -61,8 +61,16 @@ PARSE_STRUCTURE_INVALID = diagnostics.PARSE_STRUCTURE_INVALID
 TERMINAL_RESULT_MISSING = diagnostics.TERMINAL_RESULT_MISSING
 PARSE_OK = diagnostics.PARSE_OK
 
+#: 提示词版本（**代码里的权威来源**）。
+#:
+#: 提示词文件里**不许**再塞版本标记：那个文件的字节就是发给模型的字节，
+#: 动一个字就等于改了模型输入（契约表 §6.5「不改提示词」）。
+#: 版本号放在这里；提示词里若写了 ``prompt-version: vX`` 标记，
+#: 以提示词里的为准（那是显式覆盖），没有标记就回落到这个常量。
+_PROMPT_VERSION = "v1"
+
 #: 提示词里的版本标记（可选）：``prompt-version: v1``。
-#: 提示词里没标就写 None —— **不猜**版本。
+#: 提示词文件里现在**没有**这个标记，保留匹配逻辑是为了将来显式覆盖时仍能生效。
 _PROMPT_VERSION_PATTERN = re.compile(
     r"prompt-version:\s*([A-Za-z0-9._\-]+)", re.IGNORECASE
 )
@@ -851,10 +859,13 @@ def _record_parse_outcome(
     )
 
 
-def _prompt_version(prompt_text: str) -> str | None:
-    """提示词版本：提示词里没标就写 None —— **不猜**。"""
+def _prompt_version(prompt_text: str) -> str:
+    """提示词版本：提示词里的标记优先，没有标记就回落到代码常量。
+
+    **不写 None** —— 版本号始终有值，日志里才能对齐到是哪一版提示词。
+    """
     match = _PROMPT_VERSION_PATTERN.search(prompt_text or "")
-    return match.group(1) if match else None
+    return match.group(1) if match else _PROMPT_VERSION
 
 
 def _system_prompt_text(messages: list[dict[str, Any]]) -> str:
