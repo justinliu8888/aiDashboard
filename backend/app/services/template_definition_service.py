@@ -16,6 +16,7 @@
 造数器（#50）与示意载荷（#51）按它造数，前端（#53）按它标注。
 """
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 from app.data.machine_room_energy import METRIC_DEVICE_ENERGY, METRIC_TOTAL_ENERGY
@@ -25,9 +26,21 @@ from app.schemas.template_design import TemplateDesign, TemplateRegion
 from app.services.data_source_mode import (
     DEFAULT_SOURCE_MODE,
     SOURCE_MODE_KEY,
+    SOURCE_MODE_USER_JSON,
     record_source_mode,
     resolve_source_mode,
     source_mode_of_region,
+)
+from app.services.effective_combination import build_combination
+from app.services.json_input_service import (
+    OP_GROUP_BY,
+    OP_PASSTHROUGH,
+    OP_RATIO,
+    OP_SUM,
+    build_field_mapping,
+    is_date_field,
+    is_summable_field,
+    normalize_field_key,
 )
 from app.services.report_draft_service import build_definition_draft
 from app.services.report_template_service import classify_metric_kind
@@ -357,6 +370,321 @@ def _plan_placement(kind: str, *, index: int) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------
+# 用户 JSON 输入的绑定（工单 #64）
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _JsonBinding:
+    """当前会话里用户提交的那份 JSON 输入。
+
+    绑定的是**最新一版**（候选或生效都取它）：定义建好、方案确认、
+    组合原子提交之后，这一版就是生效输入。提交失败或冲突时
+    **旧生效组合原样保留** —— 组合在定义里，不在输入记录里。
+    """
+
+    input_id: str
+    input_version: int
+    field_keys: list[str]
+    schema: dict[str, Any]
+    rows: list[dict[str, Any]]
+
+
+def _resolve_json_binding() -> _JsonBinding | None:
+    """当前会话有没有用户提交的 JSON 输入。
+
+    会话身份走请求级上下文（与既有工具同一套口径）。
+    没有提交过 → ``None``（按模拟示例处理，不改既有行为）。
+    """
+    try:
+        from app.services.session_context import current_session_key
+        from app.services.user_json_service import user_json_service
+    except Exception:  # noqa: BLE001
+        return None
+    session_id = current_session_key()
+    if not session_id:
+        return None
+    try:
+        record = user_json_service.latest_for_session(session_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if record is None:
+        return None
+    rows = user_json_service.rows_of(record)
+    field_keys = [
+        str(item.get("key"))
+        for item in (record.schema.get("fields") or [])
+        if item.get("key")
+    ]
+    return _JsonBinding(
+        input_id=record.inputId,
+        input_version=record.inputVersion,
+        field_keys=field_keys,
+        schema=record.schema,
+        rows=rows,
+    )
+
+
+def _field_types(schema: Mapping[str, Any]) -> dict[str, list[str]]:
+    return {
+        str(item.get("key")): list(item.get("types") or [])
+        for item in (schema.get("fields") or [])
+        if item.get("key")
+    }
+
+
+def _json_data_issues(binding: _JsonBinding) -> list[str]:
+    """这份数据的**问题清单**（类型混乱、缺失、null）。
+
+    只说结构事实，不带业务数值（ADR 0004 §5.1）。
+    """
+    issues: list[str] = []
+    for item in binding.schema.get("fields") or []:
+        key = str(item.get("key") or "")
+        if item.get("mixed"):
+            issues.append(
+                f"字段「{key}」混了多种类型（{'、'.join(item.get('types') or [])}），"
+                "已按明细展示并保留原值。"
+            )
+        if item.get("missingCount"):
+            issues.append(
+                f"字段「{key}」有 {item.get('missingCount')} 行缺失，"
+                "缺失按「（缺失）」标注，不当成 0。"
+            )
+        if item.get("nullCount"):
+            issues.append(
+                f"字段「{key}」有 {item.get('nullCount')} 行是 null，"
+                "null 与 0 分开标注。"
+            )
+    return issues
+
+
+def _numeric_field_keys(binding: _JsonBinding) -> list[str]:
+    """输入里**数值型**的字段（按字段结构判定，不按名字猜）。"""
+    types = _field_types(binding.schema)
+    return [
+        key for key in binding.field_keys
+        if "number" in (types.get(key) or [])
+    ]
+
+
+def _date_field_keys(binding: _JsonBinding) -> list[str]:
+    """输入里**日期型**的字段（按取值能不能解析成时间判定）。"""
+    result: list[str] = []
+    for key in binding.field_keys:
+        values = [row.get(key) for row in binding.rows[:50]]
+        if is_date_field(key, values):
+            result.append(key)
+    return result
+
+
+def _match_field(
+    *, labels: list[str], binding: _JsonBinding, candidates: list[str]
+) -> str | None:
+    """按字段身份在候选字段里找一个匹配的。
+
+    先按**名字相等**找（列 id / 列显示名 / 编码里的字段名），
+    找不到再按**候选集合的语义**兜底（数值字段 / 日期字段）。
+    兜底只在这一层做，且只在名字确实对不上时用。
+    """
+    normalized = {
+        normalize_field_key(key): key for key in binding.field_keys
+    }
+    for label in labels:
+        key = normalized.get(normalize_field_key(label))
+        if key:
+            return key
+    if not candidates:
+        return None
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _region_column_targets(
+    region: Mapping[str, Any],
+) -> list[tuple[str, str, str]]:
+    """这个区域要绑定的列：``(columnId, 标签候选, 角色)``。
+
+    角色取值：
+
+    - ``value``  值列（表格的普通列、指标卡的那一个量）；
+    - ``x``      趋势图的横轴（日期）；
+    - ``y``      趋势图的纵轴（数值）。
+    """
+    component = region.get("component") or {}
+    if not isinstance(component, Mapping):
+        return []
+    ctype = str(component.get("type") or "").upper()
+    targets: list[tuple[str, str, str]] = []
+    if ctype == "TABLE":
+        for column in component.get("columns") or []:
+            if not isinstance(column, Mapping):
+                continue
+            targets.append(
+                (
+                    str(column.get("id") or column.get("fieldRef") or ""),
+                    str(column.get("label") or ""),
+                    "value",
+                )
+            )
+    elif ctype == "METRIC_CARD":
+        metric = component.get("metric") or {}
+        if isinstance(metric, Mapping):
+            targets.append(
+                (
+                    str(metric.get("fieldRef") or metric.get("id") or ""),
+                    str(metric.get("label") or ""),
+                    "value",
+                )
+            )
+    elif ctype == "CHART":
+        for encoding in component.get("encodings") or []:
+            if not isinstance(encoding, Mapping):
+                continue
+            channel = str(encoding.get("channel") or "").upper()
+            role = "x" if channel == "X" else "y" if channel == "Y" else ""
+            if not role:
+                continue
+            targets.append(
+                (
+                    str(encoding.get("fieldRef") or ""),
+                    str(encoding.get("fieldRef") or ""),
+                    role,
+                )
+            )
+    return targets
+
+
+def _build_json_field_mapping(
+    *,
+    regions: list[dict[str, Any]],
+    binding: _JsonBinding,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """构造 JSON 模式下的「板块与列 → 输入字段」映射。
+
+    逐项核对：绑定的字段**确实存在于当前输入**（规格第 23 条）。
+    绑不上的列不进映射 —— 渲染时降级明细展示并说明，不编值。
+    """
+    numeric_keys = _numeric_field_keys(binding)
+    date_keys = _date_field_keys(binding)
+    mapping: list[dict[str, Any]] = []
+    unmapped: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for region in regions:
+        region_id = str(region.get("id") or "")
+        for column_id, label, role in _region_column_targets(region):
+            candidates: list[str] = []
+            if role == "x":
+                candidates = date_keys
+            elif role == "y":
+                candidates = numeric_keys
+            field_key = _match_field(
+                labels=[column_id, label], binding=binding, candidates=candidates
+            )
+            if field_key and field_key not in used:
+                used.add(field_key)
+                mapping.append(
+                    {
+                        "regionId": region_id,
+                        "columnId": column_id,
+                        "inputFieldKey": field_key,
+                        "inputFieldPath": None,
+                    }
+                )
+                continue
+            unmapped.append(
+                {
+                    "regionId": region_id,
+                    "columnId": column_id,
+                    "label": label,
+                    "reason": (
+                        "输入里没有同名字段"
+                        if not field_key
+                        else "该字段已被其它列绑定"
+                    ),
+                }
+            )
+    return mapping, unmapped
+
+
+def _build_json_processing_rules(
+    *,
+    regions: list[dict[str, Any]],
+    plan_sections: list[Any],
+    mapping: list[dict[str, Any]],
+    binding: _JsonBinding,
+) -> list[dict[str, Any]]:
+    """JSON 模式下的**受控处理规则**。
+
+    默认**直接展示输入值**（``PASSTHROUGH``）。求和 / 分组 / 占比只在
+    **方案声明了对应展示意图**（用户确认过的那份方案）时才生成，
+    并且：温度、PUE、累计电表读数、编号这类字段**不默认求和**
+    （规格第 25 条）—— 命中就退回明细展示。
+    """
+    types = _field_types(binding.schema)
+    rules: list[dict[str, Any]] = []
+    for index, region in enumerate(regions):
+        region_id = str(region.get("id") or "")
+        section = plan_sections[index] if index < len(plan_sections) else {}
+        intent = str((section or {}).get("displayIntent") or "")
+        region_mappings = [
+            item for item in mapping if item.get("regionId") == region_id
+        ]
+        if not region_mappings:
+            continue
+        group_key = _first_text_field(region_mappings, types)
+        value_key = _first_numeric_field(region_mappings, types)
+        for item in region_mappings:
+            field_key = str(item.get("inputFieldKey") or "")
+            column_id = str(item.get("columnId") or "")
+            operation = OP_PASSTHROUGH
+            params: dict[str, Any] = {}
+            if (
+                intent == "total"
+                and field_key == value_key
+                and is_summable_field(field_key)
+            ):
+                operation = OP_SUM
+            elif (
+                intent in ("comparison", "composition")
+                and field_key == value_key
+                and group_key
+                and group_key != field_key
+            ):
+                operation = OP_GROUP_BY if intent == "comparison" else OP_RATIO
+                params = {"groupBy": group_key, "valueField": field_key}
+            rules.append(
+                {
+                    "ruleId": f"rule_{region_id}_{column_id}_{operation}".lower(),
+                    "operation": operation,
+                    "targetFieldKey": field_key,
+                    "params": params,
+                }
+            )
+    return rules
+
+
+def _first_text_field(
+    mapping: list[dict[str, Any]], types: Mapping[str, list[str]]
+) -> str | None:
+    for item in mapping:
+        key = str(item.get("inputFieldKey") or "")
+        field_types = types.get(key) or []
+        if field_types and "number" not in field_types and "boolean" not in field_types:
+            return key
+    return None
+
+
+def _first_numeric_field(
+    mapping: list[dict[str, Any]], types: Mapping[str, list[str]]
+) -> str | None:
+    for item in mapping:
+        key = str(item.get("inputFieldKey") or "")
+        if "number" in (types.get(key) or []):
+            return key
+    return None
+
+
 def _align_resample_grain(region: dict[str, Any], grain: str) -> None:
     """把区域管道里重采样节点的粒度对齐到方案粒度。
 
@@ -393,9 +721,16 @@ def build_template_definition(
     区域级 ``templateBinding.previewSpec.sourceMode``。
     """
     current = TemplateDesign.model_validate(template)
-    mode = resolve_source_mode(
-        source_mode or (plan or {}).get(SOURCE_MODE_KEY)
-    )
+    # 用户 JSON 输入（工单 #64）：会话里提交过 JSON 就走 JSON 模式。
+    # 绑定的是**最新一版**输入记录 —— 组合随定义一起提交，
+    # 提交失败 / 冲突时旧生效组合原样保留。
+    json_binding = _resolve_json_binding()
+    if json_binding is not None:
+        mode = resolve_source_mode(SOURCE_MODE_USER_JSON)
+    else:
+        mode = resolve_source_mode(
+            source_mode or (plan or {}).get(SOURCE_MODE_KEY)
+        )
     window = (plan.get("requirements") or {}).get("timeRange")
     seed = build_definition_draft(current.title, subject_id, timeRange=window,
                                   componentRequests=["total"])
@@ -608,6 +943,34 @@ def build_template_definition(
         "definitionId": current.planId or current.id,
         "definitionVersion": current.planRevision,
     }
+    if json_binding is not None:
+        # 生效组合（契约表 §2）：来源模式、输入 ID 与版本、字段映射、
+        # 处理规则与定义版本**绑成一组**，随定义一起落库。
+        mapping, unmapped = _build_json_field_mapping(
+            regions=regions, binding=json_binding
+        )
+        rules = _build_json_processing_rules(
+            regions=regions,
+            plan_sections=list(plan.get("sections") or []),
+            mapping=mapping,
+            binding=json_binding,
+        )
+        seed.metadata["effectiveCombination"] = build_combination(
+            plan_id=str(current.planId or ""),
+            plan_revision=int(current.planRevision or 0),
+            definition_id=str(current.planId or current.id),
+            definition_version=int(current.planRevision or 0),
+            source_mode=mode.mode,
+            input_id=json_binding.input_id,
+            input_version=json_binding.input_version,
+            field_mapping=mapping,
+            processing_rules=rules,
+        )
+        # 绑不上的列：不编值、不丢行 —— 记下来，渲染时降级明细展示并说明。
+        seed.metadata["jsonInputIssues"] = {
+            "unmappedColumns": unmapped,
+            "dataIssues": _json_data_issues(json_binding),
+        }
     seed.metadata["pendingNotes"] = list(current.pendingNotes)
     seed.dependencies["metricRefs"] = [
         item for item in seed.dependencies.get("metricRefs", [])

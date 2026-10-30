@@ -231,7 +231,15 @@ def validate_combination(
             problems.append("模拟示例模式不应绑定 JSON 输入。")
     if field_keys is not None:
         problems.extend(validate_field_mapping(normalized["fieldMapping"], field_keys))
-    problems.extend(validate_processing_rules(normalized["processingRules"], field_keys or []))
+        problems.extend(validate_processing_rules(normalized["processingRules"], field_keys))
+    else:
+        # 没有当前输入的字段清单时，按组合自己声明的字段核对：
+        # 规则指向的字段必须在映射里出现过（不能凭空多一个字段）。
+        known = {
+            str(item.get("inputFieldKey") or "")
+            for item in normalized["fieldMapping"]
+        }
+        problems.extend(validate_processing_rules(normalized["processingRules"], sorted(known)))
     return problems
 
 
