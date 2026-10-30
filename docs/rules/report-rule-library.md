@@ -1,6 +1,6 @@
 # 展示规则库（第一版）
 
-**规则库版本：1.0.0**
+**规则库版本：1.0.1**
 规则表代码：`backend/app/services/report_rule_library.py`
 契约来源：GitHub #55《开发规格 - 报表智能生成与调整》第二章「规则库与选型」第 9–11 条
 工单：#60「统一开发 05：第一版规则库与命中依据持久化」
@@ -57,9 +57,35 @@ DisplayRule(
 `别要`。它们**不是**明确指定（规则被禁用），但同句里另一次出现的
 「用柱状图」不受影响。
 
-**指令词的例外**：`费用`、`适用`、`重要`、`运用`这类词里的「用／要」不是
-指令词 —— 那是词的一部分，不是用户在下指令。这条由指令词的正则负责，
-与否定写法是两回事。
+否定写法由**两层**挡，两层口径一致：
+
+1. **指令词层** —— 指令词正则用 lookbehind 挡住紧挨着它的否定字：
+   「不要」里的「要」前面是「不」、「别用」里的「用」前面是「别」，所以它们
+   **不是**指令词。这一层改造前就有，本模块第一版把它漏掉了，导致
+   「不要那种柱状图」里的「要」被当成了指令词 —— 1.0.1 已补回。
+2. **规则表禁用条件** —— 否定词紧挨着类型词、且**这一处前面没有别的指令词**
+   时，那一次出现被禁用。
+
+**指令词的例外**：指令词正则用 lookbehind 挡住**紧挨着指令词**的字。下面这些词里的
+「用／要」**单独**不构成指令词 —— 那是词的一部分，不是用户在下指令：
+
+| 词 | 为什么不是指令词 |
+| --- | --- |
+| `户用` | 「用」前面是「户」 |
+| `适用` | 「用」前面是「适」 |
+| `利用` | 「用」前面是「利」 |
+| `运用` | 「用」前面是「运」 |
+
+两点别混淆：
+
+- `使用` 本身**就是一个指令词** —— 「使用柱状图」是明确指定；被挡住的是
+  「使用」里那个单独的「用」。
+- `用户` 的「用」在**词首**（前面没有字），所以「用户柱状图」也是明确指定；
+  被挡住的是「户用」这类写法。
+
+`费用`、`重要` **不在**这份名单里 —— 它们的「用／要」是成立的
+（「费用柱状图」「重要柱状图」都算明确指定）。这是沿用改造前的行为，本轮
+没有改。
 
 ## 3. 规则族与选型三档
 
@@ -110,13 +136,13 @@ DisplayRule(
 
 ```json
 {
-  "ruleVersion": "1.0.0",
+  "ruleVersion": "1.0.1",
   "selectionEvidence": [
     {
       "sectionId": "section_1",
       "ruleId": "DR-MAP-COMPARISON",
       "componentType": "bar_chart",
-      "detail": "展示目的=comparison"
+      "detail": "模型给的语义候选→展示目的=comparison"
     }
   ]
 }
@@ -125,7 +151,9 @@ DisplayRule(
 - `ruleVersion`：定稿这份方案时用的规则库版本。
 - `selectionEvidence`：每个板块是被**哪条规则**、按**什么前提**定稿的。
 
-`detail` 记的是**真实命中的前提**，一路能追溯回去：
+`detail` 记的是**真实命中的前提**，一路能追溯回去。展示目的那一族还多写一段
+「展示目的**是怎么来的**」（模型给的语义候选 / 哪个关键词命中的）——
+所以 `detail` 不是光秃秃一句「展示目的=comparison」：
 
 | 场景 | `ruleId` | `detail` |
 | --- | --- | --- |
@@ -174,7 +202,7 @@ DisplayRule(
 | `DR-COLUMN-CABINET` | column | 300 | `机柜`、`cabinet` | `机柜名称、状态、负载率` | `model_declared_columns` | `系统为「{section_title}」补齐了栏目：{column_labels}。` |
 | `DR-COLUMN-ENERGY` | column | 200 | `能耗`、`耗电`、`用电`、`energy` | `设备名称、耗电量` | `model_declared_columns` | `系统为「{section_title}」补齐了栏目：{column_labels}。` |
 | `DR-COLUMN-DEVICE` | column | 100 | `设备`、`device` | `设备名称、状态` | `model_declared_columns` | `系统为「{section_title}」补齐了栏目：{column_labels}。` |
-| `DR-COLUMN-USER-HINT` | column | 50 | — | `` | `model_declared_columns` | `系统为「{section_title}」补齐了栏目：{column_labels}。` |
+| `DR-COLUMN-USER-HINT` | column | 50 | — | `用户点名的栏目` | `model_declared_columns` | `系统为「{section_title}」补齐了栏目：{column_labels}。` |
 | `DR-GRAIN-MINUTE` | grain | 500 | `分钟`、`分粒` | `MINUTE` | `grain_declared` | `时间粒度按 {suggested_display} 处理。` |
 | `DR-GRAIN-HOUR` | grain | 400 | `小时`、`逐时`、`时点` | `HOUR` | `grain_declared` | `时间粒度按 {suggested_display} 处理。` |
 | `DR-GRAIN-DAY` | grain | 300 | `按天`、`每天`、`天粒`、`日粒`、`逐日` | `DAY` | `grain_declared` | `时间粒度按 {suggested_display} 处理。` |
@@ -208,4 +236,5 @@ DisplayRule(
 
 | 版本 | 日期 | 变更 |
 | --- | --- | --- |
+| 1.0.1 | 2026-10-30 | 修「否定 + 隔字」被当成明确指定：指令词正则补回否定 lookbehind（「不要那种柱状图」里的「要」不再是指令词），禁用条件与指令词层改成同一口径。**选型行为与本工单改造前一致**（差分 1241 例 0 差异）。§2 的「指令词的例外」改成写真实的排除字表，`费用` / `重要` 不再被误列为例外；§4 的 `detail` 示例改成真实产出形态；规则表补上 `DR-COLUMN-USER-HINT` 的建议展示。 |
 | 1.0.0 | 2026-10-30 | 第一版。把展示目的关键词表、展示目的到组件类型的映射、组件类型关键词表、栏目预设表、粒度关键词表纳入规则体系；优先级从元组顺序改为显式字段；命中依据与规则版本随方案持久化。 |
