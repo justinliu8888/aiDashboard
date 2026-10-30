@@ -70,3 +70,136 @@ def test_array_path_marker_is_ignored_when_absent() -> None:
     assert routing_rules.extract_array_path("这是昨天的数据") is None
     assert routing_rules.extract_array_path("数组位置") is None
     assert routing_rules.extract_array_path("arrayPath:") is None
+
+
+# --------------------------------------------------------------------------
+# F2 —— 处理规则的归属：显式解析，不靠拆字符串猜
+# --------------------------------------------------------------------------
+
+
+def _metric_card_definition(region_id: str, column_id: str) -> dict[str, Any]:
+    return {
+        "regions": [
+            {
+                "id": region_id,
+                "role": "SUMMARY",
+                "component": {
+                    "type": "METRIC_CARD",
+                    "metric": {"id": column_id, "label": "总耗电", "fieldRef": column_id},
+                    "columns": [
+                        {"id": column_id, "label": "总耗电", "fieldRef": column_id}
+                    ],
+                },
+            }
+        ]
+    }
+
+
+def test_rule_with_underscore_column_id_does_not_land_in_a_phantom_region() -> None:
+    """列 id 含下划线时，规则落到**真实区域**，不落到幻影区域。
+
+    旧实现按 ``split("_")`` 反解：``rule_region_2_total_energy_sum`` 被拆成
+    区域 ``region_2_total`` —— 这个区域**根本不存在**，规则被静默丢掉，
+    汇总口径不生效也没有提示。
+    """
+    from app.services.effective_combination import normalize_combination
+    from app.services.json_payload_service import (
+        _rules_by_region,
+        build_user_json_payloads,
+    )
+
+    combination = normalize_combination(
+        {
+            "sourceMode": "user_json",
+            "inputId": "inp_1",
+            "inputVersion": 1,
+            "fieldMapping": [
+                {
+                    "regionId": "region_2",
+                    "columnId": "total_energy",
+                    "inputFieldKey": "energy",
+                }
+            ],
+            "processingRules": [
+                {
+                    "ruleId": "rule_region_2_total_energy_sum",
+                    "operation": "SUM",
+                    "targetFieldKey": "energy",
+                    "params": {},
+                }
+            ],
+        }
+    )
+
+    grouped = _rules_by_region(
+        combination, region_ids=["region_1", "region_2", "region_3"]
+    )
+    assert sorted(grouped.keys()) == ["region_2"]
+    assert "region_2_total" not in grouped
+
+    payloads = build_user_json_payloads(
+        definition=_metric_card_definition("region_2", "total_energy"),
+        rows=[{"energy": 1.0}, {"energy": 2.0}],
+        combination=combination,
+    )
+    assert sorted(payloads.keys()) == ["region_2"]
+    # 规则真的生效了：按全部行求和，而不是显示第一行的值。
+    assert payloads["region_2"]["value"] == 3.0
+
+
+def test_rule_region_resolution_is_unchanged_for_plain_ids() -> None:
+    """不带下划线的列 id：归属与旧实现一致（不引入行为变化）。"""
+    from app.services.effective_combination import normalize_combination
+    from app.services.json_payload_service import _rules_by_region
+
+    combination = normalize_combination(
+        {
+            "sourceMode": "user_json",
+            "inputId": "inp_1",
+            "inputVersion": 1,
+            "fieldMapping": [
+                {
+                    "regionId": "region_1",
+                    "columnId": "energyKwh",
+                    "inputFieldKey": "energyKwh",
+                }
+            ],
+            "processingRules": [
+                {
+                    "ruleId": "rule_region_1_energykwh_sum",
+                    "operation": "SUM",
+                    "targetFieldKey": "energyKwh",
+                    "params": {},
+                }
+            ],
+        }
+    )
+    grouped = _rules_by_region(combination, region_ids=["region_1"])
+    assert list(grouped.keys()) == ["region_1"]
+
+
+def test_unresolvable_rule_is_dropped_instead_of_guessing_a_region() -> None:
+    """认不出归属的规则**不执行**，也不落到任何区域（更不落到幻影区域）。"""
+    from app.services.effective_combination import normalize_combination
+    from app.services.json_payload_service import _rules_by_region
+
+    combination = normalize_combination(
+        {
+            "sourceMode": "user_json",
+            "inputId": "inp_1",
+            "inputVersion": 1,
+            "fieldMapping": [
+                {"regionId": "region_1", "columnId": "energy", "inputFieldKey": "energy"}
+            ],
+            "processingRules": [
+                {
+                    "ruleId": "rule_mystery_zone_col_sum",
+                    "operation": "SUM",
+                    "targetFieldKey": "energy",
+                    "params": {},
+                }
+            ],
+        }
+    )
+    grouped = _rules_by_region(combination, region_ids=["region_1"])
+    assert grouped == {}
