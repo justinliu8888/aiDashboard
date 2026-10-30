@@ -674,7 +674,9 @@ def _chart_payload(
     x_labels: list[str] = []
     y_values: list[float] = []
     points: list[dict[str, Any]] = []
-    unit = ""
+    # 单位与指标卡**同一套取法**：只认方案声明的 format.unitLabel
+    # （纵轴那一列的声明）。方案没声明单位就留空 —— 不猜 kWh（规格第 24 条）。
+    unit = _declared_unit(region, y_column) if y_column else ""
     if not x_field or not y_field:
         if not x_field and not y_field:
             missing = "横轴或纵轴字段"
