@@ -3176,6 +3176,25 @@ function readSourceMode(definition, region, payload, defRegion) {
   return "";
 }
 
+/**
+ * 整份报表的来源模式：先看定义级信号，再看载荷里各区域带的标记。
+ *
+ * 定义级优先（它是权威）；定义是老形状（没有 sourceMode）时，
+ * 载荷区域上的 dataSource 就是唯一依据（契约表 §1.1）。
+ */
+function readReportSourceMode(definition, payload) {
+  const fromDefinition = readSourceMode(definition, null, null, null);
+  if (fromDefinition) return fromDefinition;
+  const regions = Array.isArray(payload?.regions) ? payload.regions : [];
+  let sawSimulated = false;
+  for (const region of regions) {
+    const key = String(region?.dataSource || "").trim();
+    if (key === "user_json") return key;
+    if (key === "simulated") sawSimulated = true;
+  }
+  return sawSimulated ? "simulated" : "";
+}
+
 /** 面板顶部那句来源说明：按来源模式说。 */
 function renderSourceNoteHtml(sourceMode) {
   if (sourceMode === WorkbenchQuery.SOURCE_MODE_USER_JSON) {
@@ -3207,7 +3226,7 @@ function renderPanelHeader(definition, payload, regionCount) {
   const name = definition?.metadata?.name || "报表草稿";
   const windowLabel = readPayloadWindowLabel(payload);
   // 来源模式只按服务端给的信号说；拿不到就不写来源说明（宁可少说，不许说假话）。
-  const sourceMode = readSourceMode(definition, null, payload, null);
+  const sourceMode = readReportSourceMode(definition, payload);
   const sourceNote = renderSourceNoteHtml(sourceMode);
   header.innerHTML = `
     <div class="flex items-start justify-between gap-4">
