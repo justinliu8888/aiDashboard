@@ -57,6 +57,30 @@ class EditOperation(BaseModel):
     # CHANGE_METRIC / ADD_SECTION
     metricRef: str | None = None
     metricVersion: str | None = None
+    #: 目录外指标的**用户原话**（指标意图）。
+    #:
+    #: 解析不出真实指标标识时用它：不再以「未登记」拒绝，而是转成可澄清
+    #: 或带显式假设的模拟候选（工单 #65）。有它时 ``metricRef`` 为空 ——
+    #: 目录外指标**不伪造** ``metricRef``，它只有一个稳定的模拟身份。
+    metricIntent: str | None = None
+    #: 目录外指标的**服务端解析结果**（候选）：``{"intent", "kind",
+    #: "unit", "status", "note"}``。
+    #:
+    #: 用户拍板过口径之后（耗电量？占比？功率？），以**这一份**为准 ——
+    #: 接受时不再按原话重新解析一遍，口径不会漂。
+    metricCandidate: dict[str, Any] | None = None
+
+    #: 候选所基于的**草稿版本**。
+    #:
+    #: 接受时用它判过期：候选是基于旧版本草稿做的，服务端直接拒绝
+    #: （工单 #65，契约表 §4.2）。为空 = 不做这项校验（当场解析当场应用）。
+    baseDefinitionRevision: int | None = None
+
+    #: 选型依据：``{"ruleId", "componentType", "detail", "explain"}``。
+    #:
+    #: 命中依据来自**真实规则命中**（工单 #60 的规则库），不是事后编的；
+    #: 组件类型由用户原话或规则定稿，系统**不静默改写**（工单 #65）。
+    componentSelection: dict[str, Any] | None = None
 
     # CHANGE_TIME_RANGE
     timeWindow: dict[str, Any] | None = None

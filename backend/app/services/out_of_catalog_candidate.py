@@ -188,6 +188,35 @@ class OutOfCatalogCandidate:
             return self.note
         return "仅模拟展示、业务口径待确认"
 
+    def as_dict(self) -> dict[str, Any]:
+        """候选的**可落库**形态（跟着编辑计划走，接受时用同一份口径）。"""
+        return {
+            "intent": self.intent,
+            "kind": self.kind,
+            "unit": self.unit,
+            "status": self.status,
+            "note": self.note,
+        }
+
+
+def candidate_from_dict(raw: Any) -> OutOfCatalogCandidate | None:
+    """从落库的候选还原一份（认不出来就返回 ``None``，不硬造）。"""
+    if not isinstance(raw, dict):
+        return None
+    intent = str(raw.get("intent") or "").strip()
+    if not intent:
+        return None
+    status = str(raw.get("status") or "").strip()
+    if status not in (STATUS_AMBIGUOUS, STATUS_OUT_OF_CATALOG):
+        return None
+    return OutOfCatalogCandidate(
+        intent=intent,
+        kind=str(raw.get("kind") or "generic"),
+        unit=str(raw.get("unit") or ""),
+        status=status,
+        note=str(raw.get("note") or ""),
+    )
+
 
 def _match_clarification_choice(
     candidates: list[dict[str, Any]], answer: str,
@@ -258,12 +287,21 @@ def resolve_out_of_catalog_candidate(
 def out_of_catalog_region_reason(candidate: OutOfCatalogCandidate, *, source_mode: str = "simulated") -> str:
     """目录外指标那一块的**区域说明**（模板层与编辑层共用同一句）。
 
-    复用 ``simulated_field_semantics.out_of_catalog_reason``：真实目录的
+    复用 ``simulated_field_semantics.out_of_catalog_note``：真实目录的
     限制**不得**被说成「模拟渲染做不到」—— 模拟模式下这一块照样出数。
-    """
-    from app.services.simulated_field_semantics import out_of_catalog_reason
 
-    return out_of_catalog_reason(source_mode, intent=candidate.intent)
+    这里用的是**已经解析好的候选**（用户拍板过口径的按拍板的结果写），
+    不重新按意图解析一遍 —— 两处各解析一次，口径就会漂。
+    """
+    from app.services.simulated_field_semantics import (
+        OUT_OF_CATALOG_REASON_PREFIX,
+        out_of_catalog_note,
+    )
+
+    reason = OUT_OF_CATALOG_REASON_PREFIX + out_of_catalog_note(source_mode)
+    if candidate.note:
+        reason = f"{reason} {candidate.note}"
+    return reason
 
 
 # ---------------------------------------------------------------- 模拟身份
