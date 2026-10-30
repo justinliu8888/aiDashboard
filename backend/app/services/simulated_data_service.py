@@ -113,6 +113,10 @@ SUPPORTED_GRAINS = ("MINUTE", "HOUR", "DAY")
 #: 标题区域不产出数据载荷（规格：覆盖所有**非标题**区域）。
 TITLE_ROLES = ("REPORT_TITLE",)
 
+#: 语义未声明的列，造数器给的是**占位**。占位文案必须让人一眼看出这是
+#: 占位、不是业务数（契约表 §3.4 的 ⑤ 级：语义未声明 → 明确标注）。
+PLACEHOLDER_VALUE_SUFFIX = "（口径待确认）"
+
 #: 告警级别取值池（示例值，非真实告警）。
 _ALARM_LEVELS = ("严重", "重要", "一般", "提示", "警告")
 
@@ -873,8 +877,13 @@ def _metric_family(kind: str, metric_key: str, unit: str) -> str:
     一个，否则同一份报表内部自相矛盾。
 
     判据集中在 ``simulated_field_semantics.metric_family_seed_key``（**全仓库
-    只有这一处来源**）：描述里的 ``deterministicScope.seedKey`` 与这里的量族
-    必须是同一个东西，否则声明与实际会对不上。
+    只有这一处来源**）。
+
+    **与描述里的 ``deterministicScope`` 的关系（如实记录，别当成约束）**：
+    描述里的 ``deterministicScope`` **记录**该字段的预期作用域；当前造数器
+    **按区域 / 量族自行推导**种子，**不由本字段决定** —— 也就是说，本函数
+    返回的量族**不读**描述里的 ``seedKey``。两侧目前对得上，是靠「写入侧
+    与本函数用同一套判据」保证的，不是靠字段本身约束的。
     """
     return metric_family_seed_key(kind, metric_key, unit)
 
@@ -933,7 +942,10 @@ def _generic_value(kind: str, seed: str) -> Any:
     if kind == "pue":
         return round(hash_float(seed, 1.2, 1.8 - 1e-6), 2)
     if kind == "text":
-        return f"示例值 {int(hash_float(seed, 1, 99))}"
+        # 语义没解析出来的列给的是**占位**，不是业务数。占位文案必须说清
+        # 自己是占位（契约表 §3.4 的 ⑤ 级：语义未声明 → 明确标注），
+        # 用户不能把「示例值 11」当成真的业务数值。
+        return f"示例值 {int(hash_float(seed, 1, 99))}{PLACEHOLDER_VALUE_SUFFIX}"
     return round(hash_float(seed, 10.0, 500.0), 1)
 
 
