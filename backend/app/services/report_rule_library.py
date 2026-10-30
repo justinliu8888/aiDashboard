@@ -256,6 +256,9 @@ class RuleContext:
     column_hints: tuple[str, ...] = ()
     #: 当前可渲染的组件类型。
     renderable_component_types: frozenset[ComponentType] = RENDERABLE_COMPONENT_TYPES
+    #: 展示目的**是怎么来的**（「关键词「对比」」/「模型给的语义候选」）。
+    #: 命中依据要能一路追溯到真实命中，不只是「展示目的=comparison」。
+    intent_source: str = ""
     #: 正在判定的关键词（明确指定这一族按关键词逐条判）。
     candidate_keyword: str = ""
     #: 正在判定的那一次出现（-1 = 不限，按关键词的任意一次出现判）。
@@ -841,10 +844,12 @@ def match_explicit_component_type(
     是板块标题），而且没被否定（「不要柱状图」不算）。模型自己选的类型
     不算 —— 那不是用户的指定。
 
-    同一句里出现多个类型词时取**最先出现**的那个。
+    同一句里出现多个类型词时取**最先出现**的那个；同一位置命中多个写法
+    时取**更具体**的那个（「折线图」比「折线」更具体）—— 与改造前
+    「长的先匹配」的口径一致。
     """
     base = replace(context or RuleContext(), text=clause)
-    candidates: list[tuple[int, int, str, DisplayRule, str]] = []
+    candidates: list[tuple[int, int, int, str, DisplayRule, str]] = []
     for rule in _by_priority(_family_rules(FAMILY_EXPLICIT)):
         for keyword in rule.match_values:
             for index in _keyword_positions(clause, keyword):
@@ -855,11 +860,14 @@ def match_explicit_component_type(
                     continue
                 if not _directive_before(clause, index):
                     continue
-                candidates.append((index, -rule.priority, rule.rule_id, rule, keyword))
+                # 位置优先；同位置取更长的写法（更具体）；再同才按规则 ID。
+                candidates.append(
+                    (index, -len(keyword), -rule.priority, rule.rule_id, rule, keyword)
+                )
                 break
     if not candidates:
         return None
-    index, _, _, rule, keyword = min(candidates)
+    _, _, _, _, rule, keyword = min(candidates)
     component_type = rule.payload
     label = COMPONENT_TYPE_LABEL.get(component_type, component_type.value)
     values = {"component_label": label, "suggested_display": rule.suggested_display}
@@ -882,24 +890,36 @@ def explicit_hit_for_type(
 
     用在「沿用上一版用户明确指定过的类型」这种情形：类型是确定的，但要
     记下是**哪条规则**给的依据 —— 命中依据不能是空白的。
+
+    同一类型有多个写法时（柱状图 / 条形图 / 柱图），取**该类型标签对应**
+    的那条规则（标签就是这一类型的正式叫法）—— 与「明确指定」这一族在
+    同一位置挑写法时的口径一致，命中依据不会因为字典序而指到一条更冷僻
+    的规则上。
     """
-    for rule in _by_priority(_family_rules(FAMILY_EXPLICIT)):
-        if rule.payload is not component_type:
-            continue
-        label = COMPONENT_TYPE_LABEL.get(component_type, component_type.value)
-        values = {
-            "component_label": label,
-            "suggested_display": rule.suggested_display,
-        }
-        return _hit(
-            rule,
-            detail=detail or f"组件类型={component_type.value}",
-            explain=_render(rule.explain_template, values),
-            reason=_render(rule.reason_template, values),
-            suggested_display=rule.suggested_display,
-            payload=component_type,
-        )
-    return None
+    candidates = [
+        rule
+        for rule in _family_rules(FAMILY_EXPLICIT)
+        if rule.payload is component_type
+    ]
+    if not candidates:
+        return None
+    label = COMPONENT_TYPE_LABEL.get(component_type, component_type.value)
+    rule = next(
+        (item for item in candidates if label in item.match_values),
+        max(candidates, key=lambda item: (len(item.match_values[0]), item.rule_id)),
+    )
+    values = {
+        "component_label": label,
+        "suggested_display": rule.suggested_display,
+    }
+    return _hit(
+        rule,
+        detail=detail or f"组件类型={component_type.value}",
+        explain=_render(rule.explain_template, values),
+        reason=_render(rule.reason_template, values),
+        suggested_display=rule.suggested_display,
+        payload=component_type,
+    )
 
 
 def match_component_mapping(
@@ -931,9 +951,17 @@ def match_component_mapping(
             "intent_label": intent_label,
             "suggested_display": rule.suggested_display,
         }
+        # 命中依据要能一路追溯：展示目的**怎么来的**（哪个关键词 / 模型候选）
+        # 也要写下来，不只写「展示目的=comparison」。
+        source = scoped.intent_source
+        detail = (
+            f"{source}→展示目的={display_intent.value}"
+            if source
+            else f"展示目的={display_intent.value}"
+        )
         return _hit(
             rule,
-            detail=f"展示目的={display_intent.value}",
+            detail=detail,
             explain=_render(rule.explain_template, values),
             reason=_render(rule.reason_template, values),
             suggested_display=rule.suggested_display,

@@ -628,22 +628,40 @@ def _resolve_display_intent(
     return None, None
 
 
+def _intent_source(display_intent: DisplayIntent | None, intent_hit: RuleHit | None) -> str:
+    """展示目的**是怎么来的** —— 命中依据要能一路追溯到真实命中。
+
+    模型给的 ``displayIntent`` 是语义候选（写明「模型给的语义候选」），
+    从请求里读出来的就写明是哪个关键词命中的。
+    """
+    if display_intent is None:
+        return ""
+    if intent_hit is not None:
+        return intent_hit.detail
+    return "模型给的语义候选"
+
+
 def _select_component_type(
     *,
     explicit: RuleHit | None,
     display_intent: DisplayIntent | None,
     model_type: ComponentType,
+    intent_source: str = "",
 ) -> RuleHit:
     """定稿组件类型，返回命中的那条规则。
 
     优先级是**显式**的：**用户明确指定 300 > 按展示目的映射 200 > 模型
     原选 100**。每一层都还要满足规则自己的前提条件 —— 被禁用的规则
     不参与定稿。理由由命中的规则渲染，不是事后编的。
+
+    ``intent_source`` 记着展示目的是怎么来的，命中依据才能一路追溯到
+    真实命中（哪个关键词 / 模型的哪个语义候选）。
     """
     return select_component_type(
         explicit_hit=explicit,
         display_intent=display_intent,
         model_component_type=model_type,
+        context=RuleContext(intent_source=intent_source),
     )
 
 
@@ -828,13 +846,14 @@ def resolve_plan(
         except ValueError:
             model_type = ComponentType.TEXT
 
-        display_intent, _intent_hit = _resolve_display_intent(
+        display_intent, intent_hit = _resolve_display_intent(
             section, sections=sections, request_text=request_text
         )
         hit = _select_component_type(
             explicit=explicit_hit,
             display_intent=display_intent,
             model_type=model_type,
+            intent_source=_intent_source(display_intent, intent_hit),
         )
         component_type = hit.payload
         selections.append(

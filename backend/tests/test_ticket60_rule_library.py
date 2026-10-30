@@ -283,6 +283,77 @@ def test_the_hit_evidence_records_the_premise_that_fired():
     assert evidence.componentType == ComponentType.BAR_CHART
 
 
+def test_the_evidence_names_the_keyword_that_fired_the_intent():
+    """展示目的的命中依据要写清是**哪个关键词**读出来的。
+
+    只写「展示目的=comparison」看不出依据来自哪里 —— 命中的关键词也要
+    记下来，理由才真能一路追溯到真实命中。
+    """
+    payload = _candidate_payload()
+    payload["sections"] = [
+        _section("各机房耗电对比", "metric_card"),
+    ]
+
+    plan = apply_candidate(payload, plan_id="plan_060", current_request="看各机房的对比")
+
+    evidence = plan.selectionEvidence[0]
+    assert evidence.ruleId == "DR-MAP-COMPARISON"
+    assert "对比" in evidence.detail
+
+
+def test_the_evidence_says_the_display_intent_came_from_the_model_candidate():
+    """展示目的来自模型的语义候选时，依据要写明这一点。"""
+    payload = _candidate_payload()
+    payload["sections"] = [
+        _section("各机房耗电对比", "metric_card", displayIntent="comparison"),
+    ]
+
+    plan = apply_candidate(payload, plan_id="plan_060")
+
+    evidence = plan.selectionEvidence[0]
+    assert evidence.ruleId == "DR-MAP-COMPARISON"
+    assert "模型给的语义候选" in evidence.detail
+
+
+def test_the_most_specific_wording_wins_at_the_same_position():
+    """同一位置命中多个写法时取**更具体**的那个。
+
+    「用折线图」命中的是「折线图」那条规则，不是更短的「折线」——
+    与改造前「长的先匹配」的口径一致，命中依据才指得准。
+    """
+    hit = rules.match_explicit_component_type("用折线图")
+
+    assert hit is not None
+    assert hit.rule_id == "DR-EXPLICIT-LINE-CHART"
+    assert "折线图" in hit.detail
+
+
+def test_the_carried_over_type_records_the_canonical_rule():
+    """沿用上一版已指定的类型时，依据指向该类型的**正式叫法**那条规则。
+
+    上一版用户明确说了「用指标卡」，这一版没改这块 → 类型沿用，依据仍
+    指向「指标卡」那条规则，而不是同类型的另一个冷僻写法。
+    """
+    payload = _candidate_payload()
+    payload["sections"] = [
+        _section("总耗电", "metric_card"),
+    ]
+    previous = apply_candidate(
+        payload, plan_id="plan_060", current_request="总耗电用指标卡"
+    )
+    assert previous.sections[0].explicitComponentType == ComponentType.METRIC_CARD
+
+    updated = apply_candidate(
+        _candidate_payload(sections=[_section("总耗电", "metric_card")]),
+        previous=previous.model_dump(mode="json"),
+        expected_revision=1,
+    )
+
+    # 用户没说改类型 → 沿用上一版；依据仍指向「指标卡」那条规则。
+    assert updated.sections[0].explicitComponentType == ComponentType.METRIC_CARD
+    assert updated.selectionEvidence[0].ruleId == "DR-EXPLICIT-METRIC-CARD"
+
+
 def test_the_model_only_gives_a_semantic_candidate_the_server_finalizes():
     """模型给的展示目的只是语义候选，组件类型由服务端按规则定稿。"""
     payload = _candidate_payload()
