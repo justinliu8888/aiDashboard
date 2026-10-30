@@ -87,7 +87,12 @@ ADD_WORDS = (
     "加一个", "加个", "加张", "加条",
     "新增",
 )
-GRAIN_WORDS = ("粒度", "按分钟", "按小时", "按天", "分钟级", "小时级", "天级", "compile", "compilation")
+#: 说明用户谈的是「粒度」这件事的**话题词**（与具体取值无关）。
+#:
+#: 这里**不收取值词**（「按小时」「小时级」…）：取值只认明确点名的写法
+#: （``GRAIN_EXPLICIT_FROM_TEXT``），取值词出现在卡片名里时不是新值。
+#: 旧表把取值词也当成话题词，于是「小时趋势」这种卡片名会被算成粒度话题。
+GRAIN_WORDS = ("粒度", "compile", "compilation")
 
 CHART_KIND_MAP = {
     "柱状图": "BAR",
@@ -867,15 +872,24 @@ class TemplateEditEngine:
 
         # ===== 7. 改 compilation 粒度 =====
         #
-        # 粒度新值同样只来自**明确的改动动词片段**，且只认明确点名的写法
-        # （按小时 / 小时级 / 按天）：裸词「小时」「天」经常来自卡片名
-        # （「小时趋势」），那是用来定位对象的，不是新值。
-        if new_value:
-            grain_unit = self._parse_grain(new_value, explicit_only=True)
-        else:
-            # 没有改动动词：用户在问「能不能按 X 粒度看」，整句都是诉求。
-            grain_unit = self._parse_grain(text)
-        if grain_unit or any(w in text for w in GRAIN_WORDS):
+        # 粒度新值与时间窗**同口径**（规格第 48 条 / 契约表 §7）：
+        # 只认**明确点名的写法**（按小时 / 小时级 / 按天粒度）。
+        # 卡片名里的「小时」「天」（「小时趋势」）只用来定位对象，不是新值。
+        #
+        # 新值片段的来源：
+        #   * 有改动动词片段（``new_value``）→ 只从片段里取明确点名的写法；
+        #   * 没有改动动词 → 整句里**去掉卡片名**之后取明确点名的写法。
+        #     （不去掉卡片名，「把小时趋势的标题改一下」会被当成改粒度。）
+        #
+        # 澄清答案走的是**第一档**：调用方把整句塞进 ``change_value``，
+        # 整句就是用户给的新值（「按小时」），这里按同一口径取明确点名。
+        topic_text = self._text_without_region_label(text, target_region)
+        grain_source = new_value if new_value else topic_text
+        grain_unit = self._parse_grain(grain_source, explicit_only=True)
+        # 「能不能按哪些粒度」这类问句没有新值，但仍然是粒度话题：
+        # 话题词只认「粒度 / compile」，不拿取值词当话题词 ——
+        # 「小时趋势」里的「小时」既不是新值，也不是话题。
+        if grain_unit or any(w in topic_text for w in GRAIN_WORDS):
             plan.intent = EditIntent.CHANGE_COMPILATION_GRAIN
             plan.confidence = 0.85
             if target_region is None:
@@ -1620,6 +1634,24 @@ class TemplateEditEngine:
             if word in lowered:
                 return grain
         return None
+
+    @staticmethod
+    def _text_without_region_label(text: str, region: dict[str, Any] | None) -> str:
+        """去掉句子里指向目标卡片的那部分。
+
+        卡片名里的「小时」「天」（「小时趋势」）只用来**定位对象**，
+        不是新值：留着它，「把小时趋势的标题改一下」就会被当成改粒度。
+
+        找不到目标卡片、或卡片名没出现在句子里时原样返回。
+        """
+        if not region:
+            return text
+        label = _region_label(region)
+        if not label or len(label) < 2:
+            return text
+        if label not in text:
+            return text
+        return text.replace(label, " ")
 
     @staticmethod
     def _parse_time_range(text: str) -> tuple[dict[str, Any] | None, str]:
