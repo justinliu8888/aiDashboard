@@ -125,6 +125,28 @@
       ]
     },
     {
+      "name": "page-accept-06-json-issues-dedup",
+      "path": "/frontend/tests/page_accept_harness.html?scene=json-issues",
+      "title": "工单 08b 页面层验收 harness",
+      "waitMs": 2000,
+      "ignore": ["/health", "/api/sessions"],
+      "selectors": [
+        "#preview-root [data-json-input-issues]",
+        "#preview-root [data-region-payload-notes]"
+      ],
+      "texts": [
+        "数据里的问题",
+        "以下栏目没能绑定到输入字段",
+        "字段「total_energy」有 3 行缺失",
+        "这个指标没能绑定到输入字段，没有编值。",
+        "共 300 行，已显示前 200 行"
+      ],
+      "counts": [
+        "#preview-root [data-json-input-issues]==1",
+        "#preview-root [data-region-payload-notes]==2"
+      ]
+    },
+    {
       "name": "page-accept-05-workbench-load",
       "path": "/frontend/pages/workbench.html",
       "title": "AI 报表生成工作台",

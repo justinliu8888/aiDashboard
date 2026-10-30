@@ -1554,13 +1554,12 @@ def _generate_user_json_payloads(
             "绑定的用户 JSON 输入记录不存在，无法渲染。",
         )
     rows = user_json_service.rows_of(record)
-    metadata = definition.get("metadata") or {}
-    issues = ((metadata.get("jsonInputIssues") or {}).get("dataIssues")) or []
+    # 全局数据问题（`metadata.jsonInputIssues.dataIssues`）**不进区域载荷** ——
+    # 它由报表面板顶部渲染一次；塞进每块板的 notes 就是同一句话说 N 遍。
     payloads = build_user_json_payloads(
         definition=definition,
         rows=rows,
         combination=combination,
-        issues=list(issues),
     )
     for payload in payloads.values():
         payload[SOURCE_MODE_KEY] = SOURCE_MODE_USER_JSON

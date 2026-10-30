@@ -277,6 +277,9 @@ def test_non_summable_reason_is_written_into_data_issues() -> None:
 
     承诺写在 ``json_input_service`` 的注释里（「把原因写进数据问题说明」）；
     落点是契约表 §2 已登记的 ``metadata.jsonInputIssues.dataIssues``。
+
+    契约表 §4.3.2 ⑤：**全局数据问题只说一次** —— 定义级说过了，
+    区域 ``payload.notes`` 里就不再复制（复制 = 同一句话说 N 遍）。
     """
     from tests.support.acceptance_harness import (
         ScriptedModel,
@@ -312,11 +315,19 @@ def test_non_summable_reason_is_written_into_data_issues() -> None:
             str(rule.get("operation")) == "PASSTHROUGH" for rule in rules
         ), rules
 
-        # 原因也进了**用户能看到的**载荷说明里。
+        # 原因进了**用户能看到的**说明里 —— 但**只在面板顶部说一次**
+        # （契约表 §4.3.2 ⑤）：它是**整份输入**的问题，由
+        # ``metadata.jsonInputIssues.dataIssues`` 承载，顶部渲染一次就够了。
+        # 再塞进每个区域的 ``payload.notes`` 就是同一句话说 N 遍。
         preview = confirmed.get("reportPreviewPayload") or {}
         notes = [
             note
             for item in preview.get("regions") or []
             for note in ((item.get("payload") or {}).get("notes") or [])
         ]
-        assert any("temperature" in note and "求和" in note for note in notes), notes
+        # 区域 notes 里**没有**任何全局数据问题的文案。
+        assert not [
+            note for note in notes if any(str(item) in note for item in data_issues)
+        ], notes
+        # 区域自己的话**一条不少**（这个指标没绑上字段 → 区域自己解释）。
+        assert any("这个指标没能绑定到输入字段" in note for note in notes), notes

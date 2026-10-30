@@ -518,3 +518,74 @@ test("没有 jsonInputIssues 时不多画（没话说就不说）", () => {
   );
   assert.equal(api.renderJsonInputIssuesHtml(null), "");
 });
+
+// ================================================================ 全局问题只说一次
+
+/** 数一段文本里某个子串出现了几次。 */
+function countOccurrences(haystack, needle) {
+  if (!needle) return 0;
+  let count = 0;
+  let from = 0;
+  for (;;) {
+    const hit = haystack.indexOf(needle, from);
+    if (hit < 0) return count;
+    count += 1;
+    from = hit + needle.length;
+  }
+}
+
+test("全局数据问题只说一次：顶部一次，区域卡片里不重复（契约表 §4.3.2 ⑤）", () => {
+  // 服务端写在定义级 metadata.jsonInputIssues 里的全局问题。
+  const GLOBAL_TEXT =
+    "字段「total_energy」有 3 行缺失，缺失按「（缺失）」标注，不当成 0。";
+  const definition = {
+    regions: [{ id: "region_1", name: "设备耗电明细" }],
+    metadata: {
+      jsonInputIssues: {
+        unmappedColumns: [
+          { regionId: "region_1", columnId: "c2", label: "采集时间", reason: "输入里没有同名字段" },
+        ],
+        dataIssues: [GLOBAL_TEXT],
+      },
+    },
+  };
+
+  // ① 报表面板顶部：这句话出现**一次**。
+  const api = loadApi(["renderJsonInputIssuesHtml"], [extractConst("esc")]);
+  const topHtml = api.renderJsonInputIssuesHtml(definition);
+  assert.equal(
+    countOccurrences(topHtml, GLOBAL_TEXT),
+    1,
+    "全局数据问题在顶部只说一次"
+  );
+
+  // ② 区域卡片：只摆 payload.notes 里的**区域专属**说明，
+  //    定义级的全局文案不会被前端塞进区域卡片。
+  const cardApi = loadCardApi();
+  const card = renderCard(
+    cardApi,
+    {
+      regionId: "region_1",
+      name: "设备耗电明细",
+      role: "DETAIL",
+      componentType: "TABLE",
+      payload: jsonTablePayload(),
+    },
+    { id: "region_1", name: "设备耗电明细" }
+  );
+  assert.deepEqual(card.notes, [
+    "共 300 行，已显示前 200 行（上限 200 行）；汇总计算仍按全部 300 行。",
+  ]);
+  assert.equal(
+    countOccurrences(card.notes.join("\n"), GLOBAL_TEXT),
+    0,
+    "区域卡片里不再重复同一句"
+  );
+
+  // ③ 整个页面看下来：这句话一共出现 1 次（顶部 1 + 区域 0）。
+  assert.equal(
+    countOccurrences(topHtml + card.notes.join("\n"), GLOBAL_TEXT),
+    1,
+    "同一句话在页面上只说一次"
+  );
+});

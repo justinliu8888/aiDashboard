@@ -232,10 +232,15 @@ def _table_payload(
     region: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
     mapping: Mapping[str, str],
-    issues: Sequence[str],
     record_count: int,
 ) -> dict[str, Any]:
-    """明细表载荷：每列都指向一个输入字段。"""
+    """明细表载荷：每列都指向一个输入字段。
+
+    ``notes`` **只放这块板自己的话** —— 全局数据问题（类型混乱、缺失、
+    null、不默认求和）不往这里塞：那些是**整份输入**的问题，由
+    ``metadata.jsonInputIssues.dataIssues`` 承载，报表面板顶部说一次就够
+    （塞进每一块板就是同一句话说 N 遍）。
+    """
     component = region.get("component") or {}
     columns = [
         dict(column)
@@ -250,10 +255,7 @@ def _table_payload(
             "dataSource": USER_JSON_DATA_SOURCE,
             "recordCount": record_count,
             "displayedRows": 0,
-            "notes": _notes(
-                list(issues)
-                + ["这个板块没有声明栏目，已按明细展示原始数据。"]
-            ),
+            "notes": _notes(["这个板块没有声明栏目，已按明细展示原始数据。"]),
         }
     displayed = list(rows)[:MAX_DISPLAY_ROWS]
     payload_rows: list[dict[str, Any]] = []
@@ -269,7 +271,7 @@ def _table_payload(
             present = field_key in row
             payload_row[field_ref] = render_cell(row.get(field_key), present=present)
         payload_rows.append(payload_row)
-    notes = list(issues)
+    notes: list[str] = []
     if len(rows) > len(displayed):
         notes.append(
             f"共 {len(rows)} 行，已显示前 {len(displayed)} 行"
@@ -306,7 +308,6 @@ def _metric_card_payload(
     source_rows: Sequence[Mapping[str, Any]],
     mapping: Mapping[str, str],
     rules: Sequence[Mapping[str, Any]],
-    issues: Sequence[str],
     record_count: int,
 ) -> dict[str, Any]:
     """指标卡载荷。
@@ -323,6 +324,9 @@ def _metric_card_payload(
 
     **宁可少说，不许说假话**：口径说明写的是**实际发生了什么** —— 规则被
     跳过（比如温度不默认求和）时写实话，不写「按求和展示」。
+
+    ``notes`` **只放这块板自己的话** —— 全局数据问题不往这里塞
+    （同一份全局问题说 N 遍就是重复显示，见 :func:`build_user_json_payloads`）。
     """
     component = region.get("component") or {}
     metric = component.get("metric") or {}
@@ -331,7 +335,7 @@ def _metric_card_payload(
     label = str(metric.get("label") or region.get("name") or "指标")
     column_id = str(metric.get("fieldRef") or metric.get("id") or "")
     field_key = mapping.get(column_id)
-    notes = list(issues)
+    notes: list[str] = []
     value: Any = None
     unit = _declared_unit(region, column_id)
     precision = _declared_precision(region, column_id)
@@ -688,7 +692,6 @@ def _chart_payload(
     region: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
     mapping: Mapping[str, str],
-    issues: Sequence[str],
     record_count: int,
 ) -> dict[str, Any]:
     """图表载荷。
@@ -707,9 +710,11 @@ def _chart_payload(
 
     **单位只认方案声明的** ``format.unitLabel``（纵轴那一列的声明）；
     方案没声明单位就留空 —— 不猜 kWh（规格第 24 条）。
+
+    ``notes`` **只放这块板自己的话** —— 全局数据问题不往这里塞。
     """
     component = region.get("component") or {}
-    notes = list(issues)
+    notes: list[str] = []
     x_column, y_column = _encoding_columns(component)
     x_field = mapping.get(x_column, "") if x_column else ""
     y_field = mapping.get(y_column, "") if y_column else ""
@@ -776,7 +781,6 @@ def _data_quality_payload(
     *,
     region: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
-    issues: Sequence[str],
     record_count: int,
 ) -> dict[str, Any]:
     """数据质量载荷：用**真实统计**，不编覆盖率。"""
@@ -804,13 +808,11 @@ def _data_quality_payload(
         "duplicates": duplicates,
         "freshnessSeconds": None,
         "dataSource": USER_JSON_DATA_SOURCE,
-        "notes": _notes(list(issues)),
+        "notes": [],
     }
 
 
-def _text_payload(
-    *, region: Mapping[str, Any], issues: Sequence[str]
-) -> dict[str, Any]:
+def _text_payload(*, region: Mapping[str, Any]) -> dict[str, Any]:
     component = region.get("component") or {}
     content = component.get("content") or {}
     text = str(content.get("template") or region.get("name") or "")
@@ -818,7 +820,7 @@ def _text_payload(
         "rendered": text,
         "template": text,
         "dataSource": USER_JSON_DATA_SOURCE,
-        "notes": _notes(list(issues)),
+        "notes": [],
     }
 
 
@@ -827,12 +829,19 @@ def build_user_json_payloads(
     definition: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
     combination: Mapping[str, Any],
-    issues: Sequence[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """按生效组合，用**完整已校验数据**生成每个区域的载荷。
 
     返回 ``{regionId: payload}``，与模拟模式的载荷**同构** ——
     前端不需要为 JSON 模式另写一套渲染。
+
+    **区域 ``notes`` 只放这块板自己的话。**
+
+    整份输入的**全局数据问题**（类型混乱、字段缺失、null、不默认求和）
+    由 ``definition.metadata.jsonInputIssues.dataIssues`` 承载 ——
+    报表面板顶部渲染一次就够了。**不再把全局问题复制进每一块板的
+    notes**：那会让同一句话说 N 遍（顶部一次 + 每块板一次），
+    用户看到的是一堆一模一样的黄条。
     """
     normalized = normalize_combination(combination)
     mapping_by_region = _mapping_by_region(normalized)
@@ -842,7 +851,6 @@ def build_user_json_payloads(
         if isinstance(region, Mapping) and region.get("id")
     ]
     rules_by_region = _rules_by_region(normalized, region_ids=region_ids)
-    shared_issues = [str(item) for item in (issues or []) if item]
     record_count = len(rows)
     result: dict[str, dict[str, Any]] = {}
     for region in definition.get("regions") or []:
@@ -865,7 +873,6 @@ def build_user_json_payloads(
                 region=region,
                 rows=processed,
                 mapping=mapping,
-                issues=shared_issues,
                 record_count=record_count,
             )
         elif ctype == "METRIC_CARD":
@@ -877,7 +884,6 @@ def build_user_json_payloads(
                 source_rows=rows,
                 mapping=mapping,
                 rules=rules,
-                issues=shared_issues,
                 record_count=record_count,
             )
         elif ctype == "CHART":
@@ -885,24 +891,21 @@ def build_user_json_payloads(
                 region=region,
                 rows=processed,
                 mapping=mapping,
-                issues=shared_issues,
                 record_count=record_count,
             )
         elif ctype == "DATA_QUALITY":
             payload = _data_quality_payload(
                 region=region,
                 rows=processed,
-                issues=shared_issues,
                 record_count=record_count,
             )
         elif ctype == "TEXT":
-            payload = _text_payload(region=region, issues=shared_issues)
+            payload = _text_payload(region=region)
         else:
             payload = {
                 "dataSource": USER_JSON_DATA_SOURCE,
                 "notes": _notes(
-                    list(shared_issues)
-                    + [f"组件类型 {ctype} 在用户 JSON 模式下没有对应展示，已留空。"]
+                    [f"组件类型 {ctype} 在用户 JSON 模式下没有对应展示，已留空。"]
                 ),
             }
         result[region_id] = payload
