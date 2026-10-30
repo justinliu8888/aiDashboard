@@ -43,12 +43,14 @@ from app.services.report_template_service import build_template_design
 from app.services.simulated_data_service import PLACEHOLDER_VALUE_SUFFIX
 from app.services.simulated_field_semantics import (
     CANONICAL_FIELD_CATALOG,
+    IDENTITY_MATCHABLE_IDENTITIES,
     PRODUCT_COLUMN_VOCABULARY,
     VALUE_TYPE_BY_SEMANTIC_KIND,
     VALUE_TYPE_COST,
     VALUE_TYPE_DEVICE_ID,
     VALUE_TYPE_DEVICE_NAME,
     VALUE_TYPE_ENERGY,
+    VALUE_TYPE_LEVEL,
     VALUE_TYPE_PERCENT,
     VALUE_TYPE_POWER,
     VALUE_TYPE_STATUS,
@@ -221,9 +223,84 @@ def test_field_identity_tail_is_split_on_both_dot_and_underscore():
 
 
 def test_underscore_tail_of_a_generated_column_id_hits_the_catalog():
-    """③ ``identity``：生产形态的取值键 ``section_1_col_energy`` 也能切出末段。"""
+    """③ ``identity``：生产形态的取值键 ``section_1_col_energyKwh`` 也能切出末段。
+
+    末段切分**本身**没变 —— 变的是切出来的末段**算不算「能唯一确定量口径的
+    具体条目」**（契约表 §3.4 ③，v1.18.0）。``energyKwh`` 是具体条目，
+    ``energy`` 是通用量词（见下一个用例）。
+    """
     description = _describe(
-        {"id": "col_energy", "label": "总耗电量", "fieldRef": "section_1_col_energy"}
+        {"id": "col_energyKwh", "label": "总耗电量", "fieldRef": "section_1_col_energyKwh"}
+    )
+
+    assert description.semanticSource == "identity"
+    assert description.valueType == VALUE_TYPE_ENERGY
+
+
+@pytest.mark.parametrize(
+    "token,label,expected",
+    [
+        ("energy", "总耗电量", VALUE_TYPE_ENERGY),
+        ("cost", "电费", VALUE_TYPE_COST),
+        ("power", "峰值功率", VALUE_TYPE_POWER),
+        ("kwh", "耗电量", VALUE_TYPE_ENERGY),
+        ("kw", "峰值功率", VALUE_TYPE_POWER),
+        ("yuan", "电费", VALUE_TYPE_COST),
+    ],
+)
+def test_a_generic_quantity_token_is_not_identity_matchable(
+    token: str, label: str, expected: str
+):
+    """③ **通用量词不算**「能唯一确定量口径的具体条目」（契约表 §3.4 ③）。
+
+    ``energy`` / ``cost`` / ``power`` / ``kwh`` / ``kw`` / ``yuan`` 只说明
+    「是个量」，不说明「是哪个量」。③ 的级序**优先于**④，一命中就遮蔽显示名
+    —— 认了它们，占位就会变成**错数字**（比占位更坏）。
+    """
+    assert token not in CANONICAL_FIELD_CATALOG
+    assert token not in IDENTITY_MATCHABLE_IDENTITIES
+
+    description = _describe(
+        {"id": f"col_{token}", "label": label, "fieldRef": f"section_1_col_{token}"}
+    )
+
+    # 末段切分还在，但通用量词不被③ 认 → 落到④ 显示名精确查表。
+    assert description.semanticSource == "vocabulary"
+    assert description.valueType == expected
+
+
+@pytest.mark.parametrize(
+    "column_id,label,expected",
+    [
+        ("col_power", "负载率", VALUE_TYPE_PERCENT),
+        ("col_load", "设备名称", VALUE_TYPE_DEVICE_NAME),
+        ("col_count", "告警级别", VALUE_TYPE_LEVEL),
+        ("col_percent", "负载率", VALUE_TYPE_PERCENT),
+    ],
+)
+def test_a_bare_quantity_word_never_shadows_the_display_name(
+    column_id: str, label: str, expected: str
+):
+    """③ **不遮蔽** ④：裸量词身份不能盖过显示名。
+
+    这几条是独立复核实测出来的**错量纲**：`col_power` + 「负载率」修前是
+    ``percent``（对），修后变成 ``power``（把 215.85 kW 当负载率读）。
+    """
+    description = _describe(
+        {"id": column_id, "label": label, "fieldRef": f"section_1_{column_id}"}
+    )
+
+    assert description.semanticSource == "vocabulary"
+    assert description.valueType == expected
+
+
+def test_a_specific_identity_still_shadows_the_display_name():
+    """③ 认**具体条目**时仍然优先于④（收紧的是「通用量词」，不是③ 本身）。"""
+    description = _describe(
+        {
+            "id": "col_energyKwh", "label": "神秘列",
+            "fieldRef": "section_1_col_energyKwh",
+        }
     )
 
     assert description.semanticSource == "identity"

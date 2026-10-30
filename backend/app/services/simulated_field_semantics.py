@@ -31,7 +31,11 @@
    只声明 ``semanticKind`` 时按语义类别**推导**对应值形态
    （``energy`` → ``energy``、``cost`` → ``cost``…），不再先判「未声明」；
 2. ``unit``       —— 列**声明了单位**（``format.unitLabel``），单位决定值形态；
-3. ``identity``   —— 列的**字段身份**命中规范字段目录（``energyKwh`` / ``deviceName``…）；
+3. ``identity``   —— 列的**字段身份**命中规范字段目录里**能唯一确定量口径**
+   的**具体条目**（``energyKwh`` / ``costYuan`` / ``powerKw`` / ``deviceName``…）；
+   **通用量词不算**（``energy`` / ``cost`` / ``power`` / ``kwh`` / ``kw`` /
+   ``yuan`` / ``percent`` / ``count`` / ``load`` —— 只说明「是个量」，
+   不说明「是哪个量」）；
 4. ``vocabulary`` —— 列的**显示名**精确命中产品栏目词表（封闭词表，不是模糊匹配）；
 5. ``unresolved`` —— 以上都不成立 → 明确记成「语义未声明」：``semanticKind``
    记 ``generic``、``valueType`` 记 ``text``，**不猜**。
@@ -40,6 +44,13 @@
 是**精确命中封闭词表**（产品自己那几套预设栏目），也不是模糊匹配。词表里
 没有的名字一律落到第 5 条。老定义没有 ``semanticKind`` / ``valueType`` 时
 按 ``generic`` / ``text`` 处理，**不回退到按列名猜**。
+
+**为什么第 3 条要收紧**（契约表 §3.4 ③，v1.18.0）：第 3 条的级序**优先于**
+第 4 条 —— 身份一命中就**遮蔽**显示名。于是身份 token 必须**比显示名更具体**
+才配得上这个优先级：``col_power`` + 「负载率」按 ``power`` 认会给出
+215.85 kW（该是百分比），``col_load`` + 「设备名称」按 ``load`` 认会给出
+百分比（该是设备名）。**占位变错数字，比占位更坏。** 只认具体条目是**收紧**，
+不是恢复按列名猜。
 
 **两条切分 / 查表的细则（都只做「切」与「查」，不做「猜」）**
 
@@ -194,16 +205,22 @@ SCOPE_VALUES = (SCOPE_REGION, SCOPE_METRIC_FAMILY)
 # **字段身份** → 值形态。产品自己的数据集字段与默认栏目都落在这些身份上，
 # 所以「身份 → 值形态」是一张**目录**，不是猜测。
 #
-# 目录的准入规则（两条，缺一不可）：
+# 目录的准入规则（三条，缺一不可）：
 #
 # 1. **精确查表**：键就是**字段身份**（列 ``id`` / 取值键 ``fieldRef`` 本身
 #    或它的末段），命不中就是命不中 —— 不做子串匹配、不做关键词猜测；
 # 2. **不与产品栏目词表打架**：③ 身份级**优先于**④ 词表级，所以一个比
 #    词表更**笼统**的身份 token 不能进目录（否则「设备编号」列会因为身份
-#    叫 ``col_device`` 而显示成设备**名**）。因此目录里只有**量**类 token
-#    （``energy`` / ``cost`` / ``power``…）与**具体实体身份**
-#    （``deviceName`` / ``cabinetName``…），没有 ``device`` / ``name``
-#    这种笼统的实体词 —— 那一类交给④ 封闭词表。
+#    叫 ``col_device`` 而显示成设备**名**）。没有 ``device`` / ``name``
+#    这种笼统的实体词 —— 那一类交给④ 封闭词表；
+# 3. **通用量词不算「量口径」**（契约表 §3.4 ③，v1.18.0 收紧）：
+#    ``energy`` / ``cost`` / ``power`` / ``kwh`` / ``kw`` / ``yuan`` 只说明
+#    「是个量」，不说明「是哪个量」—— 按它们认定会把该出百分比 / 设备名的
+#    列说成另一种量（例 ``col_power`` + 「负载率」→ power）。**占位变错数字，
+#    比占位更坏。** 这一类 token 已从目录里**整个去掉**。
+#
+# 目录里的每一条都**能唯一确定量口径**（kWh 的耗电量、元的电费、kW 的功率、
+# 设备名 / 设备编号 / 告警级别……），所以每一项都能被③ 直接采用。
 
 CANONICAL_FIELD_CATALOG: dict[str, dict[str, str]] = {
     "timestamp": {"valueType": VALUE_TYPE_TIME},
@@ -230,15 +247,48 @@ CANONICAL_FIELD_CATALOG: dict[str, dict[str, str]] = {
     "current": {"valueType": VALUE_TYPE_CURRENT},
     # 机柜负载率：产品里这一列的身份就叫 load，量纲是百分比。
     "load": {"valueType": VALUE_TYPE_PERCENT, "unit": "%"},
-    # —— 量类通用 token（③ 身份级末段切分后落在这几个 token 上）——
-    # 这些 token 的量纲唯一，不会与④ 词表里的任何栏目词冲突。
-    "energy": {"valueType": VALUE_TYPE_ENERGY, "unit": "kWh"},
-    "cost": {"valueType": VALUE_TYPE_COST, "unit": "元"},
-    "power": {"valueType": VALUE_TYPE_POWER, "unit": "kW"},
-    "kwh": {"valueType": VALUE_TYPE_ENERGY, "unit": "kWh"},
-    "kw": {"valueType": VALUE_TYPE_POWER, "unit": "kW"},
-    "yuan": {"valueType": VALUE_TYPE_COST, "unit": "元"},
 }
+
+
+#: ③ 身份级**只认**这些条目（契约表 §3.4 ③：能**唯一确定量口径**的具体条目）。
+#:
+#: ③ 用的是**字段身份**（列的 ``id`` / 取值键的末段），而③ 的级序**优先于**
+#: ④ 显示名词表 —— 身份一命中就**遮蔽**显示名。于是身份 token 必须**比
+#: 显示名更具体**才配得上这个优先级：
+#:
+#: - **具体字段身份**（``energyKwh`` / ``costYuan`` / ``energyCost`` /
+#:   ``powerKw`` / ``pueValue`` / ``deviceName`` / ``cabinetName`` …）
+#:   —— 名字里就带着「是哪个量」或「是哪个实体」，命中即是对的；
+#: - **只说明「是个量」/「是个比率」/「是个计数」/「是个负载」**的裸词
+#:   （``percent`` / ``count`` / ``load``）—— **不认**：它们遮蔽显示名的
+#:   代价是**把对的说成错的**（例 ``col_count`` + 「告警级别」→ count、
+#:   ``col_load`` + 「设备名称」→ percent）。
+#:
+#: 这一条是**收紧**，不是恢复按列名猜：③ 仍然只查表、命中不了就是命中不了。
+IDENTITY_MATCHABLE_IDENTITIES: frozenset[str] = frozenset(
+    {
+        "timestamp",
+        "time",
+        "energyKwh",
+        "costYuan",
+        "energyCost",
+        "powerKw",
+        "pueValue",
+        "pue",
+        "deviceId",
+        "deviceName",
+        "deviceType",
+        "cabinetName",
+        "cabinetStatus",
+        "level",
+        "status",
+        "description",
+        "duration",
+        "temperature",
+        "voltage",
+        "current",
+    }
+)
 
 
 #: 产品栏目词表：显示名 → **规范字段身份**。
@@ -471,10 +521,10 @@ def describe_simulated_field(
             value_type = kind_by_unit
             source = "unit"
         else:
-            # 3. 字段身份命中规范字段目录
+            # 3. 字段身份命中规范字段目录（**只认能唯一确定量口径的具体条目**）
             for candidate in _canonical_identities(column):
                 entry = CANONICAL_FIELD_CATALOG.get(candidate)
-                if entry:
+                if entry and candidate in IDENTITY_MATCHABLE_IDENTITIES:
                     value_type = entry["valueType"]
                     unit = unit or entry.get("unit", "")
                     source = "identity"
