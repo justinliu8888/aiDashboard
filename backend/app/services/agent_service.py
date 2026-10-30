@@ -1631,7 +1631,16 @@ class AgentService:
         工单 #58（规格第 45 条）：这一道门必须同时覆盖**确定性编辑快路**
         与**模型编辑支路**。咨询、问题反馈、目录外新增三类都不产生
         待接受的修改计划，也不改定义。
+
+        只在会产生编辑候选的编辑态生效（WAITING_USER_CONFIRM /
+        USER_EDITING_TEMPLATE）。新建流程（文字方案阶段）有自己的意图
+        判定与回答契约，不走这一道门。
         """
+        if request.state not in {
+            AgentState.WAITING_USER_CONFIRM,
+            AgentState.USER_EDITING_TEMPLATE,
+        }:
+            return None
         if intent is UserIntent.ISSUE_FEEDBACK:
             return self._analyze_issue_feedback(request)
         if intent is UserIntent.ASK_QUESTION:
