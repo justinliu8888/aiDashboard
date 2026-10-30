@@ -1306,8 +1306,12 @@ def resolve_include_trend(slots: dict[str, Any]) -> bool:
 
 #: 数组位置标记行。用户在消息里写明记录数组在报文里的位置
 #: （规格第 31 条），服务端按它取数组，不自己挑。
+#:
+#: **冒号可省**：契约表 §4.3 登记了两种写法 —— ``数组位置: data.records``
+#: 与 ``@arrayPath data.records``。后者**没有冒号**，所以这里的冒号是
+#: 可选的：两种写法都要认（写了冒号也认，不写也认）。
 _ARRAY_PATH_MARKER = re.compile(
-    r"^\s*(?:@arrayPath|arrayPath|数组位置)\s*[:：]\s*(?P<path>[^\s]+)\s*$",
+    r"^\s*(?:@arrayPath|arrayPath|数组位置)\s*(?:[:：]\s*)?(?P<path>(?![:：])[^\s]+)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -1315,7 +1319,8 @@ _ARRAY_PATH_MARKER = re.compile(
 def extract_array_path(message: str) -> str | None:
     """从消息里取「数组位置」标记。
 
-    约定：单独一行写成 ``数组位置: data.records`` 或 ``@arrayPath data.records``。
+    约定：单独一行写成 ``数组位置: data.records`` 或 ``@arrayPath data.records``
+    （契约表 §4.3 登记的两种写法，**冒号可省**）。
     没有这一行 → ``None``（服务端按「顶层数组」或「唯一数组」处理）。
     """
     match = _ARRAY_PATH_MARKER.search(message or "")
