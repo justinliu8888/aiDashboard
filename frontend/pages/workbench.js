@@ -134,7 +134,7 @@ let sessionRestoreToken = 0;
 let businessMenuReplayed = false;
 
 // --------------------------------------------------------------------------
-// 文字方案（#19 先确认，再生成）
+// 文字方案（#19 先确认，再生成；#66 底部追加最新版）
 //
 // 方案模块（workbench_plan.js）只负责「把方案显示出来、把确认意图交回来」：
 //   - 它不发 HTTP；
@@ -146,6 +146,12 @@ let businessMenuReplayed = false;
 //   2. busy / error / canConfirm 由**这一处**统一决策，
 //      不从历史文案里猜「用户到底确认了没有」；
 //   3. 收到确认回调后，由上层发请求（请求里带动作与所依据的版本）。
+//
+// #66 之后方案卡不再是「会移动的气泡」：
+//   - 每来**一版**方案，就在左侧对话区**底部追加**一张新卡；
+//   - 旧卡**留在原地**，标为历史，确认入口失效；
+//   - 同一份方案（按稳定 versionId 判重）不追加第二遍；
+//   - 用户在上方读历史时**不强行滚动**，给一个可点的「有最新方案」提示。
 // --------------------------------------------------------------------------
 
 const planState = {
@@ -155,7 +161,59 @@ const planState = {
   error: null,
   // 已确认方案的折叠视图是否展开。默认收起（需求稿 §2.8）。
   planExpanded: false,
+  // 卡片外壳（<details>）是否展开。最新一版默认展开 —— 它在对话区底部，要能读全。
+  cardExpanded: true,
+  // 当前这一版的稳定 ID（契约表 §4.1.2）。前端按它去重。
+  versionId: "",
+  // 卡片前的那一句简短说明（与实际提交改动一致）。
+  summaryLine: "",
 };
+
+// --------------------------------------------------------------------------
+// 方案卡片登记表（#66）
+//
+// 去重键 → 卡片句柄。**别名**都指向同一张卡：
+//   "ver:<versionId>"      服务端给的稳定 ID（契约表 §4.1.2）
+//   "plan:<planId>#<rev>"  方案身份 + 版本号（契约表 §4.1，与上面一一对应）
+// 两个别名都记上，刷新前后拿到的键名不一样也不会把同一份方案追加两遍。
+// --------------------------------------------------------------------------
+
+const planCards = {
+  /** 别名 → 卡片句柄 */
+  byAlias: new Map(),
+  /** 当前待确认的那一版（最新一版）的卡片句柄 */
+  current: null,
+  /** 自增序号：给每张卡片一个稳定的 DOM 标识 */
+  serial: 0,
+};
+
+/** 卡片登记表清空（对话区被清空时用）。 */
+function resetPlanCards() {
+  planCards.byAlias.clear();
+  planCards.current = null;
+  planCards.serial = 0;
+}
+
+/** 清掉已经不在页面上的卡片登记：别让去重表记住一张已经摘掉的卡。 */
+function pruneDisconnectedPlanCards() {
+  for (const [alias, card] of Array.from(planCards.byAlias.entries())) {
+    if (!card || !card.root || !card.root.isConnected) planCards.byAlias.delete(alias);
+  }
+  const current = planCards.current;
+  if (current && (!current.root || !current.root.isConnected)) planCards.current = null;
+}
+
+/** 这一份方案是不是已经在屏上了（按稳定版本键判重）。 */
+function findPlanCard(version) {
+  const api = window.WorkbenchPlan;
+  if (!api || !version) return null;
+  pruneDisconnectedPlanCards();
+  for (const alias of api.versionAliasKeys(version)) {
+    const known = planCards.byAlias.get(alias);
+    if (known) return known;
+  }
+  return null;
+}
 
 // --------------------------------------------------------------------------
 // 文字方案的挂载位置：左侧对话区里的一条 AI 回复。
@@ -175,8 +233,11 @@ const planState = {
 let planBubble = null;
 let planRoot = null;
 
-/** 建一条承载方案模块的 AI 气泡。 */
-function createPlanBubble() {
+/**
+ * 建一条承载方案模块的 AI 气泡。
+ * @param {string} rootId 挂载根的 DOM id（当前卡是 plan-root，历史卡另起一个）
+ */
+function createPlanBubble(rootId) {
   const bubble = document.createElement("div");
   bubble.className = "flex gap-2.5";
   bubble.setAttribute("data-plan-bubble", "");
@@ -189,12 +250,38 @@ function createPlanBubble() {
   body.className = "flex-1 min-w-0";
 
   const root = document.createElement("div");
-  root.id = "plan-root";
+  root.id = rootId || "plan-root";
 
   body.appendChild(root);
   bubble.appendChild(avatar);
   bubble.appendChild(body);
   return { bubble, root };
+}
+
+/** 建一张方案卡片的句柄（先不渲染）。 */
+function makePlanCard(bubble, root, version) {
+  planCards.serial += 1;
+  return {
+    serial: planCards.serial,
+    bubble,
+    root,
+    version: version || null,
+    aliases: [],
+    isHistory: false,
+    cardExpanded: true,
+    summaryLine: "",
+    designPhase: null,
+    reportPlan: null,
+  };
+}
+
+/** 把一版的别名登记进表（去重靠它）。 */
+function registerPlanCard(card, version) {
+  const api = window.WorkbenchPlan;
+  if (!api || !card) return;
+  const aliases = api.versionAliasKeys(version);
+  card.aliases = aliases;
+  for (const alias of aliases) planCards.byAlias.set(alias, card);
 }
 
 /**
@@ -204,10 +291,12 @@ function createPlanBubble() {
  */
 function mountPlanHost() {
   if (!chatScroll) return { root: null, fresh: false };
-  if (!planBubble || !planRoot || !planRoot.isConnected) {
-    const host = createPlanBubble();
+  pruneDisconnectedPlanCards();
+  if (!planCards.current || !planRoot || !planRoot.isConnected) {
+    const host = createPlanBubble("plan-root");
     planBubble = host.bubble;
     planRoot = host.root;
+    planCards.current = makePlanCard(planBubble, planRoot, null);
   }
   if (planBubble.parentNode !== chatScroll) {
     chatScroll.appendChild(planBubble);
@@ -253,6 +342,119 @@ function planCanConfirm(state = planState) {
   return true;
 }
 
+/**
+ * 把当前这一张卡**降级**成历史卡：留在原地，标为历史，确认入口失效。
+ *
+ * 降级只改「这张卡是什么身份」，**不改它的原文** —— 旧版正文保留在原地。
+ */
+function demoteCurrentPlanCard() {
+  const api = window.WorkbenchPlan;
+  const card = planCards.current;
+  if (!api || !card || !card.root) return;
+  card.isHistory = true;
+  card.cardExpanded = false;
+  // 历史卡的 DOM id 让开：当前卡用 plan-root，历史卡另起一个。
+  card.root.id = "plan-root-history-" + card.serial;
+  api.render(
+    card.root,
+    {
+      designPhase: card.designPhase,
+      reportPlan: card.reportPlan,
+      busy: false,
+      error: null,
+      canConfirm: false,
+      planExpanded: card.cardExpanded,
+      versionId: card.version ? card.version.versionId : "",
+      isHistory: true,
+      collapsible: true,
+      cardExpanded: card.cardExpanded,
+      cardTitle: planHistoryCardTitle(card),
+      summaryLine: card.summaryLine,
+    },
+    { onAction: handlePlanAction }
+  );
+}
+
+/** 历史卡的标题：「历史版本 · 版本 N」（版本号拿不到就只说历史版本）。 */
+function planHistoryCardTitle(card) {
+  const api = window.WorkbenchPlan;
+  const base = (api && api.PLAN_CARD_TITLE_HISTORY) || "历史版本";
+  const revision = card && card.reportPlan ? card.reportPlan.revision : null;
+  if (revision === null || revision === undefined) return base;
+  return base + " · 版本 " + revision;
+}
+
+/**
+ * 在对话区**底部追加**一张新的方案卡片（#66）。
+ *
+ * - 旧卡留在原地（降级成历史卡）；
+ * - 同一份方案不追加第二遍（按稳定版本键判重）；
+ * - 追加完按用户所在位置决定要不要跟随滚动。
+ *
+ * @returns {boolean} true = 真的追加了一张
+ */
+function appendPlanCard(version, options = {}) {
+  const api = window.WorkbenchPlan;
+  if (!api || !chatScroll || !version || !version.reportPlan) return false;
+  pruneDisconnectedPlanCards();
+  // 去重：重复响应、乱序响应、重连都不追加同一份方案。
+  if (findPlanCard(version)) return false;
+
+  // 旧卡留在原地：当前这一张先降级成历史卡。
+  demoteCurrentPlanCard();
+
+  const host = createPlanBubble("plan-root-pending-" + (planCards.serial + 1));
+  const card = makePlanCard(host.bubble, host.root, version);
+  registerPlanCard(card, version);
+  card.designPhase = options.designPhase || null;
+  card.reportPlan = version.reportPlan;
+  card.summaryLine = options.summaryLine || "";
+  card.cardExpanded = true;
+
+  // 新卡成为「当前待确认的那一版」。
+  planCards.current = card;
+  planBubble = card.bubble;
+  planRoot = card.root;
+  card.root.id = "plan-root";
+  chatScroll.appendChild(card.bubble);
+  chatBubbleObserver.observe(card.bubble);
+
+  renderPlanModule();
+  // 挪到本轮回复的下面（延到这一轮渲染结束）。
+  anchorPlanBubble();
+  // 用户不在底部时**不强行滚动**，给一个可点的提示。
+  // 恢复会话时（follow=false）不跟：整段历史一次性铺开，最后统一贴底。
+  if (options.follow !== false) followLatestPlan();
+  return true;
+}
+
+/**
+ * 新方案来了之后要不要跟着滚到底。
+ *
+ * 用户在底部 → 跟正常新消息一样滚到底；
+ * 用户在上方读历史 → **不强行滚动**，给一个可点的「有最新方案」提示。
+ */
+function followLatestPlan() {
+  if (chatStickToBottom) {
+    scrollChatBottom();
+    hideLatestPlanHint();
+    return;
+  }
+  showLatestPlanHint();
+}
+
+/** 显示「有最新方案」提示（用户在读历史，没被强行拽到底）。 */
+function showLatestPlanHint() {
+  const btn = $("btn-latest-plan");
+  if (btn) btn.classList.remove("hidden");
+}
+
+/** 收起「有最新方案」提示。 */
+function hideLatestPlanHint() {
+  const btn = $("btn-latest-plan");
+  if (btn) btn.classList.add("hidden");
+}
+
 function renderPlanModule() {
   const api = window.WorkbenchPlan;
   if (!api) return;
@@ -269,6 +471,14 @@ function renderPlanModule() {
     // 没有方案：把气泡从对话流里摘掉，不留空白位置。
     if (planRoot) api.clear(planRoot);
     if (planBubble && planBubble.parentNode) planBubble.parentNode.removeChild(planBubble);
+    // 卡片不在屏上了，去重表也别记着它。
+    const card = planCards.current;
+    if (card) {
+      for (const alias of card.aliases) planCards.byAlias.delete(alias);
+    }
+    planCards.current = null;
+    planBubble = null;
+    planRoot = null;
     return;
   }
   const { root, fresh } = mountPlanHost();
@@ -276,6 +486,8 @@ function renderPlanModule() {
   // 记住用户有没有展开折叠视图：重渲染（busy 抖动 / 新响应）时不把它弹回去。
   const existing = root.querySelector("details.confirmed-plan-details");
   if (existing) planState.planExpanded = existing.open === true;
+  const shell = root.querySelector("details.plan-card-details");
+  if (shell) planState.cardExpanded = shell.open === true;
   api.render(
     root,
     {
@@ -285,10 +497,85 @@ function renderPlanModule() {
       error: planState.error,
       canConfirm: planCanConfirm(),
       planExpanded: planState.planExpanded,
+      versionId: planState.versionId,
+      isHistory: false,
+      collapsible: true,
+      cardExpanded: planState.cardExpanded,
+      cardTitle: api.PLAN_CARD_TITLE_CURRENT,
+      summaryLine: planState.summaryLine,
     },
     { onAction: handlePlanAction }
   );
+  // 当前卡的内容记在卡片自己身上：它降级成历史卡时要还原原文。
+  const card = planCards.current;
+  if (card) {
+    card.designPhase = planState.designPhase;
+    card.reportPlan = planState.reportPlan;
+    card.summaryLine = planState.summaryLine;
+    card.version = {
+      versionId: planState.versionId,
+      planId: planState.reportPlan?.id || "",
+      planRevision: planState.reportPlan?.revision ?? null,
+    };
+  }
   if (fresh) anchorPlanBubble();
+}
+
+/**
+ * 这一版是不是比当前那一版**新**。
+ *
+ * 判据是方案版本号（契约表 §4.1：修改时 revision 递增）。
+ * 版本号拿不到 → 认为是新的：宁可多画一张，也不把服务端给的新版本挡掉。
+ */
+function isNewerPlanVersion(version, currentVersion) {
+  if (!version) return false;
+  if (!currentVersion) return true;
+  const next = version.planRevision;
+  const current = currentVersion.planRevision;
+  if (next === null || next === undefined) return true;
+  if (current === null || current === undefined) return true;
+  return next > current;
+}
+
+/**
+ * 卡片前的那一句简短说明。
+ *
+ * **只用服务端的话**：这一轮响应带的回复（首句）。
+ * 前端不自己描述「改了什么」—— 自己编出来的说明会与实际提交不一致（工单 #66）。
+ */
+function buildPlanSummaryLine(data, version) {
+  const reply = typeof data?.reply === "string" ? data.reply.trim() : "";
+  if (reply) return firstSentence(reply);
+  const revision = version ? version.planRevision : null;
+  return revision === null || revision === undefined
+    ? "文字方案已更新。"
+    : "文字方案已更新到版本 " + revision + "。";
+}
+
+/** 取第一句（到第一个句号 / 感叹号 / 问号为止），并限长。 */
+function firstSentence(text, limit = 80) {
+  const flat = String(text || "").replace(/\s+/g, " ").trim();
+  if (!flat) return "";
+  const matched = flat.match(/^[\s\S]*?[。！？!?]/);
+  let sentence = matched ? matched[0] : flat;
+  if (sentence.length > limit) sentence = sentence.slice(0, limit) + "…";
+  return sentence.trim();
+}
+
+/** 从一次响应里同步方案状态。 */
+/**
+ * 两份版本是不是**同一版**。
+ *
+ * 按去重键比（versionId 与「方案身份 + 版本号」两个别名都算），
+ * 不比字符串：两个来源给的键名不一样时也要能认出是同一版。
+ */
+function isSamePlanVersion(left, right) {
+  const api = window.WorkbenchPlan;
+  if (!api || !left || !right) return false;
+  const leftKeys = api.versionAliasKeys(left);
+  const rightKeys = api.versionAliasKeys(right);
+  if (!leftKeys.length || !rightKeys.length) return false;
+  return leftKeys.some((key) => rightKeys.includes(key));
 }
 
 /** 从一次响应里同步方案状态。 */
@@ -297,10 +584,53 @@ function syncPlanFromResponse(data) {
   const phase = data.designPhase || null;
   const plan = data.domainObjects?.reportPlan || null;
   if (!phase && !plan) return;
-  planState.designPhase = phase || planState.designPhase;
-  if (plan) planState.reportPlan = plan;
+  const api = window.WorkbenchPlan;
+  const version = api ? api.readPlanVersion(data) : null;
+
+  // 这一轮有没有带来**新的一版**方案？
+  const known = version ? findPlanCard(version) : null;
+  const currentCard = planCards.current;
+  const currentVersion = currentCard ? currentCard.version : null;
+  const isNewVersion = !!version && !known && isNewerPlanVersion(version, currentVersion);
+
+  // 当前这张卡的内容先记下来：它马上要降级成历史卡，原文要留在原地。
+  if (currentCard && isNewVersion) {
+    currentCard.designPhase = planState.designPhase;
+    currentCard.reportPlan = planState.reportPlan;
+    currentCard.summaryLine = planState.summaryLine;
+  }
+
+  if (isNewVersion) {
+    // 新的一版：底部**追加**一张卡（旧的留在原地）。
+    planState.designPhase = phase || planState.designPhase;
+    planState.reportPlan = plan || planState.reportPlan;
+    planState.versionId = version.versionId || "";
+    planState.summaryLine = buildPlanSummaryLine(data, version);
+    planState.cardExpanded = true;
+    appendPlanCard(version, {
+      designPhase: planState.designPhase,
+      summaryLine: planState.summaryLine,
+    });
+    return;
+  }
+
+  // 不是新的一版。
+  //
+  // **迟到的旧版响应不夺取确认资格**：当前卡上那一版比它新，就不拿它覆盖 ——
+  // 覆盖了就等于让旧版把当前待确认的那一版顶下去（工单 #66）。
+  const sameAsCurrent = isSamePlanVersion(version, currentVersion);
+  const aboutPlan = !!(plan || version);
+  if (!aboutPlan || sameAsCurrent) {
+    planState.designPhase = phase || planState.designPhase;
+  }
+  if (plan && (sameAsCurrent || (!known && !currentCard))) {
+    planState.reportPlan = plan;
+  }
   // 出错时展示错误条；成功时清掉上一次的错误。
-  planState.error = data.error ? data.error.message || data.error.code || null : null;
+  //
+  // 失败**不**把错误写进方案卡：失败时上一版方案仍然有效（工单 #66），
+  // 失败的原因由对话区说（见 appendFailureNotice），卡片保持原样、仍然可确认。
+  planState.error = null;
   renderPlanModule();
   // 草稿已出：把右侧滚回顶部，让用户第一眼看到草稿而不是聊天记录。
   if (phase === "DRAFT_READY") previewRoot.parentElement.scrollTop = 0;
@@ -309,12 +639,71 @@ function syncPlanFromResponse(data) {
 /** 从会话详情里恢复方案（刷新 / 重建服务后）。 */
 function restorePlanFromDetail(detail) {
   const snapshot = detail?.snapshot || {};
+  const api = window.WorkbenchPlan;
+  const versions = api ? api.readPlanVersionSequence(snapshot) : [];
   planState.designPhase = snapshot.designPhase || null;
   planState.reportPlan = snapshot.reportPlan || null;
   planState.busy = false;
   planState.error = null;
   // 刷新后默认收起（需求稿 §2.8）。
   planState.planExpanded = false;
+  planState.cardExpanded = true;
+  planState.versionId = "";
+  planState.summaryLine = "";
+  if (versions.length) {
+    // 有版本序列：按**真实保存顺序**还原历史卡片与最新版。
+    restorePlanVersions(snapshot, versions);
+    return;
+  }
+  // 老会话没有版本序列：只按**实际存储**恢复当前那一版可用方案，
+  // **不伪造**过去的版本（契约表 §4.1.2）。
+  renderPlanModule();
+}
+
+/** 把屏上的方案卡片全摘掉（对话区被清空时用）。 */
+function clearPlanCards() {
+  const api = window.WorkbenchPlan;
+  if (api && planRoot) api.clear(planRoot);
+  if (chatScroll) {
+    for (const node of Array.from(chatScroll.querySelectorAll("[data-plan-bubble]"))) {
+      if (node.parentNode) node.parentNode.removeChild(node);
+    }
+  }
+  resetPlanCards();
+  planBubble = null;
+  planRoot = null;
+}
+
+/**
+ * 按**真实保存顺序**还原方案版本卡片（刷新 / 重新打开会话）。
+ *
+ * 每一版一张卡：前面的是历史卡（留在原地、标为历史、确认入口失效），
+ * 最后一张是当前待确认的那一版。
+ */
+function restorePlanVersions(snapshot, versions) {
+  const api = window.WorkbenchPlan;
+  if (!api) return;
+  const usable = versions.filter((record) => record && record.reportPlan);
+  if (!usable.length) return;
+
+  // 只画了当前方案的那张卡先摘掉：下面按真实保存顺序逐版重建。
+  clearPlanCards();
+
+  const phase = snapshot.designPhase || null;
+  for (let index = 0; index < usable.length; index += 1) {
+    const record = usable[index];
+    const isLast = index === usable.length - 1;
+    // 中间那些版当时是「待确认」，现在只是历史 —— 不摆阶段徽标。
+    if (planCards.current) planCards.current.designPhase = null;
+    planState.designPhase = isLast ? phase : null;
+    planState.reportPlan = record.reportPlan;
+    planState.versionId = record.versionId || "";
+    planState.summaryLine = "";
+    planState.cardExpanded = true;
+    appendPlanCard(record, { designPhase: planState.designPhase, follow: false });
+  }
+  // 最后一版就是当前待确认的那一版：确认资格按服务端阶段算。
+  planState.designPhase = phase;
   renderPlanModule();
 }
 
@@ -606,6 +995,8 @@ chatScroll.addEventListener("scroll", () => {
   if (atBottom !== chatStickToBottom) {
     chatStickToBottom = atBottom;
     updateJumpButton();
+    // 用户自己回到底部了：「有最新方案」提示就没用了。
+    if (chatStickToBottom) hideLatestPlanHint();
   }
 }, { passive: true });
 
@@ -1822,9 +2213,20 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
   syncPlanFromResponse(data);
   if (fromChoice) clearChoiceLock();
   if (data.error) {
+    // JSON 输入被拒：面板里也摆一份**可修正**的提示（哪里不对、怎么改）。
+    showJsonPasteErrorHint(data.error);
     // 失败原因要看得见：对话区一条 AI 回复（与恢复会话那处同一套写法）。
     appendAgentError(data.error);
+    // 失败**不**更新方案：上一版仍然有效（工单 #66）。
+    appendPlanFailureNotice();
     return;
+  }
+
+  // JSON 输入被收下：说清这份数据的来路（契约表 §1.1）。
+  if (data.debug?.jsonInput?.accepted === true) {
+    appendJsonSourceNote();
+    closeJsonPastePanel();
+    clearJsonPasteInputs();
   }
 
   // 只读问答：不推进业务。
@@ -2340,6 +2742,38 @@ function appendAgentError(error) {
 }
 
 /**
+ * 失败时补一句：本次没更新，上一版仍然有效（工单 #66）。
+ *
+ * 失败**不**生成假装改好的方案、不出现成功摘要；屏上那张卡原样留着，
+ * 仍然可确认（真正的边界在后端的版本校验 —— 契约表 §8 不变量 6）。
+ * 屏上还没有方案时没什么「上一版」可保，就不说这句。
+ */
+function appendPlanFailureNotice() {
+  if (!planState.reportPlan) return;
+  appendAiText("本次未更新，上一版仍有效。");
+}
+
+/**
+ * JSON 输入被拒：面板里也摆一份**可修正**的提示（哪里不对、怎么改）。
+ *
+ * 不是 JSON 失败就什么都不做 —— 别的失败原因由对话区说。
+ */
+function showJsonPasteErrorHint(error) {
+  const code = String((error && error.code) || "");
+  if (!WorkbenchQuery.isJsonErrorCode(code)) return;
+  showJsonPasteHint(error);
+}
+
+/**
+ * JSON 输入被收下时，在对话区说清这份数据的来路（契约表 §1.1）。
+ *
+ * 只说「用户提供的数据，未经业务核验」—— **不宣称已连接真实业务库**。
+ */
+function appendJsonSourceNote() {
+  appendAiText("这份数据的来源：" + WorkbenchQuery.USER_JSON_SOURCE_LABEL + "。");
+}
+
+/**
  * 读会话恢复响应里的失败原因。
  *
  * 后端在模拟载荷生成不出来时（典型：方案要「按周统计」，示意数据只能按
@@ -2422,7 +2856,7 @@ function readPayloadUnit(region, payload, defRegion) {
  *
  * 这里只如实说明**哪个指标还没接通、为什么**，不承诺计算口径或公式。
  */
-function readCapabilityNotes(region, payload, defRegion) {
+function readCapabilityNotes(region, payload, defRegion, sourceMode) {
   // 判「是不是授权问题」的关键词 —— 与后端
   // `report_template_service._SCOPE_KEYWORDS` **同一套词**：
   // 授权 / 权限 / 越权。两边不一致时，同一段原因会被一方说成
@@ -2431,6 +2865,14 @@ function readCapabilityNotes(region, payload, defRegion) {
   // 「不在支持的数据范围」）时，那仍然是能力问题，不是授权问题。
   const SCOPE_KEYWORDS = ["授权", "权限", "越权"];
   const KIND_LABELS = { capability: "能力待接通", scope: "不在授权范围" };
+  // JSON 模式下，服务端那条 pendingReason 可能还写着「模拟业务数据」——
+  // 那是**说假话**（这份数据是用户贴进来的，不是模拟的）。
+  // 宁可少说：这种原因不当作能力原因显示；数据来路由界面自己的来源标注说。
+  //
+  // 取值 "user_json" 是契约表 §1.1 定死的来源模式枚举；
+  // 这里写死字面量是因为本函数会被接缝探针**单独抽出来**跑，
+  // 不能依赖模块里的别的符号。
+  const isUserJson = sourceMode === "user_json";
 
   const groups = new Map(); // 类别 → 该类别的具体项
   const seen = new Set();
@@ -2442,7 +2884,11 @@ function readCapabilityNotes(region, payload, defRegion) {
       const label = String(metric.label || metric.metricKey || "指标").trim();
       if (!label || seen.has(label)) continue;
       seen.add(label);
-      const reason = String(metric.pendingReason || "").trim();
+      const rawReason = String(metric.pendingReason || "").trim();
+      const mentionsSource = rawReason.includes("模拟业务数据")
+        || rawReason.includes("模拟示例")
+        || rawReason.includes("接入真实数据");
+      const reason = isUserJson && mentionsSource ? "" : rawReason;
       const kind = !reason
         ? "capability"
         : SCOPE_KEYWORDS.some((kw) => reason.includes(kw))
@@ -2681,12 +3127,107 @@ function readPayloadWindowLabel(payload) {
   return start || end || "";
 }
 
-/** 面板顶部：报表名 + 一行「这是模拟业务数据」的说明。 */
+// --------------------------------------------------------------------------
+// 数据来源模式（契约表 §1）
+//
+// 界面上的来源标注**只按服务端给的信号说**，前端不自己猜：
+//   1. definition.metadata.effectiveCombination.sourceMode —— 生效组合（权威）；
+//   2. definition.metadata.sourceMode —— 定义级；
+//   3. region.dataSource / payload.dataSource —— 载荷侧的区域级与逐区域标记；
+//   4. region.templateBinding.sourceMode / defRegion.templateBinding.sourceMode。
+//
+// **拿不到信号就不显示来源标注** —— 宁可少说，不许说假话。
+// 特别地：JSON 模式下界面只说「用户提供的数据，未经业务核验」，
+// **不宣称已连接真实业务库**（契约表 §1.1 / §1.2）。
+// --------------------------------------------------------------------------
+
+/** 来源模式 → 界面上的说法。 */
+function sourceModeText(sourceMode) {
+  if (sourceMode === WorkbenchQuery.SOURCE_MODE_USER_JSON) {
+    return WorkbenchQuery.USER_JSON_SOURCE_LABEL;
+  }
+  if (sourceMode === WorkbenchQuery.SOURCE_MODE_SIMULATED) {
+    return WorkbenchQuery.SIMULATED_SOURCE_LABEL;
+  }
+  return "";
+}
+
+/**
+ * 这一块（整份报表）是什么来源模式。
+ *
+ * 返回 "" = 拿不到信号 → 界面上不显示来源标注。
+ */
+function readSourceMode(definition, region, payload, defRegion) {
+  const candidates = [
+    definition?.metadata?.effectiveCombination?.sourceMode,
+    definition?.metadata?.sourceMode,
+    region?.dataSource,
+    payload?.sourceMode,
+    payload?.dataSource,
+    region?.templateBinding?.sourceMode,
+    defRegion?.templateBinding?.sourceMode,
+  ];
+  for (const candidate of candidates) {
+    const key = String(candidate == null ? "" : candidate).trim();
+    // 只认契约里定死的两个取值；「mock_energy」这类数据源标识**不是**来源模式。
+    if (key === "user_json") return key;
+    if (key === "simulated") return key;
+  }
+  return "";
+}
+
+/**
+ * 整份报表的来源模式：先看定义级信号，再看载荷里各区域带的标记。
+ *
+ * 定义级优先（它是权威）；定义是老形状（没有 sourceMode）时，
+ * 载荷区域上的 dataSource 就是唯一依据（契约表 §1.1）。
+ */
+function readReportSourceMode(definition, payload) {
+  const fromDefinition = readSourceMode(definition, null, null, null);
+  if (fromDefinition) return fromDefinition;
+  const regions = Array.isArray(payload?.regions) ? payload.regions : [];
+  let sawSimulated = false;
+  for (const region of regions) {
+    const key = String(region?.dataSource || "").trim();
+    if (key === "user_json") return key;
+    if (key === "simulated") sawSimulated = true;
+  }
+  return sawSimulated ? "simulated" : "";
+}
+
+/** 面板顶部那句来源说明：按来源模式说。 */
+function renderSourceNoteHtml(sourceMode) {
+  if (sourceMode === WorkbenchQuery.SOURCE_MODE_USER_JSON) {
+    return "<span>当前显示的是<b>用户粘贴的 JSON 数据</b>：" +
+      WorkbenchQuery.USER_JSON_SOURCE_LABEL + "。</span>";
+  }
+  if (sourceMode === WorkbenchQuery.SOURCE_MODE_SIMULATED) {
+    return "<span>当前显示的是<b>模拟业务数据</b>，用于核对版式；接入真实数据后会自动替换。</span>";
+  }
+  return "";
+}
+
+/**
+ * 这条原因里有没有「数据来源」的说法。
+ *
+ * JSON 模式下服务端那条 pendingReason 可能还写着「模拟业务数据」——
+ * 那是**说假话**（这份数据是用户贴进来的）。宁可少说：这种原因不当作
+ * 能力原因显示；数据来路由界面自己的来源标注说。
+ */
+function mentionsSourceClaim(reason) {
+  const text = String(reason || "");
+  return text.includes("模拟业务数据") || text.includes("模拟示例") || text.includes("接入真实数据");
+}
+
+/** 面板顶部：报表名 + 一行来源说明（按来源模式说）。 */
 function renderPanelHeader(definition, payload, regionCount) {
   const header = document.createElement("div");
   header.className = "bg-white rounded-xl border border-slate-200 p-5";
   const name = definition?.metadata?.name || "报表草稿";
   const windowLabel = readPayloadWindowLabel(payload);
+  // 来源模式只按服务端给的信号说；拿不到就不写来源说明（宁可少说，不许说假话）。
+  const sourceMode = readReportSourceMode(definition, payload);
+  const sourceNote = renderSourceNoteHtml(sourceMode);
   header.innerHTML = `
     <div class="flex items-start justify-between gap-4">
       <div class="flex-1 min-w-0">
@@ -2706,10 +3247,12 @@ function renderPanelHeader(definition, payload, regionCount) {
         ${renderGenerationInputs(definition)}
       </div>
     </div>
-    <div class="mt-3 flex items-start gap-1.5 text-[11px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5" data-simulated-note>
+    ${sourceNote ? `
+    <div class="mt-3 flex items-start gap-1.5 text-[11px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5" data-simulated-note="${esc(sourceMode)}">
       <iconify-icon class="text-sm mt-px" icon="mdi:flask-outline"></iconify-icon>
-      <span>当前显示的是<b>模拟业务数据</b>，用于核对版式；接入真实数据后会自动替换。</span>
+      ${sourceNote}
     </div>
+    ` : ""}
   `;
 
   const nameEl = header.querySelector(".report-name");
@@ -2745,7 +3288,21 @@ function renderRegionCard(region, definition, payload, totalsByUnit) {
   const defRegion = findDefinitionRegion(definition, region.regionId);
   const p = region.payload || {};
   const unit = readPayloadUnit(region, p, defRegion);
-  const capabilityNotes = readCapabilityNotes(region, p, defRegion);
+  // 来源模式（契约表 §1）：只按服务端给的信号说。
+  //
+  // 这里的 typeof 兜一下是给「接缝探针 / 既有单测把本函数单独抽进沙箱」用的：
+  // 那边没有模块级的 readSourceMode。缺了就当「拿不到来源模式」——
+  // 拿不到就不显示来源角标（宁可少说，不许说假话）。
+  const sourceMode = typeof readSourceMode === "function"
+    ? readSourceMode(definition, region, p, defRegion)
+    : "";
+  const capabilityNotes = readCapabilityNotes(region, p, defRegion, sourceMode);
+  // 用户 JSON 模式的角标说明。
+  // 这里写死字面量：本函数会被接缝探针与既有单测**单独抽进沙箱**跑，
+  // 那边没有模块级的符号可用。同一句话的权威副本在
+  // workbench_query.js 的 USER_JSON_SOURCE_LABEL，两边一致由
+  // workbench_66b_frontend.test.mjs 盯着。
+  const USER_JSON_BADGE_NOTE = "用户提供的数据，未经业务核验";
 
   const card = document.createElement("div");
   card.className = "bg-white rounded-xl border border-slate-200 p-5 group";
@@ -2760,9 +3317,15 @@ function renderRegionCard(region, definition, payload, totalsByUnit) {
         <p class="text-xs text-slate-500 mt-0.5">role: <span class="mono">${esc(region.role || defRegion?.role || "")}</span> · component: <span class="mono">${esc(region.componentType || defRegion?.component?.type || "")}</span>${chartKind ? ' / <span class="mono">' + esc(chartKind) + "</span>" : ""}</p>
       </div>
       <div class="flex items-center gap-1 shrink-0">
+        ${sourceMode === "user_json" ? `
+        <span class="region-badge inline-flex items-center gap-1 rounded-md text-[11px] font-medium px-2 py-0.5 border bg-slate-100 text-slate-600 border-slate-200" data-region-badge="user_json" title="${esc(USER_JSON_BADGE_NOTE)}">
+          <iconify-icon class="text-xs" icon="mdi:database-outline"></iconify-icon>用户数据
+        </span>
+        ` : sourceMode === "simulated" ? `
         <span class="region-badge inline-flex items-center gap-1 rounded-md text-[11px] font-medium px-2 py-0.5 border bg-slate-100 text-slate-600 border-slate-200" data-region-badge="simulated" title="模拟业务数据，接入真实数据后自动替换">
           <iconify-icon class="text-xs" icon="mdi:flask-outline"></iconify-icon>示意
         </span>
+        ` : ""}
         ${defRegion ? `
         <span class="region-tools">
           <button class="btn-display-options h-7 rounded border border-slate-200 hover:bg-blue-50 hover:border-blue-200 hover:text-blue-700 text-[11px] text-slate-500 px-2 transition" title="查看适合当前数据的展示方式">展示方式</button>
@@ -3252,6 +3815,8 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   businessMenuReplayed = false;
   destroyCharts();
   chatScroll.innerHTML = "";
+  // 对话区清空了：屏上的方案卡片（含历史卡）与去重登记一并清掉。
+  clearPlanCards();
   previewRoot.innerHTML = "";
 
   session.sessionId = detail.sessionId;
@@ -3473,19 +4038,117 @@ function startNewSession() {
   chatScroll.innerHTML = "";
   previewRoot.innerHTML = "";
   previewRoot.appendChild(previewEmpty);
-  // 新对话没有方案：清掉上一条对话的方案卡片。
+  // 新对话没有方案：清掉上一条对话的方案卡片（含历史卡与去重登记）。
+  clearPlanCards();
   planState.designPhase = null;
   planState.reportPlan = null;
   planState.busy = false;
   planState.error = null;
   planState.planExpanded = false;
+  planState.cardExpanded = true;
+  planState.versionId = "";
+  planState.summaryLine = "";
   renderPlanModule();
   setState("ANALYZING");
   updateMeta();
   renderSessionList();
 }
 
+// --------------------------------------------------------------------------
+// JSON 粘贴入口（#66）
+//
+// 左侧对话区要给用户一个**明确**的入口：把记录数组贴进来，并附一句自然语言。
+// 服务端已经在既有 POST /api/agent/chat 上认 JSON 段（routing_rules.detect_json_payload），
+// 前端不新增端点、不新增协议。
+//
+// 客户端先自查一遍是为了**当场**给出「哪里不对、怎么改」；
+// 服务端仍然是唯一的边界（契约表 §8 不变量 6）。
+// --------------------------------------------------------------------------
+
+/** 打开 / 收起 JSON 粘贴面板。 */
+function toggleJsonPastePanel(open) {
+  const panel = $("json-paste-panel");
+  if (!panel) return;
+  const show = open === undefined ? panel.classList.contains("hidden") : Boolean(open);
+  panel.classList.toggle("hidden", !show);
+  if (show) {
+    const data = $("json-paste-data");
+    if (data && typeof data.focus === "function") data.focus();
+  }
+}
+
+/** 关掉 JSON 粘贴面板。 */
+function closeJsonPastePanel() {
+  toggleJsonPastePanel(false);
+}
+
+/** 在粘贴面板里摆一条**可修正**的提示。 */
+function showJsonPasteHint(error) {
+  const hint = $("json-paste-hint");
+  if (!hint) return;
+  const text = WorkbenchQuery.jsonErrorHint(error);
+  hint.textContent = text;
+  hint.classList.toggle("hidden", !text);
+}
+
+/** 清掉粘贴面板里的提示。 */
+function clearJsonPasteHint() {
+  const hint = $("json-paste-hint");
+  if (!hint) return;
+  hint.textContent = "";
+  hint.classList.add("hidden");
+}
+
+/** 清掉粘贴框里的内容（服务端收下之后才清）。 */
+function clearJsonPasteInputs() {
+  const data = $("json-paste-data");
+  const note = $("json-paste-note");
+  if (data) data.value = "";
+  if (note) note.value = "";
+  clearJsonPasteHint();
+}
+
+/**
+ * 把粘贴的 JSON 发出去。
+ *
+ * 先自查：本地不通过就**当场**给出「哪里不对、怎么改」，不发给服务端；
+ * 本地通过才发（服务端还会再校验一遍）。
+ */
+function submitJsonPaste() {
+  const dataEl = $("json-paste-data");
+  const noteEl = $("json-paste-note");
+  const raw = dataEl ? String(dataEl.value || "") : "";
+  const note = noteEl ? String(noteEl.value || "") : "";
+  const verdict = WorkbenchQuery.parseJsonPaste(raw);
+  if (!verdict.ok) {
+    showJsonPasteHint(verdict.error);
+    return;
+  }
+  clearJsonPasteHint();
+  const message = WorkbenchQuery.buildJsonPasteMessage(note, raw);
+  if (!message.trim()) {
+    showJsonPasteHint({ code: "JSON_INPUT_EMPTY", message: "请把记录数组贴进来再试。" });
+    return;
+  }
+  sendMessage(message);
+}
+
 // -------- 事件绑定 --------
+$("btn-json-paste")?.addEventListener("click", () => toggleJsonPastePanel());
+$("btn-json-paste-cancel")?.addEventListener("click", () => {
+  clearJsonPasteHint();
+  closeJsonPastePanel();
+});
+$("btn-json-paste-send")?.addEventListener("click", () => submitJsonPaste());
+
+// 「有最新方案」：用户在上方读历史时点它跳到底部（不强行拽）。
+$("btn-latest-plan")?.addEventListener("click", () => {
+  chatStickToBottom = true;
+  chatScroll.scrollTop = chatScroll.scrollHeight;
+  updateJumpButton();
+  hideLatestPlanHint();
+});
+
 document.querySelector("[data-quick]").addEventListener("click", (event) => {
   sendMessage(event.currentTarget.dataset.quick);
 });

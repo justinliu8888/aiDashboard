@@ -104,6 +104,69 @@
   const MODULE_ATTR = "data-plan-module";
   const MODULE_NAME = "report-plan";
 
+  // ---------------------------------------------------------------- 卡片文案
+
+  /** 当前待确认那一版的卡片标题。 */
+  const PLAN_CARD_TITLE_CURRENT = "最新方案";
+
+  /** 历史版本的卡片标题前缀（后面接版本号）。 */
+  const PLAN_CARD_TITLE_HISTORY = "历史版本";
+
+  /** 历史版本的确认入口为什么点不动。 */
+  const HISTORY_CONFIRM_HINT = "历史版本不能确认；只有当前待确认的最新版可以确认。";
+
+  // ---------------------------------------------------------------- 方案版本身份
+  //
+  // 契约表 §4.1.2：每一版方案有一条**版本记录**，稳定 ID 叫 versionId，
+  // 「同一版永远是同一个」。前端按它去重：重复响应、乱序响应与重连
+  // 都不会把同一份方案追加两遍（工单 #66）。
+  //
+  // **键名只出现在这一段**：后端改了字段名（或者 A 段最后落定的键名与这里
+  // 略有出入），只改这一处就行，不要散到全文件。
+
+  /** 版本记录里用到的字段名。 */
+  const VERSION_FIELDS = {
+    versionId: "versionId",
+    planId: "planId",
+    planRevision: "planRevision",
+    sequence: "sequence",
+    createdAt: "createdAt",
+    isCurrent: "isCurrent",
+    confirmed: "confirmed",
+    recovered: "recovered",
+    reportPlan: "reportPlan",
+  };
+
+  /**
+   * 「版本记录」可能挂在来源对象的哪些位置（**对象**形态）。
+   *
+   * A 段给本轮响应定的是**版本 ID**（字符串形态，见 VERSION_ID_PATHS）；
+   * 这里留的是「整条记录」的读法，兜住别的形状。
+   */
+  const VERSION_SOURCE_PATHS = [
+    ["planVersion"],
+    ["domainObjects", "planVersion"],
+    ["planVersionRecord"],
+    ["domainObjects", "planVersionRecord"],
+    ["reportPlanVersion"],
+    ["domainObjects", "reportPlanVersion"],
+  ];
+
+  /**
+   * 「版本 ID」可能挂在来源对象的哪些位置（**字符串**形态）。
+   *
+   * A 段定的落点：`AgentResponse.debug.planVersionId`；
+   * 顶层 `AgentResponse.planVersionId` 是等价读法。
+   * 它与版本序列里的 `versionId` **同源同值** —— 两处直接比就行。
+   */
+  const VERSION_ID_PATHS = [
+    ["debug", "planVersionId"],
+    ["planVersionId"],
+  ];
+
+  /** 会话快照里「版本序列」的位置：A 段定的是 `snapshot.planVersions`。 */
+  const VERSION_SEQUENCE_KEYS = ["planVersions"];
+
   // ---------------------------------------------------------------- 样式
   // 用内联样式而不是外部 CSS：本模块不引入样式表、不改宿主页面，
   // 协调者接入时可以直接覆盖这些类名。
@@ -139,6 +202,11 @@
     empty: "font-size:13px;color:#94a3b8;",
     row: "font-size:13px;color:#475569;margin:2px 0;",
     rowKey: "color:#64748b;",
+    // ↓↓↓ #66：卡片外壳（折叠布局）与历史标记
+    cardTitle: "cursor:pointer;font-size:13px;font-weight:600;color:#334155;margin:0 0 8px;list-style:revert;",
+    cardBody: "margin-top:8px;",
+    badgeHistory: "display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;background:#f1f5f9;color:#64748b;font-size:11px;",
+    summaryLine: "font-size:13px;color:#334155;margin:0 0 8px;line-height:1.6;",
     // ↓↓↓ 以下 7 个样式键是 renderChart 的依赖。
     // 需求稿 §3.3 明令「严禁删除折线图 SVG 渲染与 chartFill 样式」，
     // 它们与网格、与模板中间页都无关 —— 模板中间页下线**不代表**删它们。
@@ -209,6 +277,129 @@
     if (cssText) node.setAttribute("style", cssText);
     if (className) node.setAttribute("class", className);
     return node;
+  }
+
+  // ---------------------------------------------------------------- 方案版本身份
+
+  /** 按路径取一个值：路径里任何一层不是对象就返回 undefined。 */
+  function pick(source, path) {
+    let current = source;
+    for (const key of path) {
+      if (!isPlainObject(current)) return undefined;
+      current = current[key];
+    }
+    return current;
+  }
+
+  /**
+   * 把一条版本记录归一成前端自己用的形状。
+   *
+   * 缺什么就是缺：没有 versionId 就是没有，不拿 planId 顶替
+   * —— versionId 是「服务端给的稳定 ID」，顶替了就等于前端自己编了一个。
+   */
+  function normalizeVersionRecord(raw) {
+    if (!isPlainObject(raw)) return null;
+    const plan = isPlainObject(raw[VERSION_FIELDS.reportPlan]) ? raw[VERSION_FIELDS.reportPlan] : null;
+    const versionId = safeText(raw[VERSION_FIELDS.versionId]);
+    const planId = safeText(raw[VERSION_FIELDS.planId]) || (plan ? safeText(plan.id) : "");
+    const revisionRaw =
+      raw[VERSION_FIELDS.planRevision] != null
+        ? raw[VERSION_FIELDS.planRevision]
+        : plan
+          ? plan.revision
+          : null;
+    const planRevision = typeof revisionRaw === "number" && isFinite(revisionRaw) ? revisionRaw : null;
+    if (!versionId && !planId && !plan) return null;
+    return {
+      versionId,
+      planId,
+      planRevision,
+      sequence: typeof raw[VERSION_FIELDS.sequence] === "number" ? raw[VERSION_FIELDS.sequence] : null,
+      createdAt: safeText(raw[VERSION_FIELDS.createdAt]),
+      isCurrent: raw[VERSION_FIELDS.isCurrent] === true,
+      confirmed: raw[VERSION_FIELDS.confirmed] === true,
+      recovered: raw[VERSION_FIELDS.recovered] === true,
+      reportPlan: plan,
+    };
+  }
+
+  /**
+   * 从一次响应（或一条快照记录）里读出这一版的身份。
+   *
+   * 找不到就返回 null —— **不猜**。调用方据此判断「这一轮有没有带来新的一版」。
+   */
+  function readPlanVersion(source) {
+    if (!isPlainObject(source)) return null;
+    // 整条记录的读法（对象形态）。
+    for (const path of VERSION_SOURCE_PATHS) {
+      const found = normalizeVersionRecord(pick(source, path));
+      if (found) return found;
+    }
+    // 版本 ID 的读法（字符串形态）：A 段定的落点是 debug.planVersionId，
+    // 顶层 planVersionId 是等价读法。
+    const plan = readPlanBody(source);
+    for (const path of VERSION_ID_PATHS) {
+      const versionId = safeText(pick(source, path));
+      if (!versionId) continue;
+      return normalizeVersionRecord({
+        versionId,
+        planId: safeText(pick(source, ["debug", "planId"])) || (plan ? safeText(plan.id) : ""),
+        planRevision: pick(source, ["debug", "planRevision"]) ?? (plan ? plan.revision : null),
+        reportPlan: plan,
+      });
+    }
+    // 响应没带版本 ID，但带了方案本身：按「方案身份 + 版本号」当这一版的身份。
+    // 契约表 §4.1：方案身份是 (plan.id, plan.revision)；§4.1.2 的 versionId
+    // 正是从「会话 + 方案 + 版本」派生的，两者一一对应。
+    if (plan) return normalizeVersionRecord({ reportPlan: plan });
+    return null;
+  }
+
+  /** 来源对象里的方案正文（domainObjects.reportPlan）。 */
+  function readPlanBody(source) {
+    const domainObjects = isPlainObject(source.domainObjects) ? source.domainObjects : null;
+    const plan = domainObjects && isPlainObject(domainObjects.reportPlan) ? domainObjects.reportPlan : null;
+    return plan;
+  }
+
+  /**
+   * 从会话快照里读出方案版本序列（按**真实保存顺序**）。
+   *
+   * 老会话没有这个键 → 返回空数组：前端**不伪造**过去的版本
+   * （契约表 §4.1.2「旧数据的默认行为」）。
+   */
+  function readPlanVersionSequence(snapshot) {
+    if (!isPlainObject(snapshot)) return [];
+    for (const key of VERSION_SEQUENCE_KEYS) {
+      const list = snapshot[key];
+      if (!Array.isArray(list)) continue;
+      const out = [];
+      for (const item of list) {
+        const record = normalizeVersionRecord(item);
+        if (record) out.push(record);
+      }
+      out.sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+      return out;
+    }
+    return [];
+  }
+
+  /**
+   * 这一版的**去重键**（可能不止一个别名）。
+   *
+   * 优先用后端给的稳定 versionId；同时给出「方案身份 + 版本号」这一个别名 ——
+   * 两者语义等价（versionId 就是从会话 + 方案 + 版本派生的），所以
+   * 「这次响应带 versionId、刷新后恢复只带 planId + planRevision」
+   * 也不会把同一份方案追加两遍。
+   */
+  function versionAliasKeys(record) {
+    if (!record) return [];
+    const keys = [];
+    if (record.versionId) keys.push("ver:" + record.versionId);
+    if (record.planId) {
+      keys.push("plan:" + record.planId + "#" + (record.planRevision == null ? "" : record.planRevision));
+    }
+    return keys;
   }
 
   // ---------------------------------------------------------------- 视图归一
@@ -285,6 +476,19 @@
       busy: source.busy === true,
       error: errorText(source.error),
       canConfirm: source.canConfirm === true,
+      // ---- #66：卡片身份与卡片外壳 ----
+      // 这一版的稳定 ID（契约表 §4.1.2）。前端按它去重。
+      versionId: safeText(source.versionId),
+      // 这是不是一张**历史**卡片（旧版本）：标为历史，确认入口失效。
+      isHistory: source.isHistory === true,
+      // 卡片要不要带折叠外壳（沿用既有的 <details> 折叠布局）。
+      collapsible: source.collapsible === true,
+      // 折叠外壳默认展开：最新一版在对话区底部要能读全。
+      cardExpanded: source.cardExpanded !== false,
+      // 卡片标题（"最新方案" / "历史版本 · 版本 N"）。
+      cardTitle: ownString(source.cardTitle),
+      // 卡片前的那一句简短说明（与实际提交改动一致，不编造）。
+      summaryLine: ownString(source.summaryLine),
     };
   }
 
@@ -414,9 +618,27 @@
     if (view.reportPlan && view.revision !== null) {
       box.appendChild(makeText(doc, "span", STYLE.badge, "版本 " + view.revision));
     }
+    // 历史卡片：明确标成历史，别让用户以为它还能确认。
+    if (view.isHistory) {
+      box.appendChild(makeText(doc, "span", STYLE.badgeHistory, PLAN_CARD_TITLE_HISTORY));
+    }
     if (view.busy) {
       box.appendChild(makeText(doc, "span", STYLE.badgeBusy, "处理中…"));
     }
+    return box;
+  }
+
+  /**
+   * 卡片前的那一句简短说明。
+   *
+   * 文案由上层给（服务端的说法）：前端**不自己编**这一版改了什么。
+   */
+  function renderSummaryLine(doc, view) {
+    const text = safeText(view.summaryLine);
+    if (!text) return null;
+    const box = makeText(doc, "div", STYLE.summaryLine, text);
+    box.setAttribute("class", "plan-summary-line");
+    box.setAttribute("data-plan-summary", "");
     return box;
   }
 
@@ -731,7 +953,12 @@
     button.textContent = "确认方案";
     button.disabled = !enabled;
     if (!enabled) {
-      button.setAttribute("title", view.busy ? "处理中，暂不可确认方案" : "当前不可确认方案");
+      if (view.isHistory) {
+        // 历史卡片：入口**失效**（只是引导，真正的边界在后端的版本校验 —— 契约表 §8 不变量 6）。
+        button.setAttribute("title", HISTORY_CONFIRM_HINT);
+      } else {
+        button.setAttribute("title", view.busy ? "处理中，暂不可确认方案" : "当前不可确认方案");
+      }
     }
 
     // 点击时再查一次当前状态：即便 DOM 被绕过（disabled 被强制触发），
@@ -747,7 +974,9 @@
 
     box.appendChild(button);
 
-    if (view.busy) {
+    if (view.isHistory) {
+      box.appendChild(makeText(doc, "span", STYLE.hint, HISTORY_CONFIRM_HINT));
+    } else if (view.busy) {
       box.appendChild(makeText(doc, "span", STYLE.hint, "处理中，暂不可确认方案。"));
     }
     return box;
@@ -793,6 +1022,9 @@
     // 判据一律以 designPhase 为准，**不要**拿「内部模板」那个中间产物做判据：
     // 新流程下后端仍可能把内部模板作为只读中间产物带回响应里，
     // 拿它做判据会让模板态以另一种形式复活。
+    //
+    // 这一层折叠视图**一直都在**（#66 的卡片外壳是外面那一层，不替代它）：
+    // 已确认的方案收起来，右侧的草稿才是主角。
     if (view.designPhase === PHASE_DRAFT_READY) {
       body.appendChild(renderConfirmedPlanDetails(doc, view));
       return body;
@@ -812,10 +1044,32 @@
   // ---------------------------------------------------------------- 公共 API
 
   /**
+   * 卡片外壳（#66）。
+   *
+   * 沿用既有的折叠布局（原生 <details>，与「查看已确认的文字方案」同一套），
+   * **不新增按钮**：卡片标题就是折叠开关。
+   *   - 最新一版：默认展开 —— 它在对话区底部，要能读全；
+   *   - 历史版本：默认收起 —— 原文留在原地，展开才看。
+   */
+  function renderCardShell(doc, view, state) {
+    const details = makeBlock(doc, "details", "", "plan-card-details");
+    details.setAttribute("data-plan-card", view.isHistory ? "history" : "current");
+    details.setAttribute("data-plan-collapsed", view.cardExpanded ? "false" : "true");
+    if (view.cardExpanded) details.setAttribute("open", "");
+    details.appendChild(
+      makeText(doc, "summary", STYLE.cardTitle, view.cardTitle || PLAN_CARD_TITLE_CURRENT)
+    );
+    details.appendChild(renderBody(doc, view, state));
+    return details;
+  }
+
+  /**
    * 渲染一份方案视图。
    *
    * @param {Element} root          宿主容器。模块只往里加自己的一层 div
-   * @param {object}  view          {designPhase, reportPlan, busy, error, canConfirm}
+   * @param {object}  view          {designPhase, reportPlan, busy, error, canConfirm,
+   *                                 versionId, isHistory, collapsible, cardExpanded,
+   *                                 cardTitle, summaryLine}
    * @param {object}  options       {onAction}
    * @returns {undefined}
    */
@@ -860,7 +1114,15 @@
     const errorBox = renderError(doc, normalized);
     if (errorBox) container.appendChild(errorBox);
 
-    container.appendChild(renderBody(doc, normalized, state));
+    // 卡片前的那一句简短说明（与实际提交改动一致）。
+    const summaryLine = renderSummaryLine(doc, normalized);
+    if (summaryLine) container.appendChild(summaryLine);
+
+    if (normalized.collapsible) {
+      container.appendChild(renderCardShell(doc, normalized, state));
+    } else {
+      container.appendChild(renderBody(doc, normalized, state));
+    }
 
     root.appendChild(container);
 
@@ -909,6 +1171,17 @@
     PHASE_LABELS,
     MODULE_ATTR,
     MODULE_NAME,
+    PLAN_CARD_TITLE_CURRENT,
+    PLAN_CARD_TITLE_HISTORY,
+    HISTORY_CONFIRM_HINT,
+    // ---- #66：方案版本身份（去重与还原都靠它）----
+    VERSION_FIELDS,
+    VERSION_SOURCE_PATHS,
+    VERSION_SEQUENCE_KEYS,
+    normalizeVersionRecord,
+    readPlanVersion,
+    readPlanVersionSequence,
+    versionAliasKeys,
     normalizeView,
     errorText,
     canConfirmNow,
