@@ -28,6 +28,9 @@ from app.schemas.agent import (
     AGENT_PROTOCOL_VERSION,
     DESIGN_ACTION_CONFIRM_PLAN,
     DESIGN_ACTION_CONFIRM_TEMPLATE,
+    LOCK_SCOPE_INPUT_AND_MENU,
+    LOCK_SCOPE_MENU_ONLY,
+    LOCK_SCOPE_NONE,
     AgentBlock,
     AgentError,
     AgentQuestion,
@@ -127,6 +130,23 @@ EDIT_COMMAND_WORDS = (
     "改成", "改为", "换成", "换为", "调成", "设为", "设定为",
 )
 
+# 「你自己决定 / 别问了」：用户把选择权交回给系统。
+#
+# 规格第 16 条：这时**停止阻塞追问**，改为以可见假设继续，
+# **不代用户接受** —— 不自动接受计划、不替用户确认修改。
+DELEGATION_WORDS = (
+    "你自己决定", "你看着办", "你自己看着办", "你来决定", "你决定",
+    "别问了", "不用问了", "不要问了", "别再问了", "不用再问",
+    "随便你", "随便吧", "自行决定", "你随便",
+)
+
+# 交给用户「不再追问」之后的非阻塞说明里给出的可选替代（规格第 18 条）。
+DELEGATION_ALTERNATIVES = (
+    "① 把要改的对象和改法一次说完整（例如「把第 2 张卡片标题改成 X」），我直接出候选计划；",
+    "② 保持当前报表不变，先问别的问题；",
+    "③ 换一个对象重新提一次修改要求。",
+)
+
 # 目标定位依赖「用户实际看到的可见顺序」的解析方式。
 # 序数和指代词必须靠可见顺序定位；精确名称和选中卡片本身就是可靠锚点，
 # 不要求前端回传 visibleRegionIds。
@@ -144,6 +164,23 @@ QUERY_UNSAFE_ANSWER = (
     "草稿和待确认操作都没有变化，可以稍后再问一次。"
 )
 EmitEvent = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+def _question_from_pending(raw: dict[str, Any]) -> AgentQuestion:
+    """从 ``sessions.pending_choice`` 里读回那份有效菜单。
+
+    老会话的菜单**没有** ``lockScope`` 这个键（它是本轮新增的键）：
+    按契约表 §5.3「旧数据的默认行为」一律当成 ``"menu_only"`` 处理 ——
+    等于今天的行为（不锁输入）。
+
+    这里必须显式补上这个键，不能让模型按阶段判据推导：否则老会话里那份
+    「模板已生成、等待下一步操作」的菜单会在刷新后突然把输入锁住，
+    与「老数据按 menu_only 处理」的规定相反。
+    """
+    data = dict(raw)
+    data.setdefault("lockScope", LOCK_SCOPE_MENU_ONLY)
+    return AgentQuestion(**data)
+
 
 
 async def _emit(
@@ -407,7 +444,7 @@ class AgentService:
         if isinstance(raw, dict):
             try:
                 AgentState(raw["state"])
-                return [AgentQuestion(**raw["question"])]
+                return [_question_from_pending(raw["question"])]
             except (KeyError, TypeError, ValueError):
                 logger.warning(
                     "[agent.chat] step=pending_choice_invalid conversationId=%s raw=%s",
@@ -524,7 +561,7 @@ class AgentService:
         if pending_raw:
             try:
                 pending_state = AgentState(pending_raw["state"])
-                pending = (pending_state, AgentQuestion(**pending_raw["question"]))
+                pending = (pending_state, _question_from_pending(pending_raw["question"]))
             except (KeyError, ValueError):
                 logger.warning(
                     "[agent.chat] step=pending_choice_invalid conversationId=%s raw=%s",
@@ -1177,11 +1214,14 @@ class AgentService:
 
     @staticmethod
     def _pending_edit_question() -> AgentQuestion:
+        # 待确认修改计划出现时**恢复选择锁**（契约表 §5.2）：
+        # 这一阶段要连输入框一起锁住，用户先选「接受修改 / 继续调整 / 取消」。
         return AgentQuestion(
             id=EDIT_CHOICE_ID,
             prompt="确认这次修改：",
             expects="SINGLE_CHOICE",
             selectionOnly=True,
+            lockScope=LOCK_SCOPE_INPUT_AND_MENU,
             options=[
                 QuestionOption(value=value, label=value)
                 for value in (EDIT_ACCEPT, EDIT_ADJUST, EDIT_CANCEL)
@@ -1191,6 +1231,113 @@ class AgentService:
     @staticmethod
     def _draft_revision(definition: ReportDefinitionDraft) -> int:
         return int((definition.metadata or {}).get("revision") or 0)
+
+    @staticmethod
+    def _is_delegated_decision(message: str) -> bool:
+        """用户是不是把选择权交回给系统（规格第 16 条）。
+
+        「你自己决定」「别问了」这类话出现时，继续追问就是**阻塞**用户：
+        他已经说过了不要再问。
+        """
+        text = (message or "").strip()
+        if not text:
+            return False
+        return any(word in text for word in DELEGATION_WORDS)
+
+    @staticmethod
+    def _is_pure_delegation(message: str) -> bool:
+        """整句只有「你自己决定」这类交代，别的什么都没说。
+
+        「你自己决定吧」是纯交代 → 立刻停止阻塞。
+        「把标题改成 X，你看着办」是**带着要求的交代** → 仍要出候选，
+        只是不再追问。
+        """
+        text = (message or "").strip()
+        if not AgentService._is_delegated_decision(text):
+            return False
+        rest = text
+        for word in DELEGATION_WORDS:
+            rest = rest.replace(word, "")
+        rest = re.sub(r"[\s,，。.!！?？~、;；:：的了吧呀啊]", "", rest)
+        return not rest
+
+    def _delegated_assumption(
+        self, request: AgentRequest, definition: ReportDefinitionDraft | None
+    ) -> str:
+        """写在明面上的假设（规格第 16、18 条）。
+
+        可假设的是**模拟示例的主题、栏目与布局**；不是权限、实际字段，
+        更不是用户的接受动作 —— 所以这里只说「沿用什么」，不说「替你定了什么」。
+        """
+        parts: list[str] = []
+        if definition is not None:
+            name = (definition.metadata or {}).get("name") or "当前报表"
+            regions = definition.regions or []
+            parts.append(f"沿用「{name}」现有的栏目、口径与时间窗")
+            parts.append(f"共 {len(regions)} 张卡片都不动")
+        else:
+            parts.append("沿用当前报表现有的栏目与口径")
+        parts.append("不替你接受任何改动")
+        return "；".join(parts) + "。"
+
+    def _delegated_response(
+        self,
+        request: AgentRequest,
+        definition: ReportDefinitionDraft | None,
+        *,
+        extra: str = "",
+    ) -> AgentResponse:
+        """「你自己决定 / 别问了」之后：**停止阻塞**，给可见假设。
+
+        三条硬边界（规格第 16、18 条）：
+
+        1. 不再抛问题（``questions`` 为空）—— 不阻塞用户；
+        2. 假设写在明面上，用户能看见、能推翻；
+        3. **不代用户接受** —— 不生成待接受计划、不改草稿、不自动接受。
+        """
+        assumption = self._delegated_assumption(request, definition)
+        reply = (
+            "好，不再追问了。我按下面的假设继续："
+            f"{assumption}"
+            f"{extra}"
+            "这份报表没有变化，也没有生成待接受的修改计划。"
+            "你可以选一种继续方式："
+            + "".join(DELEGATION_ALTERNATIVES)
+        )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=request.state,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportPolicyDraft=request.snapshots.reportPolicy,
+                reportDefinitionDraft=definition or request.snapshots.reportDefinition,
+            ),
+            questions=[],
+            uiActions=["template_editing", "delegated_assumption"],
+            debug={
+                "editOutcome": "delegated_assumption",
+                "editingIntent": "UNKNOWN",
+            },
+        )
+
+    def _clarification_or_delegated(
+        self,
+        request: AgentRequest,
+        definition: ReportDefinitionDraft | None,
+        question: str,
+        *,
+        choices: list[QuestionOption] | None = None,
+        intent: str = "UNKNOWN",
+        region_id: str = "",
+        delegated: bool = False,
+    ) -> AgentResponse:
+        """要追问的地方，先看用户是不是已经说了「别问了」。"""
+        if delegated:
+            return self._delegated_response(request, definition)
+        return self._edit_clarification_response(
+            request, question, choices=choices, intent=intent, region_id=region_id
+        )
 
     @staticmethod
     def _reference_is_reliable(reference, context) -> bool:
@@ -1264,7 +1411,9 @@ class AgentService:
             if active.planId != candidate.planId:
                 response.reply = "上一份修改计划仍待确认，请先处理该计划。"
                 response.debug["editingTargetRegionId"] = active.targetRegionId or None
-            session_service.reset_clarification(session_key)
+            # 这里**不**清澄清计数（契约表 §7.2、规格第 19 条）：
+            # 候选计划落库不是新任务，随后的**局部调整**不重置额度。
+            # 换一件事（额度键变了）才由 record_clarification 自然重开。
             request.collectedInfo.pop("pendingEditRequest", None)
             request.collectedInfo.pop("pendingEditTimeAnchor", None)
             response.domainObjects.pendingEditPlan = PendingEditPlan(
@@ -1315,10 +1464,14 @@ class AgentService:
             else "edit:unresolved"
         )
         if not session_service.can_ask_clarification(session_key, key=key):
+            # 一轮之后仍缺安全目标（规格第 18 条）：保留当前报告，给**非阻塞**
+            # 说明与可选替代 —— 不猜目标、不造空计划、不继续循环强制询问。
             response.reply = (
                 f"这项修改我已经追问过 {MAX_CLARIFICATION_ROUNDS} 轮，还是没能确定："
                 f"{response.reply}"
-                "草稿没有修改。你可以把要改的对象和改法一次说完整，我再出候选计划。"
+                "当前报表保持原样，草稿没有修改，也没有替你接受任何改动。"
+                "你可以选一种继续方式："
+                + "".join(DELEGATION_ALTERNATIVES)
             )
             response.questions = []
             response.uiActions = ["template_edit_clarification_limit"]
@@ -1331,7 +1484,9 @@ class AgentService:
         return response
 
     def _edit_notice(
-        self, request: AgentRequest, message: str, *, code: str | None = None
+        self, request: AgentRequest, message: str, *, code: str | None = None,
+        questions: list[AgentQuestion] | None = None,
+        ui_actions: list[str] | None = None,
     ) -> AgentResponse:
         record = session_service.repository.get_session(
             current_session_key() or request.conversationId
@@ -1356,6 +1511,8 @@ class AgentService:
                     else request.snapshots.reportPolicy
                 ),
             ),
+            questions=questions or [],
+            uiActions=list(ui_actions or []),
             error=AgentError(code=code, message=message) if code else None,
         )
 
@@ -1369,13 +1526,23 @@ class AgentService:
             )
         if request.message in {EDIT_CANCEL, EDIT_ADJUST}:
             session_service.clear_pending_plan(session_key)
-            session_service.reset_clarification(session_key)
-            message = (
-                "已取消这次修改，草稿没有变化。"
-                if request.message == EDIT_CANCEL
-                else "草稿没有变化。请告诉我这份修改计划需要怎样调整。"
+            if request.message == EDIT_CANCEL:
+                # 取消 = 这件事结束了，下一件事按额度键规则重新开。
+                session_service.reset_clarification(session_key)
+                return self._edit_notice(
+                    request, "已取消这次修改，草稿没有变化。"
+                )
+            # 「继续调整」（规格第 58 条）：旧计划不再可接受，模板本身不变，
+            # 回到**统一对话** —— 用户可以接着问、接着提反馈、接着改。
+            #
+            # 这不是新任务：澄清额度**不重开**（契约表 §7.2「普通回复与局部
+            # 调整不重置额度」），所以这里不 reset_clarification。
+            return self._edit_notice(
+                request,
+                "草稿没有变化。请告诉我这份修改计划需要怎样调整。",
+                questions=self._editing_prompt_questions(),
+                ui_actions=["template_editing", "ask_template_edit_detail"],
             )
-            return self._edit_notice(request, message)
 
         record = session_service.repository.get_session(session_key)
         stored = (record.snapshot or {}).get("definition") if record else None
@@ -1645,6 +1812,13 @@ class AgentService:
             AgentState.USER_EDITING_TEMPLATE,
         }:
             return None
+        if self._is_pure_delegation(request.message):
+            # 「你自己决定 / 别问了」：用户已经明说不要再问。
+            # 这一句不能被当成提问（去回答「好」）、也不能被当成修改指令。
+            # 停止阻塞、给可见假设、**不代用户接受**（规格第 16 条）。
+            return self._delegated_response(
+                request, request.snapshots.reportDefinition
+            )
         if intent is UserIntent.ISSUE_FEEDBACK:
             return self._analyze_issue_feedback(request)
         if intent is UserIntent.ASK_QUESTION:
@@ -1847,6 +2021,9 @@ class AgentService:
         if readonly is not None:
             return readonly
 
+        # 用户说「你自己决定 / 别问了」：不再追问，但仍要把能做的改完。
+        delegated = self._is_delegated_decision(message)
+
         prior = request.collectedInfo.get("pendingEditRequest")
         continuing = bool(prior) and not any(
             word in message for word in ("删除", "删掉", "改成", "改为", "换成", "新增", "取消")
@@ -1862,14 +2039,16 @@ class AgentService:
         if reference.status != "NOT_FOUND":
             if reference.status != "RESOLVED":
                 # 指代词没选中对象、序数越界：先问清楚是哪一张。
-                return self._edit_clarification_response(
-                    request, reference.question or "请指出要改的正文卡片名称。",
-                    intent="UNKNOWN",
+                return self._clarification_or_delegated(
+                    request, definition,
+                    reference.question or "请指出要改的正文卡片名称。",
+                    intent="UNKNOWN", delegated=delegated,
                 )
             if not self._reference_is_reliable(reference, request.context):
-                return self._edit_clarification_response(
-                    request, "当前页面卡片顺序无法核对，请指出要改的卡片名称。",
-                    intent="UNKNOWN",
+                return self._clarification_or_delegated(
+                    request, definition,
+                    "当前页面卡片顺序无法核对，请指出要改的卡片名称。",
+                    intent="UNKNOWN", delegated=delegated,
                 )
             selected_region_id = reference.regionId
 
@@ -1905,10 +2084,11 @@ class AgentService:
                 )
                 for option in resolved_time.options
             ]
-            return self._edit_clarification_response(
-                request, resolved_time.question, choices=choices,
+            return self._clarification_or_delegated(
+                request, definition, resolved_time.question, choices=choices,
                 intent=EditIntent.CHANGE_TIME_RANGE.value,
                 region_id=selected_region_id or "",
+                delegated=delegated,
             )
 
         scope = ToolScope(
@@ -1940,12 +2120,13 @@ class AgentService:
                 else None
             )
             if composite is None:
-                return self._edit_clarification_response(
-                    request,
+                return self._clarification_or_delegated(
+                    request, definition,
                     "指定的数据源无法同时满足该卡片的指标字段和目标粒度；"
                     "本次没有修改草稿，请重新指定数据源或粒度。",
                     intent=EditIntent.CHANGE_COMPILATION_GRAIN.value,
                     region_id=plan.target.regionId,
+                    delegated=delegated,
                 )
             composite.confidence = plan.confidence
             plan = composite
@@ -1994,6 +2175,10 @@ class AgentService:
                 )
             )
         if plan.intent == EditIntent.UNKNOWN or plan.needsClarification or plan.confidence < 0.7:
+            if delegated:
+                # 用户说了「别问了」：不再追问，改成可见假设 + 可选替代。
+                # **不猜目标、不造空计划**（规格第 16、18 条）。
+                return self._delegated_response(request, definition)
             if isinstance(self._agent, FakeReportAgent):
                 if plan.needsClarification or plan.intent == EditIntent.UNKNOWN:
                     result = template_edit_engine.apply(
@@ -2018,6 +2203,13 @@ class AgentService:
             }]
         )
         summary = plan.summary or self._describe_rule_edit(plan, definition)
+        # 用户说了「你自己决定」：候选照出，但假设写在明面上，
+        # 而且仍然要他自己点「接受修改」—— **不代用户接受**（规格第 16 条）。
+        delegated_note = (
+            f"\n（你让我自己决定，我按下面这个假设出的候选："
+            f"{self._delegated_assumption(request, definition)}）"
+            if delegated else ""
+        )
         candidate = {
             "planId": f"plan_{uuid.uuid4().hex}",
             "draftRevision": self._draft_revision(definition),
@@ -2029,7 +2221,10 @@ class AgentService:
         return AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.USER_EDITING_TEMPLATE,
-            reply=f"待确认的修改：{summary}\n接受后才会校验并修改草稿。",
+            reply=(
+                f"待确认的修改：{summary}\n接受后才会校验并修改草稿。"
+                f"{delegated_note}"
+            ),
             designSessionId=request.context.designSessionId,
             domainObjects=AgentResponseDomainObjects(
                 reportDefinitionDraft=definition,
@@ -2241,11 +2436,14 @@ class AgentService:
 
     @staticmethod
     def _editing_prompt_questions() -> list[AgentQuestion]:
+        # 「已选修改 / 继续调整」之后的**统一对话**入口：这里不锁，
+        # 用户可以一起问、一起提反馈、一起改（规格第 58 条）。
         return [
             AgentQuestion(
                 id="template_edit_action",
                 prompt="请选择或直接输入修改要求：",
                 expects="SINGLE_CHOICE",
+                lockScope=LOCK_SCOPE_NONE,
                 options=[
                     QuestionOption(value="删除这个 section", label="删除这个 section"),
                     QuestionOption(value="改标题", label="改标题"),
@@ -2260,11 +2458,14 @@ class AgentService:
 
     @staticmethod
     def _editing_confirm_questions() -> list[AgentQuestion]:
+        # 「确认编辑后的草稿」是确认态，不是「等待下一步操作选择」：
+        # 输入框保持可用，用户在确认前仍能问一句（契约表 §5.2 的 menu_only）。
         return [
             AgentQuestion(
                 id="template_edit_confirm",
                 prompt="请确认当前编辑后的草稿：",
                 expects="SINGLE_CHOICE",
+                lockScope=LOCK_SCOPE_MENU_ONLY,
                 options=[
                     QuestionOption(value=CONFIRM_BUTTON_VALUE, label="同意"),
                     QuestionOption(value=MODIFY_BUTTON_VALUE, label="修改"),
@@ -2634,10 +2835,13 @@ class AgentService:
 
     @staticmethod
     def _ready_questions() -> list[AgentQuestion]:
+        # 旧流程的 READY 菜单：契约表 §5.2 没有把它列进「锁输入」的阶段，
+        # 保持既有行为（只锁菜单，输入框可用）。
         return [AgentQuestion(
             id="ready_action",
             prompt="请选择下一步操作：",
             expects="SINGLE_CHOICE",
+            lockScope=LOCK_SCOPE_MENU_ONLY,
             options=[
                 QuestionOption(value="继续修改", label="继续修改"),
                 QuestionOption(value="发布", label="发布"),
