@@ -824,6 +824,23 @@ def _safe_warning(message: str, *args: Any) -> None:
         pass
 
 
+def _safe_failure(message: str, exc: BaseException) -> None:
+    """写一条失败日志：**只留原因类型，不留异常原文**。
+
+    和 :func:`_safe_warning` 一样不许抛错；区别是这里把异常对象换成
+    它的类型 —— 上游异常原文可能带用户数据（#61）。
+    """
+    try:
+        logger.warning(
+            "%s errorType=%s",
+            message,
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _notify(emit: Emit | None, event: dict[str, Any]) -> None:
     """进度回调。回调自身出错不影响本轮结论。"""
     if emit is None:
@@ -833,7 +850,8 @@ async def _notify(emit: Emit | None, event: dict[str, Any]) -> None:
         if inspect.isawaitable(result):
             await result
     except Exception as exc:  # noqa: BLE001
-        _safe_warning("方案设计进度回调失败：%s", exc)
+        # 异常原文不进日志：只留原因类型（#61）。
+        _safe_failure("方案设计进度回调失败", exc)
 
 
 def _record_parse_outcome(

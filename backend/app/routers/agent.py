@@ -13,12 +13,26 @@ from fastapi.responses import StreamingResponse
 from app.schemas.agent import AgentRequest, AgentResponse, AgentState
 from app.services import report_diagnostics_service as diagnostics
 from app.services.agent_service import agent_service
+from app.services.report_log_safety import (
+    log_info,
+    log_warning,
+    user_visible_error_message,
+)
 from app.services.request_timeline import log_timeline_step, start_timeline
 from app.services.session_service import session_service
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
+
+
+class _PublicFailure(RuntimeError):
+    """对外只说人话的失败。
+
+    内部原因（异常类型、调用栈）已经写进日志。这里抛出去的异常
+    **不带异常原文** —— 否则 Web 服务器会把原文写进自己的错误日志，
+    用户可见的错误消息里也会夹带上游的技术细节。
+    """
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -32,9 +46,15 @@ def _log_failure(message: str, exc: Exception) -> None:
     上游异常文本可能带凭据或用户数据，所以异常对象换成 ``None``：
     栈还在（能看出哪一行炸的），消息没了。
     """
-    logger.warning(
-        "%s errorType=%s",
+    request_id = "-"
+    state = diagnostics.current_model_call()
+    if state is not None:
+        request_id = state.request_id
+    log_warning(
+        logger,
+        "%s requestId=%s errorType=%s",
         message,
+        request_id,
         type(exc).__name__,
         exc_info=(type(exc), None, exc.__traceback__),
     )
@@ -82,7 +102,8 @@ async def chat(request: AgentRequest) -> AgentResponse:
     )
     log_timeline_step("router_received")
     # 只记长度，不记用户原话。
-    logger.info(
+    log_info(
+        logger,
         "[agent.chat] step=router_received conversationId=%s resumeOf=%s state=%s messageLength=%d",
         request.conversationId,
         request.resumeOfConversationId,
@@ -98,11 +119,13 @@ async def chat(request: AgentRequest) -> AgentResponse:
             f"elapsed_ms={(perf_counter() - started) * 1000:.1f}",
             exc,
         )
-        raise
+        # 抛出去的异常不带原文：Web 服务器会把异常消息写进自己的错误日志。
+        raise _PublicFailure(user_visible_error_message(exc)) from None
     log_timeline_step("router_return")
     # 「业务已返回」：这一事件说明业务结论已经出来了，
     # 不代表客户端已经收到 —— 客户端确认是另一件事。
-    logger.info(
+    log_info(
+        logger,
         "[agent.chat] step=router_return conversationId=%s event=business_returned "
         "elapsed_ms=%.1f response_state=%s uiActions=%s error=%s",
         request.conversationId,
@@ -143,7 +166,8 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
             )
             log_timeline_step("router_received")
             # 只记长度，不记用户原话。
-            logger.info(
+            log_info(
+                logger,
                 "[agent.chat.stream] step=router_received conversationId=%s resumeOf=%s state=%s messageLength=%d",
                 request.conversationId,
                 request.resumeOfConversationId,
@@ -162,7 +186,8 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
             try:
                 response = await agent_service.chat(request, emit=emit)
                 log_timeline_step("router_return")
-                logger.info(
+                log_info(
+                    logger,
                     "[agent.chat.stream] step=router_return conversationId=%s event=business_returned "
                     "elapsed_ms=%.1f response_state=%s uiActions=%s error=%s",
                     request.conversationId,
@@ -181,7 +206,8 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
                 )
                 # 「final 已入队」：只说明 final 进了发送队列，
                 # **不等于**客户端已经收到 —— 没有客户端确认就不能这么说。
-                logger.info(
+                log_info(
+                    logger,
                     "[agent.chat.stream] step=final_enqueued conversationId=%s "
                     "event=final_enqueued elapsed_ms=%.1f",
                     request.conversationId,
@@ -190,7 +216,8 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
             except asyncio.CancelledError:
                 cancelled = True
                 log_timeline_step("router_cancelled")
-                logger.info(
+                log_info(
+                    logger,
                     "[agent.chat.stream] step=router_cancelled conversationId=%s elapsed_ms=%.1f",
                     request.conversationId,
                     (perf_counter() - started) * 1000,
@@ -203,10 +230,18 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
                     f"elapsed_ms={(perf_counter() - started) * 1000:.1f}",
                     exc,
                 )
-                await emit("error", {"message": str(exc)})
+                # 用户可见的错误消息里不带异常原文：只说「出了什么事、怎么办」。
+                await emit(
+                    "error",
+                    {
+                        "message": user_visible_error_message(exc),
+                        "code": "INTERNAL_ERROR",
+                    },
+                )
             finally:
                 # 「流结束或被取消」：这两个必须分开记。
-                logger.info(
+                log_info(
+                    logger,
                     "[agent.chat.stream] step=stream_end conversationId=%s event=%s elapsed_ms=%.1f",
                     request.conversationId,
                     "stream_cancelled" if cancelled else "stream_finished",
