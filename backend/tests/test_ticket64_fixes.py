@@ -203,3 +203,120 @@ def test_unresolvable_rule_is_dropped_instead_of_guessing_a_region() -> None:
     )
     grouped = _rules_by_region(combination, region_ids=["region_1"])
     assert grouped == {}
+
+
+# --------------------------------------------------------------------------
+# F9 —— 不可求和字段名：按词段精确匹配，不靠裸子串
+# --------------------------------------------------------------------------
+
+
+def test_non_summable_matching_does_not_hit_unrelated_words() -> None:
+    """裸子串会误伤：``grid``（含 id）、``notify``（含 no）、``postcode``（含 code）。"""
+    assert json_svc.is_summable_field("grid") is True
+    assert json_svc.is_summable_field("notify") is True
+    assert json_svc.is_summable_field("postcode") is True
+    assert json_svc.is_summable_field("grid_energy") is True
+
+
+def test_non_summable_matching_still_covers_identifiers_and_readings() -> None:
+    """词段精确匹配之后，编号 / 读数 / 温度类字段仍然**不默认求和**。"""
+    for key in (
+        "temperature",
+        "温度",
+        "pue",
+        "meter_reading",
+        "device_id",
+        "id",
+        "id2",
+        "deviceCode",
+        "nodeId",
+        "temperatureC",
+        "编号",
+        "设备号",
+        "累计电表读数",
+    ):
+        assert json_svc.is_summable_field(key) is False, key
+
+
+def test_summable_energy_fields_are_not_blocked() -> None:
+    """目录里的能量字段（``energyKwh``）与合计类字段仍然可以求和。"""
+    for key in ("energy", "energyKwh", "total_energy", "energy_reading"):
+        assert json_svc.is_summable_field(key) is True, key
+
+
+def test_non_summable_reason_explains_why() -> None:
+    """原因是人话，能说清楚「为什么这个字段没被求和」。"""
+    reason = json_svc.non_summable_reason("temperature")
+    assert "temperature" in reason
+    assert "温度" in reason
+    assert "求和" in reason
+    # 可求和的字段没有原因要解释。
+    assert json_svc.non_summable_reason("energy") == ""
+
+
+# --------------------------------------------------------------------------
+# F4 —— 不可求和的原因写进数据问题说明
+# --------------------------------------------------------------------------
+
+
+def _temperature_sections() -> list[dict[str, Any]]:
+    """一份「总量」意图的方案：指标意图里点名了 temperature 字段。"""
+    return [
+        {
+            "id": "section_total",
+            "title": "总温度概览",
+            "metricIntents": ["总温度（字段 temperature）"],
+            "componentType": "metric_card",
+            "displayIntent": "total",
+        }
+    ]
+
+
+def test_non_summable_reason_is_written_into_data_issues() -> None:
+    """温度字段被退回明细展示时，**原因要写进**数据问题说明。
+
+    承诺写在 ``json_input_service`` 的注释里（「把原因写进数据问题说明」）；
+    落点是契约表 §2 已登记的 ``metadata.jsonInputIssues.dataIssues``。
+    """
+    from tests.support.acceptance_harness import (
+        ScriptedModel,
+        acceptance_harness,
+        plan_candidate,
+    )
+
+    rows = [
+        {"ts": "2024-01-01", "temperature": 20.0},
+        {"ts": "2024-01-02", "temperature": 22.0},
+    ]
+    model = ScriptedModel(plan_candidate(sections=_temperature_sections()))
+    with acceptance_harness(model=model) as harness:
+        harness.send(f"这是昨天的数据 {json.dumps(rows, ensure_ascii=False)}")
+        plan = harness.read_session()["snapshot"]["reportPlan"]
+        confirmed = harness.confirm_plan(plan)
+        definition = confirmed["domainObjects"]["reportDefinitionDraft"]
+        assert definition is not None
+
+        metadata = definition.get("metadata") or {}
+        issues = metadata.get("jsonInputIssues") or {}
+        data_issues = issues.get("dataIssues") or []
+        assert any(
+            "temperature" in str(item) and "求和" in str(item)
+            for item in data_issues
+        ), data_issues
+
+        # 规则确实退回 PASSTHROUGH（不默认求和）。
+        combination = metadata.get("effectiveCombination") or {}
+        rules = combination.get("processingRules") or []
+        assert rules
+        assert all(
+            str(rule.get("operation")) == "PASSTHROUGH" for rule in rules
+        ), rules
+
+        # 原因也进了**用户能看到的**载荷说明里。
+        preview = confirmed.get("reportPreviewPayload") or {}
+        notes = [
+            note
+            for item in preview.get("regions") or []
+            for note in ((item.get("payload") or {}).get("notes") or [])
+        ]
+        assert any("temperature" in note and "求和" in note for note in notes), notes

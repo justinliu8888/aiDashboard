@@ -121,6 +121,34 @@ NON_SUMMABLE_FIELD_TOKENS: tuple[str, ...] = (
 )
 
 
+#: 命中「不默认求和」的字段 → **人话**的分类（写进数据问题说明）。
+#:
+#: 与 :data:`NON_SUMMABLE_FIELD_TOKENS` 一一对应：命中哪个词，就用它
+#: 解释「为什么这个字段不能求和」。
+NON_SUMMABLE_REASON_LABELS: dict[str, str] = {
+    "temperature": "温度类指标",
+    "temp": "温度类指标",
+    "celsius": "温度类指标",
+    "温度": "温度类指标",
+    "pue": "PUE 类指标",
+    "累计电表读数": "累计电表读数",
+    "电表读数": "累计电表读数",
+    "累计读数": "累计电表读数",
+    "meterreading": "累计电表读数",
+    "meterreadingtotal": "累计电表读数",
+    "cumulative": "累计电表读数",
+    "energyreadings": "累计电表读数",
+    "总表读数": "累计电表读数",
+    "编号": "编号类字段",
+    "序号": "编号类字段",
+    "设备号": "编号类字段",
+    "机柜号": "编号类字段",
+    "id": "编号类字段",
+    "no": "编号类字段",
+    "code": "编号类字段",
+}
+
+
 #: 字段值的类型名（封闭集合）。
 TYPE_STRING = "string"
 TYPE_NUMBER = "number"
@@ -757,19 +785,98 @@ def validate_field_mapping(
 # --------------------------------------------------------------------------
 
 
+#: 字段名里的**分隔符**（下划线、连字符、空格、点、括号……）。
+_FIELD_KEY_SEPARATORS = re.compile(r"[^0-9A-Za-z一-鿿]+")
+
+#: 驼峰边界：``deviceCode`` → ``device`` + ``Code``；``PUEValue`` → ``PUE`` + ``Value``。
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+#: 中文字符（中文没有词边界，只能按子串判）。
+_CJK_PATTERN = re.compile(r"[一-鿿]")
+
+
+def _field_key_segments(field_key: str) -> list[str]:
+    """字段名的**词段**。
+
+    先按分隔符切开，再按驼峰边界切开：``device_id`` → ``["device", "id"]``，
+    ``deviceCode`` → ``["device", "Code"]``，``UPS01`` → ``["UPS01"]``。
+    """
+    segments: list[str] = []
+    for chunk in _FIELD_KEY_SEPARATORS.split(str(field_key or "")):
+        if not chunk:
+            continue
+        segments.extend(part for part in _CAMEL_BOUNDARY.split(chunk) if part)
+    return segments
+
+
+def _segment_matches_token(segment: str, token: str) -> bool:
+    """这一段是不是**就是**这个词。
+
+    末尾的数字算编号的一部分（``id2`` / ``no1`` 仍然是编号类字段）。
+    """
+    normalized_segment = normalize_field_key(segment)
+    normalized_token = normalize_field_key(token)
+    if not normalized_segment or not normalized_token:
+        return False
+    if normalized_segment == normalized_token:
+        return True
+    stripped = re.sub(r"\d+$", "", normalized_segment)
+    return bool(stripped) and stripped == normalized_token
+
+
+def _non_summable_token(field_key: str) -> str | None:
+    """命中了哪个「不默认求和」的词；没命中返回 ``None``。
+
+    判据是**词段精确匹配**，不是裸子串：裸子串会把 ``grid``（含 ``id``）、
+    ``notify``（含 ``no``）、``postcode``（含 ``code``）误判成编号类字段 ——
+    方向虽然保守（宁可不求和也不错求和），但会让本可求和的字段退化成明细。
+
+    三条判据（与 :data:`NON_SUMMABLE_FIELD_TOKENS` 一一对应）：
+
+    1. 整个字段名就是这个词：``meterreading`` / ``pue`` / ``编号``；
+    2. 字段名里的**某一段**就是这个词：``device_id`` → ``id``、
+       ``deviceCode`` → ``Code``；
+    3. 中文没有词边界（``温度值`` / ``累计电表读数``）：按子串判。
+    """
+    normalized = normalize_field_key(field_key)
+    if not normalized:
+        return None
+    segments = _field_key_segments(field_key)
+    for token in NON_SUMMABLE_FIELD_TOKENS:
+        normalized_token = normalize_field_key(token)
+        if not normalized_token:
+            continue
+        if normalized == normalized_token:
+            return token
+        if any(_segment_matches_token(segment, token) for segment in segments):
+            return token
+        if _CJK_PATTERN.search(normalized_token) and normalized_token in normalized:
+            return token
+    return None
+
+
 def is_summable_field(field_key: str) -> bool:
     """这个字段**能不能**默认求和 / 平均。
 
     温度、PUE、累计电表读数、编号这类值**不默认求和**（规格第 25 条）：
     求出来的数没有业务意义。命中就返回 False。
     """
-    normalized = normalize_field_key(field_key)
-    if not normalized:
-        return False
-    for token in NON_SUMMABLE_FIELD_TOKENS:
-        if normalize_field_key(token) and normalize_field_key(token) in normalized:
-            return False
-    return True
+    return _non_summable_token(field_key) is None
+
+
+def non_summable_reason(field_key: str) -> str:
+    """这个字段**为什么**不默认求和 —— 人话，写进数据问题说明。
+
+    没命中「不默认求和」的词 → 返回空字符串（没什么要解释的）。
+    """
+    token = _non_summable_token(field_key)
+    if token is None:
+        return ""
+    label = NON_SUMMABLE_REASON_LABELS.get(token, "不适合求和的字段")
+    return (
+        f"字段「{field_key}」是{label}，求和没有业务意义，"
+        "已按明细展示，没有做汇总。"
+    )
 
 
 def validate_processing_rules(
