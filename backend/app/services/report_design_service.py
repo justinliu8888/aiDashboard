@@ -81,6 +81,18 @@ from app.services.preview_service import (
 )
 from app.services.simulated_data_service import SimulatedDataError
 from app.services.template_definition_service import build_template_definition
+from app.services.data_source_mode import (
+    SOURCE_MODE_KEY,
+    SOURCE_MODE_USER_JSON,
+    SourceMode,
+    resolve_source_mode,
+    source_mode_of_definition,
+)
+from app.services.report_log_safety import (
+    log_failure,
+    log_warning,
+    safe_reason,
+)
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.services.session_context import current_session_key
 from app.services.session_service import session_service
@@ -233,11 +245,19 @@ _VERSION_PATTERN = re.compile(r"第\d+版")
 
 
 def _reason_text(exc: Exception) -> str:
-    """异常的可读原因，**原样**透传给用户。
+    """异常的可读原因，**原样**透传。
 
     不做二次概括、不截断：下游（方案契约层、模板层）已经把「哪个板块
     出了什么事」写进异常消息里了，这里再概括一次等于把可定位的信息
     丢掉。截断尤其危险 —— 板块名往往在消息末尾。
+
+    **只用在领域校验这条路上**（``_plan_contract_error``）：那里抛的是
+    我们自己写的契约错误，消息由我们拼、板块标识是结构化的。
+
+    **上游异常不再用它**（工单 #64 F3bis）：上游异常原文可能带用户数据
+    （用户 JSON 里的字段值、用户名、路径），用户可见的回复里不许出现
+    原文 —— 那一类路径改用 :func:`_safe_failure_reason`（只给能行动的
+    提示）与 :func:`safe_reason`（只给类型名，进日志与操作记录）。
     """
     message = str(exc).strip()
     return message or exc.__class__.__name__
@@ -256,6 +276,137 @@ def _definition_dict(
     if isinstance(definition, dict):
         return definition
     return None
+
+
+# --------------------------------------------------------------------------
+# 来源模式口径（工单 #64 F3）
+#
+# 右侧那块画的是什么，取决于**服务端记录的来源模式**（契约表 §4.3）：
+#
+# - 模拟示例（simulated）：系统按固定种子造的示例业务数据（ADR 0004）。
+#   **既有文案一个字不改** —— 那是既有业务输出。
+# - 用户 JSON（user_json）：用户自己提供的数据，**未经业务核验**。
+#   这里**不说**「模拟业务数据」—— 那是事实性错误（画的是用户自己的
+#   数据，不是造出来的）；也**不说**「接入真实数据后会自动替换」/
+#   「已接上真实数据」—— 那同样是不存在的事实。
+# --------------------------------------------------------------------------
+
+#: 右侧渲染口径 —— 模拟示例（ADR 0004）。既有文案，**逐字不改**。
+_RENDER_NOTE_SIMULATED = (
+    "右侧这份报表用系统生成的**模拟业务数据**渲染，是用来核对版式的"
+    "示意，接入真实数据后会自动替换。"
+)
+
+#: 右侧渲染口径 —— 用户 JSON。用户自己的数据，**未经业务核验**。
+_RENDER_NOTE_USER_JSON = (
+    "右侧这份报表用你提交的 JSON 渲染：用户提供的数据，未经业务核验。"
+)
+
+#: 「出了数」的措辞 —— 模拟示例（既有文案，逐字不改）。
+_NUMBERS_NOTE_SIMULATED = "已绑定指标并出了示意数值"
+
+#: 「出了数」的措辞 —— 用户 JSON（数值来自用户自己的数据，不是示意）。
+_NUMBERS_NOTE_USER_JSON = "已绑定指标并出了数值"
+
+#: 渲染没成功的措辞 —— 模拟示例（既有文案，逐字不改）。
+_RENDER_FAILED_SIMULATED = "示意数据没有生成出来"
+
+#: 渲染没成功的措辞 —— 用户 JSON（用户自己的数据没渲染出来）。
+_RENDER_FAILED_USER_JSON = "数据没有渲染出来"
+
+
+def _session_has_user_json() -> bool:
+    """当前会话有没有提交过用户 JSON 输入。
+
+    判据与定义层（``template_definition_service``）**一致**：会话里最新
+    一版输入记录存在就算有。**只看有没有这条记录，不读原文**。
+
+    读不到（存储没就绪 / 会话没绑定）→ 按「没有」处理：宁可说模拟，
+    也不把用户的数据说成别的来源。
+    """
+    try:
+        from app.services.user_json_service import user_json_service
+    except Exception:  # noqa: BLE001
+        return False
+    session_id = current_session_key()
+    if not session_id:
+        return False
+    try:
+        return user_json_service.latest_for_session(session_id) is not None
+    except Exception:  # noqa: BLE001
+        log_warning(logger, "[report_design] 读会话 JSON 输入记录失败")
+        return False
+
+
+def _reply_source_mode(
+    *,
+    definition: Any = None,
+    plan: Mapping[str, Any] | None = None,
+) -> SourceMode:
+    """回复口径用的来源模式。
+
+    判定顺序与定义层（``template_definition_service``）**一致**：
+
+    1. 定义里服务端**记录**的来源模式（``metadata.sourceMode``）；
+    2. 方案里记录的 ``sourceMode``；
+    3. 当前会话提交过的用户 JSON（会话里有输入记录 → 用户 JSON 模式）；
+    4. 默认口径（模拟示例）。
+
+    **不猜**：认不出来的记录值一律走默认口径 —— 宁可说模拟，也不把
+    用户的数据说成别的来源。
+    """
+    if definition is not None:
+        mode = source_mode_of_definition(_definition_dict(definition))
+        if mode.recorded:
+            return mode
+    if plan:
+        declared = resolve_source_mode(plan.get(SOURCE_MODE_KEY))
+        if declared.recorded:
+            return declared
+    if _session_has_user_json():
+        return resolve_source_mode(SOURCE_MODE_USER_JSON)
+    return resolve_source_mode(None)
+
+
+def _render_note(mode: SourceMode) -> str:
+    """右侧那块是用什么数据渲染的（按来源模式分别说）。"""
+    return _RENDER_NOTE_USER_JSON if mode.is_user_json else _RENDER_NOTE_SIMULATED
+
+
+def _numbers_note(mode: SourceMode) -> str:
+    """「出了数」的说法（按来源模式分别说）。"""
+    return _NUMBERS_NOTE_USER_JSON if mode.is_user_json else _NUMBERS_NOTE_SIMULATED
+
+
+def _render_failed_note(mode: SourceMode) -> str:
+    """渲染没成功的说法（按来源模式分别说）。"""
+    return _RENDER_FAILED_USER_JSON if mode.is_user_json else _RENDER_FAILED_SIMULATED
+
+
+def _safe_failure_reason(exc: BaseException) -> str:
+    """失败原因里**可以**给用户看的部分（没有就空串）。
+
+    只认**我们自己写的、带结构化板块标识**的领域契约错误：板块序号与
+    标题是模型方案的结构（方案卡片上用户本来就能看到），说清楚「是哪
+    一块出了问题」用户才能动手改。
+
+    **异常原文一律不给**（工单 #64 F3bis）：上游异常文本可能带用户数据
+    （用户 JSON 里的字段值、用户名、路径）。原因类型留在日志里
+    （:func:`safe_reason` / :func:`log_failure`）。
+    """
+    if not isinstance(exc, PlanContractError):
+        return ""
+    index = getattr(exc, "section_index", None)
+    title = getattr(exc, "section_title", None)
+    label = "".join(
+        part
+        for part in (
+            f"板块 {index + 1}" if isinstance(index, int) else "",
+            f"「{title}」" if title else "",
+        )
+        if part
+    )
+    return f"{label}不符合方案契约" if label else ""
 
 
 def _plan_contract_error(sections: Any) -> str | None:
@@ -751,14 +902,16 @@ class ReportDesignService:
             draft = build_template_definition(template, plan, request.context.subjectId)
             title = template.get("title") or plan.get("topic") or "报表"
             plan_revision = template.get("planRevision") or plan.get("revision")
+            # 右侧那块画的是什么，按**服务端记录的来源模式**说（工单 #64 F3）：
+            # 用户 JSON 模式画的是用户自己的数据，不是模拟业务数据。
+            mode = _reply_source_mode(definition=draft, plan=plan)
             response = AgentResponse(
                 conversationId=request.conversationId, state=AgentState.WAITING_USER_CONFIRM,
                 designSessionId=request.context.designSessionId,
                 designPhase=DESIGN_PHASE_DRAFT_READY,
                 reply=(
                     f"已按第 {plan_revision} 版方案「{title}」生成报表草稿。"
-                    "右侧这份报表用系统生成的**模拟业务数据**渲染，是用来核对版式的"
-                    "示意，接入真实数据后会自动替换。"
+                    f"{_render_note(mode)}"
                     "请确认草稿后继续校验、试运行；尚未接通的指标会标注「能力待接通」。"
                 ),
                 domainObjects=AgentResponseDomainObjects(
@@ -1804,7 +1957,10 @@ class ReportDesignService:
         if bound:
             # 同 _draft_response：ADR 0004 起草稿阶段就用模拟业务数据渲染，
             # 既不说「已接上数据」，也不说「数值待试运行产生」。
-            reply += f"{len(bound)} 个区域已绑定指标并出了示意数值"
+            #
+            # 措辞按**服务端记录的来源模式**分别说（工单 #64 F3）：用户
+            # JSON 模式下的数值来自用户自己的数据，不是「示意数值」。
+            reply += f"{len(bound)} 个区域{_numbers_note(_reply_source_mode(plan=plan))}"
             if placeholder_note:
                 reply += f"，{placeholder_note}"
             reply += "。"
@@ -1880,17 +2036,22 @@ class ReportDesignService:
         placeholder_note = _placeholder_fragment(capability_regions, scope_regions)
         title = template.get("title") or (plan or {}).get("topic") or "报表"
         plan_revision = template.get("planRevision") or (plan or {}).get("revision")
+        # 来源模式：定义里服务端记录的那一份；没有就按会话里的 JSON 输入
+        # 记录与方案记录兜底（工单 #64 F3）。
+        mode = _reply_source_mode(definition=draft, plan=plan)
 
         reply = (
             f"已按第 {plan_revision} 版方案「{title}」生成报表草稿。"
-            "右侧这份报表用系统生成的**模拟业务数据**渲染，是用来核对版式的"
-            "示意，接入真实数据后会自动替换。"
+            f"{_render_note(mode)}"
         )
         if bound:
             # ADR 0004：草稿阶段就用模拟业务数据渲染，**不再**说
             # 「数值待试运行产生」—— 那是旧口径。反过来也不能说「已接上
             # 真实数据」—— 那同样是不存在的事实。
-            reply += f"{len(bound)} 个区域已绑定指标并出了示意数值"
+            #
+            # 用户 JSON 模式下的数值来自用户自己的数据（未经业务核验），
+            # 那是**真实的那份数据**，不是「示意数值」。
+            reply += f"{len(bound)} 个区域{_numbers_note(mode)}"
             if placeholder_note:
                 reply += f"，{placeholder_note}"
             reply += "。"
@@ -2012,19 +2173,24 @@ class ReportDesignService:
                 .get("templateBinding", {})
                 .get("definitionId"),
             )
+            # 失败口径按**来源模式**分别说（工单 #64 F3）：用户 JSON 模式
+            # 下没渲染出来的是用户自己的数据，不是「示意数据」。
+            mode = source_mode_of_definition(definition_dict)
+            numbers_note = _numbers_note(mode)
+            failed_note = _render_failed_note(mode)
             response.reportPreviewPayload = None
             response.error = AgentError(
                 code=code,
-                message=f"示意数据没有生成出来：{exc}",
+                message=f"{failed_note}：{exc}",
             )
-            # 失败时不能还留着「出了示意数值」—— 同一段正文里先说出了数、
+            # 失败时不能还留着「出了数」—— 同一段正文里先说出了数、
             # 后说没生成出来，是自相矛盾。把那句改成失败口径，原因单独说明。
             response.reply = response.reply.replace(
-                "已绑定指标并出了示意数值",
-                "已绑定指标，但示意数据没有生成出来",
+                numbers_note,
+                f"已绑定指标，但{failed_note}",
             )
-            if "示意数据没有生成出来" not in response.reply:
-                response.reply += "示意数据没有生成出来"
+            if failed_note not in response.reply:
+                response.reply += failed_note
             response.reply += f"（原因：{exc}）"
         return response
 
@@ -2034,6 +2200,10 @@ class ReportDesignService:
 
         正文由前端方案模块渲染；这里给一句可读的摘要，
         读屏与「只看文本」的场景也不丢信息。
+
+        「确认后会用什么数据渲染」这句话按**服务端记录的来源模式**说
+        （工单 #64 F3）：用户 JSON 模式画的是用户自己提交的那份数据，
+        不是「系统生成的模拟业务数据」。
         """
         if not plan:
             return "已准备好文字方案，请查看左侧对话区里的方案卡片。"
@@ -2046,10 +2216,16 @@ class ReportDesignService:
         head = f"已根据你的要求整理出文字方案（第 {revision} 版）：{topic}。"
         if titles:
             head += f"包含板块：{titles}。"
-        head += (
-            "请在左侧对话区查看完整方案；确认后我会用系统生成的模拟业务数据"
-            "把这份报表渲染出来。"
-        )
+        if _reply_source_mode(plan=plan).is_user_json:
+            head += (
+                "请在左侧对话区查看完整方案；确认后我会用你提交的 JSON"
+                "把这份报表渲染出来（用户提供的数据，未经业务核验）。"
+            )
+        else:
+            head += (
+                "请在左侧对话区查看完整方案；确认后我会用系统生成的模拟业务数据"
+                "把这份报表渲染出来。"
+            )
         return head
 
     # ---------- 辅助 ----------
