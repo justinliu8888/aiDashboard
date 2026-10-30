@@ -519,6 +519,18 @@ def test_out_of_catalog_add_reaches_the_edit_fast_path(post_chat, definition):
     assert "未登记" not in payload["reply"]
 
 
+def test_rate_metric_add_is_classified_as_out_of_catalog_add():
+    """「新增一个设备耗电率指标」在意图层就是**目录外新增**（工单 #65c）。
+
+    「设备耗电率」不是已登记指标名（它只是**包含**别名「设备耗电」）。
+    意图层已经认得出这一点 —— 差的是引擎那一步：别名命中不等于识别成功。
+    """
+    assert classify_message_intent(
+        "新增一个设备耗电率指标",
+        known_metrics=["总耗电", "设备耗电", "能耗成本", "PUE"],
+    ) is UserIntent.OUT_OF_CATALOG_ADD
+
+
 # ==========================================================================
 # P1 澄清额度真正按「事项」计（契约表 §7.2 / §7.4）
 # ==========================================================================

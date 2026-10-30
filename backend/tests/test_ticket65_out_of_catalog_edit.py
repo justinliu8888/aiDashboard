@@ -900,35 +900,169 @@ def test_consultation_still_only_appends_chat(post_chat, definition):
     assert definition.metadata["revision"] == 0
 
 
-@pytest.mark.xfail(
-    reason=(
-        "引擎层仍按**别名子串**匹配把「设备耗电率」映射到已登记的「设备耗电」："
-        "template_edit_engine.parse 的新增分支里 `if metric_ref: candidate = None` "
-        "会把已经解析好的目录外候选丢掉（规格第 6 条：目录外指标不静默映射到"
-        "已登记指标）。该文件由并行的修复代理在改，本票不越界修改 —— "
-        "引擎改成「别名命中不等于识别成功：抽取到的指标名本身不是已登记指标名"
-        "时优先用候选」之后本用例即转正。"
-    ),
-    strict=False,
-)
+# ==========================================================================
+# 工单 #65c：别名命中 ≠ 识别成功
+# ==========================================================================
+#
+# 别名的匹配是**子串**：「设备耗电率」包含别名「设备耗电」—— 但用户问的
+# 是**比率**，不是 kWh 的耗电量。引擎原来按别名子串就认定「已登记指标」，
+# 紧接着把已经解析好的目录外候选丢掉（`if metric_ref: candidate = None`），
+# 于是「设备耗电率」被**静默映射**成「设备耗电」（规格第 6 条）。
+#
+# 下面两串都要守住：
+#   - 「设备耗电率」→ 目录外候选（带可澄清的问句 / 显式假设）；
+#   - 「设备耗电」  → 仍然命中已登记指标（既有行为一个字不变）。
+
+
+def test_rate_metric_add_is_not_mapped_onto_device_energy(definition):
+    """「新增一个设备耗电率指标」→ 目录外候选，不挂到已登记的「设备耗电」。"""
+    plan = parse(definition, "新增一个设备耗电率指标")
+
+    assert plan.intent == EditIntent.ADD_SECTION
+    assert plan.operation.metricRef is None, "目录外指标不该被静默映射到已登记指标"
+    assert plan.operation.metricIntent == "设备耗电率"
+    assert plan.operation.metricCandidate is not None
+    # 口径不清 → 带**可澄清的问句**，不替他选一个当结论。
+    assert plan.needsClarification is True
+    assert "设备耗电率" in plan.clarificationQuestion
+    assert "耗电量" in plan.clarificationQuestion
+    assert "占比" in plan.clarificationQuestion
+    assert "功率" in plan.clarificationQuestion
+
+
+def test_rate_metric_add_carries_the_chosen_caliber(definition):
+    """用户拍板口径 → 出**带显式假设**的模拟候选（仍然不挂 metricRef）。"""
+    plan = parse(definition, "新增一个设备耗电率指标 耗电量")
+
+    assert plan.operation.metricRef is None
+    assert plan.operation.metricIntent == "设备耗电率"
+    assert plan.operation.metricCandidate["status"] == "out_of_catalog"
+    assert plan.operation.metricCandidate["unit"] == "kWh"
+    assert "口径待确认" in plan.operation.metricCandidate["note"]
+    assert plan.needsClarification is False
+
+
+def test_device_energy_add_still_hits_the_registered_metric(definition):
+    """「新增一个设备耗电指标」「加个设备耗电」→ 仍然命中已登记指标。"""
+    for text in ("新增一个设备耗电指标", "加个设备耗电"):
+        plan = parse(definition, text)
+
+        assert plan.operation.metricRef == _metric_ref_by_label("设备耗电"), text
+        assert plan.operation.metricIntent is None, text
+        assert plan.operation.metricCandidate is None, text
+        assert plan.needsClarification is False, text
+
+
+def test_ranking_device_energy_add_still_hits_the_registered_metric(definition):
+    """「设备耗电排名」只是加了展示要求，量口径没变 → 仍然命中已登记指标。"""
+    plan = parse(definition, "新增一个设备耗电排名卡片")
+
+    assert plan.operation.metricRef == _metric_ref_by_label("设备耗电")
+    assert plan.operation.metricCandidate is None
+
+
+def test_rate_metric_change_is_not_mapped_onto_device_energy(definition):
+    """改指标分支同样：换成「设备耗电率」→ 目录外候选，不静默映射。"""
+    plan = parse(
+        definition, "把设备耗电排名的指标换成设备耗电率",
+        selected="region_device_ranking",
+    )
+
+    assert plan.intent == EditIntent.CHANGE_METRIC
+    assert plan.operation.metricRef is None, "目录外指标不该被静默映射到已登记指标"
+    assert plan.operation.metricIntent == "设备耗电率"
+    assert plan.operation.metricCandidate is not None
+    assert plan.needsClarification is True
+    assert "设备耗电率" in plan.clarificationQuestion
+
+
+def test_device_energy_change_still_hits_the_registered_metric(definition):
+    """改指标分支：换成「设备耗电」→ 仍然命中已登记指标（既有行为不变）。"""
+    plan = parse(
+        definition, "把设备耗电排名的指标换成设备耗电",
+        selected="region_device_ranking",
+    )
+
+    assert plan.intent == EditIntent.CHANGE_METRIC
+    assert plan.operation.metricRef == _metric_ref_by_label("设备耗电")
+    assert plan.operation.metricCandidate is None
+    assert plan.needsClarification is False
+
+
+def test_accepted_rate_metric_block_is_marked_capability_pending(definition):
+    """接受之后：右侧多出一块**带模拟数字**的板块，标「能力待接通」。"""
+    result = apply(definition, "新增一个设备耗电率指标 耗电量")
+    updated = result.draftAfterEdit.model_dump(mode="json")
+    payload = preview(updated)
+
+    before_ids = {region["id"] for region in definition.regions}
+    region = next(
+        item for item in payload["regions"]
+        if item["regionId"] not in before_ids
+    )
+
+    assert region["name"] == "设备耗电率"
+    assert region["capabilityPending"] is True
+    assert region["dataSource"] == "simulated"
+    assert region["payload"]["rows"]
+
+    added = next(item for item in updated["regions"] if item["id"] not in before_ids)
+    binding = added["templateBinding"]
+    assert binding["metricRefs"] == [], "目录外指标不伪造真实指标绑定"
+    assert binding["previewSpec"]["metrics"][0]["bindingKind"] == "simulated"
+    assert "能力待接通" in binding["placeholderReason"]
+
+
 def test_out_of_catalog_rate_metric_is_not_mapped_onto_a_registered_one(
     post_chat, definition
 ):
-    """「新增一个设备耗电率指标」应当出模拟候选，而不是被静默映射成「设备耗电」。
+    """接口层：「新增一个设备耗电率指标」不静默映射成「设备耗电」。
 
-    意图层已经把它判成 OUT_OF_CATALOG_ADD（「设备耗电率」不是已登记指标名），
-    差的是引擎那一步。
+    用户看得见的行为：先问口径（「耗电量？占比？功率？」），拍板之后才出
+    **待接受**的模拟候选 —— 候选里没有真实指标标识。
     """
-    response = post_chat(
+    snapshots = {"reportDefinition": definition.model_dump(mode="json")}
+
+    first = post_chat(
         "新增一个设备耗电率指标",
+        state="USER_EDITING_TEMPLATE",
+        snapshots=snapshots,
+    ).json()
+
+    # 不静默映射：没有产出任何挂到已登记指标上的修改计划。
+    assert first["domainObjects"]["pendingEditPlan"] is None
+    assert "设备耗电率" in first["reply"]
+    assert "耗电量" in first["reply"]
+    assert "未登记" not in first["reply"]
+    assert first["domainObjects"]["changeSet"] is None
+    assert definition.metadata["revision"] == 0
+
+    # 用户拍板口径 → 出目录外候选：没有 metricRef，带着已选的口径。
+    second = post_chat(
+        "耗电量", state="USER_EDITING_TEMPLATE", snapshots=snapshots,
+    ).json()
+
+    assert second["uiActions"] == ["pending_edit_plan"]
+    operation = second["domainObjects"]["pendingEditPlan"]["operations"][0]["operation"]
+    assert operation.get("metricRef") is None, "目录外指标不该被静默映射到已登记指标"
+    assert operation["metricIntent"] == "设备耗电率"
+    assert operation["metricCandidate"]["status"] == "out_of_catalog"
+    assert operation["metricCandidate"]["unit"] == "kWh"
+
+
+def test_known_device_energy_add_is_still_a_registered_metric(post_chat, definition):
+    """「新增一个设备耗电指标」仍然是**正常** ADD_SECTION（不变成模拟候选）。"""
+    response = post_chat(
+        "新增一个设备耗电指标",
         state="USER_EDITING_TEMPLATE",
         snapshots={"reportDefinition": definition.model_dump(mode="json")},
     ).json()
 
+    assert response["uiActions"] == ["pending_edit_plan"]
     operation = response["domainObjects"]["pendingEditPlan"]["operations"][0]["operation"]
-    assert operation.get("metricRef") is None, "目录外指标不该被静默映射到已登记指标"
-    assert operation["metricIntent"] == "设备耗电率"
-    assert operation["metricCandidate"]["status"] in {"out_of_catalog", "ambiguous"}
+    assert operation["metricRef"] == _metric_ref_by_label("设备耗电")
+    assert operation.get("metricCandidate") is None, "已知指标不该变成模拟候选"
+    assert response["debug"]["editingIntent"] == "ADD_SECTION"
 
 
 
