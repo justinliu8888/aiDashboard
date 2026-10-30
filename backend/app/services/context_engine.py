@@ -17,7 +17,7 @@ import json
 import logging
 from enum import Enum
 from time import perf_counter
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, model_validator
@@ -64,6 +64,11 @@ class UserIntent(str, Enum):
     NEW_TASK = "NEW_TASK"
     PROVIDE_INFO = "PROVIDE_INFO"
     UNKNOWN = "UNKNOWN"
+    # 工单 #58：在既有九类上扩展，不另起一套平行意图体系。
+    #: 问题反馈：对当前这份报表不满，但没说要改什么（「好丑啊，一个点……」）。
+    ISSUE_FEEDBACK = "ISSUE_FEEDBACK"
+    #: 目录外新增：要加一个当前指标目录里没有的指标。
+    OUT_OF_CATALOG_ADD = "OUT_OF_CATALOG_ADD"
 
 
 # 模型偶尔会输出后端枚举之外的 intent（例如 GENERATE_REPORT / CREATE_REPORT）。
@@ -97,6 +102,16 @@ _INTENT_ALIASES: dict[str, UserIntent] = {
     "PROVIDE_INFORMATION": UserIntent.PROVIDE_INFO,
     "SUPPLEMENT": UserIntent.PROVIDE_INFO,
     "FILL_INFO": UserIntent.PROVIDE_INFO,
+    # 工单 #58：问题反馈 / 目录外新增。
+    "FEEDBACK": UserIntent.ISSUE_FEEDBACK,
+    "ISSUE": UserIntent.ISSUE_FEEDBACK,
+    "COMPLAINT": UserIntent.ISSUE_FEEDBACK,
+    "PROBLEM": UserIntent.ISSUE_FEEDBACK,
+    "ISSUE_REPORT": UserIntent.ISSUE_FEEDBACK,
+    "OUT_OF_CATALOG": UserIntent.OUT_OF_CATALOG_ADD,
+    "ADD_OUT_OF_CATALOG": UserIntent.OUT_OF_CATALOG_ADD,
+    "NEW_METRIC": UserIntent.OUT_OF_CATALOG_ADD,
+    "ADD_NEW_METRIC": UserIntent.OUT_OF_CATALOG_ADD,
 }
 
 #: 这些意图一定会改变状态机，不允许 Concierge 用 DIRECT_REPLY 绕过深路由。
@@ -115,9 +130,14 @@ STATE_CHANGING_INTENTS: frozenset[UserIntent] = frozenset(
 #:
 #: 草稿、已记录进度、具体能力这三类问题都必须由业务 Agent 用事实工具
 #: 查证后回答；路由器提前给结论就会变成「凭 hasDefinition 猜事实」。
+#:
+#: 工单 #58：问题反馈（读实际定义 / 窗口 / 粒度 / 渲染载荷）与
+#: 目录外新增（要核对指标目录）同样需要事实，一并归进来。
 FACT_DEPENDING_INTENTS: frozenset[UserIntent] = frozenset(
     {
         UserIntent.ASK_QUESTION,
+        UserIntent.ISSUE_FEEDBACK,
+        UserIntent.OUT_OF_CATALOG_ADD,
     }
 )
 
@@ -152,6 +172,58 @@ def coerce_action(value: Any) -> "ConciergeAction":
         if key in {"DEEP_ROUTE", "DEEP", "ROUTE", "ESCALATE"}:
             return ConciergeAction.DEEP_ROUTE
     return ConciergeAction.DEEP_ROUTE
+
+
+# --------------------------------------------------------------------------
+# 规则层意图判定（工单 #58）
+# --------------------------------------------------------------------------
+#
+# 「规则层判定 + 模型深路由」是既有的两层结构。这里补的是规则层里
+# **新增两类意图**的判定：问题反馈与目录外新增。
+#
+# 关键约束（规格第 45、49 条）：意图识别排在任何会产生编辑候选的规则
+# 之前；规则自设的高置信度不能替代意图判断。规则层自认为「很确定」的
+# 时间窗（0.88）不能盖过意图 ——「昨日能耗趋势好丑啊，一个点……」里的
+# 「昨日」是卡片名的一部分，不是要写进去的新值。
+
+
+def classify_message_intent(
+    message: str,
+    *,
+    known_metrics: Iterable[str] | None = None,
+    subject_required: bool = True,
+) -> UserIntent:
+    """规则层判定这句话想干什么。
+
+    判定顺序是有讲究的：
+
+    1. 生成请求 → 新任务；
+    2. 目录外新增 → 交给通用模拟策略（先澄清或标成显式假设）；
+    3. 有明确改动动词 → 明确修改（**先认动词，再谈新值**）；
+    4. 问题反馈 → 解释与建议，不产生修改计划；
+    5. 只读提问 → 咨询；
+    6. 都认不出来 → UNKNOWN，交给模型深路由。
+
+    参数：
+
+    * ``known_metrics``：当前授权范围内已登记的指标名，供目录外新增判定用；
+    * ``subject_required``：问题反馈是否必须指向报表业务对象。编辑态里
+      「对象」就是当前这张草稿，所以那里传 False（规格第 51 条）。
+    """
+    text = (message or "").strip()
+    if not text:
+        return UserIntent.UNKNOWN
+    if routing_rules.is_clear_generation_request(text):
+        return UserIntent.NEW_TASK
+    if routing_rules.detect_out_of_catalog_add(text, known_metrics=known_metrics):
+        return UserIntent.OUT_OF_CATALOG_ADD
+    if routing_rules.has_operation_command(text):
+        return UserIntent.MODIFY
+    if routing_rules.detect_issue_feedback(text, subject_required=subject_required):
+        return UserIntent.ISSUE_FEEDBACK
+    if routing_rules.is_readonly_question(text):
+        return UserIntent.ASK_QUESTION
+    return UserIntent.UNKNOWN
 
 
 class RoutingAction(str, Enum):
@@ -238,6 +310,10 @@ class RouteDecision(BaseModel):
 
 
 # 节点 5.5 TemplateEditEngine 粗判用的关键词，与 agent_service.TEMPLATE_EDIT_HINT_WORDS 保持一致
+#
+# 工单 #58：**不收裸时间词**。卡片名里带「昨日」「最近 7 天」很常见
+# （「昨日能耗趋势」「最近 7 天总耗电」），收进来会让整句被送进编辑快路。
+# 时间窗的新值只能来自明确的改动动词片段。
 _TEMPLATE_EDIT_HINTS = (
     "删", "删除", "去掉", "不要", "移除",
     "改成", "改为", "重命名", "叫做", "标题", "名字",
@@ -245,7 +321,6 @@ _TEMPLATE_EDIT_HINTS = (
     "数据源",
     "柱状图", "折线图", "饼图", "面积图", "表格", "明细表",
     "粒度", "分钟", "小时", "按天",
-    "最近 7 天", "最近 30 天", "本周", "本月",
     "指标", "能耗成本", "pue",
     "降序", "升序", "排序",
     "怎么展示", "展示方式", "展示形式",
@@ -299,14 +374,16 @@ _CONCIERGE_PROMPT = """
 **问当前对话的事（草稿 / 进度 / 能力）一律 DEEP_ROUTE**：
 这类问题要有事实才能回答，你手里没有事实，不能直接给结论。
 
-userIntent 只能从下面这 9 个值里选，不要自创：
-CONFIRM / MODIFY / REJECT / ASK_QUESTION / CHITCHAT / CANCEL / NEW_TASK / PROVIDE_INFO / UNKNOWN
+userIntent 只能从下面这 11 个值里选，不要自创：
+CONFIRM / MODIFY / REJECT / ASK_QUESTION / CHITCHAT / CANCEL / NEW_TASK / PROVIDE_INFO / UNKNOWN / ISSUE_FEEDBACK / OUT_OF_CATALOG_ADD
 
 其中：
 - 要生成报表 → NEW_TASK；
 - 回答上一轮追问 → PROVIDE_INFO；
 - 确认 / 修改 / 重做 / 取消 → 对应 CONFIRM / MODIFY / REJECT / CANCEL；
 - 问草稿或指标含义 → ASK_QUESTION；
+- 对当前这份结果不满但没说要改什么（「好丑啊，一个点……」）→ ISSUE_FEEDBACK；
+- 要加一个当前指标目录里没有的指标 → OUT_OF_CATALOG_ADD；
 - 打招呼、问你能做什么 → CHITCHAT；
 - 判断不了 → UNKNOWN。
 
@@ -350,6 +427,8 @@ _SYSTEM_PROMPT = """
 - NEW_TASK：开始一个新的报表任务
 - PROVIDE_INFO：补充上一轮追问的信息
 - UNKNOWN：无法判断
+- ISSUE_FEEDBACK：对当前这份结果不满或提问题，但没有明确要求改什么
+- OUT_OF_CATALOG_ADD：要新增一个当前指标目录里没有的指标
 
 可选 routingAction：
 - CONTINUE_CURRENT：不拦截，交给当前 state 的业务逻辑继续处理
@@ -366,6 +445,19 @@ routingAction 一律填 CONTINUE_CURRENT，交给业务 Agent 用事实工具查
 也不要为了"给个说法"提前回答，更不要改问时间范围、粒度这类生成条件。
 用户输入含糊、无法判断是提问还是操作时，也走 CONTINUE_CURRENT，
 后面的查询链路会给一个针对性的澄清。
+
+**ISSUE_FEEDBACK 同样用 CONTINUE_CURRENT**：
+用户说「好丑啊，一个点……」「只有一个点」这类话时，他是在说当前这份结果
+哪里不对劲，**没有说要改什么**。这类轮次只解释与建议：读实际定义、
+窗口、粒度与渲染载荷，给出有依据的说明；**不要**替他挑一个修改值，
+也**不要**凭空提出修改计划。证据不足就说证据不足，或给一个针对性的澄清。
+注意：句子里出现「昨日」这类时间词不等于要把时间窗改成昨天 —— 卡片名里
+的时间词只用来定位对象。
+
+**OUT_OF_CATALOG_ADD 用 CONTINUE_CURRENT**：
+用户要加一个当前指标目录里没有的指标时，交给通用模拟策略处理
+（先澄清语义，或标成显式假设后给候选），不要在路由层把它映射到
+「总耗电」这类已有指标。
 
 安全打断示例：
 - WAITING_USER_CONFIRM 下用户说"昨日总耗电删掉" → MODIFY + JUMP_STATE + ANALYZING
@@ -1233,6 +1325,17 @@ class ContextEngine:
             AgentState.VALIDATING,
             AgentState.PREVIEWING,
         }
+
+        # 问题反馈（#58）：模型不可用时也要能把它和「明确修改」分开。
+        # 「好丑啊，一个点……」没有疑问标记，is_readonly_question 认不出来，
+        # 不单独判的话它会掉进编辑快路，被当成要改时间窗。
+        if routing_rules.detect_issue_feedback(request.message):
+            return RouteDecision(
+                userIntent=UserIntent.ISSUE_FEEDBACK,
+                routingAction=RoutingAction.CONTINUE_CURRENT,
+                confidence=0.6,
+                reason=f"fallback: {reason}",
+            )
 
         # 只读提问：模型不可用时也要能把「问当前对话的事」和「下指令」分开。
         # 交给业务 Agent 用事实工具查证后回答，不在路由层给结论。
