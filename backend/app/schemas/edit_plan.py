@@ -133,5 +133,11 @@ class EditPlan(BaseModel):
     # 便于现有单步消费方照常读到目标和操作。
     operations: list[EditOperationStep] = Field(default_factory=list)
 
+    #: 这份计划所基于的**生效组合快照**（契约表 §2.1 的结构）。
+    #:
+    #: 接受时逐字段比对当前生效组合：对不上就是**过期 / 冲突**，服务端
+    #: 直接拒绝，旧生效组合原样保留（契约表 §4.2）。
+    baseCombination: dict[str, Any] | None = None
+
     # 面向用户的修改摘要；确认菜单直接展示这句话。
     summary: str = ""

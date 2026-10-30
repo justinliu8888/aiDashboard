@@ -119,6 +119,10 @@ class PendingEditPlan(BaseModel):
         operations     操作列表
         summary        面向用户的摘要
 
+    另外记一份**生效组合快照**（契约表 §4.2 的 ``baseCombination``）：
+    计划所基于的那一份组合。接受时逐字段比对当前生效组合 —— 对不上
+    就是**过期 / 冲突**，服务端直接拒绝，旧生效组合原样保留。
+
     operations 里每一项描述「改什么」，具体字段由编辑引擎一侧定义，
     这里只当不透明数据存取，不复述一份，避免两处定义漂移。
     允许多带字段（extra=allow），别把调用方已经写好的信息丢掉。
@@ -132,6 +136,9 @@ class PendingEditPlan(BaseModel):
     operations: list[dict[str, Any]] = Field(default_factory=list)
     summary: str = ""
     createdAt: str = ""
+    #: 计划所基于的**生效组合快照**（结构同契约表 §2.1）。
+    #: 老计划没有这一项 → 只按 ``draftRevision`` 比（既有行为，不加严）。
+    baseCombination: dict[str, Any] = Field(default_factory=dict)
 
 
 class EditClarification(BaseModel):

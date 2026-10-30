@@ -32,6 +32,11 @@ from app.services.catalog_mock_service import (
     match_source_by_alias,
 )
 from app.services.data_source_mode import source_mode_of_definition
+from app.services.effective_combination import (
+    combination_of,
+    combinations_match,
+    record_combination,
+)
 from app.services.edit_time_resolver import (
     STATUS_RESOLVED,
     extract_change_value,
@@ -642,6 +647,10 @@ class TemplateEditEngine:
         情况）；不传就从消息里按「明确的改动动词」取。片段为空 = 没有新值。
         """
         plan = EditPlan(isTemplateEdit=True, confidence=0.0)
+        # 这份计划所基于的**生效组合快照**（契约表 §2.1 / §4.2）：
+        # 接受时逐字段比对，对不上就拒绝。
+        if definition is not None:
+            plan.baseCombination = combination_of(definition.model_dump(mode="json"))
         text = (message or "").strip()
         if not text or definition is None:
             plan.intent = EditIntent.UNKNOWN
@@ -989,6 +998,22 @@ class TemplateEditEngine:
                 debug={"intent": plan.intent.value, "reason": "clarification"},
             )
 
+        # 版本校验（工单 #65，契约表 §4.2）：候选是基于**旧版本草稿**做的，
+        # 或者它依据的生效组合已经变了 —— 服务端直接拒绝，草稿一个字节
+        # 都不动。安全边界在服务端，不靠禁用按钮。
+        stale = self._stale_reason(plan, definition)
+        if stale is not None:
+            message, reason = stale
+            return EditResult(
+                plan=plan,
+                draftBeforeEdit=before,
+                draftAfterEdit=before,
+                needsClarification=True,
+                clarificationQuestion=message,
+                editingTargetRegionId=plan.target.regionId or None,
+                debug={"intent": plan.intent.value, "reason": reason},
+            )
+
         # 组合修改：多个操作一次确认、原子应用
         if plan.operations:
             return self._apply_composite(
@@ -1037,6 +1062,11 @@ class TemplateEditEngine:
             )
 
         _bump_revision(updated)
+        # 修改形成了新一版 → 这一版**关联自己的生效组合**（契约表 §2.1）。
+        # 旧版本的迟到结果按这个组合对不上，会被拒绝，不会覆盖新版本。
+        record_combination(
+            updated.metadata, combination_of(updated.model_dump(mode="json")),
+        )
         return EditResult(
             plan=plan,
             draftBeforeEdit=before,
@@ -1047,6 +1077,42 @@ class TemplateEditEngine:
             editingTargetRegionId=plan.target.regionId or None,
             debug={"intent": plan.intent.value},
         )
+
+    @staticmethod
+    def _stale_reason(
+        plan: EditPlan, definition: ReportDefinitionDraft,
+    ) -> tuple[str, str] | None:
+        """这份计划是不是**过期 / 冲突**了（契约表 §4.2）。
+
+        两条判据：
+
+        1. 候选所基于的**草稿版本**与当前生效定义不一致 → 过期；
+        2. 候选所依据的**生效组合**与当前不一致 → 冲突。
+
+        返回 ``(面向用户的话, 失败分类)``；没问题返回 ``None``。
+        """
+        base_revision = plan.operation.baseDefinitionRevision
+        if (
+            base_revision is not None
+            and int(base_revision) != _definition_revision(definition)
+        ):
+            return (
+                "这份修改是基于旧版本的草稿提的，草稿已经变了；"
+                "请按当前草稿重新说明一次要改什么。",
+                "stale_edit_plan",
+            )
+        base_combination = plan.baseCombination
+        if base_combination is None:
+            return None
+        if not combinations_match(
+            base_combination, combination_of(definition.model_dump(mode="json")),
+        ):
+            return (
+                "这份修改所依据的生效组合已经变了（来源或输入换了），"
+                "请按当前状态重新提出修改。",
+                "combination_conflict",
+            )
+        return None
 
     def _apply_one_intent(
         self,
