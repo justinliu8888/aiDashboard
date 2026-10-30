@@ -434,6 +434,27 @@ def test_one_round_then_non_blocking_explanation(post_chat, definition):
     assert "你可以选一种继续方式" in second["reply"]
 
 
+def test_normal_reply_does_not_reset_the_quota(post_chat, definition):
+    """普通回复（把追问答完整）不重置额度（契约表 §7.2）。"""
+    post_chat("改一下", state="USER_EDITING_TEMPLATE", snapshots=_snap(definition)).json()
+    assert session_service.load_clarification("conv_test").rounds == 1
+
+    # 这一句把追问答完整了 → 出候选计划。
+    answer = post_chat(
+        "把趋势图改成按分钟粒度",
+        state="USER_EDITING_TEMPLATE",
+        snapshots=_snap(definition),
+    ).json()
+    assert answer["domainObjects"]["pendingEditPlan"] is not None
+
+    # 额度没有被清掉：同一项不能再问第二轮。
+    assert session_service.load_clarification("conv_test").rounds == 1
+    assert (
+        session_service.can_ask_clarification("conv_test", key="edit:unresolved")
+        is False
+    )
+
+
 def test_local_adjustment_does_not_reset_the_quota(post_chat, definition):
     """局部调整不重置额度：候选计划落库后同一项仍然只能问一轮。"""
     post_chat("改一下", state="USER_EDITING_TEMPLATE", snapshots=_snap(definition)).json()

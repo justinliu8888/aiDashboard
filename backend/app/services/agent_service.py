@@ -182,7 +182,6 @@ def _question_from_pending(raw: dict[str, Any]) -> AgentQuestion:
     return AgentQuestion(**data)
 
 
-
 async def _emit(
     emit: EmitEvent | None, event: str, data: dict[str, Any]
 ) -> None:
@@ -1289,8 +1288,6 @@ class AgentService:
         self,
         request: AgentRequest,
         definition: ReportDefinitionDraft | None,
-        *,
-        extra: str = "",
     ) -> AgentResponse:
         """「你自己决定 / 别问了」之后：**停止阻塞**，给可见假设。
 
@@ -1304,7 +1301,6 @@ class AgentService:
         reply = (
             "好，不再追问了。我按下面的假设继续："
             f"{assumption}"
-            f"{extra}"
             "这份报表没有变化，也没有生成待接受的修改计划。"
             "你可以选一种继续方式："
             + "".join(DELEGATION_ALTERNATIVES)
