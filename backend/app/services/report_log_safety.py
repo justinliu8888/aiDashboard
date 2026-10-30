@@ -111,18 +111,20 @@ def log_failure(logger: logging.Logger, message: str, exc: BaseException) -> Non
         pass
 
 
-def log_info(logger: logging.Logger, message: str, *args: Any) -> None:
+def log_info(logger: logging.Logger, message: str, *args: Any, **kwargs: Any) -> None:
     """写一条常规日志；日志器自己抛错也不许影响业务请求。"""
     try:
-        logger.info(message, *args)
+        logger.info(message, *args, **kwargs)
     except Exception:  # noqa: BLE001
         pass
 
 
-def log_warning(logger: logging.Logger, message: str, *args: Any) -> None:
+def log_warning(
+    logger: logging.Logger, message: str, *args: Any, **kwargs: Any
+) -> None:
     """写一条告警日志；日志器自己抛错也不许影响业务请求。"""
     try:
-        logger.warning(message, *args)
+        logger.warning(message, *args, **kwargs)
     except Exception:  # noqa: BLE001
         pass
 
