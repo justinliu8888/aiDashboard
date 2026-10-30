@@ -431,6 +431,10 @@ def test_json_input_is_not_copied_into_chat_messages() -> None:
             assert "机柜1" not in (message.content or "")
             assert _json_text() not in (message.content or "")
             assert "已提交 JSON 数据" in (message.content or "")
+        # 消息的**载荷**里也没有渲染出来的业务数值（落库口径裁掉载荷数据，
+        # 只留 previewContext —— ADR 0004 §5.1 的既有口径）。
+        for message in messages:
+            assert "机柜1" not in json.dumps(message.payload or {}, ensure_ascii=False)
         # 原始数组只在输入记录表里。
         rows = _stored_input_rows(harness)
         assert len(rows) == 1
@@ -702,3 +706,51 @@ def test_safe_summary_has_no_business_values() -> None:
         assert record.inputId in summary
         assert "机柜1" not in summary
         assert "1.0" not in summary
+
+
+def test_model_declared_field_names_bind_columns_and_axes() -> None:
+    """模型把输入字段名写进列 id / 指标意图时，服务端据此绑定（并逐项核对）。"""
+    sections = [
+        {
+            "id": "section_chart",
+            "title": "各设备能耗对比",
+            "metricIntents": ["能耗（字段 energy）"],
+            "componentType": "bar_chart",
+            "displayIntent": "comparison",
+        },
+        {
+            "id": "section_table",
+            "title": "能耗明细",
+            "metricIntents": ["能耗（字段 energy）"],
+            "componentType": "table",
+            "displayIntent": "records",
+            "columns": [
+                {"id": "ts", "label": "日期"},
+                {"id": "energy", "label": "能耗"},
+            ],
+        },
+    ]
+    model = ScriptedModel(plan_candidate(sections=sections))
+    with acceptance_harness(model=model) as harness:
+        plan = harness.send(f"数据 {_json_text()}")["domainObjects"]["reportPlan"]
+        confirmed = harness.confirm_plan(plan)
+        definition = confirmed["domainObjects"]["reportDefinitionDraft"]
+        combination = combination_of_definition(definition)
+        keys = {
+            str(item.get("inputFieldKey")) for item in combination["fieldMapping"]
+        }
+        assert "energy" in keys
+        assert "ts" in keys
+        # 逐项核对：绑定的字段都真的在输入里。
+        assert json_svc.validate_field_mapping(
+            combination["fieldMapping"], {"ts", "device", "energy"}
+        ) == []
+        # 图表拿到了坐标 → 有数据点，不是降级空图。
+        preview = confirmed.get("reportPreviewPayload") or {}
+        charts = [
+            item["payload"]
+            for item in preview.get("regions") or []
+            if (item.get("payload") or {}).get("points") is not None
+        ]
+        assert charts
+        assert any(chart.get("points") for chart in charts)

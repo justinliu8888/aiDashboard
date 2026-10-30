@@ -604,6 +604,15 @@ def build_model_context(
     )
     for row in list(sample)[:sample_limit]:
         lines.append(json.dumps(row, ensure_ascii=False, default=str))
+    # 服务端要求（不是数据里的话）：让方案里的栏目能绑到用户的字段上。
+    #
+    # 模型的列 id 与指标意图如果**原样带上输入字段名**，服务端就能逐项
+    # 核对并绑定；绑不上的列会降级成明细展示，用户看到的是「（未绑定）」。
+    lines.append(
+        "【服务端要求】为这些数据设计栏目时，请把输入字段名原样写进栏目的 id，"
+        "并在指标意图里带上对应字段名（例如「机柜能耗（字段 energy）」）；"
+        "可用字段名：" + "、".join(str(item.get("key")) for item in fields if item.get("key"))
+    )
     return "\n".join(lines)
 
 
@@ -617,19 +626,55 @@ def normalize_field_key(text: Any) -> str:
     return re.sub(r"[\s_\-（）()\[\]【】.:：/]+", "", str(text or "")).lower()
 
 
+def find_field_key_in_text(text: str, field_keys: Sequence[str]) -> str | None:
+    """在一段文字里找出**原样出现**的输入字段名。
+
+    这是「模型说的字段名」与「用户的字段名」之间的桥：模型把列 id 或
+    指标意图写成「机柜能耗（字段 energy）」时，服务端能认出 ``energy``。
+
+    判据是**字面出现**（带词边界），不是模糊相似：认不出就是认不出。
+    命中的字段名一定在当前输入的字段清单里，所以逐项核对天然成立。
+    """
+    if not text:
+        return None
+    for key in field_keys:
+        token = str(key or "").strip()
+        if len(token) < 2:
+            # 太短的字段名（"a"、"1"）不做字面匹配：误绑的风险太大。
+            continue
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9_])" + re.escape(token) + r"(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        if pattern.search(text):
+            return key
+    return None
+
+
 def match_input_field(
     *, column_label: str, column_id: str, field_keys: Sequence[str]
 ) -> str | None:
     """把一列绑定到一个输入字段。
 
-    判据是**字段身份**（列的显示名或列 id 与输入字段名的归一相等），
-    不是模糊猜测：命中不了就是命中不了（规格第 23 条要求服务端逐项核对）。
+    三步判据（**从确定到宽松**）：
+
+    1. 列 id / 显示名与输入字段名**归一后相等**；
+    2. 输入字段名在列 id / 显示名里**原样出现**（带词边界）——
+       模型把字段名写进列 id 或说明文字时能认出来；
+    3. 都认不出 → **不绑**（命中不了就是命中不了）。
+
+    服务端拿到的每一个绑定都要能逐项核对：这个字段确实存在于当前输入
+    （规格第 23 条）。
     """
     normalized = {
         normalize_field_key(key): key for key in field_keys
     }
-    for candidate in (column_label, column_id):
+    for candidate in (column_id, column_label):
         key = normalized.get(normalize_field_key(candidate))
+        if key:
+            return key
+    for candidate in (column_id, column_label):
+        key = find_field_key_in_text(candidate, field_keys)
         if key:
             return key
     return None

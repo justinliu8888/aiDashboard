@@ -17,7 +17,7 @@
 """
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from app.data.machine_room_energy import METRIC_DEVICE_ENERGY, METRIC_TOTAL_ENERGY
 from app.schemas.report_definition import ReportDefinitionDraft
@@ -38,6 +38,7 @@ from app.services.json_input_service import (
     OP_RATIO,
     OP_SUM,
     build_field_mapping,
+    find_field_key_in_text,
     is_date_field,
     is_summable_field,
     normalize_field_key,
@@ -479,13 +480,56 @@ def _date_field_keys(binding: _JsonBinding) -> list[str]:
     return result
 
 
+def _region_intent_text(
+    region: Mapping[str, Any], section: Mapping[str, Any] | None = None
+) -> list[str]:
+    """这个区域声明的**指标意图**文字（模型的原话）。
+
+    意图里可能原样带着输入字段名（模型被要求这样写），服务端据此
+    把指标 / 图表绑到用户的字段上。
+
+    意图有两个来源，都要看：
+
+    - **方案板块的 ``metricIntents``**（模型写的原话）；
+    - 定义里区域 ``previewSpec.metrics[].label``（目录内指标这里是目录
+      里的显示名，不是模型原话 —— 所以方案侧那份不能漏）。
+    """
+    texts: list[str] = []
+    if isinstance(section, Mapping):
+        for intent in section.get("metricIntents") or []:
+            text = str(intent or "").strip()
+            if text:
+                texts.append(text)
+    binding = region.get("templateBinding") or {}
+    spec = binding.get("previewSpec") or {}
+    for metric in spec.get("metrics") or []:
+        if isinstance(metric, Mapping):
+            label = str(metric.get("label") or "")
+            if label:
+                texts.append(label)
+    name = str(region.get("name") or "")
+    if name:
+        texts.append(name)
+    return texts
+
+
 def _match_field(
-    *, labels: list[str], binding: _JsonBinding, candidates: list[str]
+    *,
+    labels: list[str],
+    binding: _JsonBinding,
+    candidates: list[str],
+    extra_texts: list[str] | None = None,
 ) -> str | None:
     """按字段身份在候选字段里找一个匹配的。
 
-    先按**名字相等**找（列 id / 列显示名 / 编码里的字段名），
-    找不到再按**候选集合的语义**兜底（数值字段 / 日期字段）。
+    顺序（**从确定到宽松**）：
+
+    1. **归一后相等**：列 id / 显示名 / 编码里的字段名与输入字段名相等；
+    2. **原样出现**：输入字段名在列 id / 显示名 / 指标意图里字面出现
+       （带词边界）—— 模型把字段名写进来时能认出来；
+    3. **角色兜底**：横轴取日期字段、纵轴取数值字段，
+       **只在候选唯一时**用（有歧义就不猜）。
+
     兜底只在这一层做，且只在名字确实对不上时用。
     """
     normalized = {
@@ -493,6 +537,10 @@ def _match_field(
     }
     for label in labels:
         key = normalized.get(normalize_field_key(label))
+        if key:
+            return key
+    for label in list(labels) + list(extra_texts or []):
+        key = find_field_key_in_text(label, binding.field_keys)
         if key:
             return key
     if not candidates:
@@ -555,10 +603,66 @@ def _region_column_targets(
     return targets
 
 
+def _field_from_intent(
+    intent_texts: Sequence[str],
+    binding: _JsonBinding,
+    candidates: Sequence[str],
+) -> str | None:
+    """从**指标意图**里认出输入字段（模型被要求原样写出字段名）。
+
+    认出的字段必须**符合角色**：横轴只认日期字段、纵轴只认数值字段 ——
+    把数值当时间用（或者反过来）就是编口径。
+
+    意图里认不出就退回候选集合 —— **只在候选唯一时**用（有歧义不猜）。
+    """
+    for text in intent_texts:
+        key = find_field_key_in_text(text, binding.field_keys)
+        if key and key in candidates:
+            return key
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _apply_json_chart_encodings(
+    *,
+    regions: list[dict[str, Any]],
+    binding: _JsonBinding,
+    plan_sections: list[Any],
+) -> None:
+    """JSON 模式：把图表的坐标轴绑到**用户的字段**上。
+
+    为什么要在这一步处理：目录外指标（占位区）的图表**没有坐标编码**
+    （空壳里只有 chartKind），没有编码就没有「横轴 / 纵轴」可绑。
+
+    绑定的判据与字段映射一致（契约表 §3.5）：横轴取**日期字段**、
+    纵轴取**指标意图里点名的数值字段**；认不出就不绑 —— 宁可留空，
+    也不猜一个轴出来。
+    """
+    date_keys = _date_field_keys(binding)
+    numeric_keys = _numeric_field_keys(binding)
+    sections = list(plan_sections or [])
+    for index, region in enumerate(regions):
+        component = region.get("component") or {}
+        if str(component.get("type") or "").upper() != "CHART":
+            continue
+        section = sections[index] if index < len(sections) else None
+        intent_texts = _region_intent_text(region, section)
+        x_field = _field_from_intent(intent_texts, binding, date_keys)
+        y_field = _field_from_intent(intent_texts, binding, numeric_keys)
+        if not x_field or not y_field or x_field == y_field:
+            continue
+        component["encodings"] = [
+            {"channel": "X", "fieldRef": x_field},
+            {"channel": "Y", "fieldRef": y_field},
+        ]
+
+
 def _build_json_field_mapping(
     *,
     regions: list[dict[str, Any]],
     binding: _JsonBinding,
+    plan_sections: list[Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """构造 JSON 模式下的「板块与列 → 输入字段」映射。
 
@@ -569,17 +673,27 @@ def _build_json_field_mapping(
     date_keys = _date_field_keys(binding)
     mapping: list[dict[str, Any]] = []
     unmapped: list[dict[str, Any]] = []
-    used: set[str] = set()
-    for region in regions:
+    sections = list(plan_sections or [])
+    for index, region in enumerate(regions):
         region_id = str(region.get("id") or "")
+        section = sections[index] if index < len(sections) else None
+        intent_texts = _region_intent_text(region, section)
+        # 同一个字段可以在**不同板块**各绑一次（趋势图的横轴与明细表的
+        # 日期列常常是同一个字段）；同一板块内只绑一次。
+        used: set[str] = set()
         for column_id, label, role in _region_column_targets(region):
             candidates: list[str] = []
             if role == "x":
                 candidates = date_keys
             elif role == "y":
                 candidates = numeric_keys
+            # 指标意图里的字段名只用来认**值列**：横轴认错了会把数值
+            # 当成时间用。
             field_key = _match_field(
-                labels=[column_id, label], binding=binding, candidates=candidates
+                labels=[column_id, label],
+                binding=binding,
+                candidates=candidates,
+                extra_texts=intent_texts if role in ("value", "y") else None,
             )
             if field_key and field_key not in used:
                 used.add(field_key)
@@ -632,7 +746,9 @@ def _build_json_processing_rules(
         ]
         if not region_mappings:
             continue
-        group_key = _first_text_field(region_mappings, types)
+        group_key = _first_text_field(
+            region_mappings, types, date_keys=_date_field_keys(binding)
+        )
         value_key = _first_numeric_field(region_mappings, types)
         for item in region_mappings:
             field_key = str(item.get("inputFieldKey") or "")
@@ -665,10 +781,19 @@ def _build_json_processing_rules(
 
 
 def _first_text_field(
-    mapping: list[dict[str, Any]], types: Mapping[str, list[str]]
+    mapping: list[dict[str, Any]],
+    types: Mapping[str, list[str]],
+    *,
+    date_keys: Sequence[str] = (),
 ) -> str | None:
+    """分组键：第一个**非数值、非日期**的字段。
+
+    日期字段不当分组键：按时间分组得到的是趋势，不是「各对象对比」。
+    """
     for item in mapping:
         key = str(item.get("inputFieldKey") or "")
+        if key in set(date_keys):
+            continue
         field_types = types.get(key) or []
         if field_types and "number" not in field_types and "boolean" not in field_types:
             return key
@@ -952,8 +1077,15 @@ def build_template_definition(
     if json_binding is not None:
         # 生效组合（契约表 §2）：来源模式、输入 ID 与版本、字段映射、
         # 处理规则与定义版本**绑成一组**，随定义一起落库。
+        _apply_json_chart_encodings(
+            regions=regions,
+            binding=json_binding,
+            plan_sections=list(plan.get("sections") or []),
+        )
         mapping, unmapped = _build_json_field_mapping(
-            regions=regions, binding=json_binding
+            regions=regions,
+            binding=json_binding,
+            plan_sections=list(plan.get("sections") or []),
         )
         rules = _build_json_processing_rules(
             regions=regions,
