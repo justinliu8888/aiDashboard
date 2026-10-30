@@ -274,20 +274,19 @@ def test_technical_failure_does_not_reset_other_item_counter(service: SessionSer
     assert state.key == "change_region_2"
 
 
-def test_can_ask_clarification_stops_after_three_rounds(service: SessionService):
+def test_can_ask_clarification_stops_after_one_round(service: SessionService):
+    """一次生成或调整意图最多主动澄清一轮（规格第 13 条）。"""
     key = "change_region_2"
     assert service.can_ask_clarification("sess_1", key=key) is True
 
-    for _ in range(3):
-        service.record_clarification("sess_1", key=key, question="再问一次？")
+    service.record_clarification("sess_1", key=key, question="再问一次？")
 
     assert service.can_ask_clarification("sess_1", key=key) is False
 
 
 def test_can_ask_clarification_is_true_for_a_new_item(service: SessionService):
-    """另一项待定修改的轮次不占这项的预算。"""
-    for _ in range(3):
-        service.record_clarification("sess_1", key="change_region_2", question="再问一次？")
+    """另一项待定修改的轮次不占这项的预算（额度按「事项」计）。"""
+    service.record_clarification("sess_1", key="change_region_2", question="再问一次？")
 
     assert service.can_ask_clarification("sess_1", key="remove_region_3") is True
 
