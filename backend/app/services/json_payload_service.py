@@ -537,6 +537,101 @@ def _describe_rules(
     return ""
 
 
+def _encoding_columns(component: Mapping[str, Any]) -> tuple[str, str]:
+    """区域声明的横轴 / 纵轴**列 id**（``component.encodings`` 的 X / Y 通道）。
+
+    声明了几个通道就返回几个 —— 没声明的那条轴**留空**（不猜）。
+    """
+    x_column = ""
+    y_column = ""
+    for encoding in component.get("encodings") or []:
+        if not isinstance(encoding, Mapping):
+            continue
+        channel = str(encoding.get("channel") or "").upper()
+        field_ref = str(encoding.get("fieldRef") or "")
+        if not field_ref:
+            continue
+        if channel == "X" and not x_column:
+            x_column = field_ref
+        elif channel == "Y" and not y_column:
+            y_column = field_ref
+    return x_column, y_column
+
+
+def _declared_columns(region: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """区域**声明的列**（带语义描述的那一份）。
+
+    先取 ``component.columns``（方案定稿列），没有再取
+    ``templateBinding.previewSpec.columns``（契约表 §3.4 的列语义描述）。
+    """
+    component = region.get("component") or {}
+    columns = [
+        column
+        for column in (component.get("columns") or [])
+        if isinstance(column, Mapping)
+    ]
+    if columns:
+        return columns
+    binding = region.get("templateBinding") or {}
+    if not isinstance(binding, Mapping):
+        return []
+    spec = binding.get("previewSpec") or {}
+    if not isinstance(spec, Mapping):
+        return []
+    return [
+        column
+        for column in (spec.get("columns") or [])
+        if isinstance(column, Mapping)
+    ]
+
+
+def _declared_value_type(column: Mapping[str, Any]) -> str:
+    """这一列**声明过**的值形态；没声明返回空串。
+
+    只认声明：``valueType`` 优先；只声明了 ``semanticKind`` 时按语义类别
+    推导值形态（契约表 §3.4 的 ① 级）。**都不声明就是不声明** —— 不猜。
+    """
+    value_type = str(column.get("valueType") or "").strip().lower()
+    if value_type:
+        return value_type
+    semantic_kind = str(column.get("semanticKind") or "").strip().lower()
+    if semantic_kind:
+        return VALUE_TYPE_BY_SEMANTIC_KIND.get(semantic_kind, "")
+    return ""
+
+
+def _is_time_column(column: Mapping[str, Any]) -> bool:
+    """这一列声明的是**时间 / 日期**类（横轴用）。"""
+    return _declared_value_type(column) == VALUE_TYPE_TIME
+
+
+def _is_numeric_column(column: Mapping[str, Any]) -> bool:
+    """这一列声明的是**数值**类（纵轴用）。"""
+    return _declared_value_type(column) in _NUMERIC_VALUE_TYPES
+
+
+def _axis_column(
+    columns: Sequence[Mapping[str, Any]],
+    mapping: Mapping[str, str],
+    predicate: Callable[[Mapping[str, Any]], bool],
+) -> str:
+    """从区域声明的列里挑出**符合条件且绑上了输入字段**的那一列。
+
+    挑不出来就返回空串 —— **不按列 id 含不含 date / time 猜，也不按映射
+    顺序随便挑一列**（ADR 0004 §5.4）。
+    """
+    for column in columns:
+        if not predicate(column):
+            continue
+        column_id = str(column.get("id") or "")
+        if not column_id:
+            continue
+        if not mapping.get(column_id):
+            continue
+        return column_id
+    return ""
+
+
 def _chart_payload(
     *,
     region: Mapping[str, Any],
@@ -547,45 +642,47 @@ def _chart_payload(
 ) -> dict[str, Any]:
     """图表载荷。
 
+    **横纵轴只按方案声明选**（ADR 0004 §5.4：不按标题 / 列名猜）：
+
+    ① 区域 ``component.encodings`` 的 X / Y 通道 → ``fieldRef`` → 字段映射；
+    ② encodings **没声明**的那条轴，退而用**区域声明的列**里带语义描述的
+       那一列：时间 / 日期类作横轴，数值类作纵轴。
+
+    **不按列 id 含不含 date / time 猜，也不按映射顺序随便挑一列当纵轴** ——
+    那两招都会把图画到别的列上（有数据也画不出点）。
+
     **没有日期就不画趋势**：横轴字段取不到、或取到的值解析不成时间，
     就给空点并说明原因（降级明细展示），不编趋势。
+
+    **单位只认方案声明的** ``format.unitLabel``（纵轴那一列的声明）；
+    方案没声明单位就留空 —— 不猜 kWh（规格第 24 条）。
     """
     component = region.get("component") or {}
     notes = list(issues)
-    # 横纵轴按**区域声明的编码**来（通道 → 字段），再经映射找到输入字段。
-    x_column = ""
-    y_column = ""
-    for encoding in component.get("encodings") or []:
-        if not isinstance(encoding, Mapping):
-            continue
-        channel = str(encoding.get("channel") or "").upper()
-        field_ref = str(encoding.get("fieldRef") or "")
-        if channel == "X":
-            x_column = field_ref
-        elif channel == "Y":
-            y_column = field_ref
-    x_field = mapping.get(x_column, "")
-    y_field = mapping.get(y_column, "")
-    if not x_field:
-        x_field = next(
-            (
-                key for column_id, key in mapping.items()
-                if column_id != y_column
-                and ("date" in str(column_id).lower() or "time" in str(column_id).lower())
-            ),
-            "",
-        )
-    if not y_field:
-        y_field = next(
-            (key for column_id, key in mapping.items() if key != x_field),
-            "",
-        )
+    x_column, y_column = _encoding_columns(component)
+    x_field = mapping.get(x_column, "") if x_column else ""
+    y_field = mapping.get(y_column, "") if y_column else ""
+    if not x_column or not y_column:
+        # encodings 没声明的那条轴 → 用**区域声明的列**里带语义描述的列。
+        declared = _declared_columns(region)
+        if not x_column:
+            x_column = _axis_column(declared, mapping, _is_time_column)
+            x_field = mapping.get(x_column, "")
+        if not y_column:
+            y_column = _axis_column(declared, mapping, _is_numeric_column)
+            y_field = mapping.get(y_column, "")
     x_labels: list[str] = []
     y_values: list[float] = []
     points: list[dict[str, Any]] = []
     unit = ""
     if not x_field or not y_field:
-        notes.append("数据里没有可用的横轴或纵轴字段，已降级明细展示，没有编趋势。")
+        if not x_field and not y_field:
+            missing = "横轴或纵轴字段"
+        elif not x_field:
+            missing = "横轴字段"
+        else:
+            missing = "纵轴字段"
+        notes.append(f"区域没有声明可用的{missing}，已降级明细展示，没有编趋势。")
     else:
         invalid_dates = 0
         for row in rows:
