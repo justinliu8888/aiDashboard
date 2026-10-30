@@ -213,6 +213,11 @@ class AgentService:
         self._agent = _build_agent()
 
     def _remember_choice(self, response: AgentResponse) -> AgentResponse:
+        if response.turnKind == TURN_KIND_QUERY_ANSWER:
+            # 只读咨询轮：原菜单、pendingChoice、待确认修改计划、澄清轮次
+            # 一律不动（ADR 0002 §6.1）。咨询不是决定，不能顺手「恢复」
+            # 出一个选择锁。
+            return response
         if response.state == AgentState.WAITING_USER_CONFIRM:
             # 所有生成路径共用同一确认协议；旧 Agent 的 confirm_draft 不能绕过选项锁。
             response.questions = self._editing_confirm_questions()
@@ -1827,7 +1832,9 @@ class AgentService:
                 # 能用确定性证据答的（有登记的展示方式 / 编译粒度）直接答。
                 readonly = self._try_answer_readonly_query(request, definition)
                 if readonly is not None:
-                    return readonly
+                    # 确定性回答也走**同一套**只读契约（规格第 52 条、
+                    # 契约表 §7.3）：同一套四态事实语义、同样只追加聊天。
+                    return self._normalize_query_answer(request, readonly, None)
             route = RouteDecision(
                 userIntent=UserIntent.ASK_QUESTION,
                 routingAction=RoutingAction.CONTINUE_CURRENT,
@@ -2019,7 +2026,8 @@ class AgentService:
         # 不改草稿、不产生待确认计划，也不占修改澄清轮次。
         readonly = self._try_answer_readonly_query(request, definition)
         if readonly is not None:
-            return readonly
+            # 同样走**同一套**只读契约（规格第 52 条）：只追加聊天。
+            return self._normalize_query_answer(request, readonly, None)
 
         # 用户说「你自己决定 / 别问了」：不再追问，但仍要把能做的改完。
         delegated = self._is_delegated_decision(message)

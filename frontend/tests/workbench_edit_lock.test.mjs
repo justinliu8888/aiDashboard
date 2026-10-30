@@ -423,3 +423,20 @@ test("syncInputControls：老会话的菜单（没有 lockScope）不锁输入",
   assert.equal(dom.input.disabled, false);
   assert.equal(dom.send.disabled, false);
 });
+
+// ==========================================================================
+// AC10 不新增独立「询问」按钮来绕过选择锁
+// ==========================================================================
+
+test("页面里没有独立的「询问」按钮（要继续咨询先选「继续调整」）", () => {
+  const html = readFileSync(new URL("../pages/workbench.html", import.meta.url), "utf8");
+  const js = readFileSync(new URL("../pages/workbench.js", import.meta.url), "utf8");
+
+  // 静态页面里没有「询问」这个按钮。
+  assert.equal(html.includes("询问"), false);
+  // 脚本里也不会凭空造一个。
+  assert.equal(js.includes("询问"), false);
+  // 「继续调整」这个入口是既有的（待确认修改计划的三个选项之一）。
+  assert.equal(js.includes("继续调整"), true);
+});
+
