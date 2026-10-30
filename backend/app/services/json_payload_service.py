@@ -11,15 +11,19 @@
 - **不编值**：没有日期就不画趋势，没有单位就不写单位，
   无效日期或混合类型降级明细展示并说明数据问题（规格第 24 / 52 条）；
 - **默认直接展示输入值**：求和 / 分组 / 占比只在方案声明了对应展示意图
-  时才生效，且温度、PUE、累计电表读数、编号**不默认求和**（规格第 25 条）。
+  时才生效，且温度、PUE、累计电表读数、编号**不默认求和**（规格第 25 条）；
+- **宁可少说，不许说假话**：指标卡的值**只来自实际生效的处理结果**，
+  口径说明写的是**实际发生了什么**（规则被跳过就写实话，不写「按求和展示」）；
+  图表的坐标轴**只按方案声明**选，不按列名猜（ADR 0004 §5.4）。
 """
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from app.services.effective_combination import normalize_combination
 from app.services.json_input_service import (
     MAX_DISPLAY_ROWS,
+    OP_AVG,
     OP_GROUP_BY,
     OP_PASSTHROUGH,
     OP_RATIO,
@@ -27,13 +31,50 @@ from app.services.json_input_service import (
     PROCESSING_OPERATIONS,
     apply_processing_rules,
     build_rule_id,
+    is_summable_field,
+    non_summable_reason,
     parse_datetime_value,
     render_cell,
+)
+from app.services.simulated_field_semantics import (
+    VALUE_TYPE_BY_SEMANTIC_KIND,
+    VALUE_TYPE_COST,
+    VALUE_TYPE_COUNT,
+    VALUE_TYPE_CURRENT,
+    VALUE_TYPE_DURATION,
+    VALUE_TYPE_ENERGY,
+    VALUE_TYPE_PERCENT,
+    VALUE_TYPE_POWER,
+    VALUE_TYPE_PUE,
+    VALUE_TYPE_TEMPERATURE,
+    VALUE_TYPE_TIME,
+    VALUE_TYPE_VOLTAGE,
 )
 
 
 #: 用户 JSON 模式下的区域级数据源标记（契约表 §1.1：随来源模式走）。
 USER_JSON_DATA_SOURCE = "user_json"
+
+#: 汇总类操作。``PASSTHROUGH`` **不算** —— 它的意思就是「不汇总，直接展示
+#: 输入值」（规格第 25 条）。
+_SUMMARY_OPERATIONS: tuple[str, ...] = (OP_SUM, OP_AVG, OP_GROUP_BY, OP_RATIO)
+
+#: 数值类的值形态（契约表 §3.2 的取值域里，量纲是数的那几个）。
+#: 时间 / 日期类只有 ``time`` 一个 —— 图表横轴用它。
+_NUMERIC_VALUE_TYPES: frozenset[str] = frozenset(
+    {
+        VALUE_TYPE_ENERGY,
+        VALUE_TYPE_COST,
+        VALUE_TYPE_POWER,
+        VALUE_TYPE_PUE,
+        VALUE_TYPE_PERCENT,
+        VALUE_TYPE_COUNT,
+        VALUE_TYPE_DURATION,
+        VALUE_TYPE_TEMPERATURE,
+        VALUE_TYPE_VOLTAGE,
+        VALUE_TYPE_CURRENT,
+    }
+)
 
 
 def _mapping_by_region(
@@ -259,12 +300,27 @@ def _metric_card_payload(
     *,
     region: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
+    source_rows: Sequence[Mapping[str, Any]],
     mapping: Mapping[str, str],
     rules: Sequence[Mapping[str, Any]],
     issues: Sequence[str],
     record_count: int,
 ) -> dict[str, Any]:
-    """指标卡载荷：值来自受控处理规则的**结果**。"""
+    """指标卡载荷。
+
+    **值只来自当前生效的处理结果**（契约表 §2 的受控处理规则）：
+
+    - 有**生效的汇总规则** → 值就是那条规则算出来的结果；
+    - 没有生效的汇总口径 → 单行输入直接显示那一行的值（规格第 25 条
+      「默认直接展示输入值」），多行输入**不编合计值**（同条「依据不清时用
+      明细表」）。
+
+    **不许拿「第一行」冒充这个指标的值** —— 那是在说假话（卡片标题写着
+    「总耗电」，用户看到的却是某一行的数）。
+
+    **宁可少说，不许说假话**：口径说明写的是**实际发生了什么** —— 规则被
+    跳过（比如温度不默认求和）时写实话，不写「按求和展示」。
+    """
     component = region.get("component") or {}
     metric = component.get("metric") or {}
     if not isinstance(metric, Mapping):
@@ -276,16 +332,19 @@ def _metric_card_payload(
     value: Any = None
     unit = _declared_unit(region, column_id)
     precision = _declared_precision(region, column_id)
-    applied = _describe_rules(rules, field_key)
     if not field_key:
         notes.append("这个指标没能绑定到输入字段，没有编值。")
-    elif not rows:
+    elif not source_rows:
         notes.append("输入数据里没有可用记录。")
     else:
-        raw = rows[0].get(field_key)
-        value = render_cell(raw, present=field_key in rows[0])
-        if value is None and field_key not in rows[0]:
-            notes.append(f"字段「{field_key}」在数据里缺失。")
+        value, value_notes = _metric_value(
+            processed=rows,
+            source_rows=source_rows,
+            field_key=field_key,
+            rules=rules,
+            record_count=record_count,
+        )
+        notes.extend(value_notes)
     metrics = [
         {
             "metricKey": column_id or field_key or label,
@@ -309,37 +368,172 @@ def _metric_card_payload(
         "windowLabel": f"用户提供的 JSON 数据（{record_count} 行）",
         "dataSource": USER_JSON_DATA_SOURCE,
         "metrics": metrics,
-        "notes": _notes(notes + ([applied] if applied else [])),
+        "notes": _notes(notes),
     }
+
+
+def _governing_rule(
+    rules: Sequence[Mapping[str, Any]], field_key: str | None
+) -> Mapping[str, Any] | None:
+    """管这个指标字段的**汇总规则**；没有就返回 ``None``。
+
+    ``PASSTHROUGH`` 不算汇总规则 —— 它的意思就是「不汇总，直接展示输入值」。
+
+    规则打在**别的字段**上不算这个指标的口径（那张卡说的是这个字段的数，
+    不是另一个字段的合计）。
+    """
+    if not field_key:
+        return None
+    for rule in rules:
+        operation = str(rule.get("operation") or "")
+        if operation not in _SUMMARY_OPERATIONS:
+            continue
+        target = str(rule.get("targetFieldKey") or "")
+        params = rule.get("params") or {}
+        value_field = (
+            str(params.get("valueField") or "") if isinstance(params, Mapping) else ""
+        )
+        if target == field_key or value_field == field_key:
+            return rule
+    return None
+
+
+def _rule_skipped_reason(rule: Mapping[str, Any] | None) -> str:
+    """规则**声明了但没有执行**时的实话；执行了（或没有规则）返回空串。
+
+    只认一种跳过：求和打在**不可求和**的字段上（温度 / PUE / 累计电表读数 /
+    编号）—— 服务端不执行它（规格第 25 条）。
+
+    理由直接用 :func:`non_summable_reason` 那套人话口径，**不另造一套**
+    说法，也不写「按求和展示…用户已确认」。
+    """
+    if rule is None:
+        return ""
+    operation = str(rule.get("operation") or "")
+    target = str(rule.get("targetFieldKey") or "")
+    if operation == OP_SUM and target and not is_summable_field(target):
+        return non_summable_reason(target) or (
+            f"字段「{target}」不适合求和，这条规则没有执行，没有编合计值。"
+        )
+    return ""
+
+
+def _aggregate_value(
+    processed: Sequence[Mapping[str, Any]],
+    field_key: str,
+    operation: str,
+) -> tuple[Any, bool]:
+    """汇总规则的**实际结果** —— 指标卡能显示的那个数。
+
+    - 求和 / 平均：整块数据被压成**一行**，那个值就是指标值；
+    - 分组 / 占比：结果是**多个值**（每组一个 / 每行一个），**没有单一
+      合计** —— 不许拿第一行 / 第一组冒充。
+
+    返回 ``(值, 认不认得出)``；认不出时值是 ``None``（不编值）。
+    """
+    if operation in (OP_GROUP_BY, OP_RATIO):
+        return None, False
+    if len(processed) != 1:
+        return None, False
+    row = processed[0]
+    if field_key not in row:
+        return None, False
+    return render_cell(row.get(field_key), present=True), True
+
+
+def _no_single_value_note(rule: Mapping[str, Any], caliber_note: str) -> str:
+    """分组 / 占比口径下**没有单一数值**时的说明。"""
+    operation = str(rule.get("operation") or "")
+    params = rule.get("params") or {}
+    if operation == OP_GROUP_BY:
+        subject = "分组的结果是每组一个值"
+    else:
+        subject = "占比的结果是每行一个比例"
+    return (
+        f"{caliber_note}{subject}，不是一个单独的数值；"
+        "这个指标卡不显示数值（没有拿第一行 / 第一组冒充总量），"
+        "分项数值请看明细表或图表。"
+    )
+
+
+def _metric_value(
+    *,
+    processed: Sequence[Mapping[str, Any]],
+    source_rows: Sequence[Mapping[str, Any]],
+    field_key: str,
+    rules: Sequence[Mapping[str, Any]],
+    record_count: int,
+) -> tuple[Any, list[str]]:
+    """指标的值与**实话**口径说明。返回 ``(值, 说明列表)``。
+
+    - **有生效的汇总规则** → 值就是那条规则算出来的结果；
+    - **没有生效的汇总口径** → 单行输入直接显示那一行的值；多行输入
+      **不编合计值**，说明里写清「没有编合计值，要逐行看数值请看明细表」。
+    """
+    notes: list[str] = []
+    rule = _governing_rule(rules, field_key)
+    skipped = _rule_skipped_reason(rule)
+    if rule is not None and not skipped:
+        operation = str(rule.get("operation") or "")
+        value, readable = _aggregate_value(processed, field_key, operation)
+        if readable:
+            notes.append(_describe_rules(rules, field_key))
+            return value, notes
+        # 规则生效了，但结果**不是一个单独的数值**（分组 / 占比）。
+        notes.append(_no_single_value_note(rule, _describe_rules(rules, field_key)))
+        return None, notes
+    # 没有生效的汇总口径。
+    if skipped:
+        notes.append(skipped)
+        reason = "这条汇总口径没有生效"
+    else:
+        reason = "方案没有为这个指标声明汇总口径"
+    if record_count <= 1:
+        row = source_rows[0] if source_rows else {}
+        present = field_key in row
+        value = render_cell(row.get(field_key), present=present)
+        if not present:
+            notes.append(f"字段「{field_key}」在数据里缺失。")
+        else:
+            notes.append(f"按输入值直接展示：当前数据只有 1 行，{reason}。")
+        return value, notes
+    notes.append(
+        f"{reason}，当前数据共 {record_count} 行，没有编合计值；"
+        "要逐行看数值请看明细表。"
+    )
+    return None, notes
 
 
 def _describe_rules(
     rules: Sequence[Mapping[str, Any]], field_key: str | None
 ) -> str:
-    """处理规则的人话说明 —— 让用户看得见口径是怎么来的。"""
-    for rule in rules:
-        operation = str(rule.get("operation") or "")
-        if operation == OP_PASSTHROUGH:
-            continue
-        target = str(rule.get("targetFieldKey") or "")
-        if field_key and target != field_key:
-            continue
-        if operation == OP_SUM:
-            return "口径：按求和展示（依据：方案声明的总量口径，用户已确认）。"
-        if operation == OP_GROUP_BY:
-            params = rule.get("params") or {}
-            return (
-                "口径：按「"
-                + str(params.get("groupBy") or "")
-                + "」分组展示（依据：方案声明的比较口径，用户已确认）。"
-            )
-        if operation == OP_RATIO:
-            params = rule.get("params") or {}
-            return (
-                "口径：按「"
-                + str(params.get("valueField") or target)
-                + "」占比展示（依据：方案声明的构成口径，用户已确认）。"
-            )
+    """处理规则的人话说明 —— 让用户看得见口径是怎么来的。
+
+    只描述**实际生效**的规则：规则被跳过（温度不默认求和）时**不写**
+    「按求和展示」—— 那是在说假话（宁可少说，不许说假话）。
+    """
+    rule = _governing_rule(rules, field_key)
+    if rule is None or _rule_skipped_reason(rule):
+        return ""
+    operation = str(rule.get("operation") or "")
+    params = rule.get("params") or {}
+    target = str(rule.get("targetFieldKey") or "")
+    if operation == OP_SUM:
+        return "口径：按求和展示（依据：方案声明的总量口径，用户已确认）。"
+    if operation == OP_AVG:
+        return "口径：按平均值展示（依据：方案声明的平均口径，用户已确认）。"
+    if operation == OP_GROUP_BY:
+        return (
+            "口径：按「"
+            + str(params.get("groupBy") or "")
+            + "」分组展示（依据：方案声明的比较口径，用户已确认）。"
+        )
+    if operation == OP_RATIO:
+        return (
+            "口径：按「"
+            + str(params.get("valueField") or target)
+            + "」占比展示（依据：方案声明的构成口径，用户已确认）。"
+        )
     return ""
 
 
@@ -528,6 +722,9 @@ def build_user_json_payloads(
             payload = _metric_card_payload(
                 region=region,
                 rows=processed,
+                # 原始输入行：判断「输入只有 1 行」与「那一行的值」用它 ——
+                # 处理结果可能已经被别的规则改过形状。
+                source_rows=rows,
                 mapping=mapping,
                 rules=rules,
                 issues=shared_issues,
