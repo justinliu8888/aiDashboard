@@ -2124,26 +2124,30 @@ class AgentService:
     def _issue_analysis_response(
         self, request: AgentRequest, analysis: IssueAnalysis
     ) -> AgentResponse:
-        """把问题分析收敛成「不推进业务」的只读回答。"""
+        """把问题分析收敛成「不推进业务」的只读回答。
+
+        契约表 §7.3 硬边界：「咨询与问题分析**复用既有的只读事实查证与
+        回答契约**（同一套四态事实语义）；查询工具与执行工具的权限
+        **不合并**，业务对象**不重建**。」
+
+        所以这里**不再自己拼一份**只读不变量（state / turnKind /
+        toolRequests / uiActions / domainObjects / questions）——
+        那些一律交给 :meth:`_normalize_query_answer`，与咨询路径
+        **共用同一份实现**。两份逻辑各写一遍就会漂移：之前这里直接把
+        客户端送来的请求快照当业务对象回传，而咨询路径取的是服务端
+        会话记录里的可信对象（ADR 0002 §1「请求快照……不作事实依据」）。
+        """
         reply = analysis.summary
         if not analysis.evidence_sufficient:
             reply = (
                 f"{reply}\n请告诉我是哪一张卡片、哪里看着不对"
                 "（比如「趋势图只有一根线」），我按实际定义给你核对。"
             )
-        return AgentResponse(
+        response = AgentResponse(
             conversationId=request.conversationId,
             state=request.state,
-            turnKind=TURN_KIND_QUERY_ANSWER,
-            toolRequests=[],
             reply=reply,
             designSessionId=request.context.designSessionId,
-            domainObjects=AgentResponseDomainObjects(
-                reportDefinitionDraft=request.snapshots.reportDefinition,
-                reportPolicyDraft=request.snapshots.reportPolicy,
-            ),
-            questions=self._preserved_menu(request, None),
-            uiActions=["query_answer"],
             debug={
                 "queryMode": True,
                 "userIntent": UserIntent.ISSUE_FEEDBACK.value,
@@ -2159,6 +2163,9 @@ class AgentService:
                 },
             },
         )
+        # 与咨询路径**同一套**归一化：业务对象取服务端可信记录，
+        # 状态不推进、不发起执行类工具请求、保留原待确认菜单。
+        return self._normalize_query_answer(request, response, None)
 
     async def _try_handle_template_edit(
         self, request: AgentRequest
