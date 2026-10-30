@@ -639,3 +639,84 @@ def test_degraded_response_copy_unchanged():
     assert response.reply == "本轮查证遇到技术问题，草稿没有修改。请稍后重试。"
     assert response.error is not None
     assert response.error.code == "EDIT_VERIFICATION_UNAVAILABLE"
+
+
+def test_exact_content_stays_in_restricted_local_dir_only(
+    diagnostics_dir, monkeypatch, tmp_path
+):
+    """精确原文只落受限本机目录：不进业务数据库，也不进 Git 仓库。
+
+    这是「临时诊断例外」的边界：它只影响诊断文件，不放宽
+    「模拟业务数值不落盘」的默认约束。
+    """
+    import stat
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "diagnostics_exact_content", True)
+    monkeypatch.setattr(
+        settings, "diagnostics_exact_content_until", "2999-01-01T00:00:00"
+    )
+    monkeypatch.setattr(settings, "diagnostics_exact_content_scope", "*")
+    secret = "精确原文 " + SECRET_MODEL
+
+    _write_diagnostic("conv_exact_1", secret)
+
+    # 落盘位置：目录 0700、文件 0600（只有当前用户能读）
+    files = list(diagnostics_dir.glob("*.jsonl"))
+    assert files
+    assert stat.S_IMODE(diagnostics_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(files[0].stat().st_mode) == 0o600
+
+    # 不在 Git 仓库里
+    repo_root = Path(__file__).resolve().parents[2]
+    assert repo_root not in diagnostics_dir.resolve().parents
+    default_dir = Path(
+        "~/Library/Logs/haewu-ai-report/diagnostics"
+    ).expanduser()
+    assert repo_root not in default_dir.resolve().parents
+
+    # 不在业务数据库里
+    session_db = tmp_path / "sessions.db"
+    if session_db.exists():
+        assert secret not in session_db.read_bytes().decode("utf-8", "ignore")
+    assert diagnostics_dir.resolve() != session_db.resolve()
+
+
+def test_exact_content_does_not_change_business_storage_behaviour(
+    diagnostics_dir, monkeypatch
+):
+    """精确原文模式只影响诊断层：业务存储该不落还是不落。
+
+    「模拟业务数值不落盘」的默认约束没有被这个开关放宽：
+    开关打开前后，业务存储写进去的东西一模一样。
+    """
+    import sqlite3
+    import threading
+
+    from app.storage.report_design_sqlite import SqliteReportDesignRepository
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "diagnostics_exact_content", True)
+    monkeypatch.setattr(
+        settings, "diagnostics_exact_content_until", "2999-01-01T00:00:00"
+    )
+    monkeypatch.setattr(settings, "diagnostics_exact_content_scope", "*")
+
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    repo = SqliteReportDesignRepository(connection=conn, lock=threading.RLock())
+    repo.initialize_schema()
+    try:
+        claim = repo.claim_operation("sess_exact", "msg_exact", None)
+        repo.fail_operation(
+            claim["operationId"],
+            {"code": "TEMPLATE_COMMIT_FAILED", "message": "上游异常 " + SECRET_EXC},
+        )
+        row = conn.execute(
+            "SELECT error_message FROM report_design_operations WHERE operation_id = ?",
+            (claim["operationId"],),
+        ).fetchone()
+        # 业务库里的原因字段依旧只有固定文案，与精确原文开关无关
+        assert row is not None
+        assert SECRET_EXC not in row[0]
+    finally:
+        conn.close()
