@@ -44,6 +44,39 @@ class Settings:
     # 可靠性
     llm_repair_retries: int = int(os.getenv("LLM_REPAIR_RETRIES", "1"))
 
+    # 模型诊断（#57）：失败诊断记录落在**受限本机目录**——
+    # 仅当前用户可读写，不在前端公开目录、不在 Git 仓库、不进 API 响应。
+    diagnostics_enabled: bool = os.getenv(
+        "AI_DIAGNOSTICS_ENABLED", "true"
+    ).lower() not in {"0", "false", "no", "off"}
+    diagnostics_dir: Path = Path(
+        os.getenv(
+            "AI_DIAGNOSTICS_DIR",
+            str(Path.home() / "Library/Logs/haewu-ai-report/diagnostics"),
+        )
+    ).expanduser()
+    # 单条诊断记录上限（字节）、诊断目录总容量上限（字节）、保留期限（天）。
+    diagnostics_max_record_bytes: int = int(
+        os.getenv("AI_DIAGNOSTICS_MAX_RECORD_BYTES", str(64 * 1024))
+    )
+    diagnostics_max_total_bytes: int = int(
+        os.getenv("AI_DIAGNOSTICS_MAX_TOTAL_BYTES", str(10 * 1024 * 1024))
+    )
+    diagnostics_retention_days: int = int(
+        os.getenv("AI_DIAGNOSTICS_RETENTION_DAYS", "7")
+    )
+    # 精确原文模式：**默认关闭**。开启还要同时满足「未过期」与「在范围内」，
+    # 且凭据样式的内容永远被抹掉。本轮只实现开关，不开启。
+    diagnostics_exact_content: bool = os.getenv(
+        "AI_DIAGNOSTICS_EXACT_CONTENT", "false"
+    ).lower() in {"1", "true", "yes", "on"}
+    diagnostics_exact_content_until: str = os.getenv(
+        "AI_DIAGNOSTICS_EXACT_CONTENT_UNTIL", ""
+    )
+    diagnostics_exact_content_scope: str = os.getenv(
+        "AI_DIAGNOSTICS_EXACT_CONTENT_SCOPE", ""
+    )
+
     # ReAct 预算：AgentScope 默认 max_iters=50，报表场景用不了那么多步
     react_max_iters: int = int(os.getenv("REACT_MAX_ITERS", "6"))
     react_max_iters_edit: int = int(os.getenv("REACT_MAX_ITERS_EDIT", "4"))

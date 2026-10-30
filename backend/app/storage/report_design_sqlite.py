@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, NamedTuple
 
+from app.services.report_diagnostics_service import note_operation
 from app.storage.report_design_repository import (
     CLAIM_KIND_CLAIMED,
     CLAIM_KIND_CONFLICT,
@@ -268,6 +269,10 @@ class SqliteReportDesignRepository:
 
                 now = _now()
                 operation_id = f"rdop_{uuid.uuid4().hex[:12]}"
+                # 诊断（#57）：操作 id 在这里生成，顺手记进请求级上下文，
+                # 后面的模型调用就能把请求标识和操作标识关联起来。
+                # 不落库、不改 schema —— 只影响这一轮请求内的关联。
+                note_operation(operation_id)
                 # 会话还没进过设计流程就先记下「需要一份方案」。
                 # 已有行不动：修改方案的认领不能把阶段退回 PLAN_NEEDED。
                 conn.execute(

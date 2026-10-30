@@ -11,6 +11,7 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
 from app.schemas.agent import AgentRequest, AgentResponse, AgentState
+from app.services import report_diagnostics_service as diagnostics
 from app.services.agent_service import agent_service
 from app.services.request_timeline import log_timeline_step, start_timeline
 from app.services.session_service import session_service
@@ -23,6 +24,20 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 def _sse(event: str, data: dict[str, Any]) -> str:
     payload = json.dumps(data, ensure_ascii=False, default=str)
     return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _log_failure(message: str, exc: Exception) -> None:
+    """记一次失败：**不留异常原文**，只留调用栈。
+
+    上游异常文本可能带凭据或用户数据，所以异常对象换成 ``None``：
+    栈还在（能看出哪一行炸的），消息没了。
+    """
+    logger.warning(
+        "%s errorType=%s",
+        message,
+        type(exc).__name__,
+        exc_info=(type(exc), None, exc.__traceback__),
+    )
 
 
 async def _emit_reply_stream(reply: str, emit) -> None:
@@ -60,27 +75,36 @@ def _persist_turn(request: AgentRequest, response: AgentResponse) -> None:
 async def chat(request: AgentRequest) -> AgentResponse:
     started = perf_counter()
     start_timeline(request.conversationId)
+    # 请求级上下文：这一轮里的模型调用靠它关联会话与消息。
+    diagnostics.begin_request_context(
+        conversation_id=request.conversationId,
+        message_id=request.messageId,
+    )
     log_timeline_step("router_received")
+    # 只记长度，不记用户原话。
     logger.info(
-        "[agent.chat] step=router_received conversationId=%s resumeOf=%s state=%s message=%r",
+        "[agent.chat] step=router_received conversationId=%s resumeOf=%s state=%s messageLength=%d",
         request.conversationId,
         request.resumeOfConversationId,
         request.state.value,
-        request.message,
+        len(request.message or ""),
     )
     try:
         response = await agent_service.chat(request)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log_timeline_step("router_failed")
-        logger.exception(
-            "[agent.chat] step=router_failed conversationId=%s elapsed_ms=%.1f",
-            request.conversationId,
-            (perf_counter() - started) * 1000,
+        _log_failure(
+            f"[agent.chat] step=router_failed conversationId={request.conversationId} "
+            f"elapsed_ms={(perf_counter() - started) * 1000:.1f}",
+            exc,
         )
         raise
     log_timeline_step("router_return")
+    # 「业务已返回」：这一事件说明业务结论已经出来了，
+    # 不代表客户端已经收到 —— 客户端确认是另一件事。
     logger.info(
-        "[agent.chat] step=router_return conversationId=%s elapsed_ms=%.1f response_state=%s uiActions=%s error=%s",
+        "[agent.chat] step=router_return conversationId=%s event=business_returned "
+        "elapsed_ms=%.1f response_state=%s uiActions=%s error=%s",
         request.conversationId,
         (perf_counter() - started) * 1000,
         response.state.value,
@@ -101,19 +125,30 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
             data = {**data, "elapsedMs": round((perf_counter() - started) * 1000)}
             try:
                 await queue.put((event, data))
-            except Exception:  # noqa: BLE001
-                # 队列已无人消费，忽略即可，不能影响主流程
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # 队列已无人消费，忽略即可，不能影响主流程。
+                # 但不留着：这一条现在能查到了（只记异常类型）。
+                _log_failure(
+                    f"[agent.chat.stream] step=emit_failed conversationId={request.conversationId} "
+                    f"event={event}",
+                    exc,
+                )
 
         async def run_chat() -> None:
             start_timeline(request.conversationId)
+            # 请求级上下文：这一轮里的模型调用靠它关联会话与消息。
+            diagnostics.begin_request_context(
+                conversation_id=request.conversationId,
+                message_id=request.messageId,
+            )
             log_timeline_step("router_received")
+            # 只记长度，不记用户原话。
             logger.info(
-                "[agent.chat.stream] step=router_received conversationId=%s resumeOf=%s state=%s message=%r",
+                "[agent.chat.stream] step=router_received conversationId=%s resumeOf=%s state=%s messageLength=%d",
                 request.conversationId,
                 request.resumeOfConversationId,
                 request.state.value,
-                request.message,
+                len(request.message or ""),
             )
             await emit(
                 "stage",
@@ -123,11 +158,13 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
                     "message": request.message,
                 },
             )
+            cancelled = False
             try:
                 response = await agent_service.chat(request, emit=emit)
                 log_timeline_step("router_return")
                 logger.info(
-                    "[agent.chat.stream] step=router_return conversationId=%s elapsed_ms=%.1f response_state=%s uiActions=%s error=%s",
+                    "[agent.chat.stream] step=router_return conversationId=%s event=business_returned "
+                    "elapsed_ms=%.1f response_state=%s uiActions=%s error=%s",
                     request.conversationId,
                     (perf_counter() - started) * 1000,
                     response.state.value,
@@ -142,7 +179,16 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
                     "final",
                     response.model_dump(mode="json"),
                 )
+                # 「final 已入队」：只说明 final 进了发送队列，
+                # **不等于**客户端已经收到 —— 没有客户端确认就不能这么说。
+                logger.info(
+                    "[agent.chat.stream] step=final_enqueued conversationId=%s "
+                    "event=final_enqueued elapsed_ms=%.1f",
+                    request.conversationId,
+                    (perf_counter() - started) * 1000,
+                )
             except asyncio.CancelledError:
+                cancelled = True
                 log_timeline_step("router_cancelled")
                 logger.info(
                     "[agent.chat.stream] step=router_cancelled conversationId=%s elapsed_ms=%.1f",
@@ -152,13 +198,20 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
                 raise
             except Exception as exc:  # noqa: BLE001
                 log_timeline_step("router_failed")
-                logger.exception(
-                    "[agent.chat.stream] step=router_failed conversationId=%s elapsed_ms=%.1f",
-                    request.conversationId,
-                    (perf_counter() - started) * 1000,
+                _log_failure(
+                    f"[agent.chat.stream] step=router_failed conversationId={request.conversationId} "
+                    f"elapsed_ms={(perf_counter() - started) * 1000:.1f}",
+                    exc,
                 )
                 await emit("error", {"message": str(exc)})
             finally:
+                # 「流结束或被取消」：这两个必须分开记。
+                logger.info(
+                    "[agent.chat.stream] step=stream_end conversationId=%s event=%s elapsed_ms=%.1f",
+                    request.conversationId,
+                    "stream_cancelled" if cancelled else "stream_finished",
+                    (perf_counter() - started) * 1000,
+                )
                 await queue.put(None)
 
         task = asyncio.create_task(run_chat())
