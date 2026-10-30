@@ -39,8 +39,17 @@ def test_safe_reason_returns_exception_type_not_message():
 
 def test_omitted_texts_keep_only_length():
     assert SECRET_PHRASE not in safety.omitted_user_text(SECRET_PHRASE)
-    assert SECRET_PHRASE not in safety.omitted_model_text(SECRET_PHRASE)
     assert f"长度={len(SECRET_PHRASE)}" in safety.omitted_user_text(SECRET_PHRASE)
+
+
+def test_model_text_shape_keeps_no_content_and_caps_length():
+    """形状级摘要：一个字的内容都不留，且按上限截断。"""
+    shape = safety.model_text_shape('{"action":"GENERATE_REPORT"}')
+    assert "GENERATE_REPORT" not in shape
+    assert "a" in shape  # 字母被换成类别符
+    long_shape = safety.model_text_shape("中" * 500, limit=20)
+    assert len(long_shape) < 60
+    assert "已截断" in long_shape
 
 
 def test_capped_reason_truncates_at_limit():

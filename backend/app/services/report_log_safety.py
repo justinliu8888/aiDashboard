@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from app.services.report_diagnostics_service import mask_text_shape
+
 #: 原因类文本的长度上限。原因是要给人看的，但不能无限长。
 MAX_REASON_CHARS = 200
 
@@ -42,9 +44,16 @@ def omitted_user_text(text: str | None) -> str:
     return f"[用户原话已省略，长度={len(text or '')}]"
 
 
-def omitted_model_text(text: str | None) -> str:
-    """模型返回原文 → 只留长度。日志里看不到模型说了什么。"""
-    return f"[模型输出已省略，长度={len(text or '')}]"
+def model_text_shape(text: str | None, *, limit: int = MAX_REASON_CHARS) -> str:
+    """模型返回原文 → 形状级摘要（字符类别图），并按上限截断。
+
+    一个字的内容都不留，但能看出「像不像 JSON、断在哪」——
+    这比只留长度多了一点排查价值，又不会把原文写出去。
+    """
+    shape = mask_text_shape(text or "")
+    if len(shape) > limit:
+        return f"{shape[:limit]}...<已截断 {len(shape) - limit} 字>"
+    return shape
 
 
 def capped_reason(text: str | None, *, limit: int = MAX_REASON_CHARS) -> str:
