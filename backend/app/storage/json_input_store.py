@@ -29,6 +29,10 @@ JSON 原始记录**可以保存一份**。本模块就是那一份的落点：
 
 连接与锁**由调用方注入** —— 与设计存储、会话存储同一条连接、同一把锁，
 这样输入记录与设计对象的写入落在同一笔事务里。
+
+**建表只在初始化时做一次。** 每次读写都只走参数化的 INSERT / SELECT / UPDATE，
+不执行 DDL —— 因此不会像 ``executescript`` 那样把共享连接上别处的事务提前提交
+（契约表 §8 不变量 2 的原子切换）。
 """
 from __future__ import annotations
 
@@ -44,24 +48,35 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS report_design_json_inputs (
-    input_id      TEXT NOT NULL,
-    input_version INTEGER NOT NULL,
-    session_id    TEXT NOT NULL,
-    array_path    TEXT NOT NULL DEFAULT '',
-    raw_json      TEXT NOT NULL,
-    schema_json   TEXT NOT NULL DEFAULT '{}',
-    sample_json   TEXT NOT NULL DEFAULT '[]',
-    record_count  INTEGER NOT NULL DEFAULT 0,
-    byte_size     INTEGER NOT NULL DEFAULT 0,
-    created_at    TEXT NOT NULL,
-    PRIMARY KEY (input_id, input_version)
-);
-
-CREATE INDEX IF NOT EXISTS idx_report_design_json_inputs_session
-    ON report_design_json_inputs (session_id, input_id, input_version);
-"""
+#: 建表 / 建索引的 DDL —— **逐条**执行，不用 ``executescript``。
+#:
+#: ``executescript`` 会先 COMMIT 掉共享连接上**当前**的事务。本表与设计存储、
+#: 会话存储共用同一条连接（同一把锁），那会把别处正在跑的事务提前提交 ——
+#: 破坏契约表 §8 不变量 2 的「原子切换」。逐条 ``execute`` 没有这个副作用。
+#:
+#: DDL 只在存储层初始化时跑**一次**；之后的每次读写都只走参数化的
+#: INSERT / SELECT / UPDATE。
+_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS report_design_json_inputs (
+        input_id      TEXT NOT NULL,
+        input_version INTEGER NOT NULL,
+        session_id    TEXT NOT NULL,
+        array_path    TEXT NOT NULL DEFAULT '',
+        raw_json      TEXT NOT NULL,
+        schema_json   TEXT NOT NULL DEFAULT '{}',
+        sample_json   TEXT NOT NULL DEFAULT '[]',
+        record_count  INTEGER NOT NULL DEFAULT 0,
+        byte_size     INTEGER NOT NULL DEFAULT 0,
+        created_at    TEXT NOT NULL,
+        PRIMARY KEY (input_id, input_version)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_report_design_json_inputs_session
+        ON report_design_json_inputs (session_id, input_id, input_version)
+    """,
+)
 
 
 @dataclass(frozen=True)
@@ -137,12 +152,28 @@ class SqliteJsonInputStore:
     def __init__(self, *, connection: sqlite3.Connection, lock: threading.RLock) -> None:
         self._conn = connection
         self._lock = lock
+        self._schema_ready = False
 
     def initialize_schema(self) -> None:
-        """建表（幂等）。只新增 ``report_design_`` 前缀的表，不动旧 schema。"""
+        """建表（幂等）。**整个存储实例只做一次。**
+
+        DDL 只在存储层初始化时跑一次 —— 调用方（``user_json_service``）拿到
+        存储时就调它。之后每次读写都只走参数化的 INSERT / SELECT / UPDATE，
+        **不再执行 DDL**，也不再有 ``executescript`` 顺带提交别人事务的副作用。
+        """
         with self._lock:
-            self._conn.executescript(_SCHEMA)
-            self._conn.commit()
+            self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        """建表 —— **只做一次**；已经建过就直接返回，一个 SQL 都不发。
+
+        调用方必须已持有 ``self._lock``（``RLock`` 可重入）。
+        """
+        if self._schema_ready:
+            return
+        for statement in _SCHEMA_STATEMENTS:
+            self._conn.execute(statement)
+        self._schema_ready = True
 
     # ---------- 写 ----------
 
@@ -153,7 +184,7 @@ class SqliteJsonInputStore:
         覆盖同一行，不新增（重试不会多出一份原始数据）。
         """
         with self._lock:
-            self.initialize_schema()
+            self._ensure_schema()
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO report_design_json_inputs (
@@ -173,7 +204,7 @@ class SqliteJsonInputStore:
         if not input_id:
             return None
         with self._lock:
-            self.initialize_schema()
+            self._ensure_schema()
             row = self._conn.execute(
                 """
                 SELECT * FROM report_design_json_inputs
@@ -193,7 +224,7 @@ class SqliteJsonInputStore:
         if not session_id:
             return None
         with self._lock:
-            self.initialize_schema()
+            self._ensure_schema()
             row = self._conn.execute(
                 """
                 SELECT * FROM report_design_json_inputs
@@ -210,7 +241,7 @@ class SqliteJsonInputStore:
         if not session_id:
             return []
         with self._lock:
-            self.initialize_schema()
+            self._ensure_schema()
             rows = self._conn.execute(
                 """
                 SELECT * FROM report_design_json_inputs
@@ -224,7 +255,7 @@ class SqliteJsonInputStore:
     def next_version(self, session_id: str, input_id: str) -> int:
         """给定输入身份下的下一个版本号（从 1 起递增）。"""
         with self._lock:
-            self.initialize_schema()
+            self._ensure_schema()
             row = self._conn.execute(
                 """
                 SELECT MAX(input_version) AS latest FROM report_design_json_inputs
