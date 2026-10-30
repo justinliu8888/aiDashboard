@@ -1455,15 +1455,27 @@ class AgentService:
         intent = (response.debug or {}).get("editingIntent") or "UNKNOWN"
         target = (response.debug or {}).get("editingTargetRegionId") or ""
         current = session_service.load_clarification(session_key)
-        # 额度按「事项」计（规格第 14 条）：键 = 「这一项要做的事」。
-        #   - 上一轮就是在追同一件事 → 沿用旧键，轮数接着算（不重置）；
-        #   - 换了一件事 → 键变了，轮数从零重新计；
-        #   - 连要改什么都说不清 → 固定的「未定位」键，仍然只问一轮。
-        key = (
-            current.key if prior and current
-            else f"{intent}:{target}" if intent != "UNKNOWN" or target
-            else "edit:unresolved"
-        )
+        # 额度按「事项」计（契约表 §7.2、§7.4）：键 = 「意图:目标卡片」，
+        # 而且**由当前这一轮推导**，不沿用上一轮的键。
+        #   - 键变了 → 换了一件事 → 自然重开，轮次从 0 起
+        #     （``record_clarification`` 发现键不同即重新计数）；
+        #   - 键没变 → 还是那一件事 → 轮次接着算，第二轮被额度上限挡住。
+        #
+        # 之前这里写的是「上一轮追问过就把键钉死在旧键上」，结果**换一件事
+        # 也被上一件事挡住**：追问额度用完后，用户再提任何一件新的修改都被
+        # 回成「这项修改我已经追问过 1 轮」—— 与契约 §7.4「新事项自然重开」
+        # 矛盾，也与回复里「③ 换一个对象重新提一次修改要求」自相矛盾。
+        derived = f"{intent}:{target}" if intent != "UNKNOWN" or target else ""
+        if derived:
+            key = derived
+        elif prior and current:
+            # 这一轮认不出「意图 + 目标卡片」：多半是用户在**回答上一轮的追问**
+            # （例如只回了一个指代词）。事项还没换，沿用上一轮的键，
+            # 免得同一件事被反复追问。
+            key = current.key
+        else:
+            # 连要改什么都说不清 → 固定的「未定位」键，仍然只问一轮。
+            key = "edit:unresolved"
         if not session_service.can_ask_clarification(session_key, key=key):
             # 一轮之后仍缺安全目标（规格第 18 条）：保留当前报告，给**非阻塞**
             # 说明与可选替代 —— 不猜目标、不造空计划、不继续循环强制询问。
@@ -1476,6 +1488,11 @@ class AgentService:
             )
             response.questions = []
             response.uiActions = ["template_edit_clarification_limit"]
+            # 这一件事的额度已经用尽：**不要**把「上一轮在追问什么」继续留在
+            # collectedInfo 里，否则下一轮的「继续接上一句」会一直贴着
+            # 这件已经结束的事，新事项反而被旧事项的上下文缠住。
+            request.collectedInfo.pop("pendingEditRequest", None)
+            request.collectedInfo.pop("pendingEditTimeAnchor", None)
             return response
         session_service.record_clarification(
             session_key, key=key, question=response.reply
