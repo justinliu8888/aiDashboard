@@ -15,12 +15,20 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from app.services.report_diagnostics_service import mask_text_shape
 
 #: 原因类文本的长度上限。原因是要给人看的，但不能无限长。
 MAX_REASON_CHARS = 200
+
+#: 「一眼就是标识」的形状：字母开头，只含字母数字下划线，最长 40 字。
+#:
+#: 工具名（``submit_draft_plan``）、模式名（``GENERATE``）、房间号（``room_a``）
+#: 都是这个形状 —— 排查时必须看得见。但模型可以往这些字段里塞任意文本，
+#: 所以形状对不上的，只留形状摘要。
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,39}$")
 
 #: 给用户看的失败文案：说清楚「发生了什么、用户能做什么」，不带技术细节。
 USER_VISIBLE_ERROR_MESSAGE = "服务暂时不可用，请稍后重试"
@@ -67,6 +75,19 @@ def capped_reason(text: str | None, *, limit: int = MAX_REASON_CHARS) -> str:
     if len(value) > limit:
         return f"{value[:limit]}...<已截断 {len(value) - limit} 字>"
     return value
+
+
+def safe_identifier(value: Any) -> str:
+    """标识：形状对得上就原样保留，对不上只留形状摘要。
+
+    标识（工具名、模式名、房间号）排查时必须看得见 —— 这是「常规日志只剩
+    标识与原因」里的「标识」。但这些字段的值可能来自模型，所以只放行
+    「一眼就是标识」的形状：字母开头、只含字母数字下划线、最长 40 字。
+    """
+    text = "" if value is None else str(value)
+    if _SAFE_IDENTIFIER.match(text):
+        return text
+    return model_text_shape(text)
 
 
 def log_failure(logger: logging.Logger, message: str, exc: BaseException) -> None:
