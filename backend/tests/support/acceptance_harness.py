@@ -131,6 +131,8 @@ KNOWN_TABLES: frozenset[str] = frozenset(
         "report_design_templates",
         "report_design_confirmations",
         "report_design_definitions",
+        # 方案版本记录（工单 #63）：存的是每一版方案的**纯结构**，不是业务数值。
+        "report_design_plan_versions",
     }
 )
 

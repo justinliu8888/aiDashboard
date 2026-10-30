@@ -9,8 +9,9 @@
 表设计：
     report_design_sessions     一个会话的当前设计状态（阶段 + 当前成功方案）
     report_design_operations   一次设计操作（认领 → 提交 / 失败）
+    report_design_plan_versions 每一版方案正文的版本记录（工单 #63）
 
-两张表都不对旧表建外键：设计行可能先于聊天会话行写入，
+这些表都不对旧表建外键：设计行可能先于聊天会话行写入，
 由协调者的 write_turn 回调在同一个事务里补上会话行。
 """
 from __future__ import annotations
@@ -47,7 +48,9 @@ from app.storage.report_design_repository import (
     DesignTemplateNotFoundError,
     LoadResult,
     PhaseResetResult,
+    PlanVersionRecord,
     WriteTurn,
+    plan_version_id,
 )
 
 
@@ -127,6 +130,37 @@ CREATE TABLE IF NOT EXISTS report_design_definitions (
     template_revision INTEGER NOT NULL,
     definition_json TEXT NOT NULL
 );
+
+-- 方案版本记录（工单 #63）：每一版方案正文的可查询序列。
+--
+-- 以前方案是「整份覆盖」写进 report_design_sessions.plan_json 的：旧版正文
+-- 只残留在历史消息的响应载荷里，既查不到也还原不回来。这张表把每一版
+-- 单独存一份 —— 稳定 ID + 版本 + 正文 + 操作标识。
+--
+-- 唯一键 (session_id, plan_id, plan_revision)：同一版方案在同一个会话里
+-- 只有一条版本记录。重复响应、乱序响应与重连因此**不会重复追加**，
+-- 旧版正文也**不会被改写**。
+--
+-- 正文只存纯方案结构（设计意图），不存模拟图表载荷，也不存业务数值
+-- （ADR 0004 §5.1）。
+CREATE TABLE IF NOT EXISTS report_design_plan_versions (
+    version_id    TEXT NOT NULL,
+    session_id    TEXT NOT NULL,
+    plan_id       TEXT NOT NULL,
+    plan_revision INTEGER NOT NULL,
+    operation_id  TEXT,
+    sequence      INTEGER NOT NULL,
+    plan_json     TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (session_id, plan_id, plan_revision)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_report_design_plan_versions_id
+    ON report_design_plan_versions (version_id);
+
+-- 同一会话的版本序列按保存序号排：时间戳只到秒，两版可能同秒。
+CREATE INDEX IF NOT EXISTS idx_report_design_plan_versions_session
+    ON report_design_plan_versions (session_id, sequence);
 """
 
 
@@ -141,6 +175,7 @@ class _DesignState(NamedTuple):
     plan_id: str | None
     revision: int | None
     plan_json: str | None
+    updated_at: str | None
 
 
 class _OperationRow(NamedTuple):
@@ -213,6 +248,56 @@ class SqliteReportDesignRepository:
             "templateDesign": template,
             "definitionDraft": _load_json(draft[0]) if draft else None,
         }
+
+    # ---------- 方案版本记录（工单 #63） ----------
+
+    def list_plan_versions(self, session_id: str) -> list[PlanVersionRecord]:
+        """按**真实保存顺序**返回会话里已存的方案版本记录。
+
+        只返回真正存下来的记录。老会话没有版本历史时返回空列表 ——
+        恢复由服务层按实际存储来做，存储层不猜历史。
+        """
+        if not session_id:
+            raise ValueError("session_id 不能为空")
+
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT version_id, session_id, plan_id, plan_revision,"
+                " operation_id, sequence, plan_json, created_at"
+                " FROM report_design_plan_versions"
+                " WHERE session_id = ?"
+                " ORDER BY sequence ASC",
+                (session_id,),
+            ).fetchall()
+
+        return [
+            {
+                "versionId": row[0],
+                "sessionId": row[1],
+                "planId": row[2],
+                "planRevision": row[3],
+                "operationId": row[4],
+                "sequence": row[5],
+                "reportPlan": _load_json(row[6]),
+                "createdAt": row[7],
+            }
+            for row in rows
+        ]
+
+    def find_plan_operation(
+        self, session_id: str, plan_id: str, plan_revision: int
+    ) -> str | None:
+        """查某一版方案是**哪次操作**提交上来的（操作标识）。"""
+        if not session_id or not plan_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT operation_id FROM report_design_operations"
+                " WHERE session_id = ? AND plan_id = ? AND plan_revision = ?"
+                " AND status = ?",
+                (session_id, plan_id, plan_revision, OPERATION_SUCCEEDED),
+            ).fetchone()
+        return row[0] if row is not None else None
 
     # ---------- 认领 ----------
 
@@ -396,6 +481,10 @@ class SqliteReportDesignRepository:
                 self._check_plan_base(data, expected_revision, state)
 
                 now = _now()
+                # 版本记录（工单 #63）：覆盖之前先把当前这一版单独存一份。
+                # 不存这一步，旧版正文就只剩在历史消息的响应载荷里 ——
+                # 查不到，也还原不回来。
+                self._preserve_current_version(conn, operation.session_id, state, now)
                 conn.execute(
                     """
                     INSERT INTO report_design_sessions
@@ -436,6 +525,12 @@ class SqliteReportDesignRepository:
                 )
                 if cursor.rowcount != 1:
                     raise DesignOperationStateError(f"操作状态已变：{operation_id}")
+
+                # 新的一版入版本序列：与上面的写入同一笔事务，
+                # 要么一起成功，要么一起回滚。
+                self._append_plan_version(
+                    conn, operation.session_id, data, operation_id, now
+                )
 
                 # 协调者注入的同事务写入：消息与会话行在这里落库。
                 # 回调自己不能 commit，否则同事务提交就不成立。
@@ -1058,6 +1153,116 @@ class SqliteReportDesignRepository:
 
     # ---------- 内部 ----------
 
+    @staticmethod
+    def _next_version_sequence(conn: sqlite3.Connection, session_id: str) -> int:
+        """同一会话里的下一个保存序号（从 1 起递增）。"""
+        row = conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1"
+            " FROM report_design_plan_versions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None else 1
+
+    @staticmethod
+    def _preserve_current_version(
+        conn: sqlite3.Connection,
+        session_id: str,
+        state: _DesignState | None,
+        now: str,
+    ) -> None:
+        """覆盖之前，把会话当前这一版单独存成一条版本记录。
+
+        只在「马上要被覆盖」时做：这一版正文接下来就会被新的一版顶掉，
+        先存一份，旧版正文才不会只剩在历史消息的响应载荷里。
+
+        - 存过的版本不重复写，正文也**不改写**；
+        - 操作标识从操作表里查（查得到就是真实的那次操作，查不到就留空，
+          不猜）。
+        """
+        if state is None or not state.plan_json:
+            return
+        plan_id = state.plan_id
+        revision = state.revision
+        if not plan_id or not revision:
+            return
+
+        already = conn.execute(
+            "SELECT 1 FROM report_design_plan_versions"
+            " WHERE session_id = ? AND plan_id = ? AND plan_revision = ?",
+            (session_id, plan_id, revision),
+        ).fetchone()
+        if already is not None:
+            return
+
+        operation_id = SqliteReportDesignRepository._find_plan_operation_id(
+            conn, session_id, plan_id, revision
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO report_design_plan_versions
+                (version_id, session_id, plan_id, plan_revision, operation_id,
+                 sequence, plan_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                plan_version_id(session_id, plan_id, revision),
+                session_id,
+                plan_id,
+                revision,
+                operation_id,
+                SqliteReportDesignRepository._next_version_sequence(conn, session_id),
+                state.plan_json,
+                state.updated_at or now,
+            ),
+        )
+
+    @staticmethod
+    def _append_plan_version(
+        conn: sqlite3.Connection,
+        session_id: str,
+        data: Mapping[str, Any],
+        operation_id: str,
+        now: str,
+    ) -> None:
+        """把新提交的这一版追加进版本序列。
+
+        幂等键是「会话 + 方案 + 版本」：同一版重复提交（重复响应、乱序
+        响应、重连）**不会重复追加**，旧版正文也不受影响。
+        """
+        plan_id = str(data["id"])
+        revision = int(data["revision"])
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO report_design_plan_versions
+                (version_id, session_id, plan_id, plan_revision, operation_id,
+                 sequence, plan_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                plan_version_id(session_id, plan_id, revision),
+                session_id,
+                plan_id,
+                revision,
+                operation_id,
+                SqliteReportDesignRepository._next_version_sequence(conn, session_id),
+                json.dumps(dict(data), ensure_ascii=False),
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _find_plan_operation_id(
+        conn: sqlite3.Connection, session_id: str, plan_id: str, plan_revision: int
+    ) -> str | None:
+        """某一版方案是由哪次成功操作提交上来的（查不到就留空，不猜）。"""
+        row = conn.execute(
+            "SELECT operation_id FROM report_design_operations"
+            " WHERE session_id = ? AND plan_id = ? AND plan_revision = ?"
+            " AND status = ?",
+            (session_id, plan_id, plan_revision, OPERATION_SUCCEEDED),
+        ).fetchone()
+        return row[0] if row is not None else None
+
     def _duplicate_result(
         self, conn: sqlite3.Connection, operation: _OperationRow
     ) -> ClaimResult:
@@ -1289,13 +1494,13 @@ class SqliteReportDesignRepository:
         conn: sqlite3.Connection, session_id: str
     ) -> _DesignState | None:
         row = conn.execute(
-            "SELECT design_phase, plan_id, plan_revision, plan_json"
+            "SELECT design_phase, plan_id, plan_revision, plan_json, updated_at"
             " FROM report_design_sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
         if row is None:
             return None
-        return _DesignState(row[0], row[1], row[2], row[3])
+        return _DesignState(row[0], row[1], row[2], row[3], row[4])
 
     @staticmethod
     def _begin(conn: sqlite3.Connection) -> None:
