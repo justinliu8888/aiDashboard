@@ -788,6 +788,51 @@ def test_new_turn_restarts_the_attempt_counter(caplog) -> None:
     assert attempts == ["1", "1"]
 
 
+def test_bare_model_call_does_not_inherit_the_previous_request_context(
+    caplog,
+) -> None:
+    """没有请求上下文的裸调用：不沿用上一轮的会话，序号从 1 起。
+
+    上一轮的模型调用已经结束（解析层接手了状态），这一轮却没有开请求
+    上下文 —— 那就不能把这次调用认到上一轮的会话上去。
+    """
+    caplog.set_level(logging.INFO, logger="app")
+
+    diagnostics.begin_request_context(
+        conversation_id="conv_diag_stale", message_id="msg_diag_stale"
+    )
+    first = diagnostics.begin_model_call()
+    assert first.conversation_id == "conv_diag_stale"
+    assert first.attempt == 1
+    # 解析层接手状态 = 这一轮的模型调用结束了。
+    diagnostics.ensure_model_call_state()
+
+    # 下一轮没有开请求上下文：裸调用。
+    second = diagnostics.begin_model_call()
+    assert second.conversation_id is None
+    assert second.message_id is None
+    assert second.attempt == 1
+    assert second.request_id != first.request_id
+    # 并且有一条告警说明这次调用没有请求上下文。
+    assert "没有请求上下文" in caplog.text
+
+
+def test_same_request_keeps_incrementing_the_attempt(caplog) -> None:
+    """正常路径不变：同一轮请求里的模型调用序号递增，会话标识不变。"""
+    caplog.set_level(logging.INFO, logger="app")
+
+    diagnostics.begin_request_context(
+        conversation_id="conv_diag_keep", message_id="msg_diag_keep"
+    )
+    client = _client_with(_FakeResponse("第一轮"), _FakeResponse("第二轮"))
+    asyncio.run(_call_twice(client))
+
+    records = _model_call_records(caplog)
+    assert [record.get("attempt") for record in records] == ["1", "2"]
+    assert all(record.get("conversationId") == "conv_diag_keep" for record in records)
+    assert "没有请求上下文" not in caplog.text
+
+
 # --------------------------------------------------------------------------
 # 端到端：真实路由 → 真实设计编排 → 真实解析，诊断记录与日志对得上
 # --------------------------------------------------------------------------

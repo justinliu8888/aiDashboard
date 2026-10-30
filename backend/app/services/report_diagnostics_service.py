@@ -88,6 +88,14 @@ class RequestContext:
     stage: str | None = None
     prompt_version: str | None = None
     prompt_digest: str | None = None
+    #: 这一轮请求**还在等模型调用**吗。
+    #:
+    #: ``begin_request_context`` 开的轮次是 True：这一轮里的模型调用继承
+    #: 它的会话标识，同一轮里的重试序号递增。
+    #: 解析层接手状态之后（这一轮的模型调用已经结束）就置 False ——
+    #: 此后再来的模型调用**不属于这一轮**，会话标识留空、序号从 1 起，
+    #: 不认错上一轮的会话（契约表 §6.2：序号不跨轮累加）。
+    model_call_open: bool = False
 
 
 _request_context: ContextVar[RequestContext | None] = ContextVar(
@@ -99,6 +107,11 @@ _current_model_call: ContextVar["ModelCallState | None"] = ContextVar(
 
 
 def _ensure_context() -> RequestContext:
+    """拿到本轮的请求上下文；没有就建一个空的。
+
+    **不猜**会话标识：没有请求上下文时这里是空的，会话标识由
+    ``begin_model_call`` 按「这一轮还在等模型调用吗」决定留空还是继承。
+    """
     context = _request_context.get()
     if context is None:
         context = RequestContext()
@@ -117,7 +130,10 @@ def begin_request_context(
     调用方（路由层）在收到请求时调用；同一轮里的模型调用都从这里取关联信息。
     """
     context = RequestContext(
-        conversation_id=conversation_id, message_id=message_id, stage=stage
+        conversation_id=conversation_id,
+        message_id=message_id,
+        stage=stage,
+        model_call_open=True,
     )
     _request_context.set(context)
     _current_model_call.set(None)
@@ -189,21 +205,33 @@ def begin_model_call(*, model_id: str | None = None) -> ModelCallState:
 
     attempt 的算法：同一次请求（同一会话 + 同一消息）里接着调，序号加一；
     换了请求就从 1 重新起。序号跟着**这一轮请求**走，不跨轮累加。
+
+    **没有请求上下文时不沿用上一轮的**：这一轮不在等模型调用（请求上下文
+    已经过了这一轮），会话标识留空、序号从 1 起，并记一条告警 ——
+    免得把这次调用认到上一轮的会话上去。
     """
     context = _ensure_context()
     previous = _current_model_call.get()
     attempt = 1
-    if (
+    conversation_id = context.conversation_id
+    message_id = context.message_id
+    if not context.model_call_open:
+        # 没有请求上下文：不沿用上一轮的会话标识，序号从 1 起。
+        attempt = 1
+        conversation_id = None
+        message_id = None
+        _warn_no_request_context()
+    elif (
         previous is not None
-        and previous.conversation_id == context.conversation_id
-        and previous.message_id == context.message_id
+        and previous.conversation_id == conversation_id
+        and previous.message_id == message_id
     ):
         attempt = previous.attempt + 1
     state = ModelCallState(
         request_id=new_request_id(),
         attempt=attempt,
-        conversation_id=context.conversation_id,
-        message_id=context.message_id,
+        conversation_id=conversation_id,
+        message_id=message_id,
         operation_id=context.operation_id,
         stage=context.stage,
         model_id=model_id,
@@ -212,6 +240,14 @@ def begin_model_call(*, model_id: str | None = None) -> ModelCallState:
     )
     _current_model_call.set(state)
     return state
+
+
+def _warn_no_request_context() -> None:
+    """告警：这一次模型调用没有请求上下文。
+
+    会话标识留空、序号从 1 起 —— 不认错上一轮的会话。
+    """
+    _safe_warning("本次模型调用没有请求上下文：会话标识留空，序号从 1 起")
 
 
 def current_model_call() -> ModelCallState | None:
@@ -224,11 +260,22 @@ def ensure_model_call_state(*, model_id: str | None = None) -> ModelCallState:
 
     正常路径上由模型适配层创建（契约要求标识在适配层生成）；
     这里只兜住「注入的替身没有适配层」的情况，保证解析失败也有标识可关联。
+
+    解析层接手状态 = **这一轮的模型调用已经结束**：调用链就此关闭。
+    之后再来的模型调用就不属于这一轮了（见 ``begin_model_call``）。
     """
     state = _current_model_call.get()
-    if state is not None:
-        return state
-    return begin_model_call(model_id=model_id)
+    if state is None:
+        state = begin_model_call(model_id=model_id)
+    _close_model_call_chain()
+    return state
+
+
+def _close_model_call_chain() -> None:
+    """关掉这一轮的模型调用链（解析层接手之后）。"""
+    context = _request_context.get()
+    if context is not None:
+        context.model_call_open = False
 
 
 def text_or_unknown(value: Any) -> str:
