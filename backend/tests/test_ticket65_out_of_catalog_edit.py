@@ -24,6 +24,7 @@ import pytest
 
 from app.schemas.edit_plan import EditIntent
 from app.services.effective_combination import COMBINATION_KEYS
+from app.services.metric_mock_service import list_metrics
 from app.services.preview_service import (
     build_preview_context,
     build_report_preview_payload,
@@ -636,4 +637,298 @@ def test_chat_api_asks_for_the_caliber_before_adding(post_chat, definition):
     assert "耗电量" in response["reply"]
     assert response["domainObjects"]["pendingEditPlan"] is None
     assert response["domainObjects"]["reportDefinitionDraft"]["metadata"]["revision"] == 0
+
+
+# ==========================================================================
+# 工单 #65b：意图门不再把目录外新增挡在编辑快路之外
+# ==========================================================================
+#
+# 工单 #65 把目录外候选层实现**在编辑引擎里**（template_edit_engine →
+# out_of_catalog_candidate）。工单 #58 立的意图门对 OUT_OF_CATALOG_ADD
+# 直接跳过确定性编辑快路 —— 候选层因此永远走不到，AC1「不再以「未登记」
+# 拒绝」对最典型的说法（新增一个温度指标 / 电脑耗电率指标）不成立。
+#
+# 下面全部走**接口层主缝**（真实 POST /api/agent/chat + 独立临时会话库），
+# 断言的是用户看得见的行为：待接受的修改计划 → 接受 → 右侧真的多出一块
+# 带模拟数字、标着模拟来源的板块。
+
+
+def _metric_ref_by_label(label: str) -> str:
+    """已登记指标的标识按标签查（不写死 mock 常量）。"""
+    for item in list_metrics(subject_ref="machine_room"):
+        if item.get("label") == label:
+            return str(item.get("metricRef"))
+    raise AssertionError(f"mock 指标目录里没有「{label}」")
+
+
+def _added_block(payload: dict[str, Any], definition) -> dict[str, Any]:
+    """右侧载荷里**新多出来**的那一块。"""
+    before = {region["id"] for region in definition.regions}
+    return next(
+        item for item in payload["regions"]
+        if item["regionId"] not in before
+    )
+
+
+def test_out_of_catalog_add_is_not_blocked_by_the_intent_gate(post_chat, definition):
+    """「新增一个温度指标」不再被拒：产出**待接受的模拟候选**。"""
+    response = post_chat(
+        "新增一个温度指标",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": definition.model_dump(mode="json")},
+    ).json()
+
+    assert response["uiActions"] == ["pending_edit_plan"]
+    plan = response["domainObjects"]["pendingEditPlan"]
+    assert plan is not None, "目录外新增必须产出待接受的修改计划，而不是被拒绝"
+
+    operation = plan["operations"][0]["operation"]
+    assert operation.get("metricRef") is None, "目录外指标不伪造 metricRef"
+    assert operation["metricIntent"] == "温度"
+    assert operation["metricCandidate"]["status"] == "out_of_catalog"
+    assert "未登记" not in response["reply"]
+    # 接受之前草稿一个字节都没动。
+    assert response["domainObjects"]["changeSet"] is None
+    assert definition.metadata["revision"] == 0
+
+
+def test_ambiguous_out_of_catalog_add_asks_the_caliber_then_offers_a_candidate(
+    post_chat, definition
+):
+    """「新增一个电脑耗电率指标」：口径不清先问清楚，拍板后出模拟候选。
+
+    这一条是 AC1 的**可澄清**分支：不是拒绝，是问最关键的语义区别。
+    """
+    snapshots = {"reportDefinition": definition.model_dump(mode="json")}
+
+    first = post_chat(
+        "新增一个电脑耗电率指标",
+        state="USER_EDITING_TEMPLATE",
+        snapshots=snapshots,
+    ).json()
+
+    assert "电脑耗电率" in first["reply"]
+    assert "耗电量" in first["reply"]
+    assert "未登记" not in first["reply"]
+    assert first["domainObjects"]["pendingEditPlan"] is None
+
+    # 用户拍板口径 → 出候选。
+    second = post_chat(
+        "耗电量", state="USER_EDITING_TEMPLATE", snapshots=snapshots,
+    ).json()
+
+    assert second["uiActions"] == ["pending_edit_plan"]
+    operation = second["domainObjects"]["pendingEditPlan"]["operations"][0]["operation"]
+    assert operation.get("metricRef") is None
+    assert operation["metricIntent"] == "电脑耗电率"
+    assert operation["metricCandidate"]["status"] == "out_of_catalog"
+    assert operation["metricCandidate"]["unit"] == "kWh"
+
+
+def test_accepted_out_of_catalog_candidate_adds_a_block_with_simulated_numbers(
+    post_chat, definition
+):
+    """接受之后：右侧真的多出一块**带模拟数字**的板块，并标注模拟来源。"""
+    snapshots = {"reportDefinition": definition.model_dump(mode="json")}
+
+    candidate = post_chat(
+        "新增一个温度指标",
+        state="USER_EDITING_TEMPLATE",
+        snapshots=snapshots,
+    ).json()
+    assert candidate["uiActions"] == ["pending_edit_plan"]
+
+    accepted = post_chat(
+        "接受修改", state="USER_EDITING_TEMPLATE", snapshots=snapshots,
+    ).json()
+
+    assert accepted["domainObjects"]["changeSet"] is not None
+    draft = accepted["domainObjects"]["reportDefinitionDraft"]
+    assert draft["metadata"]["revision"] == 1
+
+    payload = preview(draft)
+    block = _added_block(payload, definition)
+    assert block["name"] == "温度"
+    assert block["capabilityPending"] is True
+    assert block["dataSource"] == "simulated"
+    assert block["payload"]["sourceMode"] == "simulated"
+
+    # 真的出数了，不是空图。
+    rows = block["payload"]["rows"]
+    assert rows
+    value_column = block["payload"]["columns"][-1]
+    assert all(
+        str(row.get(value_column["fieldRef"]) or "").strip() for row in rows
+    ), "每一行都要有模拟值"
+
+    # 标注了模拟来源。
+    region = next(item for item in draft["regions"] if item["id"] == block["regionId"])
+    reason = region["templateBinding"]["placeholderReason"]
+    assert "能力待接通" in reason
+    assert "模拟" in reason
+
+
+def test_accepted_out_of_catalog_candidate_shows_numbers_once_the_caliber_is_set(
+    post_chat, definition
+):
+    """口径定了（有单位）→ 那一列出的是**数字**。
+
+    走完整条链：澄清口径 → 模拟候选 → 接受 → 右侧那一块带数字。
+    """
+    snapshots = {"reportDefinition": definition.model_dump(mode="json")}
+
+    post_chat(
+        "新增一个电脑耗电率指标",
+        state="USER_EDITING_TEMPLATE",
+        snapshots=snapshots,
+    )
+    candidate = post_chat(
+        "耗电量", state="USER_EDITING_TEMPLATE", snapshots=snapshots,
+    ).json()
+    assert candidate["uiActions"] == ["pending_edit_plan"]
+
+    accepted = post_chat(
+        "接受修改", state="USER_EDITING_TEMPLATE", snapshots=snapshots,
+    ).json()
+    draft = accepted["domainObjects"]["reportDefinitionDraft"]
+    assert draft["metadata"]["revision"] == 1
+
+    payload = preview(draft)
+    block = _added_block(payload, definition)
+    assert block["name"] == "电脑耗电率"
+    assert block["capabilityPending"] is True
+    assert block["dataSource"] == "simulated"
+
+    value_column = block["payload"]["columns"][-1]
+    assert value_column["valueType"] == "energy"
+    row = block["payload"]["rows"][0]
+    assert isinstance(row[value_column["fieldRef"]], (int, float))
+
+    region = next(item for item in draft["regions"] if item["id"] == block["regionId"])
+    reason = region["templateBinding"]["placeholderReason"]
+    assert "能力待接通" in reason
+    assert "口径待确认" in reason
+
+
+def test_known_metric_add_is_still_a_normal_add_section(post_chat, definition):
+    """「新增一个总耗电卡片」仍是**正常** ADD_SECTION（已知指标，不该变模拟）。"""
+    response = post_chat(
+        "新增一个总耗电卡片",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": definition.model_dump(mode="json")},
+    ).json()
+
+    assert response["uiActions"] == ["pending_edit_plan"]
+    operation = response["domainObjects"]["pendingEditPlan"]["operations"][0]["operation"]
+    assert operation["metricRef"] == _metric_ref_by_label("总耗电")
+    assert operation.get("metricCandidate") is None, "已知指标不该变成模拟候选"
+    assert response["debug"]["editingIntent"] == "ADD_SECTION"
+
+
+def test_known_ranking_metric_add_is_still_a_normal_add_section(post_chat, definition):
+    """「新增一个设备耗电排名卡片」同上：已知指标，仍是正常 ADD_SECTION。"""
+    response = post_chat(
+        "新增一个设备耗电排名卡片",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": definition.model_dump(mode="json")},
+    ).json()
+
+    assert response["uiActions"] == ["pending_edit_plan"]
+    operation = response["domainObjects"]["pendingEditPlan"]["operations"][0]["operation"]
+    assert operation["metricRef"] == _metric_ref_by_label("设备耗电")
+    assert operation.get("metricCandidate") is None, "已知指标不该变成模拟候选"
+    assert response["debug"]["editingIntent"] == "ADD_SECTION"
+
+
+def test_delete_command_still_goes_through_the_modify_fast_path(post_chat, definition):
+    """「删除某个卡片」仍是 MODIFY 快路，不受意图门放开的影响。"""
+    response = post_chat(
+        "删除某个卡片",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": definition.model_dump(mode="json")},
+    ).json()
+
+    assert response["debug"]["editingIntent"] == "DELETE_SECTION"
+    assert response["domainObjects"]["pendingEditPlan"] is None
+    assert response["domainObjects"]["changeSet"] is None
+
+
+def test_visualization_change_still_goes_through_the_modify_fast_path(
+    post_chat, definition
+):
+    """「把趋势图换成柱状图」仍是 MODIFY 快路，不受意图门放开的影响。"""
+    response = post_chat(
+        "把趋势图换成柱状图",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": definition.model_dump(mode="json")},
+    ).json()
+
+    assert response["debug"]["editingIntent"] == "CHANGE_VISUALIZATION"
+    # 目标卡片按当天快照推导，不写死 id。
+    trend = next(
+        region for region in definition.regions if region.get("role") == "TREND"
+    )
+    assert response["debug"]["editingTargetRegionId"] == trend["id"]
+
+
+def test_issue_feedback_still_only_appends_chat(post_chat, definition):
+    """「这个图看不懂」仍是**问题反馈**：只追加聊天，不产计划。"""
+    response = post_chat(
+        "这个图看不懂",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": definition.model_dump(mode="json")},
+    ).json()
+
+    assert response["uiActions"] == ["query_answer"]
+    assert response["debug"]["userIntent"] == "ISSUE_FEEDBACK"
+    assert response["domainObjects"]["pendingEditPlan"] is None
+    assert response["domainObjects"]["changeSet"] is None
+    assert definition.metadata["revision"] == 0
+
+
+def test_consultation_still_only_appends_chat(post_chat, definition):
+    """「冰箱耗电明细可以用其他展示方法吗？」仍是**咨询**：只追加聊天，不产计划。"""
+    response = post_chat(
+        "冰箱耗电明细可以用其他展示方法吗？",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": definition.model_dump(mode="json")},
+    ).json()
+
+    assert response["uiActions"] == ["query_answer"]
+    assert response["domainObjects"]["pendingEditPlan"] is None
+    assert response["domainObjects"]["changeSet"] is None
+    assert definition.metadata["revision"] == 0
+
+
+@pytest.mark.xfail(
+    reason=(
+        "引擎层仍按**别名子串**匹配把「设备耗电率」映射到已登记的「设备耗电」："
+        "template_edit_engine.parse 的新增分支里 `if metric_ref: candidate = None` "
+        "会把已经解析好的目录外候选丢掉（规格第 6 条：目录外指标不静默映射到"
+        "已登记指标）。该文件由并行的修复代理在改，本票不越界修改 —— "
+        "引擎改成「别名命中不等于识别成功：抽取到的指标名本身不是已登记指标名"
+        "时优先用候选」之后本用例即转正。"
+    ),
+    strict=False,
+)
+def test_out_of_catalog_rate_metric_is_not_mapped_onto_a_registered_one(
+    post_chat, definition
+):
+    """「新增一个设备耗电率指标」应当出模拟候选，而不是被静默映射成「设备耗电」。
+
+    意图层已经把它判成 OUT_OF_CATALOG_ADD（「设备耗电率」不是已登记指标名），
+    差的是引擎那一步。
+    """
+    response = post_chat(
+        "新增一个设备耗电率指标",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": definition.model_dump(mode="json")},
+    ).json()
+
+    operation = response["domainObjects"]["pendingEditPlan"]["operations"][0]["operation"]
+    assert operation.get("metricRef") is None, "目录外指标不该被静默映射到已登记指标"
+    assert operation["metricIntent"] == "设备耗电率"
+    assert operation["metricCandidate"]["status"] in {"out_of_catalog", "ambiguous"}
+
+
 
