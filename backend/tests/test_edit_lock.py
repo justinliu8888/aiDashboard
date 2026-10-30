@@ -618,3 +618,29 @@ def test_lock_scope_derivation_follows_the_contract():
         lockScope=LOCK_SCOPE_MENU_ONLY,
     )
     assert explicit.lockScope == LOCK_SCOPE_MENU_ONLY
+
+
+def test_an_illegal_lock_scope_is_normalized_to_menu_only():
+    """契约表 §5.1 把取值域定死为三个；非法值读回时归一成 ``menu_only``。
+
+    为什么归一而不是报错：契约表 §5.3 把「缺失」的老数据默认行为定为
+    ``menu_only``，前端 ``lockScopeOf`` 对认不出的值也兜底成 ``menu_only``。
+    服务端若把非法值原样回传，前后端就会对同一份坏数据给出不同的锁。
+    """
+    illegal = AgentQuestion(
+        id="template_edit_confirm",
+        prompt="请选择下一步操作：",
+        expects="SINGLE_CHOICE",
+        lockScope="foo",  # type: ignore[arg-type]
+    )
+    assert illegal.lockScope == LOCK_SCOPE_MENU_ONLY
+
+    # 三个合法取值原样保留，不被归一改写。
+    for scope in (LOCK_SCOPE_NONE, LOCK_SCOPE_MENU_ONLY, LOCK_SCOPE_INPUT_AND_MENU):
+        kept = AgentQuestion(
+            id="template_edit_confirm",
+            prompt="请选择下一步操作：",
+            expects="SINGLE_CHOICE",
+            lockScope=scope,
+        )
+        assert kept.lockScope == scope
