@@ -237,8 +237,85 @@ def test_metric_card_with_group_rule_shows_none_of_the_grouped_values() -> None:
     # 任何一个分组的数值都不许出现在这个指标上。
     assert card["value"] not in (10.0, 20.0, 30.0)
     notes = " ".join(card["notes"])
-    assert "不是一个单独的数值" in notes
+    assert "这不是一个单独的数值" in notes
     assert "明细表" in notes or "图表" in notes
+
+
+def test_metric_card_on_a_text_column_leaves_the_value_empty_not_the_string_null() -> None:
+    """求和打在**全是文字**的列上 → 值留空，**不是**字符串 ``"null"``。
+
+    指标卡不是表格：表格单元格用 ``"null"`` 表示「这一格是 null」，
+    指标卡只有一个值 —— **没有值就是没有值** → ``None``（前端渲染成「—」）。
+    """
+    rows = [
+        {"energy": 10.0, "label": "甲"},
+        {"energy": 20.0, "label": "乙"},
+    ]
+    payloads = build_user_json_payloads(
+        definition=_metric_card(column_id="label", label="标签"),
+        rows=rows,
+        combination=_combination(
+            _mapping(column_id="label", field_key="label"),
+            [_rule("SUM", column_id="label", target="label")],
+        ),
+    )
+    card = payloads["region_1"]
+    assert card["value"] is None
+    assert card["metrics"][0]["value"] is None
+    # 说明要说清为什么没有数。
+    notes = " ".join(card["notes"])
+    assert "没有可求和的数值" in notes
+    assert "没有编合计值" in notes
+    # 没求出来就不许写「按求和展示（……用户已确认）」。
+    assert "按求和展示" not in notes
+    assert "用户已确认" not in notes
+
+
+def test_metric_card_single_row_null_value_is_empty_not_the_string_null() -> None:
+    """单行输入的值本身是 null → 指标卡的值留空（``None``），不是字符串 ``"null"``。"""
+    payloads = build_user_json_payloads(
+        definition=_metric_card(),
+        rows=[{"ts": "2024-01-01", "device": "A", "energy": None}],
+        combination=_combination(_mapping()),
+    )
+    card = payloads["region_1"]
+    assert card["value"] is None
+    assert card["metrics"][0]["value"] is None
+    notes = " ".join(card["notes"])
+    assert "没有值可显示" in notes
+    assert "按输入值直接展示" not in notes
+
+
+def test_metric_card_note_follows_the_actual_rule_not_always_ratio() -> None:
+    """说明文字按**实际规则**说：求和口径不许被写成「占比」。
+
+    形状：一条求和规则，但处理结果的形状认不出「这个指标的单一数值」
+    （规则目标与指标映射的字段不是同一个）→ 落到「不是一个单独的数值」
+    那一支。那一支的措辞必须按 operation 说，不能一律说成「占比」。
+    """
+    rows = [dict(row, power=1.0) for row in _ROWS]
+    payloads = build_user_json_payloads(
+        definition=_metric_card(),
+        rows=rows,
+        combination=_combination(
+            _mapping(),
+            [
+                _rule(
+                    "SUM",
+                    column_id="power",
+                    target="power",
+                    params={"valueField": "energy"},
+                )
+            ],
+        ),
+    )
+    card = payloads["region_1"]
+    assert card["value"] is None
+    notes = " ".join(card["notes"])
+    assert "算不出一个单独的数值" in notes
+    # 求和口径不许被说成占比，也不许说成「用户已确认」。
+    assert "占比" not in notes
+    assert "用户已确认" not in notes
 
 
 # --------------------------------------------------------------------------
