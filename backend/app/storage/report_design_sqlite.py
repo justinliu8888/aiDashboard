@@ -71,21 +71,35 @@ _MAX_ERROR_LENGTH = 2000
 # 中文异常消息一样可能带用户数据。查表是确定的：库里只可能出现下面
 # 这些我们自己写的文案。
 _SAFE_ERROR_MESSAGES: dict[str, str] = {
+    # 存储层自己产生的
     "revision_conflict": "操作基于的版本已经变了，请重新发起一次。",
+    # 模板设计阶段
     "TEMPLATE_REVISION_CONFLICT": "模板已经变了，请重新确认一次。",
     "TEMPLATE_CONFIRM_FAILED": "这次模板没有确认成功，请重试。",
     "TEMPLATE_BUILD_FAILED": "这次草稿没有生成出来，请重试。",
     "TEMPLATE_COMMIT_REJECTED": "这次草稿没有通过校验，请调整后重试。",
     "TEMPLATE_COMMIT_FAILED": "这次草稿没有保存下来，请重试。",
+    # 方案设计阶段
+    "MODEL_CALL_FAILED": "这次方案没有生成出来，请重试。",
+    "MODEL_OUTPUT_INVALID": "这次生成的方案无法识别，请重试。",
+    "UNSAFE_CONTENT": "这次生成的方案含不合适的内容，请重试。",
     "PLAN_MODEL_FAILED": "这次方案没有生成出来，请重试。",
     "PLAN_OUTPUT_INVALID": "这次生成的方案无法识别，请重试。",
+    "PLAN_ERROR": "这次生成的方案没有通过校验，请修改后重试。",
     "PLAN_INVALID_STRUCTURE": "这次生成的方案没有通过校验，请修改后重试。",
+    "PLAN_CANDIDATE_INVALID": "这次生成的方案没有通过校验，请修改后重试。",
+    "PLAN_PREVIOUS_INVALID": "上一版方案无法作为基础，请重新发起。",
     "PLAN_COLUMNS_UNRESOLVED": "这次没能确定表格要展示哪些栏目，请重试。",
     "PLAN_COMPONENT_TYPE_INVALID": "方案里的组件类型不被支持，请修改后重试。",
     "PLAN_COMMIT_REJECTED": "这次方案没有通过校验，请调整后重试。",
     "PLAN_COMMIT_FAILED": "这次方案没有保存下来，请重试。",
+    "PLAN_REVISION_CONFLICT": "方案版本已经变了，请重新确认一次。",
     "PLAN_CLARIFICATION_EMPTY": "这次澄清的内容是空的，请再说一遍。",
     "PLAN_CLARIFICATION_FAILED": "这次澄清没有提交成功，请重试。",
+    "PLAN_OPERATION_KEY_MISSING": "这次操作没有完成，请重试。",
+    "PLAN_CLAIM_FAILED": "这次操作没有完成，请重试。",
+    "PLAN_NOT_AVAILABLE": "方案还没准备好，请稍后重试。",
+    "model_timeout": "模型调用超时，请重试。",
 }
 
 # 错误码查不到时用的通用文案。
