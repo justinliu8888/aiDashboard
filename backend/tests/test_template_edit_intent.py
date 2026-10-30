@@ -469,8 +469,17 @@ def test_clarification_quota_is_one_round_per_item(post_chat, definition):
 
 
 def test_out_of_catalog_add_does_not_produce_a_plan(post_chat, definition):
-    """目录外新增不静默映射到已有指标，也不产生待接受计划。"""
+    """目录外新增不静默映射到已有指标，也不产生待接受计划。
+
+    这一轮被意图门分流到**通用路径**（不是确定性编辑快路）：
+    通用模拟策略由来源模式那一票（#59）接上。
+    """
     payload = _post(post_chat, definition, "新增一个设备温度指标")
 
     assert payload["domainObjects"]["pendingEditPlan"] is None
+    assert payload["domainObjects"]["changeSet"] is None
     assert definition.metadata["revision"] == 0
+    assert (
+        payload["debug"]["contextEngineIntent"]
+        == UserIntent.OUT_OF_CATALOG_ADD.value
+    )

@@ -64,7 +64,7 @@ from app.services.report_design_service import (
     placeholder_reply,
     report_design_service,
 )
-from app.services.report_issue_analysis import analyze_region
+from app.services.report_issue_analysis import IssueAnalysis, analyze_region
 # 判定与兜底策略放在 query_answer_service（回答文本策略的家）。
 from app.services.query_answer_service import (
     claims_live_progress,
@@ -1017,11 +1017,15 @@ class AgentService:
         if request.state == AgentState.USER_EDITING_TEMPLATE and isinstance(
             self._agent, FakeReportAgent
         ):
-            return self._edit_notice(
+            notice = self._edit_notice(
                 request,
                 "当前模型不可用，无法查证这项编辑问题；草稿没有变化，请稍后重试。",
                 code="EDIT_VERIFICATION_UNAVAILABLE",
             )
+            # 工单 #58：把这一轮判出的意图带进调试信息，观测时能看出
+            # 「目录外新增」这类请求是被意图门分流到通用路径的。
+            notice.debug = {**self._build_debug(route), **(notice.debug or {})}
+            return notice
 
         handle = getattr(self._agent, "ahandle", None)
         agent_started = perf_counter()
@@ -1703,7 +1707,9 @@ class AgentService:
         """
         try:
             _, record = preview_service.run_preview(
-                definitionId=str((definition.metadata or {}).get("name") or "definition"),
+                definitionId=str(
+                    (definition.metadata or {}).get("name") or "current_definition"
+                ),
                 definitionDraft=definition.model_dump(mode="json"),
             )
         except Exception:  # noqa: BLE001
@@ -1754,7 +1760,7 @@ class AgentService:
         return self._issue_analysis_response(request, analysis)
 
     def _issue_analysis_response(
-        self, request: AgentRequest, analysis: Any
+        self, request: AgentRequest, analysis: IssueAnalysis
     ) -> AgentResponse:
         """把问题分析收敛成「不推进业务」的只读回答。"""
         reply = analysis.summary
