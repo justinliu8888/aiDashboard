@@ -392,7 +392,7 @@ action 只能是 DIRECT_REPLY 或 DEEP_ROUTE。
 输出 JSON：
 {
   "action": "DIRECT_REPLY" 或 "DEEP_ROUTE",
-  "userIntent": "上面 9 个枚举值之一",
+  "userIntent": "上面 11 个枚举值之一",
   "reply": "如果 DIRECT_REPLY，填自然回复；否则空字符串",
   "reason": "简短原因",
   "confidence": 0.0 到 1.0

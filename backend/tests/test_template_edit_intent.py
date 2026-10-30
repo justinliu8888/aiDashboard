@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from app.schemas.agent import AgentState
@@ -101,6 +103,22 @@ def test_model_layer_prompts_know_the_two_new_intents():
     assert "ISSUE_FEEDBACK" in ce._SYSTEM_PROMPT
     assert "OUT_OF_CATALOG_ADD" in ce._SYSTEM_PROMPT
     assert "ISSUE_FEEDBACK" in ce._CONCIERGE_PROMPT
+
+
+def test_prompt_enum_count_matches_the_enum():
+    """提示词里写死的枚举个数必须与实际枚举一致。
+
+    #58 加了两个新意图，把「11 个值」改了一半 —— JSON 输出模板里还写着
+    「上面 9 个枚举值之一」。发给模型的文本自相矛盾，可能让模型漏掉新意图。
+    """
+    from app.services import context_engine as ce
+
+    count = len(UserIntent)
+    assert count == 11, "既有九类 + 本轮新增两类 = 11"
+
+    # 提示词里出现的枚举个数必须只有一个，而且等于实际枚举个数。
+    claimed = set(re.findall(r"(\d+)\s*个(?:值|枚举值)", ce._CONCIERGE_PROMPT))
+    assert claimed == {str(count)}, f"提示词里的枚举个数与实际不符：{claimed}"
 
 
 def test_coerce_intent_maps_new_aliases():
