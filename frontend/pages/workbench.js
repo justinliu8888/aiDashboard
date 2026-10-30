@@ -2977,6 +2977,9 @@ function buildTotalsByUnit(regions) {
     if (region?.componentType !== "METRIC_CARD") continue;
     const p = region.payload || {};
     const unit = String(p.unit || "").trim();
+    // 没有值就是没有值：null / 空串**不是 0**（Number(null) === 0 会把
+    // 「不知道」说成「零」）。指标卡没值 → 这一格不参与总量。
+    if (p.value == null || p.value === "") continue;
     const value = Number(p.value);
     if (!unit || !Number.isFinite(value)) continue;
     if (!totals.has(unit)) totals.set(unit, value);
@@ -3027,6 +3030,21 @@ function readTableTruncation(payload, defRegion, totalsByUnit) {
   }
   if (declaredTotal != null && declaredTotal > rows.length) {
     return { truncated: true, shown: rows.length, limit: topN ?? rows.length, total: declaredTotal };
+  }
+  // JSON 模式（契约表 §4.3）：载荷自己报「总共几行、这一块显示了几行」。
+  // recordCount > displayedRows 就是明细表被截断了 —— 这一条与定义侧的
+  // topN 无关，也**不看行和**（JSON 模式的汇总是按全部行算的，
+  // 行和不是这里的判据；拿行和反推反而会漏判）。
+  const recordCount = Number(p.recordCount);
+  const displayedRows = Number(p.displayedRows);
+  if (Number.isFinite(recordCount) && Number.isFinite(displayedRows) && recordCount > displayedRows) {
+    return {
+      truncated: true,
+      shown: displayedRows,
+      limit: displayedRows,
+      total: recordCount,
+      source: "json",
+    };
   }
   if (topN == null || rows.length < topN || !totalsByUnit) return null;
 
@@ -3219,6 +3237,73 @@ function mentionsSourceClaim(reason) {
   return text.includes("模拟业务数据") || text.includes("模拟示例") || text.includes("接入真实数据");
 }
 
+/**
+ * JSON 模式的数据问题（契约表 §2）：`metadata.jsonInputIssues`
+ * = `{unmappedColumns, dataIssues}` —— 「哪些列没绑上」「数据里有哪些问题」。
+ *
+ * 契约表 §2 写明它「供界面把话说清楚」，所以要端到屏上。
+ * 服务端写好的事实，前端只把结构摆出来，**不改写、不总结**
+ * （契约表 §8 不变量 8：宁可少说，不许说假话）：
+ * 未绑定列的 `reason`、数据问题的原文都逐字照搬。
+ *
+ * 注意：未绑定列的「（未绑定）」是写在**单元格值**里的，表格那边本来就画得出来；
+ * 这里补的是「哪一列、为什么没绑上」这一层，不重复画单元格。
+ *
+ * 只依赖 `esc`（与页面其它地方同一把转义函数）—— 会被单测抽进沙箱跑。
+ */
+function renderJsonInputIssuesHtml(definition) {
+  const issues = definition?.metadata?.jsonInputIssues;
+  if (!issues || typeof issues !== "object") return "";
+  const regionNameOf = (regionId) => {
+    const hit = (definition?.regions || []).find(
+      (item) => String(item?.id || "") === String(regionId || "")
+    );
+    return String(hit?.name || "").trim();
+  };
+
+  const unmappedLines = [];
+  for (const item of Array.isArray(issues.unmappedColumns) ? issues.unmappedColumns : []) {
+    if (item == null) continue;
+    if (typeof item === "string") {
+      const text = String(item).trim();
+      if (text) unmappedLines.push(text);
+      continue;
+    }
+    const label = String(item.label || item.columnId || "").trim();
+    const reason = String(item.reason || "").trim();
+    if (!label && !reason) continue;
+    const regionName = regionNameOf(item.regionId);
+    const where = regionName ? `（${regionName}）` : "";
+    unmappedLines.push(`「${label}」${where}${reason ? "——" + reason : ""}`);
+  }
+
+  const dataLines = [];
+  for (const item of Array.isArray(issues.dataIssues) ? issues.dataIssues : []) {
+    const text = String(item == null ? "" : item).trim();
+    if (text) dataLines.push(text);
+  }
+
+  const blocks = [];
+  if (unmappedLines.length) {
+    blocks.push(
+      `<div>以下栏目没能绑定到输入字段：</div>` +
+      unmappedLines.map((line) => `<div>· ${esc(line)}</div>`).join("")
+    );
+  }
+  if (dataLines.length) {
+    blocks.push(
+      `<div>数据里的问题：</div>` +
+      dataLines.map((line) => `<div>· ${esc(line)}</div>`).join("")
+    );
+  }
+  if (!blocks.length) return "";
+
+  return `
+    <div class="mt-3 text-[11px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5" data-json-input-issues="true">
+      ${blocks.join("")}
+    </div>`;
+}
+
 /** 面板顶部：报表名 + 一行来源说明（按来源模式说）。 */
 function renderPanelHeader(definition, payload, regionCount) {
   const header = document.createElement("div");
@@ -3253,6 +3338,7 @@ function renderPanelHeader(definition, payload, regionCount) {
       ${sourceNote}
     </div>
     ` : ""}
+    ${renderJsonInputIssuesHtml(definition)}
   `;
 
   const nameEl = header.querySelector(".report-name");
@@ -3351,6 +3437,31 @@ function renderRegionCard(region, definition, payload, totalsByUnit) {
       <div class="rounded-lg bg-rose-50 border border-rose-200 p-3 text-xs text-rose-700">
         这个板块渲染失败：${esc(err?.message || String(err))}。其余板块和后续流程不受影响。
       </div>`;
+  }
+
+  // 载荷自带的说明文字（JSON 模式：契约表 §4.3 的 `payload.notes`）。
+  //
+  // 服务端把「共 N 行，已显示前 200 行；汇总计算仍按全部 N 行。」、
+  // 「这个指标没能绑定到输入字段，没有编值。」这类**实话**写在了载荷里；
+  // 前端只把原文端出来 —— 不改写、不总结、不自己编
+  // （契约表 §8 不变量 8：宁可少说，不许说假话）。
+  //
+  // 样式沿用页面既有的说明文字（与「能力待接通」那条同一个色板），不新造一套。
+  const rawNotes = Array.isArray(p.notes) ? p.notes : (p.notes == null ? [] : [p.notes]);
+  const payloadNotes = rawNotes
+    .map((item) => String(item == null ? "" : item).trim())
+    .filter(Boolean);
+  if (payloadNotes.length) {
+    const noteBox = document.createElement("div");
+    noteBox.className =
+      "region-payload-notes text-[11px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-2";
+    noteBox.dataset.regionPayloadNotes = "true";
+    for (const line of payloadNotes) {
+      const lineEl = document.createElement("div");
+      lineEl.textContent = line;
+      noteBox.appendChild(lineEl);
+    }
+    body.appendChild(noteBox);
   }
 
   // 「能力待接通 / 不在授权范围」：角标之外额外写明哪些指标还没接通、为什么。
@@ -3479,8 +3590,16 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
 
     // 行被截断时必须说清楚：不然「各行之和 ≠ 报表总量」会变成用户眼里的矛盾。
     const truncation = readTableTruncation(p, ctx.defRegion, ctx.totalsByUnit);
+    // 截断的原因按「判据从哪来」说：
+    //   - 定义侧（模拟模式）：行数被截断，行和因此小于报表总量；
+    //   - JSON 模式：明细表最多显示 200 行（契约表 §4.3），行数本身就被截断了
+    //     （汇总仍按全部行算，行和不是这里的判据）。
+    // 两条**共用同一条提示条**（data-table-truncated），不另造一条。
+    const truncationReason = truncation?.source === "json"
+      ? `共 ${truncation.total} 行，表格行数被截断`
+      : "表格行数被截断，各行之和小于报表总量";
     const truncationNote = truncation
-      ? `<div class="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-2" data-table-truncated="true">仅显示前 ${truncation.limit} 行（表格行数被截断，各行之和小于报表总量）</div>`
+      ? `<div class="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-2" data-table-truncated="true">仅显示前 ${truncation.limit} 行（${truncationReason}）</div>`
       : "";
 
     container.innerHTML = `

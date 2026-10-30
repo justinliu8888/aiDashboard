@@ -90,6 +90,7 @@
       "url": "http://127.0.0.1:8166/frontend/pages/workbench.html",
       "continueOnError": false,
       "steps": [
+        { "waitFor": "#btn-json-paste" },
         { "eval": "document.getElementById('btn-json-paste').innerText.includes('粘贴 JSON 数据')" },
         { "eval": "document.getElementById('json-paste-panel').classList.contains('hidden') === true" },
         { "eval": "document.body.innerText.includes('未经业务核验') === false" },
