@@ -439,6 +439,11 @@ def _extract_json_object(text: str) -> dict[str, Any]:
             parsed=json_value,
         )
 
+    # 选一个**最有指向性**的位置：
+    # - 原文整体不是 JSON（错误停在最前面）而扫描找到了对象起点 → 用对象起点；
+    # - 否则用解析器放弃的那个位置（截断时正好指向末尾）。
+    if error is not None and scan_error is not None and error.pos < scan_error.pos:
+        error = scan_error
     raise _InvalidOutput(
         "模型输出不是 JSON 对象",
         parse_status=PARSE_NOT_JSON,
@@ -478,6 +483,7 @@ def _scan_json_object(text: str) -> tuple[dict[str, Any] | None, json.JSONDecode
     """在自由文本里扫描第一个配平的 JSON 对象。
 
     返回 ``(对象, 解析错误)``；错误里的偏移已换算回**原文**。
+    找到 ``{`` 却一直没闭合时，错误指向**这个对象的起点**。
     """
     start = text.find("{")
     if start < 0:
@@ -509,7 +515,8 @@ def _scan_json_object(text: str) -> tuple[dict[str, Any] | None, json.JSONDecode
                 except ValueError:
                     return None, None
                 return (parsed if isinstance(parsed, dict) else None), None
-    return None, None
+    # 扫到结尾也没闭合：对象从 start 开始就没写完。
+    return None, json.JSONDecodeError("JSON 对象没有闭合", text, start)
 
 
 #: 候选里不允许出现的顶层字段：提交 ID 和版本由服务端分配，模型不能自己给。

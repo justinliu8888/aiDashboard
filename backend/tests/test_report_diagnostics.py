@@ -349,6 +349,27 @@ def test_json_error_position_is_recorded(caplog, diagnostics_dir) -> None:
     assert record["jsonColumn"] is not None
 
 
+def test_json_error_position_points_at_the_broken_object(diagnostics_dir) -> None:
+    """输出前面带说明文字时，位置指向 JSON 对象的起点，不是整段的开头。"""
+    text = "这是说明\n```json\n{\n  \"kind\": \"plan_candidate\"\n```"
+
+    asyncio.run(
+        generate_candidate(
+            message="生成报表",
+            current_plan=None,
+            history=[],
+            model_call=_model_returning(text),
+        )
+    )
+
+    record = _read_records(diagnostics_dir)[0]
+    assert record["parseStatus"] == "PARSE_NOT_JSON"
+    # 指向第 3 行第 1 列：代码块里那个没写完的对象。
+    assert record["jsonLine"] == 3
+    assert record["jsonColumn"] == 1
+    assert text[record["jsonOffset"] : record["jsonOffset"] + 1] == "{"
+
+
 # --------------------------------------------------------------------------
 # AC5：三个事件分别记录；不声称 final 已被客户端接收
 # --------------------------------------------------------------------------
