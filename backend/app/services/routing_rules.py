@@ -969,6 +969,62 @@ _RE_ISSUE_POINT_COUNT = re.compile(
     r"(?:\d+|[一二三四五六七八九十两])\s*个?\s*(?:数据)?点(?!级|位)"
 )
 
+#: 「对当前结果不满」的**评价性形容词**（痛点词）。
+#:
+#: 固定词表（``_ISSUE_FEEDBACK_MARKERS``）只登记了「好丑」「看不懂」这类**直接**
+#: 说辞；「颜色太扎眼了」「趋势太单调了」这种带**程度副词**的抱怨不在词表里，
+#: 会被判成 ``UNKNOWN`` → 掉进编辑快路（工单 #58 独立验收的 P3 缺口）。
+#:
+#: 这里补的是**结构性特征**：程度副词 + 评价性形容词、否定式体验说法。
+#: 句子不必逐条登记 —— 配上「没有改动动词、没有疑问标记」就能判出来。
+#:
+#: 只收**负面**评价词。「好看」「漂亮」「不错」这类正面评价不在这里：
+#: 它们不是「问题反馈」，也不是修改指令，交给别的层判。
+_ISSUE_FEEDBACK_ADJECTIVES: tuple[str, ...] = (
+    # 观感
+    "扎眼", "刺眼", "晃眼", "单调", "难看", "不好看", "模糊", "潦草",
+    "拥挤", "简陋", "粗糙", "做作", "磨叽", "花哨",
+    # 可读性
+    "费劲", "费眼", "费力", "难懂", "难用", "费解", "迷惑", "冗长",
+    "冗余", "累赘", "空洞", "没用", "无意义", "不清晰", "不直观",
+    # 体验
+    "不友好", "不专业", "反直觉", "头疼", "尴尬", "糟心", "不适应",
+    "不舒服", "不方便", "别扭",
+    # 数值观感
+    "太大", "太小", "太多", "太少", "偏高", "偏低", "过长", "过短",
+    # 单字评价词：只在「程度副词 + 单字」或「单字 + 了」这两种形状里用
+    "丑", "挤", "糊", "差", "糟", "烂", "乱", "密", "闷", "晕", "烦", "累",
+)
+
+#: 抱怨句里最常见的**程度副词**（「太 X 了」「很 X」「有点 X」）。
+_ISSUE_DEGREE_WORDS: tuple[str, ...] = (
+    "有点", "有些", "过于", "非常", "特别", "格外", "相当", "十分",
+    "极其", "略微", "完全", "太", "很", "极", "挺", "真", "巨", "超",
+)
+
+#: 否定式体验说法：说不清哪里不好，但明确表示「用不下去 / 看不明白」。
+_ISSUE_NEGATIVE_USE: tuple[str, ...] = (
+    "看不下去", "看不下", "没法看", "没法用", "不能看", "用不了",
+    "不好用", "搞不懂", "看不明白", "受不了", "忍不了",
+)
+
+
+def _alternation(words: tuple[str, ...]) -> str:
+    """把一组词拼成正则分支（长的排前面，避免「太大」被「太」抢先匹配）。"""
+    return "|".join(re.escape(word) for word in sorted(words, key=len, reverse=True))
+
+
+_ISSUE_ADJ_PATTERN = _alternation(_ISSUE_FEEDBACK_ADJECTIVES)
+_ISSUE_DEGREE_PATTERN = _alternation(_ISSUE_DEGREE_WORDS)
+
+#: 「程度副词 + 评价性形容词」：「太扎眼了」「很费劲」「有点糊」。
+_RE_ISSUE_DEGREE_ADJ = re.compile(
+    rf"(?:{_ISSUE_DEGREE_PATTERN})\s*(?:地)?\s*(?:{_ISSUE_ADJ_PATTERN})"
+)
+
+#: 「评价性形容词 + 了」：「单调了」「难用了」。
+_RE_ISSUE_ADJ_DONE = re.compile(rf"(?:{_ISSUE_ADJ_PATTERN})了")
+
 #: 「加一个 / 新增」这类新增请求的说法。
 _ADD_REQUEST_WORDS: tuple[str, ...] = (
     "加一个", "加个", "再加一个", "再加个", "新增", "增加", "添加",
@@ -976,11 +1032,35 @@ _ADD_REQUEST_WORDS: tuple[str, ...] = (
 )
 
 
+def _has_structural_complaint(text: str) -> bool:
+    """句子的**形状**像不像「对当前结果不满」。
+
+    固定词表认不出的抱怨句（「颜色太扎眼了」「一眼看过去很费劲」）
+    用形状来认（工单 #58 独立验收的 P3 缺口）：
+
+    1. 「程度副词 + 评价性形容词」——「太扎眼了」「很费劲」「有点糊」；
+    2. 「评价性形容词 + 了」——「单调了」「难用了」；
+    3. 否定式体验说法——「看不下去」「没法看」。
+
+    带**疑问标记**的句子不在这里当抱怨吞掉：它更可能是提问，
+    交给 :func:`is_readonly_question` 那一层判。
+    """
+    if any(marker in text for marker in _QUESTION_MARKERS):
+        return False
+    if any(word in text for word in _ISSUE_NEGATIVE_USE):
+        return True
+    if _RE_ISSUE_DEGREE_ADJ.search(text):
+        return True
+    return bool(_RE_ISSUE_ADJ_DONE.search(text))
+
+
 def _has_issue_marker(text: str) -> bool:
     """句子里有没有「对当前结果不满」的信号。"""
     if any(marker in text for marker in _ISSUE_FEEDBACK_MARKERS):
         return True
-    return bool(_RE_ISSUE_POINT_COUNT.search(text))
+    if _RE_ISSUE_POINT_COUNT.search(text):
+        return True
+    return _has_structural_complaint(text)
 
 
 def detect_issue_feedback(message: str, *, subject_required: bool = True) -> bool:
@@ -994,7 +1074,9 @@ def detect_issue_feedback(message: str, *, subject_required: bool = True) -> boo
 
         1. 不是生成请求；
         2. 没有明确改动动词（带改动动词的仍然是明确修改）；
-        3. 有「不满 / 数量异常」的表达；
+        3. 有「不满 / 数量异常」的表达 —— 固定词表，或者
+           :func:`_has_structural_complaint` 认出来的**结构特征**
+           （程度副词 + 评价性形容词等）；
         4. 指向报表业务对象 —— ``subject_required=False`` 时跳过，
            因为编辑态里「对象」就是当前这张草稿（规格第 51 条）。
     """
@@ -1215,3 +1297,106 @@ def resolve_include_trend(slots: dict[str, Any]) -> bool:
     if "trend" in excluded:
         return False
     return True
+
+
+# --------------------------------------------------------------------------
+# 用户 JSON 输入（工单 #64）
+# --------------------------------------------------------------------------
+
+
+#: 数组位置标记行。用户在消息里写明记录数组在报文里的位置
+#: （规格第 31 条），服务端按它取数组，不自己挑。
+_ARRAY_PATH_MARKER = re.compile(
+    r"^\s*(?:@arrayPath|arrayPath|数组位置)\s*[:：]\s*(?P<path>[^\s]+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_array_path(message: str) -> str | None:
+    """从消息里取「数组位置」标记。
+
+    约定：单独一行写成 ``数组位置: data.records`` 或 ``@arrayPath data.records``。
+    没有这一行 → ``None``（服务端按「顶层数组」或「唯一数组」处理）。
+    """
+    match = _ARRAY_PATH_MARKER.search(message or "")
+    if not match:
+        return None
+    path = match.group("path").strip()
+    return path or None
+
+
+def _scan_json_span(text: str, start: int) -> tuple[str, bool]:
+    """从 ``start`` 开始扫一段 JSON，返回 ``(片段, 是否闭合)``。
+
+    括号计数**跳过字符串字面量**：JSON 里的 ``]``、``{`` 可能在字符串里。
+    """
+    pairs = {"[": "]", "{": "}"}
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+            continue
+        if char in ("]", "}"):
+            if not stack or stack[-1] != char:
+                return text[start : index + 1], True
+            stack.pop()
+            if not stack:
+                return text[start : index + 1], True
+    return text[start:], False
+
+
+def _looks_like_json(fragment: str) -> bool:
+    """这段文字像不像一份 JSON 数据。
+
+    判据保守：必须以 ``[`` / ``{`` 开头，**并且**含引号 ——
+    ``[重要]``、``[1, 2]`` 这种不是记录数据，不该被当成 JSON 输入。
+    宁可漏判（当成普通消息），不可误判（把一句中文报成语法错）。
+    """
+    text = fragment.strip()
+    if not text or text[0] not in "[{":
+        return False
+    return '"' in text
+
+
+def detect_json_payload(message: str) -> str | None:
+    """从一条聊天消息里找出用户贴的 JSON 数据段。
+
+    返回**原文片段**（调用方负责校验与存储）；没有 JSON 段时返回 ``None``。
+
+    宁可漏判不可误判：普通中文消息里带方括号的，不当成 JSON 输入。
+    """
+    text = message or ""
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        fragment, _closed = _scan_json_span(text, index)
+        if _looks_like_json(fragment):
+            return fragment
+    return None
+
+
+def strip_json_payload(message: str) -> str:
+    """把消息里的 JSON 段去掉，只留人话部分。
+
+    用于**聊天消息只保存安全摘要与引用**（规格第 21 条）：
+    落库的用户消息里不留完整数组。
+    """
+    fragment = detect_json_payload(message)
+    if not fragment:
+        return (message or "").strip()
+    text = message.replace(fragment, " ")
+    return re.sub(r"\s{2,}", " ", text).strip()

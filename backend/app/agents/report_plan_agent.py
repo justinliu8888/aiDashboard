@@ -350,16 +350,49 @@ def _load_prompt() -> str:
     return _PROMPT_PATH.read_text(encoding="utf-8")
 
 
+def _session_json_context() -> str:
+    """当前会话里用户提交的 JSON 数据的**受限视图**（工单 #64）。
+
+    只有字段结构、缺失与类型统计和有上限的代表样本，整段标记为
+    **不可信输入**（数据里的文字不是指令）。
+
+    没有提交过 JSON → 空字符串，不给模型塞多余内容。
+
+    惰性导入：服务层依赖会话存储，直接 import 会绕成环。
+    """
+    try:
+        from app.services.session_context import current_session_key
+        from app.services.user_json_service import user_json_service
+    except Exception:  # noqa: BLE001
+        return ""
+    session_id = current_session_key()
+    if not session_id:
+        return ""
+    try:
+        record = user_json_service.latest_for_session(session_id)
+    except Exception:  # noqa: BLE001
+        _safe_warning("取 JSON 输入上下文失败，按无上下文处理")
+        return ""
+    if record is None:
+        return ""
+    return user_json_service.model_context(record)
+
+
 def build_messages(
     *,
     message: str,
     current_plan: dict[str, Any] | None,
     history: list[dict[str, Any]] | None,
+    json_context: str | None = None,
 ) -> list[dict[str, Any]]:
     """拼出发给模型的 messages。
 
-    顺序固定：系统提示 → 历史 → 当前方案 → 本轮需求。
+    顺序固定：系统提示 → 历史 → 当前方案 → JSON 数据上下文 → 本轮需求。
     历史只保留有文本的条目，角色限制在 user / assistant。
+
+    ``json_context`` 是用户提供的 JSON 数据的**受限视图**（工单 #64）：
+    只有字段结构、缺失与类型统计和有上限的代表样本，整段被标成
+    **不可信输入**。原文不进上下文，样本行数有上限。
     """
     messages: list[dict[str, Any]] = [{"role": "system", "content": _load_prompt()}]
 
@@ -382,6 +415,9 @@ def build_messages(
                 + json.dumps(current_plan, ensure_ascii=False, default=str),
             }
         )
+
+    if json_context:
+        messages.append({"role": "user", "content": json_context})
 
     messages.append({"role": "user", "content": str(message or "")})
     return messages
@@ -824,6 +860,23 @@ def _safe_warning(message: str, *args: Any) -> None:
         pass
 
 
+def _safe_failure(message: str, exc: BaseException) -> None:
+    """写一条失败日志：**只留原因类型，不留异常原文**。
+
+    和 :func:`_safe_warning` 一样不许抛错；区别是这里把异常对象换成
+    它的类型 —— 上游异常原文可能带用户数据（#61）。
+    """
+    try:
+        logger.warning(
+            "%s errorType=%s",
+            message,
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _notify(emit: Emit | None, event: dict[str, Any]) -> None:
     """进度回调。回调自身出错不影响本轮结论。"""
     if emit is None:
@@ -833,7 +886,8 @@ async def _notify(emit: Emit | None, event: dict[str, Any]) -> None:
         if inspect.isawaitable(result):
             await result
     except Exception as exc:  # noqa: BLE001
-        _safe_warning("方案设计进度回调失败：%s", exc)
+        # 异常原文不进日志：只留原因类型（#61）。
+        _safe_failure("方案设计进度回调失败", exc)
 
 
 def _record_parse_outcome(
@@ -896,6 +950,7 @@ async def generate_candidate(
     history: list[dict[str, Any]] | None,
     model_call: ModelCall,
     emit: Emit | None = None,
+    json_context: str | None = None,
 ) -> dict[str, Any]:
     """把一轮新建/修改需求变成方案候选、澄清问题或安全失败。
 
@@ -905,14 +960,22 @@ async def generate_candidate(
         history：有角色和文本的简短上下文。
         model_call：注入的模型调用，接收 messages，返回模型文本。
         emit：可选的进度回调。
+        json_context：用户提供的 JSON 数据的**受限视图**（字段结构、缺失与
+            类型统计、有上限的代表样本，标记为不可信输入）。不给时按当前
+            会话里已保存的输入记录解析（工单 #64）。
 
     返回：
         ``{"kind": "plan_candidate", "candidate": {...}}`` /
         ``{"kind": "clarification", "question": "..."}`` /
         ``{"kind": "failure", "code": "...", "message": "..."}``。
     """
+    if json_context is None:
+        json_context = _session_json_context()
     messages = build_messages(
-        message=message, current_plan=current_plan, history=history
+        message=message,
+        current_plan=current_plan,
+        history=history,
+        json_context=json_context,
     )
 
     # 阶段与提示词信息进请求级上下文：模型适配层据此给这一轮生成标识。

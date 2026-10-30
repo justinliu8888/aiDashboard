@@ -27,6 +27,14 @@ from app.schemas.agent import AgentRequest, AgentState
 from app.schemas.edit_plan import EditIntent, EditPlan
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.services import routing_rules
+from app.services.report_log_safety import (
+    capped_reason,
+    log_failure,
+    log_info,
+    log_warning,
+    model_text_shape,
+    safe_reason,
+)
 from app.services.request_timeline import log_timeline_step
 from app.services.scope_service import authorized_subject_ids
 
@@ -262,9 +270,13 @@ class ConciergeDecision(BaseModel):
             original = normalized["userIntent"]
             coerced = coerce_intent(original)
             if coerced is not original:
-                logger.warning(
-                    "[context_engine] concierge intent 归一化：%r -> %s",
-                    original,
+                # 模型给的原始取值可能夹带用户数据，日志里只留它的类型与长度。
+                log_info(
+                    logger,
+                    "[context_engine] concierge intent 归一化：originalType=%s "
+                    "originalLength=%d -> %s",
+                    type(original).__name__,
+                    len(str(original)),
                     coerced.value,
                 )
             normalized["userIntent"] = coerced
@@ -392,7 +404,7 @@ action 只能是 DIRECT_REPLY 或 DEEP_ROUTE。
 输出 JSON：
 {
   "action": "DIRECT_REPLY" 或 "DEEP_ROUTE",
-  "userIntent": "上面 9 个枚举值之一",
+  "userIntent": "上面 11 个枚举值之一",
   "reply": "如果 DIRECT_REPLY，填自然回复；否则空字符串",
   "reason": "简短原因",
   "confidence": 0.0 到 1.0
@@ -609,7 +621,7 @@ class ContextEngine:
             })
             return candidate, "semantic"
         except Exception as exc:  # noqa: BLE001
-            logger.warning("编辑语义兜底未通过，保留规则追问：%s", exc)
+            log_failure(logger, "编辑语义兜底未通过，保留规则追问", exc)
             await _emit(emit, "stage", {
                 "stage": "template_edit_semantic_fallback",
                 "reason": type(exc).__name__,
@@ -687,11 +699,14 @@ class ContextEngine:
                 "message": request.message,
             },
         )
-        logger.info(
-            "[context_engine] step=route_start conversationId=%s state=%s message=%r concierge_timeout=%ss router_timeout=%ss",
+        # 只记长度，不记用户原话（#61：常规日志里不留用户原话）。
+        log_info(
+            logger,
+            "[context_engine] step=route_start conversationId=%s state=%s "
+            "messageLength=%d concierge_timeout=%ss router_timeout=%ss",
             request.conversationId,
             request.state.value,
-            request.message,
+            len(request.message or ""),
             self._settings.volc_context_concierge_timeout,
             self._settings.volc_context_router_timeout,
         )
@@ -711,11 +726,14 @@ class ContextEngine:
                     "reason": blocked.reason,
                 },
             )
-            logger.info(
-                "[context_engine] step=rule_block conversationId=%s code=%s reason=%r elapsed_total_ms=%.1f",
+            # 规则阻断的原因是我们自己写的固定文案：按上限截断后保留。
+            log_info(
+                logger,
+                "[context_engine] step=rule_block conversationId=%s code=%s "
+                "reason=%s elapsed_total_ms=%.1f",
                 request.conversationId,
                 blocked.blockCode,
-                blocked.reason,
+                capped_reason(blocked.reason),
                 (perf_counter() - total_started) * 1000,
             )
             return blocked
@@ -730,7 +748,8 @@ class ContextEngine:
         if self._client is None:
             log_timeline_step("fallback_no_client")
             await _emit(emit, "stage", {"stage": "fallback_no_client"})
-            logger.warning(
+            log_warning(
+                logger,
                 "[context_engine] step=fallback_no_client conversationId=%s reason=%s",
                 request.conversationId,
                 "VOLC_API_KEY 未配置",
@@ -759,7 +778,8 @@ class ContextEngine:
                     "reason": concierge.reason,
                 },
             )
-            logger.info(
+            log_info(
+                logger,
                 "[context_engine] step=concierge_skipped conversationId=%s elapsed_total_ms=%.1f",
                 request.conversationId,
                 (perf_counter() - total_started) * 1000,
@@ -780,13 +800,16 @@ class ContextEngine:
                 "reason": concierge.reason,
             },
         )
-        logger.info(
-            "[context_engine] step=concierge_decision conversationId=%s action=%s intent=%s confidence=%.2f reason=%r elapsed_total_ms=%.1f",
+        # reason 是模型自己写的自由文本：只留长度，不留原文（#61）。
+        log_info(
+            logger,
+            "[context_engine] step=concierge_decision conversationId=%s action=%s "
+            "intent=%s confidence=%.2f reasonLength=%d elapsed_total_ms=%.1f",
             request.conversationId,
             concierge.action.value,
             concierge.userIntent.value,
             concierge.confidence,
-            concierge.reason,
+            len(concierge.reason or ""),
             (perf_counter() - total_started) * 1000,
         )
         if concierge.action == ConciergeAction.DIRECT_REPLY and concierge.reply:
@@ -800,7 +823,8 @@ class ContextEngine:
                     "action": concierge.action.value,
                 },
             )
-            logger.info(
+            log_info(
+                logger,
                 "[context_engine] step=route_direct_reply conversationId=%s elapsed_total_ms=%.1f",
                 request.conversationId,
                 (perf_counter() - total_started) * 1000,
@@ -849,7 +873,8 @@ class ContextEngine:
                     },
                 },
             )
-            logger.info(
+            log_info(
+                logger,
                 "[context_engine] step=deep_route_start conversationId=%s model=%s",
                 request.conversationId,
                 self._settings.volc_context_router_model,
@@ -899,15 +924,20 @@ class ContextEngine:
                     },
                 },
             )
-            logger.info(
-                "[context_engine] step=deep_route_done conversationId=%s elapsed_ms=%.1f raw=%r",
+            # 模型返回原文不进常规日志：只留长度与形状级摘要（#61）。
+            log_info(
+                logger,
+                "[context_engine] step=deep_route_done conversationId=%s "
+                "elapsed_ms=%.1f rawLength=%d rawShape=%s",
                 request.conversationId,
                 (perf_counter() - router_started) * 1000,
-                _short(raw),
+                len(raw or ""),
+                model_text_shape(raw),
             )
             decision.engineStage = "deep_route_done"
             decision.isTemplateEdit = _detect_template_edit(request.message, request.state)
-            logger.info(
+            log_info(
+                logger,
                 "[context_engine] step=route_return conversationId=%s elapsed_total_ms=%.1f action=%s intent=%s",
                 request.conversationId,
                 (perf_counter() - total_started) * 1000,
@@ -917,13 +947,14 @@ class ContextEngine:
             return decision
         except Exception as exc:  # noqa: BLE001
             log_timeline_step("deep_route_failed")
+            # 异常原文既不进日志，也不进用户可见的 stage 事件：只留原因类型。
             await _emit(
                 emit,
                 "stage",
-                {"stage": "deep_route_failed", "error": str(exc)},
+                {"stage": "deep_route_failed", "error": safe_reason(exc)},
             )
-            logger.exception("ContextEngine 模型路由失败，走保守兜底：%s", exc)
-            decision = self._fallback_route(request, str(exc))
+            log_failure(logger, "ContextEngine 模型路由失败，走保守兜底", exc)
+            decision = self._fallback_route(request, safe_reason(exc))
             decision.engineStage = "deep_route_failed_fallback"
             decision.isTemplateEdit = _detect_template_edit(request.message, request.state)
             self._resolve_inputs(decision, request, explicit, defaults)
@@ -977,7 +1008,8 @@ class ContextEngine:
             return concierge
         if concierge.userIntent in FACT_DEPENDING_INTENTS:
             # 路由器手里没有草稿 / 进度 / 能力的事实，提前回答只能靠猜。
-            logger.info(
+            log_info(
+                logger,
                 "[context_engine] step=direct_reply_downgraded conversationId=%s intent=%s reason=fact_required",
                 request.conversationId,
                 concierge.userIntent.value,
@@ -997,7 +1029,8 @@ class ContextEngine:
             # 判定口径用规则层的 ``is_readonly_question`` ——
             # 它要求「有疑问标记 + 指向报表业务对象 + 没有明确改动动词」
             # 三条同时成立，普通问候和明确生成请求都排除在外。
-            logger.info(
+            log_info(
+                logger,
                 "[context_engine] step=direct_reply_downgraded conversationId=%s intent=%s reason=readonly_question_needs_facts",
                 request.conversationId,
                 concierge.userIntent.value,
@@ -1013,7 +1046,8 @@ class ContextEngine:
             )
         if concierge.userIntent not in STATE_CHANGING_INTENTS:
             return concierge
-        logger.info(
+        log_info(
+            logger,
             "[context_engine] step=direct_reply_downgraded conversationId=%s intent=%s",
             request.conversationId,
             concierge.userIntent.value,
@@ -1074,7 +1108,8 @@ class ContextEngine:
                 "model": self._settings.volc_context_concierge_model,
             },
         )
-        logger.info(
+        log_info(
+            logger,
             "[context_engine] step=concierge_start conversationId=%s model=%s",
             request.conversationId,
             self._settings.volc_context_concierge_model,
@@ -1101,24 +1136,29 @@ class ContextEngine:
                     "elapsedMs": round((perf_counter() - started) * 1000),
                 },
             )
-            logger.info(
-                "[context_engine] step=concierge_done conversationId=%s elapsed_ms=%.1f raw=%r",
+            # 模型返回原文不进常规日志：只留长度与形状级摘要（#61）。
+            log_info(
+                logger,
+                "[context_engine] step=concierge_done conversationId=%s "
+                "elapsed_ms=%.1f rawLength=%d rawShape=%s",
                 request.conversationId,
                 (perf_counter() - started) * 1000,
-                _short(raw),
+                len(raw or ""),
+                model_text_shape(raw),
             )
             return ConciergeDecision.model_validate(json.loads(raw))
         except Exception as exc:  # noqa: BLE001
             log_timeline_step("concierge_failed")
+            # 异常原文不进用户可见的 stage 事件：只留原因类型。
             await _emit(
                 emit,
                 "stage",
-                {"stage": "concierge_failed", "error": str(exc)},
+                {"stage": "concierge_failed", "error": safe_reason(exc)},
             )
-            logger.warning(
-                "[context_engine] step=concierge_failed conversationId=%s elapsed_ms=%.1f error=%s",
-                request.conversationId,
-                (perf_counter() - started) * 1000,
+            log_failure(
+                logger,
+                "[context_engine] step=concierge_failed conversationId=%s "
+                f"elapsed_ms={(perf_counter() - started) * 1000:.1f}",
                 exc,
             )
             return ConciergeDecision(
@@ -1182,7 +1222,12 @@ class ContextEngine:
             data = json.loads(raw)
             return RouteDecision.model_validate(data)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("ContextEngine 输出不合法，raw=%r, err=%s", raw, exc)
+            # 模型返回原文与异常原文都不进常规日志：只留长度与原因类型（#61）。
+            log_failure(
+                logger,
+                f"ContextEngine 输出不合法，rawLength={len(raw or '')}",
+                exc,
+            )
             return RouteDecision(
                 userIntent=UserIntent.UNKNOWN,
                 routingAction=RoutingAction.ASK_CLARIFICATION,

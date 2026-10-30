@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from app.schemas.agent import AgentState
@@ -101,6 +103,22 @@ def test_model_layer_prompts_know_the_two_new_intents():
     assert "ISSUE_FEEDBACK" in ce._SYSTEM_PROMPT
     assert "OUT_OF_CATALOG_ADD" in ce._SYSTEM_PROMPT
     assert "ISSUE_FEEDBACK" in ce._CONCIERGE_PROMPT
+
+
+def test_prompt_enum_count_matches_the_enum():
+    """提示词里写死的枚举个数必须与实际枚举一致。
+
+    #58 加了两个新意图，把「11 个值」改了一半 —— JSON 输出模板里还写着
+    「上面 9 个枚举值之一」。发给模型的文本自相矛盾，可能让模型漏掉新意图。
+    """
+    from app.services import context_engine as ce
+
+    count = len(UserIntent)
+    assert count == 11, "既有九类 + 本轮新增两类 = 11"
+
+    # 提示词里出现的枚举个数必须只有一个，而且等于实际枚举个数。
+    claimed = set(re.findall(r"(\d+)\s*个(?:值|枚举值)", ce._CONCIERGE_PROMPT))
+    assert claimed == {str(count)}, f"提示词里的枚举个数与实际不符：{claimed}"
 
 
 def test_coerce_intent_maps_new_aliases():
@@ -483,3 +501,209 @@ def test_out_of_catalog_add_does_not_produce_a_plan(post_chat, definition):
         payload["debug"]["contextEngineIntent"]
         == UserIntent.OUT_OF_CATALOG_ADD.value
     )
+
+
+# ==========================================================================
+# P1 澄清额度真正按「事项」计（契约表 §7.2 / §7.4）
+# ==========================================================================
+#
+# 修复前：额度用完一轮后，换**任何一件新的修改**都被回成
+# 「这项修改我已经追问过 1 轮」—— 上一轮的额度键被钉死，新事项再也追不到。
+# 修复后：额度键由**当前这一轮**的「意图:目标卡片」推导，
+# 键变了 → 新事项 → 自然重开；键没变 → 同一件事 → 第二轮仍被挡住。
+
+
+def test_same_item_second_ask_is_still_blocked(post_chat, definition):
+    """同一件事连问两次：第二次仍被额度上限挡住（只问一轮）。"""
+    first = _post(post_chat, definition, "删除")
+
+    assert "你想删除哪个 section" in first["reply"], "第一轮应该真的抛出追问"
+    assert first["uiActions"] != ["template_edit_clarification_limit"]
+
+    second = _post(post_chat, definition, "删除")
+
+    assert "追问过 1 轮" in second["reply"]
+    assert second["questions"] == []
+    assert second["uiActions"] == ["template_edit_clarification_limit"]
+    # 额度没有被重开：同一项仍然只问过一轮。
+    assert session_service.load_clarification("conv_test").rounds == 1
+
+
+def test_new_item_reopens_the_clarification_quota(post_chat, definition):
+    """换一件事：额度自然重开，仍然能追问（契约表 §7.4）。
+
+    这是修复前被挡住的那条路：第一轮追问过「删除哪个 section」之后，
+    用户改口提另一件事（改粒度），以前会被回成「追问过 1 轮」。
+    """
+    first = _post(post_chat, definition, "删除")
+
+    assert "你想删除哪个 section" in first["reply"]
+    assert session_service.load_clarification("conv_test").key.startswith(
+        "DELETE_SECTION"
+    )
+
+    # 换一件完全不同的事：改另一张卡片的编译粒度。
+    second = _post(post_chat, definition, "把小时趋势改成按秒粒度")
+
+    assert second["uiActions"] != ["template_edit_clarification_limit"], (
+        "新事项被上一事项的澄清额度挡住了"
+    )
+    assert "追问过 1 轮" not in second["reply"]
+    assert second["questions"], "新事项应该重新被追问"
+    # 额度记到了**新事项**的键上。
+    state = session_service.load_clarification("conv_test")
+    assert state.key.startswith("CHANGE_COMPILATION_GRAIN")
+    assert state.rounds == 1
+
+
+def test_new_item_after_the_quota_is_exhausted_can_still_be_asked(
+    post_chat, definition
+):
+    """额度用尽之后换一件事，仍然能追问（额度用尽不清掉额度本身）。"""
+    _post(post_chat, definition, "删除")
+    exhausted = _post(post_chat, definition, "删除")
+
+    assert "追问过 1 轮" in exhausted["reply"]
+
+    # 换一件事：不受上一件事已经用尽的额度影响。
+    second = _post(post_chat, definition, "把小时趋势改成按秒粒度")
+
+    assert second["uiActions"] != ["template_edit_clarification_limit"]
+    assert "追问过 1 轮" not in second["reply"]
+    assert second["questions"], "新事项应该重新被追问"
+
+
+# ==========================================================================
+# P3 问题反馈识别：不能只靠一张固定词表
+# ==========================================================================
+#
+# 验收方实测：旧词表之外的常见抱怨句（「颜色太扎眼了」「一眼看过去很费劲」）
+# 一律被判成 UNKNOWN → 掉进编辑快路 → 反问「请告诉我要怎么改当前草稿」。
+# 修法是给抱怨句加**结构性特征**（程度副词 + 评价性形容词、否定式体验说法），
+# 同时守住「正常新增 / 改名 / 删除 / 换图 / 改时间范围 / 改粒度」这条边界。
+
+#: 验收方实测掉进编辑快路的 9 句抱怨：都没有疑问标记，也都不在旧词表里。
+COMPLAINT_SAMPLES = (
+    "颜色太扎眼了",
+    "趋势太单调了",
+    "这个布局太挤了",
+    "数字太大了没法看",
+    "一眼看过去很费劲",
+    "配色很丑",
+    "看不下去",
+    "有点糊",
+    "体验很差",
+)
+
+#: 验收方确认过的正常修改请求：不能被误判成问题反馈。
+LEGITIMATE_CHANGE_REQUESTS = (
+    "新增一个总耗电卡片",
+    "新增一个设备耗电排名卡片",
+    "新增一个能耗成本卡片",
+    "把小时趋势的标题改成能耗趋势",
+    "删除这个卡片",
+    "把趋势图换成柱状图",
+    "把时间范围改成最近 7 天",
+    "把粒度改成按秒",
+)
+
+
+@pytest.mark.parametrize("message", COMPLAINT_SAMPLES)
+def test_common_complaints_are_issue_feedback(message):
+    """常见抱怨句（没有疑问标记、词表之外）也判成问题反馈。"""
+    assert routing_rules.detect_issue_feedback(
+        message, subject_required=False
+    ) is True
+    assert (
+        classify_message_intent(message, subject_required=False)
+        is UserIntent.ISSUE_FEEDBACK
+    )
+
+
+@pytest.mark.parametrize("message", COMPLAINT_SAMPLES)
+def test_complaint_does_not_produce_a_pending_edit_plan(
+    post_chat, definition, message
+):
+    """抱怨句端到端：只给分析，不产生待接受计划，不改定义。"""
+    payload = _post(post_chat, definition, message)
+
+    assert payload["turnKind"] == "query_answer"
+    assert payload["uiActions"] == ["query_answer"]
+    assert payload["domainObjects"]["pendingEditPlan"] is None
+    assert payload["domainObjects"]["changeSet"] is None
+    assert payload["debug"]["userIntent"] == UserIntent.ISSUE_FEEDBACK.value
+    assert definition.metadata["revision"] == 0
+    assert session_service.load_pending_plan("conv_test") is None
+
+
+@pytest.mark.parametrize("message", LEGITIMATE_CHANGE_REQUESTS)
+def test_legitimate_change_requests_are_not_issue_feedback(message):
+    """正常的新增 / 改名 / 删除 / 换图 / 改时间范围 / 改粒度 仍然判明确修改。"""
+    intent = classify_message_intent(message, subject_required=False)
+
+    assert intent is not UserIntent.ISSUE_FEEDBACK, "正常修改请求被当成了抱怨"
+    assert intent is UserIntent.MODIFY
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_intent"),
+    [
+        ("新增一个总耗电卡片", "ADD_SECTION"),
+        ("新增一个设备耗电排名卡片", "ADD_SECTION"),
+        ("新增一个能耗成本卡片", "ADD_SECTION"),
+        ("把小时趋势的标题改成能耗趋势", "RENAME_SECTION"),
+    ],
+)
+def test_legitimate_change_requests_still_produce_a_plan(
+    post_chat, definition, message, expected_intent
+):
+    """端到端：正常修改仍然产出待接受计划（没有被当抱怨吞掉）。"""
+    payload = _post(post_chat, definition, message)
+
+    assert payload["turnKind"] != "query_answer"
+    plan = payload["domainObjects"]["pendingEditPlan"]
+    assert plan is not None
+    assert plan["operations"][0]["intent"] == expected_intent
+    assert definition.metadata["revision"] == 0
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "删除这个卡片",
+        "把趋势图换成柱状图",
+        "把时间范围改成最近 7 天",
+        "把粒度改成按秒",
+    ],
+)
+def test_legitimate_change_requests_are_not_answered_as_query(
+    post_chat, definition, message
+):
+    """这些请求走的是**修改 / 追问**链路，不是只读答复链路。"""
+    payload = _post(post_chat, definition, message)
+
+    assert payload["turnKind"] != "query_answer"
+    assert payload["uiActions"] != ["query_answer"]
+    assert payload["domainObjects"]["changeSet"] is None
+    assert definition.metadata["revision"] == 0
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "把趋势卡片标题改成能耗卡片",
+        "把设备耗电排名卡片换成柱状图",
+        "新增一个总耗电趋势卡片",
+    ],
+)
+def test_object_names_that_also_look_like_complaints_are_not_issue_feedback(
+    message,
+):
+    """「趋势」「排名」「卡片」这些词既可能是抱怨，也可能是**对象名**。
+
+    抱怨句被识别成问题反馈的同时，正常的新增 / 改名 / 换图不能被误伤。
+    """
+    intent = classify_message_intent(message, subject_required=False)
+
+    assert intent is not UserIntent.ISSUE_FEEDBACK
+    assert intent is UserIntent.MODIFY

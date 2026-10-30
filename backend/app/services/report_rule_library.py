@@ -41,7 +41,10 @@ from app.schemas.report_plan import ComponentType, DisplayIntent, GrainUnit
 #: 规则库版本。规则表的**语义**变了才改它（改了要同步
 #: ``docs/rules/report-rule-library.md``）。方案里记着它，所以历史方案
 #: 看得出「当时是哪一版规则给出的理由」。
-RULE_LIBRARY_VERSION = "1.0.0"
+#:
+#: 1.0.1 —— 补回指令词正则里被漏掉的否定 lookbehind（「不要那种柱状图」
+#: 里的「要」不再被当成指令词），并让禁用条件与指令词层同口径。
+RULE_LIBRARY_VERSION = "1.0.1"
 
 
 def rule_library_version() -> str:
@@ -88,12 +91,24 @@ COND_COLUMN_HINTS_PRESENT = "column_hints_present"
 #: 指令词：出现在类型词前面不远处，才算「用户明确指定」。
 #: 「能耗柱状图」是板块标题，不是指定 —— 这里只管**有没有指令词**。
 #:
-#: 否定写法（「不要柱状图」）由规则表里的禁用条件挡（``COND_NEGATED_KEYWORD``），
-#: 所以这里的否定排除只留「不是指令词」的那几个（费用、适用、重要…）。
+#: 否定写法由两层挡，两层口径一致：
+#:
+#: 1. **指令词层**（本正则）：否定词紧挨着指令词时，指令词不成立 ——
+#:    ``不要柱状图`` 里的「要」前面是「不」，``别用柱状图`` 里的「用」前面
+#:    是「别」，所以它们**不是**指令词。改造前的指令词正则就是这样挡的，
+#:    本模块第一版把这两处 lookbehind 漏掉了，导致「不要那种柱状图」里的
+#:    「要」被当成了指令词 —— 现已补回。
+#: 2. **规则表禁用条件**（``COND_NEGATED_KEYWORD``）：见 ``_negated``。
+#:
+#: lookbehind 里排除的那几个字（户使适利运）是「这个「用」不是指令词」的
+#: 字：``户用`` / ``使用`` / ``适用`` / ``利用`` / ``运用`` 里的「用」单独
+#: 不算指令词。注意 ``费用`` / ``重要`` **不在**名单里 —— 那两个字不挡
+#: 「用／要」。（``使用`` 本身另有一个指令词写法，``用户`` 的「用」在词首 ——
+#: 详见规则库文档 §2「指令词的例外」。）
 _DIRECTIVE_RE = re.compile(
     r"(?:改用|改成|换成|做成|画成|变成|呈现为|显示为|表示为|展示为|使用|采用|画"
-    r"|(?<![户使适利运])用"
-    r"|要"
+    r"|(?<![不别户使适利运])用"
+    r"|(?<![不别])要"
     r"|以)"
     r"[^，,。；;！!？?\n]{0,4}$"
 )
@@ -689,6 +704,12 @@ def _negated(text: str, keyword: str, index: int = -1) -> bool:
 
     ``index`` 给定时只看那一次出现 —— 同一句里「不要柱状图，改用柱状图」
     这种写法，前一次否定不影响后一次。
+
+    口径与指令词层**一致**：否定词紧挨着类型词、且**这一处前面没有别的
+    指令词**时才算被否定。所以「不要柱状图」不算明确指定；而「改用不要
+    柱状图」这种病态写法仍按它前面的「改用」算 —— 与改造前的指令词正则
+    口径相同（那次改造把否定从指令词正则挪到了禁用条件，本模块第一版
+    两层口径没对齐，这里补齐）。
     """
     if not keyword:
         return False
@@ -697,7 +718,9 @@ def _negated(text: str, keyword: str, index: int = -1) -> bool:
     )
     for position in positions:
         prefix = (text or "")[:position]
-        if any(prefix.endswith(negation) for negation in _NEGATIONS):
+        if not any(prefix.endswith(negation) for negation in _NEGATIONS):
+            continue
+        if not _directive_before(text, position):
             return True
     return False
 

@@ -119,6 +119,9 @@ def _commit(store, session_id: str, message_id: str, plan: ReportPlan) -> None:
 
 # ---------- 1. 规则库是一份带稳定 ID 的结构化规则表 ----------
 
+#: 适用条件为空的规则 = **恒适用**（文档 §2「空 = 恒适用」）。只有这三条。
+_ALWAYS_APPLIES = {"DR-GRAIN-DEFAULT", "DR-FALLBACK-MODEL", "DR-FALLBACK-TEXT"}
+
 
 def test_every_rule_carries_the_six_required_fields():
     """稳定 ID、适用条件、建议展示、禁用条件、优先级、解释模板，一条不缺。"""
@@ -130,6 +133,16 @@ def test_every_rule_carries_the_six_required_fields():
         assert rule.explain_template, rule
         assert isinstance(rule.applies_when, tuple), rule
         assert isinstance(rule.disabled_when, tuple), rule
+        # 适用条件可以为空（恒适用），但**只有**兜底那几条允许空 ——
+        # 别的规则漏写适用条件会被这条抓住（空元组也算 tuple，光断类型抓不住）。
+        assert rule.applies_when or rule.rule_id in _ALWAYS_APPLIES, rule
+
+
+def test_only_the_fallback_rules_apply_unconditionally():
+    """适用条件为空的**只有**那三条恒适用的规则。"""
+    always = {rule.rule_id for rule in all_rules() if not rule.applies_when}
+
+    assert always == _ALWAYS_APPLIES
 
 
 def test_rule_ids_are_unique_and_stable():
@@ -176,20 +189,58 @@ def test_the_rule_library_has_a_versioned_document_that_matches_the_table():
         assert rule.rule_id in doc, rule.rule_id
 
 
+def _doc_rule_row(doc: str, rule_id: str) -> str:
+    """文档「规则表全表」里那一条规则的表格行。"""
+    rows = [
+        line
+        for line in doc.splitlines()
+        if line.startswith(f"| `{rule_id}` |")
+    ]
+    assert rows, rule_id
+    return rows[0]
+
+
 def test_the_document_lists_each_rule_with_the_same_priority_and_template():
-    """文档里那一条规则，写着的优先级与解释模板与代码一致。"""
+    """文档里那一条规则，写着的优先级、建议展示与解释模板与代码一致。"""
     doc = _RULES_DOC.read_text(encoding="utf-8")
 
     for rule in all_rules():
-        rows = [
-            line
-            for line in doc.splitlines()
-            if line.startswith(f"| `{rule.rule_id}` |")
-        ]
-        assert rows, rule.rule_id
-        row = rows[0]
+        row = _doc_rule_row(doc, rule.rule_id)
         assert f"| {rule.priority} |" in row, (rule.rule_id, row)
         assert rule.explain_template in row, (rule.rule_id, row)
+        # 建议展示也要对得上 —— 表格里空着的那一格（#60 验收发现）就是这么漏的。
+        cells = [cell.strip() for cell in row.split("|")]
+        documented = cells[5].strip("`")
+        assert documented == rule.suggested_display, (rule.rule_id, documented)
+
+
+def test_the_documented_directive_exceptions_match_the_code():
+    """文档 §2「指令词的例外」列的词，代码里真的不当指令词。
+
+    挡住哪些词是**行为** —— 文档与代码对不上时这条最先出事（#60 验收发现
+    文档把 `费用` / `重要` 也列成了例外，其实它们不是）。
+    """
+    doc = _RULES_DOC.read_text(encoding="utf-8")
+    section = doc.split("**指令词的例外**", 1)[1].split("\n## ", 1)[0]
+    listed = [
+        word
+        for line in section.splitlines()
+        if line.startswith("| `")
+        for word in re.findall(r"`([^`]+)`", line)
+    ]
+
+    assert listed, section
+    for word in listed:
+        assert rules.match_explicit_component_type(f"{word}柱状图") is None, word
+
+    # `费用` / `重要` 不在例外名单里 —— 文档表格里不该有，正文里要写明。
+    for word in ("费用", "重要"):
+        assert word not in listed, word
+        assert word in section, word
+
+    # `使用` 本身是指令词、`用户` 的「用」在词首 —— 两者都不是例外。
+    assert rules.match_explicit_component_type("使用柱状图") is not None
+    assert rules.match_explicit_component_type("用户柱状图") is not None
 
 
 # ---------- 2. 理由来自真实命中 ----------
@@ -315,6 +366,37 @@ def test_the_evidence_says_the_display_intent_came_from_the_model_candidate():
     assert "模型给的语义候选" in evidence.detail
 
 
+def test_the_evidence_detail_records_where_the_display_intent_came_from():
+    """命中依据里的 `detail` 记着展示目的**是怎么来的**。
+
+    真实产出是「模型给的语义候选→展示目的=comparison」/
+    「关键词「对比」→展示目的=comparison」—— 不是光秃秃一句
+    「展示目的=comparison」（#60 验收发现文档 §4 的示例写的是修复前的旧形式）。
+    """
+    payload = _candidate_payload()
+    payload["sections"] = [
+        _section("各机房耗电对比", "metric_card", displayIntent="comparison"),
+    ]
+
+    from_model = apply_candidate(payload, plan_id="plan_060")
+    assert (
+        from_model.selectionEvidence[0].detail
+        == "模型给的语义候选→展示目的=comparison"
+    )
+
+    payload = _candidate_payload()
+    payload["sections"] = [
+        _section("各机房耗电对比", "metric_card"),
+    ]
+    from_keyword = apply_candidate(
+        payload, plan_id="plan_060", current_request="看各机房的对比"
+    )
+    assert (
+        from_keyword.selectionEvidence[0].detail
+        == "关键词「对比」→展示目的=comparison"
+    )
+
+
 def test_the_most_specific_wording_wins_at_the_same_position():
     """同一位置命中多个写法时取**更具体**的那个。
 
@@ -383,6 +465,72 @@ def test_a_negated_type_word_is_not_an_explicit_instruction():
     assert plan.sections[0].explicitComponentType is None
     assert plan.sections[0].componentType == ComponentType.BAR_CHART
     assert plan.selectionEvidence[0].ruleId == "DR-MAP-COMPARISON"
+
+
+#: 否定词与类型词之间**隔了字** —— 否定照样成立。
+_NEGATED_WITH_GAP = (
+    "不要那种柱状图",
+    "不要那种折线图",
+    "不要那种趋势图",
+    "别用那种柱状图",
+    "别用那种趋势图",
+    "不用那种表格",
+    "别要那种指标卡",
+    "不要 柱状图",
+    "别用 折线图",
+)
+
+
+@pytest.mark.parametrize("clause", _NEGATED_WITH_GAP)
+def test_a_negated_type_word_with_words_in_between_is_not_an_explicit_instruction(clause):
+    """否定 + 隔字不算「用户明确指定」。
+
+    「不要那种柱状图」里的「要」**不是**指令词 —— 它前面是「不」。
+    这一族在规则库第一版里被漏掉了（指令词正则丢了否定 lookbehind），
+    「不要那种柱状图」会被当成「用户明确指定了柱状图」。
+    """
+    hit = rules.match_explicit_component_type(clause)
+
+    assert hit is None, (clause, hit)
+
+
+def test_a_negated_type_word_with_words_in_between_does_not_reach_the_plan():
+    """同一条链路：否定 + 隔字不会变成方案里的「明确指定」。"""
+    payload = _candidate_payload()
+    payload["sections"] = [
+        _section("各机房耗电对比", "metric_card", displayIntent="comparison"),
+    ]
+
+    plan = apply_candidate(
+        payload, plan_id="plan_060", current_request="不要那种柱状图"
+    )
+
+    assert plan.sections[0].explicitComponentType is None
+    assert plan.sections[0].componentType == ComponentType.BAR_CHART
+    assert plan.selectionEvidence[0].ruleId == "DR-MAP-COMPARISON"
+
+
+#: 改造前就成立的写法 —— 本工单**不改**它们（目标是「行为不变」）。
+#:
+#: - 「不要改成柱状图」：``改成`` 本身就是指令词，否定挡不住它；
+#: - 「不要用柱状图」：``用`` 前面是「要」而不是「不」，lookbehind 不挡；
+#: - 「改用不要柱状图」：前面的 ``改用`` 算数。
+_LEGACY_DIRECTIVE_BEHAVIOUR = {
+    "不要改成柱状图": ComponentType.BAR_CHART,
+    "不要用柱状图": ComponentType.BAR_CHART,
+    "改用不要柱状图": ComponentType.BAR_CHART,
+}
+
+
+@pytest.mark.parametrize(
+    "clause,expected", sorted(_LEGACY_DIRECTIVE_BEHAVIOUR.items())
+)
+def test_the_legacy_directive_behaviour_is_kept(clause, expected):
+    """改造前就有的行为，本工单不动 —— 改了就是「行为变了」，超出本票范围。"""
+    hit = rules.match_explicit_component_type(clause)
+
+    assert hit is not None, clause
+    assert hit.payload == expected, clause
 
 
 def test_a_plain_text_section_is_not_turned_into_a_chart():

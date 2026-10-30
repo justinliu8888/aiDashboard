@@ -1078,7 +1078,10 @@ class SessionService:
         )
 
     def can_ask_clarification(self, session_id: str, *, key: str) -> bool:
-        """还能不能再追问一次（同一项修改最多三轮）。"""
+        """还能不能再追问一次（同一项修改最多一轮，见 ``MAX_CLARIFICATION_ROUNDS``）。
+
+        换 key 表示换了一项待定修改 → 可以重新问一轮。
+        """
         state = self.load_clarification(session_id)
         if state is None or state.key != key:
             return True

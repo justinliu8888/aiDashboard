@@ -85,6 +85,7 @@ from app.services.scope_service import filter_visible
 from app.services.template_edit_engine import EditResult, template_edit_engine
 from app.tools.context import ToolScope
 from app.services.template_preview_flow import template_preview_flow
+from app.services.user_json_service import user_json_service
 from app.services.validation_service import summarize_issues_for_user, validate_definition
 
 
@@ -740,6 +741,23 @@ class AgentService:
             or design_acknowledgement
             or not routing_rules.looks_like_question(request.message)
         )
+
+        # 用户 JSON 输入（工单 #64）。
+        #
+        # 这一轮做三件事，**顺序不能换**：
+        #   1. 服务端确定性校验（语法、数组位置、规模上限、字段类型与缺失）；
+        #   2. 通过则把原始数组**存一份**（会话输入记录），不通过则什么都不存；
+        #   3. 把本轮消息换成**安全摘要与引用** —— 落库的聊天消息里
+        #      不留完整数组（规格第 21 条）。
+        #
+        # 校验通过后**不自己出报表**：交给设计流程出方案（模型看的是字段
+        # 结构与有上限的样本），方案确认后才把输入、映射与规则原子切生效。
+        if pending_guard is None:
+            json_response = await self._handle_json_input_turn(
+                request, session_key, design_turn=design_turn
+            )
+            if json_response is not None:
+                return json_response
 
         if (
             pending_guard is None
@@ -1455,15 +1473,27 @@ class AgentService:
         intent = (response.debug or {}).get("editingIntent") or "UNKNOWN"
         target = (response.debug or {}).get("editingTargetRegionId") or ""
         current = session_service.load_clarification(session_key)
-        # 额度按「事项」计（规格第 14 条）：键 = 「这一项要做的事」。
-        #   - 上一轮就是在追同一件事 → 沿用旧键，轮数接着算（不重置）；
-        #   - 换了一件事 → 键变了，轮数从零重新计；
-        #   - 连要改什么都说不清 → 固定的「未定位」键，仍然只问一轮。
-        key = (
-            current.key if prior and current
-            else f"{intent}:{target}" if intent != "UNKNOWN" or target
-            else "edit:unresolved"
-        )
+        # 额度按「事项」计（契约表 §7.2、§7.4）：键 = 「意图:目标卡片」，
+        # 而且**由当前这一轮推导**，不沿用上一轮的键。
+        #   - 键变了 → 换了一件事 → 自然重开，轮次从 0 起
+        #     （``record_clarification`` 发现键不同即重新计数）；
+        #   - 键没变 → 还是那一件事 → 轮次接着算，第二轮被额度上限挡住。
+        #
+        # 之前这里写的是「上一轮追问过就把键钉死在旧键上」，结果**换一件事
+        # 也被上一件事挡住**：追问额度用完后，用户再提任何一件新的修改都被
+        # 回成「这项修改我已经追问过 1 轮」—— 与契约 §7.4「新事项自然重开」
+        # 矛盾，也与回复里「③ 换一个对象重新提一次修改要求」自相矛盾。
+        derived = f"{intent}:{target}" if intent != "UNKNOWN" or target else ""
+        if derived:
+            key = derived
+        elif prior and current:
+            # 这一轮认不出「意图 + 目标卡片」：多半是用户在**回答上一轮的追问**
+            # （例如只回了一个指代词）。事项还没换，沿用上一轮的键，
+            # 免得同一件事被反复追问。
+            key = current.key
+        else:
+            # 连要改什么都说不清 → 固定的「未定位」键，仍然只问一轮。
+            key = "edit:unresolved"
         if not session_service.can_ask_clarification(session_key, key=key):
             # 一轮之后仍缺安全目标（规格第 18 条）：保留当前报告，给**非阻塞**
             # 说明与可选替代 —— 不猜目标、不造空计划、不继续循环强制询问。
@@ -1476,6 +1506,11 @@ class AgentService:
             )
             response.questions = []
             response.uiActions = ["template_edit_clarification_limit"]
+            # 这一件事的额度已经用尽：**不要**把「上一轮在追问什么」继续留在
+            # collectedInfo 里，否则下一轮的「继续接上一句」会一直贴着
+            # 这件已经结束的事，新事项反而被旧事项的上下文缠住。
+            request.collectedInfo.pop("pendingEditRequest", None)
+            request.collectedInfo.pop("pendingEditTimeAnchor", None)
             return response
         session_service.record_clarification(
             session_key, key=key, question=response.reply
@@ -1777,6 +1812,84 @@ class AgentService:
                 if value:
                     names.append(value)
         return names
+
+    async def _handle_json_input_turn(
+        self, request: AgentRequest, session_key: str, *, design_turn: bool
+    ) -> AgentResponse | None:
+        """用户 JSON 输入这一轮（工单 #64）。
+
+        返回 ``None`` 表示「这一轮不是 JSON 输入」，交给后面的流程。
+
+        **这一轮只做服务端能确定的事**：
+
+        1. **确定性校验**：语法、数组位置、规模上限（1 MB / 5,000 行 /
+           50 个字段，任一超限**拒绝并提示**，不截取通过）、字段类型与缺失；
+        2. **存一份**：原始记录数组只落在会话输入记录里（ADR 0004 §8 的
+           豁免：这是用户数据，不是模拟业务数值）；
+        3. **换成安全摘要**：本轮消息替换成「摘要 + 引用」——
+           落库的聊天消息里不留完整数组（规格第 21 条）。
+
+        校验不通过时**什么都不存**，也不调用模型：明确告诉用户哪里不对。
+        """
+        payload = routing_rules.detect_json_payload(request.message)
+        if payload is None:
+            return None
+        array_path = routing_rules.extract_array_path(request.message)
+        note = routing_rules.strip_json_payload(request.message)
+        record, error = user_json_service.submit(
+            session_id=session_key, text=payload, array_path=array_path
+        )
+        if error is not None:
+            # 没通过校验：原始数据不落库，消息里也不留数组。
+            request.message = "\n".join(
+                part for part in (note, "（JSON 未通过校验，未保存）") if part
+            )
+            logger.warning(
+                "[agent.chat] step=json_input_rejected conversationId=%s code=%s",
+                request.conversationId,
+                error.code,
+            )
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=request.state,
+                reply=error.message,
+                designSessionId=request.context.designSessionId,
+                error=AgentError(
+                    code=error.code,
+                    message=error.message,
+                    details=dict(error.details or {}),
+                ),
+                debug={"jsonInput": {"accepted": False, "code": error.code}},
+            )
+
+        summary = user_json_service.safe_summary(record)
+        # 落库的用户消息只留摘要与引用：完整数组不复制到消息里。
+        request.message = "\n".join(part for part in (note, summary) if part)
+        reference = user_json_service.reference(record)
+        issues = user_json_service.data_issues(record)
+        logger.info(
+            "[agent.chat] step=json_input_accepted conversationId=%s inputId=%s "
+            "version=%d rows=%d",
+            request.conversationId,
+            record.inputId,
+            record.inputVersion,
+            record.recordCount,
+        )
+        if design_turn:
+            # 设计流程接管：模型只看字段结构、缺失与类型统计与有上限的样本，
+            # 方案由用户确认后才把输入、映射与规则原子切生效。
+            return None
+        reply = f"已收到你的 JSON 数据并保存：{summary}。"
+        if issues:
+            reply += "数据里有几处要说明：" + "；".join(issues[:3]) + "。"
+        reply += "请告诉我你想用它做什么样的报表。"
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=request.state,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            debug={"jsonInput": {"accepted": True, **reference}},
+        )
 
     def _classify_intent(self, request: AgentRequest) -> UserIntent:
         """编辑态的规则层意图判定（工单 #58）。

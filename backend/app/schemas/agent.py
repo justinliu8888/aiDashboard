@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 from .change_set import ChangeSet
 from .report_definition import ReportDefinitionDraft
@@ -301,6 +301,22 @@ class AgentQuestion(BaseModel):
             if derived != LOCK_SCOPE_MENU_ONLY:
                 return {**data, "lockScope": derived}
         return data
+
+    @field_validator("lockScope", mode="before")
+    @classmethod
+    def _normalize_lock_scope(cls, value: Any) -> str:
+        """非法取值归一成 ``"menu_only"``（契约表 §5.3 的旧数据默认行为）。
+
+        契约表 §5.1 把取值域定死为三个，但服务端**不保证**生产者的写入一定合法
+        （手改的库、旧数据、外部写入都可能带进第四个值）。读回时统一归一，
+        免得前后端对同一份坏数据给出**不同的锁**——前端的 ``lockScopeOf``
+        对认不出的值本来就兜底成 ``menu_only``，这里与它保持同一口径。
+
+        归一后**不锁输入**，是三个合法取值里最弱的一档；真正的安全边界在
+        后端对确认与权限的校验（契约表 §8 不变量 6：锁只是引导）。
+        """
+        text = str(value or "").strip()
+        return text if text in LOCK_SCOPES else LOCK_SCOPE_MENU_ONLY
 
 
 class AgentBlock(BaseModel):

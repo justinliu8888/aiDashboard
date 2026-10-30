@@ -1,27 +1,46 @@
-"""生效组合（effectiveCombination，契约表 §2）。
+"""生效组合（effective combination，契约表 §2）。
 
-**这份报表当前生效的那一组绑定**：用哪个方案、哪个定义版本、来源模式是
-模拟示例还是用户 JSON、输入是哪一版、列怎么映射、走了哪些处理规则。
+**一组绑定，一组提交。**
 
-它存在的理由是**版本判据**：候选保存的是「它所基于的那一份组合」，
-接受时逐字段比对 —— 对不上就是**过期 / 冲突**，服务端直接拒绝，
-旧生效组合原样保留（契约表 §2.2 / §4.2）。
+来源模式、输入 ID 与版本、字段映射、处理规则与定义版本
+**绑成一个不可拆的整体**（规格第 31 条）：报表的数字从哪来、拿哪一版数据、
+哪一列对应哪个字段、按什么口径处理、属于哪一版定义 —— 这五件事必须同生共死。
 
-**老数据不迁移**：没有这一项的定义按**空组合**处理（来源模式取默认的
-模拟示例、输入为空、映射与规则为空），方案与定义的身份从既有的
-``metadata.templateBinding`` 回填 —— 读得懂就行，不改写历史。
+**固定 9 键**（契约表 §2.1）::
 
-落点：``ReportDefinitionDraft.metadata.effectiveCombination``（随定义落库）。
+    planId, planRevision, definitionId, definitionVersion,
+    sourceMode, inputId, inputVersion, fieldMapping, processingRules
+
+落点是 ``ReportDefinitionDraft.metadata.effectiveCombination``：
+随定义落库（``report_design_definitions.definition_json``），并进会话快照。
+
+**候选与生效分开**（规格第 30 条）：候选可以保存用于继续设计，
+但绝不覆盖已确认的输入、来源与字段映射。只有接受动作把整组一起原子切过去；
+取消、解析 / 校验失败、造数失败、版本冲突一律**保持旧生效组合**。
+
+本模块只做**纯函数**：组一份、验一份、比一份。它不落库、不提交 ——
+提交由定义层的写入路径负责。
 """
 from __future__ import annotations
 
-from typing import Any, Mapping
+import json
+from typing import Any, Mapping, Sequence
 
-from app.services.data_source_mode import source_mode_of_definition
+from app.services.data_source_mode import (
+    DEFAULT_SOURCE_MODE,
+    SOURCE_MODE_SIMULATED,
+    SOURCE_MODE_USER_JSON,
+    normalize_source_mode,
+)
+from app.services.json_input_service import (
+    PROCESSING_OPERATIONS,
+    validate_field_mapping,
+    validate_processing_rules,
+)
 
 
-#: 生效组合的字段（契约表 §2.1）。比较时**逐字段**比。
-COMBINATION_FIELDS: tuple[str, ...] = (
+#: 生效组合的**固定 9 键**（契约表 §2.1）。
+COMBINATION_KEYS: tuple[str, ...] = (
     "planId",
     "planRevision",
     "definitionId",
@@ -33,88 +52,248 @@ COMBINATION_FIELDS: tuple[str, ...] = (
     "processingRules",
 )
 
-#: 生效组合在定义里的**落点**。
-COMBINATION_KEY = "effectiveCombination"
+#: 字段映射条目的键（契约表 §2.1）。
+FIELD_MAPPING_KEYS: tuple[str, ...] = (
+    "regionId",
+    "columnId",
+    "inputFieldKey",
+    "inputFieldPath",
+)
+
+#: 处理规则条目的键（契约表 §2.1）。
+PROCESSING_RULE_KEYS: tuple[str, ...] = (
+    "ruleId",
+    "operation",
+    "targetFieldKey",
+    "params",
+)
 
 
-def _as_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+def empty_combination(
+    *,
+    plan_id: str | None = None,
+    plan_revision: int | None = None,
+    definition_id: str | None = None,
+    definition_version: int | None = None,
+) -> dict[str, Any]:
+    """空组合（契约表 §2.2 的老数据默认行为）。
 
-
-def combination_of(definition: Any) -> dict[str, Any]:
-    """这份定义当前**生效**的组合。
-
-    没有记录过的定义按**空组合**处理（契约表 §2.2）：来源模式取默认的
-    模拟示例、输入为空、映射与规则为空；方案与定义的身份从既有的
-    ``metadata.templateBinding`` 回填。
-
-    ``definitionVersion`` 是**这份定义自己的版本**（草稿 revision）——
-    编辑一次就是新一版；老定义没有 revision 时回退到方案版本。
+    老定义没有 ``effectiveCombination`` → 按空组合处理：
+    ``sourceMode = "simulated"``、``inputId = None``、``inputVersion = None``、
+    ``fieldMapping = []``、``processingRules = []``；
+    方案与定义的身份、版本从既有 ``metadata.templateBinding`` 回填。
     """
-    metadata: Mapping[str, Any] = {}
-    if isinstance(definition, Mapping):
-        raw_metadata = definition.get("metadata")
-        metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
-    recorded = metadata.get(COMBINATION_KEY)
-    recorded = recorded if isinstance(recorded, Mapping) else {}
-    binding = metadata.get("templateBinding")
-    binding = binding if isinstance(binding, Mapping) else {}
-
-    revision = metadata.get("revision")
-    if revision is None:
-        definition_version = _as_int(
-            binding.get("definitionVersion") or recorded.get("definitionVersion")
-        )
-    else:
-        definition_version = _as_int(revision)
-
-    field_mapping = recorded.get("fieldMapping")
-    processing_rules = recorded.get("processingRules")
     return {
-        "planId": str(binding.get("planId") or recorded.get("planId") or ""),
-        "planRevision": _as_int(binding.get("planRevision") or recorded.get("planRevision")),
-        "definitionId": str(
-            binding.get("definitionId")
-            or recorded.get("definitionId")
-            or metadata.get("id")
-            or ""
-        ),
-        "definitionVersion": definition_version,
-        "sourceMode": str(
-            recorded.get("sourceMode") or source_mode_of_definition(definition).mode
-        ),
-        "inputId": recorded.get("inputId"),
-        "inputVersion": recorded.get("inputVersion"),
-        "fieldMapping": list(field_mapping) if isinstance(field_mapping, list) else [],
-        "processingRules": (
-            list(processing_rules) if isinstance(processing_rules, list) else []
-        ),
+        "planId": plan_id or "",
+        "planRevision": int(plan_revision or 0),
+        "definitionId": definition_id or "",
+        "definitionVersion": int(definition_version or 0),
+        "sourceMode": DEFAULT_SOURCE_MODE,
+        "inputId": None,
+        "inputVersion": None,
+        "fieldMapping": [],
+        "processingRules": [],
     }
 
 
-def record_combination(metadata: Any, combination: Mapping[str, Any]) -> None:
-    """把生效组合**记进**定义 metadata（随定义落库）。
+def normalize_combination(value: Any) -> dict[str, Any]:
+    """把任意结构归一成**固定 9 键**的组合。
 
-    只写契约表 §2.1 定的九个键 —— 别的一概不写。
+    缺的键按空组合补齐；多的键丢掉 —— 组合的形状是封闭的。
     """
-    if not isinstance(metadata, dict):
-        return
-    metadata[COMBINATION_KEY] = {
-        field: combination.get(field) for field in COMBINATION_FIELDS
-    }
+    base = empty_combination()
+    if not isinstance(value, Mapping):
+        return base
+    source_mode = normalize_source_mode(value.get("sourceMode")) or DEFAULT_SOURCE_MODE
+    field_mapping = [
+        {
+            "regionId": str(item.get("regionId") or ""),
+            "columnId": str(item.get("columnId") or ""),
+            "inputFieldKey": str(item.get("inputFieldKey") or ""),
+            "inputFieldPath": (
+                str(item.get("inputFieldPath"))
+                if item.get("inputFieldPath") is not None
+                else None
+            ),
+        }
+        for item in (value.get("fieldMapping") or [])
+        if isinstance(item, Mapping)
+    ]
+    processing_rules = [
+        {
+            "ruleId": str(item.get("ruleId") or ""),
+            "operation": str(item.get("operation") or ""),
+            "targetFieldKey": str(item.get("targetFieldKey") or ""),
+            "params": dict(item.get("params") or {})
+            if isinstance(item.get("params"), Mapping)
+            else {},
+        }
+        for item in (value.get("processingRules") or [])
+        if isinstance(item, Mapping)
+    ]
+    input_id = value.get("inputId")
+    input_version = value.get("inputVersion")
+    base.update(
+        {
+            "planId": str(value.get("planId") or ""),
+            "planRevision": int(value.get("planRevision") or 0),
+            "definitionId": str(value.get("definitionId") or ""),
+            "definitionVersion": int(value.get("definitionVersion") or 0),
+            "sourceMode": source_mode,
+            "inputId": str(input_id) if input_id else None,
+            "inputVersion": int(input_version) if input_version is not None else None,
+            "fieldMapping": field_mapping,
+            "processingRules": processing_rules,
+        }
+    )
+    return base
 
 
-def combinations_match(left: Any, right: Any) -> bool:
-    """两份生效组合**逐字段**一致吗（契约表 §4.2 的版本校验）。
+def build_combination(
+    *,
+    plan_id: str,
+    plan_revision: int,
+    definition_id: str,
+    definition_version: int,
+    source_mode: str,
+    input_id: str | None = None,
+    input_version: int | None = None,
+    field_mapping: Sequence[Mapping[str, Any]] | None = None,
+    processing_rules: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """组一份生效组合（固定 9 键）。"""
+    combination = empty_combination(
+        plan_id=plan_id,
+        plan_revision=plan_revision,
+        definition_id=definition_id,
+        definition_version=definition_version,
+    )
+    combination["sourceMode"] = normalize_source_mode(source_mode) or DEFAULT_SOURCE_MODE
+    combination["inputId"] = str(input_id) if input_id else None
+    combination["inputVersion"] = int(input_version) if input_version is not None else None
+    combination["fieldMapping"] = [
+        {
+            "regionId": str(item.get("regionId") or ""),
+            "columnId": str(item.get("columnId") or ""),
+            "inputFieldKey": str(item.get("inputFieldKey") or ""),
+            "inputFieldPath": (
+                str(item.get("inputFieldPath"))
+                if item.get("inputFieldPath") is not None
+                else None
+            ),
+        }
+        for item in (field_mapping or [])
+    ]
+    combination["processingRules"] = [
+        {
+            "ruleId": str(item.get("ruleId") or ""),
+            "operation": str(item.get("operation") or ""),
+            "targetFieldKey": str(item.get("targetFieldKey") or ""),
+            "params": dict(item.get("params") or {})
+            if isinstance(item.get("params"), Mapping)
+            else {},
+        }
+        for item in (processing_rules or [])
+    ]
+    return combination
 
-    任何一个字段对不上 → 候选过期 / 冲突 → 服务端拒绝接受。
+
+def validate_combination(
+    combination: Any, *, field_keys: Sequence[str] | None = None
+) -> list[str]:
+    """校验一份生效组合，返回问题清单（空 = 通过）。
+
+    校验内容：
+
+    - 形状必须是固定 9 键；
+    - 来源模式取值合法；
+    - 用户 JSON 模式**必须**有输入 ID 与版本；模拟模式必须没有；
+    - 字段映射引用的字段确实存在于当前输入（逐项核对）；
+    - 处理规则只走受控操作枚举与标量参数。
     """
-    first = left if isinstance(left, Mapping) else {}
-    second = right if isinstance(right, Mapping) else {}
-    for field in COMBINATION_FIELDS:
-        if first.get(field) != second.get(field):
-            return False
-    return True
+    problems: list[str] = []
+    if not isinstance(combination, Mapping):
+        return ["生效组合不是对象。"]
+    normalized = normalize_combination(combination)
+    for key in COMBINATION_KEYS:
+        if key not in combination:
+            problems.append(f"生效组合缺少「{key}」。")
+    source_mode = normalized["sourceMode"]
+    if source_mode not in (SOURCE_MODE_SIMULATED, SOURCE_MODE_USER_JSON):
+        problems.append(f"来源模式「{source_mode}」不是合法取值。")
+    if source_mode == SOURCE_MODE_USER_JSON:
+        if not normalized["inputId"]:
+            problems.append("用户 JSON 模式必须有输入记录 ID。")
+        if normalized["inputVersion"] is None:
+            problems.append("用户 JSON 模式必须有输入版本。")
+    else:
+        if normalized["inputId"] or normalized["inputVersion"] is not None:
+            problems.append("模拟示例模式不应绑定 JSON 输入。")
+    if field_keys is not None:
+        problems.extend(validate_field_mapping(normalized["fieldMapping"], field_keys))
+        problems.extend(validate_processing_rules(normalized["processingRules"], field_keys))
+    else:
+        # 没有当前输入的字段清单时，按组合自己声明的字段核对：
+        # 规则指向的字段必须在映射里出现过（不能凭空多一个字段）。
+        known = {
+            str(item.get("inputFieldKey") or "")
+            for item in normalized["fieldMapping"]
+        }
+        problems.extend(validate_processing_rules(normalized["processingRules"], sorted(known)))
+    return problems
+
+
+def combination_matches(left: Any, right: Any) -> bool:
+    """两份组合是否**逐字段一致**（契约表 §4.2 的接受条件）。
+
+    用于「待确认修改计划所基于的组合 == 当前生效组合吗」。
+    """
+    return combination_fingerprint(left) == combination_fingerprint(right)
+
+
+def combination_fingerprint(combination: Any) -> str:
+    """组合的稳定指纹（逐字段比较用）。
+
+    只对**结构**取指纹：键顺序固定、列表按给定顺序。
+    """
+    normalized = normalize_combination(combination)
+    payload = {key: normalized[key] for key in COMBINATION_KEYS}
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def combination_of_definition(definition: Any) -> dict[str, Any]:
+    """从报表定义里读出生效组合（老定义按空组合处理）。"""
+    if not isinstance(definition, Mapping):
+        return empty_combination()
+    metadata = definition.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return empty_combination()
+    combination = metadata.get("effectiveCombination")
+    if not isinstance(combination, Mapping) or not combination:
+        binding = metadata.get("templateBinding")
+        binding = binding if isinstance(binding, Mapping) else {}
+        return empty_combination(
+            plan_id=str(binding.get("planId") or ""),
+            plan_revision=binding.get("planRevision"),
+            definition_id=str(binding.get("definitionId") or ""),
+            definition_version=binding.get("definitionVersion"),
+        )
+    return normalize_combination(combination)
+
+
+def processing_rules_for(
+    combination: Any, *, region_id: str, column_id: str
+) -> list[dict[str, Any]]:
+    """取某个「板块 + 列」上的处理规则。"""
+    normalized = normalize_combination(combination)
+    return [
+        rule
+        for rule in normalized["processingRules"]
+        if rule.get("ruleId")
+        and f"{rule['ruleId']}" == f"rule_{region_id}_{column_id}".lower()
+    ]
+
+
+def is_controlled_operation(operation: Any) -> bool:
+    """这个操作是不是受控枚举里的一个。"""
+    return str(operation or "") in PROCESSING_OPERATIONS
