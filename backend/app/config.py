@@ -61,8 +61,11 @@ class Settings:
         os.getenv("AI_SESSION_DB_PATH", str(_BACKEND_DIR / "data" / "haewu.db"))
     ).expanduser()
 
-    # 访问令牌：留空则不校验（仅限 localhost 使用）；挂公网 Tunnel 时必须设置
+    # 公网 Demo 使用浏览器 Basic Auth，用户名为 demo，令牌作为密码。
     access_token: str = os.getenv("AI_ACCESS_TOKEN", "")
+    require_access_token: bool = os.getenv("AI_REQUIRE_ACCESS_TOKEN", "0").lower() in (
+        "1", "true", "yes"
+    )
 
 
 @lru_cache
