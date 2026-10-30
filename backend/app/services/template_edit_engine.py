@@ -55,8 +55,13 @@ from app.services.report_template_service import DATA_SOURCE_LABEL
 from app.services.scope_service import filter_visible
 from app.services.simulated_field_semantics import (
     SCOPE_METRIC_FAMILY,
+    SEMANTIC_KIND_ALARMS,
+    SEMANTIC_KIND_CABINET_STATUS,
+    SEMANTIC_KIND_POWER,
+    SEMANTIC_KIND_PUE,
     deterministic_scope,
     metric_family_seed_key,
+    resolve_metric_semantics,
 )
 from app.services.template_definition_service import adapt_preview_spec
 from app.services.validation_service import fixed_interval_error
@@ -490,6 +495,52 @@ def _metrics_compatible(
     return True
 
 
+#: **形状型**口径（告警 / 机柜状态 / 功率 / PUE）—— 它们定义的是指标的
+#: **形态**，不是某个已登记指标的值口径（kWh / 元）。
+_SHAPE_METRIC_KINDS = (
+    SEMANTIC_KIND_ALARMS,
+    SEMANTIC_KIND_CABINET_STATUS,
+    SEMANTIC_KIND_POWER,
+    SEMANTIC_KIND_PUE,
+)
+
+
+def _intent_names_registered_metric(
+    intent: str, metric_ref: str, metrics: dict[str, dict[str, Any]],
+) -> bool:
+    """用户说的指标名**本身**是不是那个已登记指标（**识别成功**）。
+
+    **别名命中 ≠ 识别成功**（规格第 6 条 / 契约表 §3.5）。别名的匹配是
+    **子串**：「设备耗电率」包含别名「设备耗电」—— 但用户问的是**比率**，
+    不是 kWh 的耗电量。口径对不上就**不能**静默映射到已登记指标，得按
+    目录外候选处理（先澄清口径，或标显式假设）。
+
+    口径对不上有两种情形：
+
+    1. **口径不清**（「设备耗电率」到底是耗电量、占比还是功率？）——
+       已登记指标的口径是定死的（kWh / 元 / PUE），说不清就不可能是它；
+    2. **口径是另一种形状**（功率 kW / 告警 / 机柜状态 / PUE）——
+       与命中的已登记指标形状对不上时，说的是另一个指标。
+
+    「设备耗电」「设备耗电排名」这类**只加了展示要求**的说法，量口径
+    没变 → 仍然命中已登记指标（既有行为不变）。
+    """
+    text = str(intent or "").strip()
+    if not text:
+        return False
+    semantics = resolve_metric_semantics(intent=text)
+    if semantics.status == "ambiguous":
+        # 口径不清：说不清是哪个口径，就不是口径定死的已登记指标。
+        return False
+    if semantics.kind in _SHAPE_METRIC_KINDS:
+        label = str((metrics.get(metric_ref) or {}).get("label") or "")
+        metric_kind = resolve_metric_semantics(intent=label).kind if label else ""
+        if metric_kind != semantics.kind:
+            # 形状对不上（说功率却命中了 kWh 的耗电）→ 是另一个指标。
+            return False
+    return True
+
+
 # ---------- Engine ----------
 
 class TemplateEditEngine:
@@ -728,7 +779,11 @@ class TemplateEditEngine:
         if any(w in text for w in ADD_WORDS):
             plan.intent = EditIntent.ADD_SECTION
             plan.confidence = 0.85
-            metric_ref = match_metric_by_alias(text, set(metrics))
+            # 「用户说的指标」是已登记指标还是目录外候选，**一处判定**：
+            # 别名命中 ≠ 识别成功（见 ``_resolve_metric_target``）。
+            metric_ref, candidate = self._resolve_metric_target(
+                text, metrics, strip_add_prefix=True,
+            )
             source_ref = match_source_by_alias(text, set(catalogs)) or _default_dataset_source_ref(definition)
             if source_ref not in catalogs:
                 source_ref = None
@@ -741,10 +796,7 @@ class TemplateEditEngine:
             chart_kind = selection["chartKind"]
             component_type = selection["componentType"]
             # 目录外指标（#65）：解析不出真实指标标识时**不再拒绝**，
-            # 转成可澄清或带显式假设的模拟候选。
-            candidate = self._resolve_out_of_catalog(text, strip_add_prefix=True)
-            if metric_ref:
-                candidate = None
+            # 转成可澄清或带显式假设的模拟候选（上面已判定过）。
             section_title = (
                 candidate.label if candidate is not None
                 else self._extract_add_title(text)
@@ -928,14 +980,12 @@ class TemplateEditEngine:
 
         # ===== 8. 改指标 =====
         if "指标" in text or re.search(r"换成.+(耗电|电费|成本|pue|用电)", text, re.IGNORECASE):
-            metric_ref = match_metric_by_alias(new_value, set(metrics))
             # 目录外指标（#65）：换成一个目录里没有的指标同样**不再以
             # 「未登记」拒绝** —— 转成可澄清或带显式假设的模拟候选。
-            candidate = self._resolve_out_of_catalog(
-                new_value, strip_add_prefix=False,
+            # 与新增分支**同一处判定**：别名命中 ≠ 识别成功。
+            metric_ref, candidate = self._resolve_metric_target(
+                new_value, metrics, strip_add_prefix=False,
             )
-            if metric_ref:
-                candidate = None
             plan.intent = EditIntent.CHANGE_METRIC
             plan.confidence = 0.8
             plan.operation = EditOperation(
@@ -1608,6 +1658,34 @@ class TemplateEditEngine:
         if not intent:
             return None
         return resolve_out_of_catalog_candidate(intent, answer=answer)
+
+    @staticmethod
+    def _resolve_metric_target(
+        text: str, metrics: dict[str, dict[str, Any]], *, strip_add_prefix: bool,
+    ) -> tuple[str | None, OutOfCatalogCandidate | None]:
+        """判定「用户说的指标」落在哪一边：已登记指标还是目录外候选。
+
+        返回 ``(metricRef, 候选)``：
+
+        - 命中**已登记指标**时候选是 ``None``（照既有口径走）；
+        - 落在**目录外**时 ``metricRef`` 是 ``None``，候选带着口径走
+          （含义不清的带可澄清的问句，语义明确的带显式假设）。
+
+        **别名命中 ≠ 识别成功**（规格第 6 条 / 契约表 §3.5）：别名的匹配
+        是**子串**，「设备耗电率」包含别名「设备耗电」—— 但用户问的是
+        比率，不是 kWh 的耗电量。口径对不上就**不静默映射**到已登记指标。
+        """
+        candidate = TemplateEditEngine._resolve_out_of_catalog(
+            text, strip_add_prefix=strip_add_prefix,
+        )
+        metric_ref = match_metric_by_alias(text, set(metrics))
+        if not metric_ref or candidate is None:
+            # 没提到已登记指标 → 目录外候选；抽不出指标意图 → 照既有口径走。
+            return (None, candidate) if candidate is not None else (metric_ref, None)
+        if _intent_names_registered_metric(candidate.intent, metric_ref, metrics):
+            return metric_ref, None
+        # 口径对不上 → 目录外候选，**不静默映射**到已登记指标。
+        return None, candidate
 
     @staticmethod
     def _parse_grain(text: str, *, explicit_only: bool = False) -> str | None:
