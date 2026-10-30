@@ -163,6 +163,19 @@ def _model_call_records(caplog) -> list[dict[str, Any]]:
     return out
 
 
+def _request_ids(caplog, marker: str) -> list[str]:
+    """取出带指定标记的日志行里的 requestId。"""
+    out: list[str] = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if marker not in message:
+            continue
+        for token in message.split():
+            if token.startswith("requestId="):
+                out.append(token.partition("=")[2])
+    return out
+
+
 # --------------------------------------------------------------------------
 # AC2：元信息齐全（模型、提示词、阶段、序号、耗时、长度、分类）
 # --------------------------------------------------------------------------
@@ -199,6 +212,52 @@ def test_prompt_digest_is_stable_and_content_sensitive() -> None:
     other = diagnostics.prompt_digest("另一段提示词正文")
     assert first == again
     assert first != other
+
+
+def test_prompt_file_carries_no_version_marker_but_version_still_resolves() -> None:
+    """提示词文件里**不许**有版本标记 —— 它的字节就是发给模型的字节。
+
+    版本号改由**代码常量**提供：提示词里没标记就回落到常量，
+    ``promptVersion`` 仍然有值，提示词文件保持与改动前逐字节一致。
+    """
+    from app.agents.report_plan_agent import (
+        _PROMPT_VERSION,
+        _load_prompt,
+        _prompt_version,
+    )
+
+    prompt_text = _load_prompt()
+    assert "prompt-version" not in prompt_text.lower()
+    # 版本号来自代码常量，不是从提示词文件里读出来的。
+    assert _PROMPT_VERSION
+    assert _prompt_version(prompt_text) == _PROMPT_VERSION
+    # 提示词里的显式标记仍然优先（将来要显式覆盖时仍能生效）。
+    assert _prompt_version("prompt-version: v9") == "v9"
+
+
+def test_prompt_version_reaches_the_log_line(caplog) -> None:
+    """promptVersion 不会恒为空：模型调用那一行带着版本号。"""
+    caplog.set_level(logging.INFO, logger="app")
+    client = _client_with(_FakeResponse("不是 JSON"))
+
+    asyncio.run(
+        generate_candidate(
+            message="生成报表",
+            current_plan=None,
+            history=[],
+            model_call=client,
+        )
+    )
+
+    versions = {
+        token.partition("=")[2]
+        for record in caplog.records
+        for token in record.getMessage().split()
+        if token.startswith("promptVersion=")
+    }
+    assert versions
+    assert all(value for value in versions)
+    assert "None" not in versions
 
 
 # --------------------------------------------------------------------------
@@ -370,6 +429,33 @@ def test_json_error_position_points_at_the_broken_object(diagnostics_dir) -> Non
     assert text[record["jsonOffset"] : record["jsonOffset"] + 1] == "{"
 
 
+def test_json_offset_is_relative_to_the_original_text(diagnostics_dir) -> None:
+    """输出前面带空白时：偏移落在**原文**里真正断掉的那个字符上。
+
+    偏移、行列一律相对**原始返回文本**（含前导空白），
+    不是相对「去空白后的文本」—— 否则会指错字符。
+    """
+    text = "\n\n这是说明\n```json\n{\n  \"kind\": \"x\"\n"
+
+    asyncio.run(
+        generate_candidate(
+            message="生成报表",
+            current_plan=None,
+            history=[],
+            model_call=_model_returning(text),
+        )
+    )
+
+    record = _read_records(diagnostics_dir)[0]
+    assert record["parseStatus"] == "PARSE_NOT_JSON"
+    # 偏移指向原文里那个没写完的对象的起始 '{'。
+    assert record["jsonOffset"] == text.index("{")
+    assert text[record["jsonOffset"] : record["jsonOffset"] + 1] == "{"
+    # 行列也是 1 起、相对原文：第 5 行第 1 列。
+    assert record["jsonLine"] == 5
+    assert record["jsonColumn"] == 1
+
+
 # --------------------------------------------------------------------------
 # AC5：三个事件分别记录；不声称 final 已被客户端接收
 # --------------------------------------------------------------------------
@@ -406,6 +492,93 @@ def test_router_logs_business_final_and_stream_end_separately(client, caplog) ->
 # --------------------------------------------------------------------------
 
 
+def test_real_adapter_and_diagnostic_record_share_the_request_id(
+    caplog, diagnostics_dir
+) -> None:
+    """走**真实适配层**（假上游）：日志行与诊断记录的 requestId 是同一个。"""
+    caplog.set_level(logging.INFO, logger="app")
+    client = _client_with(_FakeResponse("模型这次没给 JSON：机房温湿度异常"))
+
+    result = asyncio.run(
+        generate_candidate(
+            message="生成报表",
+            current_plan=None,
+            history=[],
+            model_call=client,
+        )
+    )
+    assert result["code"] == "MODEL_OUTPUT_INVALID"
+
+    records = _read_records(diagnostics_dir)
+    assert len(records) == 1
+    record = records[0]
+
+    # 适配层那一行（模型调用）、解析层那一行、诊断记录：同一个 requestId。
+    call_ids = _request_ids(caplog, "step=model_call")
+    parse_ids = _request_ids(caplog, "step=model_parse")
+    assert len(call_ids) == 1
+    assert len(parse_ids) == 1
+    assert record["requestId"] == call_ids[0]
+    assert record["requestId"] == parse_ids[0]
+
+
+def test_concurrent_requests_keep_their_own_identifiers(
+    caplog, diagnostics_dir
+) -> None:
+    """3 个并发请求交错 await：标识各归各位，一个都不串。"""
+    caplog.set_level(logging.INFO, logger="app")
+
+    async def _one(index: int) -> None:
+        conversation_id = f"conv_conc_{index}"
+        message_id = f"msg_conc_{index}"
+        diagnostics.begin_request_context(
+            conversation_id=conversation_id, message_id=message_id
+        )
+        client = _client_with(_FakeResponse("模型这次没给 JSON"))
+        # 交错 await：三个协程真的互相让路，不是一个接一个跑完。
+        await asyncio.sleep(0.01 * index)
+        await generate_candidate(
+            message=f"第 {index} 轮",
+            current_plan=None,
+            history=[],
+            model_call=client,
+        )
+        await asyncio.sleep(0.01 * (3 - index))
+
+    async def _run() -> None:
+        await asyncio.gather(*(_one(index) for index in range(3)))
+
+    asyncio.run(_run())
+
+    call_ids = _request_ids(caplog, "step=model_call")
+    parse_ids = _request_ids(caplog, "step=model_parse")
+    assert len(call_ids) == 3
+    assert len(parse_ids) == 3
+    # 三个请求的标识互不相同。
+    assert len(set(call_ids)) == 3
+    # 解析层拿到的就是适配层那一个。
+    assert set(parse_ids) == set(call_ids)
+
+    # 会话标识没串：日志行里的会话与诊断记录里的会话一一对上。
+    call_conversations = {
+        record.get("conversationId") for record in _model_call_records(caplog)
+    }
+    assert call_conversations == {
+        "conv_conc_0",
+        "conv_conc_1",
+        "conv_conc_2",
+    }
+
+    records = _read_records(diagnostics_dir)
+    assert len(records) == 3
+    for record in records:
+        # 每条诊断记录都挂在自己那一轮的会话上。
+        assert record["requestId"] in call_ids
+        assert record["conversationId"] in call_conversations
+    assert len({record["requestId"] for record in records}) == 3
+    assert len({record["conversationId"] for record in records}) == 3
+
+
 def test_diagnostic_record_is_masked_and_independent(caplog, diagnostics_dir) -> None:
     """诊断记录落独立文件，内容脱敏，不含用户原话与业务数值。"""
     caplog.set_level(logging.INFO, logger="app")
@@ -433,6 +606,32 @@ def test_diagnostic_record_is_masked_and_independent(caplog, diagnostics_dir) ->
     raw = json.dumps(record, ensure_ascii=False)
     assert secret_phrase not in raw
     assert "12345" not in raw
+
+
+def test_credential_shaped_keys_are_not_written_into_the_body() -> None:
+    """键名本身像凭据的：不写进诊断正文；正常字段名仍然可读。"""
+    rendered = diagnostics.render_structure(
+        {
+            "AKIAIOSFODNN7EXAMPLE": "x",
+            "sk-abcdefgh12345678": "y",
+            "normalKey": "z",
+            "energyKwh": 1,
+            "deviceName": "UPS",
+            "机房温湿度": "机房温湿度",
+        }
+    )
+    # 键名就是凭据的：不能原样落盘。
+    assert "AKIAIOSFODNN7EXAMPLE" not in rendered
+    assert "sk-abcdefgh12345678" not in rendered
+    # 正常字段名仍然可读：排查时能对上模型给了哪些字段。
+    assert "normalKey" in rendered
+    assert "energyKwh" in rendered
+    assert "deviceName" in rendered
+    # 中文键照旧降级成 «key:N»。
+    assert "机房温湿度" not in rendered
+    # 值、数字一直都没有漏。
+    assert "«str:1»" in rendered
+    assert "«num»" in rendered
 
 
 def test_diagnostic_file_is_private_to_the_current_user(diagnostics_dir) -> None:
@@ -463,29 +662,92 @@ def test_default_diagnostics_dir_is_outside_the_repository() -> None:
 
 
 def test_diagnostic_record_is_not_in_the_session_database(
-    diagnostics_dir, tmp_path
+    client, diagnostics_dir
 ) -> None:
-    """诊断记录不进会话库：库里没有 diagnosticId。"""
-    db_path = tmp_path / "sessions.db"
+    """诊断记录不进会话库：**真的跑一轮会话**，再查会话库的表与行。
+
+    之前的写法是新建一个空 SQLite 文件、从没往里写过东西，然后断言
+    诊断标识不在里面 —— 那个断言恒真，测不到任何东西。这里跑真实的
+    会话流程：会话库确实写进了消息，再检查库里没有诊断内容。
+    """
     import sqlite3
 
-    connection = sqlite3.connect(db_path)
-    connection.execute("CREATE TABLE IF NOT EXISTS t (x TEXT)")
-    connection.commit()
-    connection.close()
+    from app.services.report_design_service import report_design_service
+    from app.services.session_service import session_service
 
-    asyncio.run(
-        generate_candidate(
-            message="生成报表",
-            current_plan=None,
-            history=[],
-            model_call=_model_returning("不是 JSON"),
-        )
-    )
-    records = _read_records(diagnostics_dir)
-    assert records
-    blob = db_path.read_bytes()
-    assert records[0]["diagnosticId"].encode("utf-8") not in blob
+    report_design_service.reset_for_tests()
+    try:
+
+        async def _bad_model(messages: list[dict[str, Any]]) -> str:
+            return "模型这次没给 JSON，给了一段说明：机房温湿度异常"
+
+        report_design_service.reset_for_tests(model_call=_bad_model)
+        payload = {
+            "agentProtocolVersion": "1.0",
+            "conversationId": "conv_sessdbcheck",
+            "sessionId": "sess_sessdbcheck",
+            "messageId": "msg_sessdbcheck",
+            "state": "ANALYZING",
+            "message": "生成一份机房能耗报表",
+            "context": {
+                "projectId": "project_001",
+                "subjectRef": "machine_room",
+                "subjectId": "room_a",
+            },
+        }
+        response = client.post("/api/agent/chat", json=payload)
+        assert response.status_code == 200
+
+        # 诊断记录确实产生了。
+        records = _read_records(diagnostics_dir)
+        assert records
+        diagnostic_id = records[0]["diagnosticId"]
+        request_id = records[0]["requestId"]
+
+        # 会话库真的写进了东西（否则下面的断言又是空的）。
+        db_path = Path(session_service._repo._db_path)
+        assert db_path.exists()
+        connection = sqlite3.connect(db_path)
+        try:
+            tables = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            ]
+            assert "messages" in tables
+            # 把**所有表的所有行**摊平成文本：诊断内容不该出现在任何一处。
+            dumped: list[str] = []
+            for table in tables:
+                for row in connection.execute(f'SELECT * FROM "{table}"'):
+                    dumped.append(json.dumps(row, ensure_ascii=False, default=str))
+            assert dumped, "这一轮会话应该往库里写了数据"
+        finally:
+            connection.close()
+        joined = "\n".join(dumped)
+
+        # 先证明这个库**确实**写进了这一轮（否则下面的断言会是空的）。
+        assert "生成一份机房能耗报表" in joined
+        # 会话库的表与行里没有诊断标识，也没有诊断正文。
+        assert diagnostic_id not in joined
+        assert request_id not in joined
+        assert "diag_" not in joined
+        assert "req_" not in joined
+        assert "机房温湿度异常" not in joined
+
+        # 落到磁盘上的字节也一样没有（WAL 模式下数据在 -wal 文件里，
+        # 两个文件都要看）。
+        blob = db_path.read_bytes()
+        wal = db_path.with_name(db_path.name + "-wal")
+        if wal.exists():
+            blob += wal.read_bytes()
+        assert diagnostic_id.encode("utf-8") not in blob
+        assert request_id.encode("utf-8") not in blob
+        assert b"diag_" not in blob
+        assert b"req_" not in blob
+        assert "机房温湿度异常".encode("utf-8") not in blob
+    finally:
+        report_design_service.reset_for_tests()
 
 
 # --------------------------------------------------------------------------
@@ -687,6 +949,51 @@ def test_new_turn_restarts_the_attempt_counter(caplog) -> None:
 
     attempts = [record.get("attempt") for record in _model_call_records(caplog)]
     assert attempts == ["1", "1"]
+
+
+def test_bare_model_call_does_not_inherit_the_previous_request_context(
+    caplog,
+) -> None:
+    """没有请求上下文的裸调用：不沿用上一轮的会话，序号从 1 起。
+
+    上一轮的模型调用已经结束（解析层接手了状态），这一轮却没有开请求
+    上下文 —— 那就不能把这次调用认到上一轮的会话上去。
+    """
+    caplog.set_level(logging.INFO, logger="app")
+
+    diagnostics.begin_request_context(
+        conversation_id="conv_diag_stale", message_id="msg_diag_stale"
+    )
+    first = diagnostics.begin_model_call()
+    assert first.conversation_id == "conv_diag_stale"
+    assert first.attempt == 1
+    # 解析层接手状态 = 这一轮的模型调用结束了。
+    diagnostics.ensure_model_call_state()
+
+    # 下一轮没有开请求上下文：裸调用。
+    second = diagnostics.begin_model_call()
+    assert second.conversation_id is None
+    assert second.message_id is None
+    assert second.attempt == 1
+    assert second.request_id != first.request_id
+    # 并且有一条告警说明这次调用没有请求上下文。
+    assert "没有请求上下文" in caplog.text
+
+
+def test_same_request_keeps_incrementing_the_attempt(caplog) -> None:
+    """正常路径不变：同一轮请求里的模型调用序号递增，会话标识不变。"""
+    caplog.set_level(logging.INFO, logger="app")
+
+    diagnostics.begin_request_context(
+        conversation_id="conv_diag_keep", message_id="msg_diag_keep"
+    )
+    client = _client_with(_FakeResponse("第一轮"), _FakeResponse("第二轮"))
+    asyncio.run(_call_twice(client))
+
+    records = _model_call_records(caplog)
+    assert [record.get("attempt") for record in records] == ["1", "2"]
+    assert all(record.get("conversationId") == "conv_diag_keep" for record in records)
+    assert "没有请求上下文" not in caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -914,6 +1221,42 @@ def test_log_write_failure_does_not_fail_the_request(monkeypatch) -> None:
             model_call=_model_returning("不是 JSON"),
         )
     )
+    assert result["code"] == "MODEL_OUTPUT_INVALID"
+
+
+def test_diagnostic_write_failure_plus_log_failure_still_returns(
+    tmp_path, monkeypatch
+) -> None:
+    """诊断写失败**且**日志器自己也抛错：业务请求照常返回。
+
+    故障处理路径上日志再抛错，会把原始异常盖掉并穿出到业务请求 ——
+    那一轮就直接失败了。契约表 §6.5：写日志 / 写诊断失败不得让业务请求失败。
+    """
+    from app.agents import report_plan_agent
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("日志盘满了")
+
+    settings = get_settings()
+    blocked = tmp_path / "blocked"
+    blocked.write_text("这不是目录", encoding="utf-8")
+    monkeypatch.setattr(settings, "diagnostics_dir", blocked)
+    monkeypatch.setattr(settings, "diagnostics_enabled", True)
+    # 诊断侧的日志器：常规日志与「写诊断失败」的告警都抛错。
+    monkeypatch.setattr(diagnostics.logger, "info", _boom)
+    monkeypatch.setattr(diagnostics.logger, "warning", _boom)
+    # 解析层在故障处理路径上的告警也抛错。
+    monkeypatch.setattr(report_plan_agent.logger, "warning", _boom)
+
+    result = asyncio.run(
+        generate_candidate(
+            message="生成报表",
+            current_plan=None,
+            history=[],
+            model_call=_model_returning("不是 JSON"),
+        )
+    )
+
     assert result["code"] == "MODEL_OUTPUT_INVALID"
 
 
