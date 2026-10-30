@@ -553,3 +553,139 @@ def test_new_item_after_the_quota_is_exhausted_can_still_be_asked(
     assert second["uiActions"] != ["template_edit_clarification_limit"]
     assert "追问过 1 轮" not in second["reply"]
     assert second["questions"], "新事项应该重新被追问"
+
+
+# ==========================================================================
+# P3 问题反馈识别：不能只靠一张固定词表
+# ==========================================================================
+#
+# 验收方实测：旧词表之外的常见抱怨句（「颜色太扎眼了」「一眼看过去很费劲」）
+# 一律被判成 UNKNOWN → 掉进编辑快路 → 反问「请告诉我要怎么改当前草稿」。
+# 修法是给抱怨句加**结构性特征**（程度副词 + 评价性形容词、否定式体验说法），
+# 同时守住「正常新增 / 改名 / 删除 / 换图 / 改时间范围 / 改粒度」这条边界。
+
+#: 验收方实测掉进编辑快路的 9 句抱怨：都没有疑问标记，也都不在旧词表里。
+COMPLAINT_SAMPLES = (
+    "颜色太扎眼了",
+    "趋势太单调了",
+    "这个布局太挤了",
+    "数字太大了没法看",
+    "一眼看过去很费劲",
+    "配色很丑",
+    "看不下去",
+    "有点糊",
+    "体验很差",
+)
+
+#: 验收方确认过的正常修改请求：不能被误判成问题反馈。
+LEGITIMATE_CHANGE_REQUESTS = (
+    "新增一个总耗电卡片",
+    "新增一个设备耗电排名卡片",
+    "新增一个能耗成本卡片",
+    "把小时趋势的标题改成能耗趋势",
+    "删除这个卡片",
+    "把趋势图换成柱状图",
+    "把时间范围改成最近 7 天",
+    "把粒度改成按秒",
+)
+
+
+@pytest.mark.parametrize("message", COMPLAINT_SAMPLES)
+def test_common_complaints_are_issue_feedback(message):
+    """常见抱怨句（没有疑问标记、词表之外）也判成问题反馈。"""
+    assert routing_rules.detect_issue_feedback(
+        message, subject_required=False
+    ) is True
+    assert (
+        classify_message_intent(message, subject_required=False)
+        is UserIntent.ISSUE_FEEDBACK
+    )
+
+
+@pytest.mark.parametrize("message", COMPLAINT_SAMPLES)
+def test_complaint_does_not_produce_a_pending_edit_plan(
+    post_chat, definition, message
+):
+    """抱怨句端到端：只给分析，不产生待接受计划，不改定义。"""
+    payload = _post(post_chat, definition, message)
+
+    assert payload["turnKind"] == "query_answer"
+    assert payload["uiActions"] == ["query_answer"]
+    assert payload["domainObjects"]["pendingEditPlan"] is None
+    assert payload["domainObjects"]["changeSet"] is None
+    assert payload["debug"]["userIntent"] == UserIntent.ISSUE_FEEDBACK.value
+    assert definition.metadata["revision"] == 0
+    assert session_service.load_pending_plan("conv_test") is None
+
+
+@pytest.mark.parametrize("message", LEGITIMATE_CHANGE_REQUESTS)
+def test_legitimate_change_requests_are_not_issue_feedback(message):
+    """正常的新增 / 改名 / 删除 / 换图 / 改时间范围 / 改粒度 仍然判明确修改。"""
+    intent = classify_message_intent(message, subject_required=False)
+
+    assert intent is not UserIntent.ISSUE_FEEDBACK, "正常修改请求被当成了抱怨"
+    assert intent is UserIntent.MODIFY
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_intent"),
+    [
+        ("新增一个总耗电卡片", "ADD_SECTION"),
+        ("新增一个设备耗电排名卡片", "ADD_SECTION"),
+        ("新增一个能耗成本卡片", "ADD_SECTION"),
+        ("把小时趋势的标题改成能耗趋势", "RENAME_SECTION"),
+    ],
+)
+def test_legitimate_change_requests_still_produce_a_plan(
+    post_chat, definition, message, expected_intent
+):
+    """端到端：正常修改仍然产出待接受计划（没有被当抱怨吞掉）。"""
+    payload = _post(post_chat, definition, message)
+
+    assert payload["turnKind"] != "query_answer"
+    plan = payload["domainObjects"]["pendingEditPlan"]
+    assert plan is not None
+    assert plan["operations"][0]["intent"] == expected_intent
+    assert definition.metadata["revision"] == 0
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "删除这个卡片",
+        "把趋势图换成柱状图",
+        "把时间范围改成最近 7 天",
+        "把粒度改成按秒",
+    ],
+)
+def test_legitimate_change_requests_are_not_answered_as_query(
+    post_chat, definition, message
+):
+    """这些请求走的是**修改 / 追问**链路，不是只读答复链路。"""
+    payload = _post(post_chat, definition, message)
+
+    assert payload["turnKind"] != "query_answer"
+    assert payload["uiActions"] != ["query_answer"]
+    assert payload["domainObjects"]["changeSet"] is None
+    assert definition.metadata["revision"] == 0
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "把趋势卡片标题改成能耗卡片",
+        "把设备耗电排名卡片换成柱状图",
+        "新增一个总耗电趋势卡片",
+    ],
+)
+def test_object_names_that_also_look_like_complaints_are_not_issue_feedback(
+    message,
+):
+    """「趋势」「排名」「卡片」这些词既可能是抱怨，也可能是**对象名**。
+
+    抱怨句被识别成问题反馈的同时，正常的新增 / 改名 / 换图不能被误伤。
+    """
+    intent = classify_message_intent(message, subject_required=False)
+
+    assert intent is not UserIntent.ISSUE_FEEDBACK
+    assert intent is UserIntent.MODIFY
