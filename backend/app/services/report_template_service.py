@@ -80,6 +80,17 @@ DEFAULT_SOURCE_REF = "catalog.machine_room.energy"
 DATA_SOURCE = "mock_energy"
 DATA_SOURCE_LABEL = "模拟数据（能耗 Mock 源，非生产事实表）"
 
+#: 区域 ``pendingReason`` 文案 —— 模拟示例（ADR 0004）。**既有文案，逐字不改**。
+PENDING_REASON_SIMULATED = "本区域数值为模拟业务数据，接入真实数据后自动替换。"
+
+#: 区域 ``pendingReason`` 文案 —— 用户 JSON（工单 #66 F）。
+#:
+#: 用户 JSON 模式下这块区域的数值是**用户自己提供的那份数据**，不是造出来的
+#: 模拟数据 —— 说「模拟业务数据」是**事实性错误**；说「接入真实数据后自动
+#: 替换」同样是**不存在的事实**（用户的数据不是系统接通的业务库）。
+#: 口径与界面一致：**用户提供的数据，未经业务核验**。
+PENDING_REASON_USER_JSON = "本区域数值来自用户提供的数据，未经业务核验。"
+
 #: 指标口径可核对的底层字段。指标登记了但字段不在数据源里，
 #: 就说明当前能力算不出这个数 —— 只能占位，不能编。
 _SOURCE = get_catalog(DEFAULT_SOURCE_REF) or {}
@@ -139,6 +150,22 @@ def _reason_is_scope(reason: Any) -> bool:
     """占位原因是不是**范围授权**问题。"""
     text = str(reason or "")
     return any(keyword in text for keyword in _SCOPE_KEYWORDS)
+
+
+def pending_reason(mode: Any = None) -> str:
+    """区域 ``pendingReason`` 的文案（按**来源模式**分别说）。
+
+    - 模拟示例（``simulated``）：既有文案，**逐字不改**（ADR 0004）。
+    - 用户 JSON（``user_json``）：用户自己提供的数据，**未经业务核验**；
+      不说「模拟业务数据」（不是事实），也不宣称已接入真实业务系统
+      （同样不是事实）。
+
+    ``mode`` 可以是 ``SourceMode``，也可以是它的字符串取值。
+    """
+    raw = mode.mode if isinstance(mode, SourceMode) else mode
+    if resolve_source_mode(raw).is_user_json:
+        return PENDING_REASON_USER_JSON
+    return PENDING_REASON_SIMULATED
 
 
 def region_data_status(region: Mapping[str, Any]) -> str:
@@ -523,7 +550,8 @@ def _build_region(
     （ADR 0004）。这一层给的是**绑定描述符**与**定稿栏目**。
 
     ``source_mode`` 是**服务端记录的来源模式**（模拟示例 / 用户 JSON）：
-    它只影响**说明文案**（真实目录的限制在两种模式下怎么表述），
+    它只影响**说明文案**（真实目录的限制在两种模式下怎么表述，
+    以及区域 ``pendingReason`` 说的是「模拟业务数据」还是「用户提供的数据」），
     不放宽授权判定，也不改变「指标绑没绑上」这件事。
     """
     section = dict(section or {})
@@ -660,9 +688,12 @@ def _build_region(
                 "offset": window.offset,
             },
             "windowLabel": window.label,
-            # 这个区域的数值**是模拟的**（ADR 0004）：草稿阶段不接真实数，
-            # 屏上那一屏由模拟业务数据渲染，接入真实数据后自动替换。
-            "pendingReason": "本区域数值为模拟业务数据，接入真实数据后自动替换。",
+            # 这个区域的数值来源**按来源模式分别说**（ADR 0004 / 工单 #66 F）：
+            # - 模拟示例：草稿阶段不接真实数，屏上那一屏由模拟业务数据渲染，
+            #   接入真实数据后自动替换（既有文案，**逐字不改**）；
+            # - 用户 JSON：数值来自**用户自己提供的那份数据**，未经业务核验
+            #   —— 说「模拟业务数据」是说反话。
+            "pendingReason": pending_reason(source_mode),
         },
         # 取数来源与数据性质披露保留：数值就来自这个模拟源
         dataSource=DATA_SOURCE,
