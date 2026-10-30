@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -24,8 +25,8 @@ from pathlib import Path
 import pytest
 
 from app.schemas.report_plan import ComponentType, ReportPlan
-from app.services import display_rule_library as rules
-from app.services.display_rule_library import (
+from app.services import report_rule_library as rules
+from app.services.report_rule_library import (
     RENDERABLE_COMPONENT_TYPES,
     RULE_LIBRARY_VERSION,
     all_rules,
@@ -43,7 +44,7 @@ _RULES_DOC = (
     Path(__file__).resolve().parents[2]
     / "docs"
     / "rules"
-    / "display-rule-library.md"
+    / "report-rule-library.md"
 )
 
 
@@ -207,6 +208,63 @@ def test_the_selection_reason_comes_from_the_rule_that_fired():
     assert evidence.ruleId == "DR-MAP-COMPARISON"
     assert plan.sections[0].selectionReason == "按展示目的「比较不同对象」选柱状图。"
     assert "比较不同对象" in plan.sections[0].selectionReason
+
+
+def _rendered_by(template: str, text: str) -> bool:
+    """这段理由是不是这条规则的解释模板渲染出来的。
+
+    模板里的占位符（``{intent_label}`` 之类）换成通配，其余字面量逐字比对 ——
+    这样「理由是这条规则自己说的」可以机械地查，不靠人眼。
+    """
+    pattern = re.sub(r"\\\{[a-zA-Z_]+\\\}", ".+?", re.escape(template))
+    return re.fullmatch(pattern, text) is not None
+
+
+def test_every_section_records_a_rule_that_exists_in_the_library():
+    """每块板块的命中依据都能在规则库里查到那条规则 —— ID 不是编出来的。"""
+    payload = _candidate_payload()
+    payload["sections"] = [
+        _section("总耗电", "metric_card", displayIntent="total"),
+        _section("耗电趋势", "metric_card", displayIntent="trend"),
+        _section("各机房耗电对比", "metric_card", displayIntent="comparison"),
+        _section("耗电构成", "metric_card", displayIntent="composition"),
+        _section("当前告警列表", "table", displayIntent="records"),
+        _section("说明：本表为模拟数据", "text", metricIntents=[]),
+    ]
+
+    plan = apply_candidate(payload, plan_id="plan_060")
+    known = {rule.rule_id for rule in all_rules()}
+
+    assert len(plan.selectionEvidence) == len(plan.sections)
+    for evidence in plan.selectionEvidence:
+        assert evidence.ruleId in known, evidence.ruleId
+
+
+def test_the_reason_of_every_section_is_that_rule_own_explanation():
+    """每块板块的理由都是**它自己那条规则**的解释模板渲染出来的。
+
+    理由不是事后编的 —— 换个说法都对不上那条规则自己的模板。
+    """
+    payload = _candidate_payload()
+    payload["sections"] = [
+        _section("总耗电", "metric_card", displayIntent="total"),
+        _section("耗电趋势", "metric_card", displayIntent="trend"),
+        _section("各机房耗电对比", "metric_card", displayIntent="comparison"),
+        _section("耗电构成", "metric_card", displayIntent="composition"),
+        _section("说明：本表为模拟数据", "text", metricIntents=[]),
+    ]
+
+    plan = apply_candidate(payload, plan_id="plan_060")
+    by_id = {rule.rule_id: rule for rule in all_rules()}
+    evidence_by_section = {item.sectionId: item for item in plan.selectionEvidence}
+
+    for section in plan.sections:
+        evidence = evidence_by_section[section.id]
+        rule = by_id[evidence.ruleId]
+        assert _rendered_by(rule.explain_template, section.selectionReason), (
+            evidence.ruleId,
+            section.selectionReason,
+        )
 
 
 def test_the_hit_evidence_records_the_premise_that_fired():

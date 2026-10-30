@@ -1,7 +1,7 @@
 # 展示规则库（第一版）
 
 **规则库版本：1.0.0**
-规则表代码：`backend/app/services/display_rule_library.py`
+规则表代码：`backend/app/services/report_rule_library.py`
 契约来源：GitHub #55《开发规格 - 报表智能生成与调整》第二章「规则库与选型」第 9–11 条
 工单：#60「统一开发 05：第一版规则库与命中依据持久化」
 
@@ -182,7 +182,7 @@ DisplayRule(
 
 ## 6. 改规则时怎么做
 
-1. 改 `backend/app/services/display_rule_library.py` 里的规则表；
+1. 改 `backend/app/services/report_rule_library.py` 里的规则表；
 2. 规则**语义**变了就改 `RULE_LIBRARY_VERSION`（只改措辞、只加注释不用改）；
 3. 同步更新本文档的「规则表全表」与「版本历史」；
 4. 跑 `backend/tests/test_ticket60_rule_library.py`（文档与规则表的一致性也在里面查）。

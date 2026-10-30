@@ -39,7 +39,7 @@ from app.schemas.report_plan import ComponentType, DisplayIntent, GrainUnit
 
 
 #: 规则库版本。规则表的**语义**变了才改它（改了要同步
-#: ``docs/rules/display-rule-library.md``）。方案里记着它，所以历史方案
+#: ``docs/rules/report-rule-library.md``）。方案里记着它，所以历史方案
 #: 看得出「当时是哪一版规则给出的理由」。
 RULE_LIBRARY_VERSION = "1.0.0"
 

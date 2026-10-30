@@ -43,7 +43,7 @@ from app.schemas.report_plan import (
     ReportPlan,
     validate_section_contract,
 )
-from app.services.display_rule_library import (
+from app.services.report_rule_library import (
     COMPONENT_TYPE_LABEL,
     RuleContext,
     RuleHit,
@@ -271,7 +271,7 @@ def drop_unaccepted_suggestion_sections(
 # 模型适配层（report_plan_agent）与领域层（本模块）共用同一份规则，
 # 两边不会各判各的。
 #
-# 规则本身住在 ``app.services.display_rule_library``（工单 #60）：每条规则
+# 规则本身住在 ``app.services.report_rule_library``（工单 #60）：每条规则
 # 带稳定 ID、适用条件、建议展示、禁用条件、优先级与解释模板。本模块只负责
 # **取用**命中结果，不自己再抄一份映射表 —— 优先级也不再靠元组顺序隐含。
 # --------------------------------------------------------------------------
