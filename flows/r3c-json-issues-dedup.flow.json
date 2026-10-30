@@ -1,0 +1,32 @@
+{
+  "outDir": "../.selfcheck/flow-r3c-json-issues-dedup",
+  "serve": "..",
+  "waitMs": 1500,
+  "timeout": 60000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "R3c-01 全局数据问题只说一次：报表面板顶部 1 次，区域卡片 0 次",
+      "path": "/frontend/tests/page_accept_harness.html?scene=json-issues",
+      "continueOnError": false,
+      "steps": [
+        { "wait": 800 },
+
+        { "eval": "document.querySelectorAll('#preview-root [data-json-input-issues]').length === 1" },
+        { "eval": "document.querySelector('#preview-root [data-json-input-issues]').innerText.includes('数据里的问题')" },
+        { "eval": "document.querySelector('#preview-root [data-json-input-issues]').innerText.includes('字段「total_energy」有 3 行缺失，缺失按「（缺失）」标注，不当成 0。')" },
+
+        { "eval": "document.querySelectorAll('#preview-root [data-region-payload-notes]').length === 2" },
+        { "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-payload-notes]')).every(function (box) { return !box.innerText.includes('字段「total_energy」有 3 行缺失'); })" },
+
+        { "eval": "(() => { var t = '字段「total_energy」有 3 行缺失，缺失按「（缺失）」标注，不当成 0。'; var root = document.getElementById('preview-root'); return root.innerText.split(t).length - 1 === 1; })()" },
+
+        { "eval": "document.getElementById('preview-root').innerText.includes('共 300 行，已显示前 200 行（上限 200 行）；汇总计算仍按全部 300 行。')" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('这个指标没能绑定到输入字段，没有编值。')" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('以下栏目没能绑定到输入字段')" },
+
+        { "screenshot": "R3c-01-全局数据问题只说一次-顶部一次区域不重复" }
+      ]
+    }
+  ]
+}
