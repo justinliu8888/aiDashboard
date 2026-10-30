@@ -77,7 +77,7 @@ from app.services.query_answer_service import (
 from app.services.request_timeline import log_timeline_step
 from app.services.session_context import bind_session_key, current_session_key
 from app.services.session_fact_service import session_fact_service
-from app.services.session_service import session_service
+from app.services.session_service import CLARIFICATION_KEY_UPDATED, session_service
 from app.services.edit_reference_resolver import resolve_visible_reference
 from app.services.edit_time_resolver import extract_change_value, resolve_time_expression
 from app.services.metric_mock_service import list_metrics
@@ -1554,11 +1554,28 @@ class AgentService:
         if not session_service.can_ask_clarification(session_key, key=key):
             # 一轮之后仍缺安全目标（规格第 18 条）：保留当前报告，给**非阻塞**
             # 说明与可选替代 —— 不猜目标、不造空计划、不继续循环强制询问。
+            #
+            # 文案**按事实分两种**（契约表 §8 不变量 8「宁可少说，不许说假话」）：
+            #   - 目标**还没定下来** → 说「还是没能确定」；
+            #   - 目标**已经定下来**、只是这个改法行不通 → 说实话：额度用完了，
+            #     这一轮不再追问，真正的原因就是下面那句原因（照原样引用，
+            #     不改写、不总结）—— 用户明明点名了卡片，同一条回复里再说
+            #     「还是没能确定」是自相矛盾。
+            if target:
+                head = (
+                    f"这项修改我已经追问过 {MAX_CLARIFICATION_ROUNDS} 轮，"
+                    "澄清额度用完了，这一轮不再追问："
+                )
+            else:
+                head = (
+                    f"这项修改我已经追问过 {MAX_CLARIFICATION_ROUNDS} 轮，"
+                    "还是没能确定："
+                )
             response.reply = (
-                f"这项修改我已经追问过 {MAX_CLARIFICATION_ROUNDS} 轮，还是没能确定："
-                f"{response.reply}"
-                "当前报表保持原样，草稿没有修改，也没有替你接受任何改动。"
-                "你可以选一种继续方式："
+                head
+                + f"{response.reply}"
+                + "当前报表保持原样，草稿没有修改，也没有替你接受任何改动。"
+                + "你可以选一种继续方式："
                 + "".join(DELEGATION_ALTERNATIVES)
             )
             response.questions = []
@@ -1568,6 +1585,21 @@ class AgentService:
             # 这件已经结束的事，新事项反而被旧事项的上下文缠住。
             request.collectedInfo.pop("pendingEditRequest", None)
             request.collectedInfo.pop("pendingEditTimeAnchor", None)
+            # 这一轮把目标解析出来了 → **把已解析的目标写回额度键**
+            # （契约表 §7.4）：键从「意图:」变成「意图:目标卡片」。
+            # 轮次**照旧带着**（这一轮没有真的把追问抛出去，不该 +1；
+            # 契约表 §7.4「只有真的问出去了才算消耗」），也不因换键归零。
+            # 效果：同一件事再说一遍 → 派生出的键与库里的键一致 → 轮次已是 1
+            # → 被挡住，不再被追问第二轮；换另一张卡片 → 键不同 → 轮次从 0 起
+            # → 仍能重新追问一轮。
+            resolved_key = (
+                f"{intent}:{target}" if target and intent != "UNKNOWN" else key
+            )
+            session_service.record_clarification(
+                session_key,
+                key=resolved_key,
+                outcome=CLARIFICATION_KEY_UPDATED,
+            )
             return response
         session_service.record_clarification(
             session_key, key=key, question=response.reply

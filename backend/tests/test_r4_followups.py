@@ -238,8 +238,102 @@ def test_target_becoming_known_continues_the_same_item(post_chat):
     assert "追问过 1 轮" in second["reply"]
     assert second["questions"] == []
     state = session_service.load_clarification("conv_test")
-    assert state.key == "CHANGE_VISUALIZATION:", "额度键应沿用上一轮"
+    # 额度用尽时，这一轮**解析出来的目标要写回额度键**（契约表 §7.4）：
+    # 键从「意图:」变成「意图:目标卡片」。
+    assert state.key == "CHANGE_VISUALIZATION:region_hourly_trend", (
+        "额度用尽时要把已解析的目标写回额度键"
+    )
     assert state.rounds == 1, "轮次接着算，不该重开"
+
+
+def test_the_same_item_is_not_asked_a_second_time(post_chat):
+    """同一件事**只被追问一轮**（复核 F-1）。
+
+    三轮形状：r1 追问 → r2（用户把目标补上）被额度挡住 → r3（同一句再说
+    一遍）**不再被追问**。
+
+    修之前：r2 被挡住时额度键还停在「目标为空」的旧键上，而
+    ``_derive_clarification_key`` 的沿用分支要求 ``pendingEditRequest``
+    还在（r2 刚把它清掉）→ r3 退回「键变了 = 新事项」→ 又问了一轮。
+    """
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    first = _post(post_chat, definition, "改成柱状图")
+    assert first["uiActions"] != ["template_edit_clarification_limit"]
+    assert first["questions"], "第一轮应该真的追问"
+
+    second = _post(post_chat, definition, "把小时趋势改成柱状图")
+    assert second["uiActions"] == ["template_edit_clarification_limit"]
+
+    third = _post(post_chat, definition, "把小时趋势改成柱状图")
+
+    # 同一件事 → 额度已经用完 → 不许再追问一轮。
+    assert third["uiActions"] == ["template_edit_clarification_limit"], (
+        f"同一件事又被追问了一轮：uiActions={third['uiActions']}"
+    )
+    assert third["questions"] == [], "同一件事又被追问了一轮"
+    assert "ask_template_edit_detail" not in (third["uiActions"] or [])
+    assert "template_editing" not in (third["uiActions"] or [])
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_VISUALIZATION:region_hourly_trend"
+    assert state.rounds == 1, "同一件事的额度不该被重开"
+
+
+def test_the_exhausted_reply_does_not_claim_the_target_is_unknown(post_chat):
+    """被挡住时的文案不许说假话（契约表 §8 不变量 8）。
+
+    用户明明点名了「小时趋势」，同一条回复里再说「还是没能确定」就是
+    自相矛盾 —— 这一轮**目标已经定下来**，只是这个改法行不通。
+    """
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    _post(post_chat, definition, "改成柱状图")
+    second = _post(post_chat, definition, "把小时趋势改成柱状图")
+
+    assert "还是没能确定" not in second["reply"], (
+        "目标已经定下来，却说「还是没能确定」"
+    )
+    # 真正的原因照原样引用，不改写、不总结。
+    assert "「小时趋势」的数据形态不适合这种展示方式" in second["reply"]
+    # 额度用完了这一事实要说清楚。
+    assert "额度用完了" in second["reply"]
+    # 边界那句逐字保留。
+    assert "当前报表保持原样，草稿没有修改，也没有替你接受任何改动。" in second["reply"]
+
+
+def test_the_exhausted_reply_still_says_unknown_when_target_is_unknown(post_chat):
+    """目标**还没定下来**时，「还是没能确定」的口径保留。"""
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    _post(post_chat, definition, "改成柱状图")
+    second = _post(post_chat, definition, "改成柱状图")
+
+    assert second["uiActions"] == ["template_edit_clarification_limit"]
+    assert "还是没能确定" in second["reply"]
+    assert "当前报表保持原样，草稿没有修改，也没有替你接受任何改动。" in second["reply"]
+
+
+def test_a_different_card_after_exhaustion_can_still_be_asked(post_chat):
+    """额度用尽后**换另一张卡片** → 仍能重新追问一轮（复核 F-1 另一半）。
+
+    额度按「事项」计：换一张卡片就是另一件事，轮次从 0 起。
+    """
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    _post(post_chat, definition, "改成柱状图")
+    _post(post_chat, definition, "把小时趋势改成柱状图")
+    assert session_service.load_clarification("conv_test").rounds == 1
+
+    other = _post(post_chat, definition, "把总耗电改成柱状图")
+
+    assert other["uiActions"] != ["template_edit_clarification_limit"], (
+        "换了一张卡片却被上一张卡片的额度挡住了"
+    )
+    assert other["questions"], "换一张卡片应该重新被追问"
+    assert "追问过 1 轮" not in other["reply"]
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_VISUALIZATION:region_total_energy"
+    assert state.rounds == 1, "新事项的轮次从 0 起算成 1"
 
 
 def test_a_different_intent_can_still_be_asked_once(post_chat):
