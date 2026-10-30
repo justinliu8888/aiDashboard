@@ -1088,7 +1088,9 @@ class AgentService:
                 code="EDIT_VERIFICATION_UNAVAILABLE",
             )
             # 工单 #58：把这一轮判出的意图带进调试信息，观测时能看出
-            # 「目录外新增」这类请求是被意图门分流到通用路径的。
+            # 这一轮判成了什么意图。工单 #65 之后，目录外新增**不再**被
+            # 意图门分流到通用路径 —— 它走确定性编辑快路出候选；快路认不
+            # 出来时才落到下面这段通用路径。
             notice.debug = {**self._build_debug(route), **(notice.debug or {})}
             return notice
 
