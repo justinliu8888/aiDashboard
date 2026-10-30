@@ -27,6 +27,10 @@ from app.services.data_source_mode import (
     SOURCE_MODE_KEY,
     normalize_source_mode,
 )
+from app.services.effective_combination import (
+    normalize_combination,
+    validate_combination,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -203,6 +207,132 @@ def _validate_source_modes(
                 )
 
 
+def _validate_effective_combination(
+    definition_draft: dict[str, Any], issues: list[ValidationIssue]
+) -> None:
+    """生效组合（契约表 §2）的一致性校验。
+
+    这一组是**绑在一起**的：来源模式、输入 ID 与版本、字段映射、
+    处理规则与定义版本。校验三件事：
+
+    1. 组合本身的形状与取值合法（固定 9 键、来源模式合法、用户 JSON 模式
+       必须绑定输入）；
+    2. 组合里的来源模式与定义级 ``metadata.sourceMode`` 一致，
+       定义身份与版本与 ``metadata.templateBinding`` 一致 ——
+       不一致说明这份定义是拼出来的；
+    3. 字段映射引用的字段**确实存在于当前绑定的输入**（逐项核对）。
+
+    老定义没有 ``effectiveCombination`` → 按空组合处理，不因此失败
+    （契约表 §2.2）。
+    """
+    metadata = definition_draft.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return
+    raw = metadata.get("effectiveCombination")
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        issues.append(
+            _issue(
+                "FIELD",
+                "EFFECTIVE_COMBINATION_INVALID",
+                "报表定义的生效组合不是对象。",
+                path="/metadata/effectiveCombination",
+                suggestion="重新生成报表，让服务端重建这一组绑定。",
+            )
+        )
+        return
+
+    combination = normalize_combination(raw)
+    for problem in validate_combination(combination):
+        issues.append(
+            _issue(
+                "FIELD",
+                "EFFECTIVE_COMBINATION_INVALID",
+                f"生效组合不合法：{problem}",
+                path="/metadata/effectiveCombination",
+                suggestion="重新生成报表，让服务端重建这一组绑定。",
+            )
+        )
+
+    definition_mode = normalize_source_mode(metadata.get(SOURCE_MODE_KEY))
+    effective = definition_mode or DEFAULT_SOURCE_MODE
+    if combination["sourceMode"] != effective:
+        issues.append(
+            _issue(
+                "FIELD",
+                "EFFECTIVE_COMBINATION_MISMATCH",
+                f"生效组合的来源模式是 {combination['sourceMode']}，"
+                f"与报表定义的 {effective} 不一致。",
+                path="/metadata/effectiveCombination/sourceMode",
+                suggestion="一份报表只用一种来源：让组合与定义保持一致。",
+            )
+        )
+
+    binding = metadata.get("templateBinding")
+    binding = binding if isinstance(binding, dict) else {}
+    if binding:
+        for key, combination_key in (
+            ("definitionId", "definitionId"),
+            ("definitionVersion", "definitionVersion"),
+        ):
+            expected = binding.get(key)
+            actual = combination[combination_key]
+            if expected is None:
+                continue
+            if str(expected) != str(actual):
+                issues.append(
+                    _issue(
+                        "FIELD",
+                        "EFFECTIVE_COMBINATION_MISMATCH",
+                        f"生效组合里的 {key} 是 {actual}，"
+                        f"与定义的 {expected} 不是同一版。",
+                        path=f"/metadata/effectiveCombination/{combination_key}",
+                        suggestion="重新确认方案，让定义与生效组合一起提交。",
+                    )
+                )
+
+    # 字段映射逐项核对：绑定的输入版本里必须真的有这些字段。
+    input_id = combination.get("inputId")
+    input_version = combination.get("inputVersion")
+    if input_id and input_version is not None:
+        field_keys = _input_field_keys(str(input_id), int(input_version))
+        if field_keys is not None:
+            for item in combination["fieldMapping"]:
+                key = str(item.get("inputFieldKey") or "")
+                if key and key not in field_keys:
+                    issues.append(
+                        _issue(
+                            "FIELD",
+                            "FIELD_MAPPING_UNKNOWN_FIELD",
+                            f"生效组合把列绑定到了输入里不存在的字段「{key}」。",
+                            path="/metadata/effectiveCombination/fieldMapping",
+                            suggestion="重新确认方案，按当前输入的字段重建映射。",
+                        )
+                    )
+
+
+def _input_field_keys(input_id: str, input_version: int) -> set[str] | None:
+    """绑定的那一版输入里有哪些字段。
+
+    找不到输入记录时返回 ``None``（不据此判失败 —— 输入缺失由渲染层
+    明确报错，这里不重复报）。
+    """
+    try:
+        from app.services.user_json_service import user_json_service
+
+        record = user_json_service.get(input_id, input_version)
+    except Exception:  # noqa: BLE001
+        return None
+    if record is None:
+        return None
+    return {
+        str(item.get("key"))
+        for item in (record.schema.get("fields") or [])
+        if item.get("key")
+    }
+
+
 def _grain_of(node: dict[str, Any]) -> str | None:
     """从一个**容器**节点里取它声明的粒度（node["grain"]）。"""
     if not isinstance(node, dict):
@@ -260,6 +390,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
 
     # ---- 来源模式层：定义级与区域级必须一致 ----
     _validate_source_modes(definition_draft, issues)
+    _validate_effective_combination(definition_draft, issues)
 
     # ---- 权限层：scope 必须在授权范围内 ----
     scope = (definition_draft.get("defaults") or {}).get("scope") or {}

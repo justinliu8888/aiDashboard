@@ -1297,3 +1297,106 @@ def resolve_include_trend(slots: dict[str, Any]) -> bool:
     if "trend" in excluded:
         return False
     return True
+
+
+# --------------------------------------------------------------------------
+# 用户 JSON 输入（工单 #64）
+# --------------------------------------------------------------------------
+
+
+#: 数组位置标记行。用户在消息里写明记录数组在报文里的位置
+#: （规格第 31 条），服务端按它取数组，不自己挑。
+_ARRAY_PATH_MARKER = re.compile(
+    r"^\s*(?:@arrayPath|arrayPath|数组位置)\s*[:：]\s*(?P<path>[^\s]+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_array_path(message: str) -> str | None:
+    """从消息里取「数组位置」标记。
+
+    约定：单独一行写成 ``数组位置: data.records`` 或 ``@arrayPath data.records``。
+    没有这一行 → ``None``（服务端按「顶层数组」或「唯一数组」处理）。
+    """
+    match = _ARRAY_PATH_MARKER.search(message or "")
+    if not match:
+        return None
+    path = match.group("path").strip()
+    return path or None
+
+
+def _scan_json_span(text: str, start: int) -> tuple[str, bool]:
+    """从 ``start`` 开始扫一段 JSON，返回 ``(片段, 是否闭合)``。
+
+    括号计数**跳过字符串字面量**：JSON 里的 ``]``、``{`` 可能在字符串里。
+    """
+    pairs = {"[": "]", "{": "}"}
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+            continue
+        if char in ("]", "}"):
+            if not stack or stack[-1] != char:
+                return text[start : index + 1], True
+            stack.pop()
+            if not stack:
+                return text[start : index + 1], True
+    return text[start:], False
+
+
+def _looks_like_json(fragment: str) -> bool:
+    """这段文字像不像一份 JSON 数据。
+
+    判据保守：必须以 ``[`` / ``{`` 开头，**并且**含引号 ——
+    ``[重要]``、``[1, 2]`` 这种不是记录数据，不该被当成 JSON 输入。
+    宁可漏判（当成普通消息），不可误判（把一句中文报成语法错）。
+    """
+    text = fragment.strip()
+    if not text or text[0] not in "[{":
+        return False
+    return '"' in text
+
+
+def detect_json_payload(message: str) -> str | None:
+    """从一条聊天消息里找出用户贴的 JSON 数据段。
+
+    返回**原文片段**（调用方负责校验与存储）；没有 JSON 段时返回 ``None``。
+
+    宁可漏判不可误判：普通中文消息里带方括号的，不当成 JSON 输入。
+    """
+    text = message or ""
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        fragment, _closed = _scan_json_span(text, index)
+        if _looks_like_json(fragment):
+            return fragment
+    return None
+
+
+def strip_json_payload(message: str) -> str:
+    """把消息里的 JSON 段去掉，只留人话部分。
+
+    用于**聊天消息只保存安全摘要与引用**（规格第 21 条）：
+    落库的用户消息里不留完整数组。
+    """
+    fragment = detect_json_payload(message)
+    if not fragment:
+        return (message or "").strip()
+    text = message.replace(fragment, " ")
+    return re.sub(r"\s{2,}", " ", text).strip()

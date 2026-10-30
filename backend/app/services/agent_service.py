@@ -85,6 +85,7 @@ from app.services.scope_service import filter_visible
 from app.services.template_edit_engine import EditResult, template_edit_engine
 from app.tools.context import ToolScope
 from app.services.template_preview_flow import template_preview_flow
+from app.services.user_json_service import user_json_service
 from app.services.validation_service import summarize_issues_for_user, validate_definition
 
 
@@ -740,6 +741,23 @@ class AgentService:
             or design_acknowledgement
             or not routing_rules.looks_like_question(request.message)
         )
+
+        # 用户 JSON 输入（工单 #64）。
+        #
+        # 这一轮做三件事，**顺序不能换**：
+        #   1. 服务端确定性校验（语法、数组位置、规模上限、字段类型与缺失）；
+        #   2. 通过则把原始数组**存一份**（会话输入记录），不通过则什么都不存；
+        #   3. 把本轮消息换成**安全摘要与引用** —— 落库的聊天消息里
+        #      不留完整数组（规格第 21 条）。
+        #
+        # 校验通过后**不自己出报表**：交给设计流程出方案（模型看的是字段
+        # 结构与有上限的样本），方案确认后才把输入、映射与规则原子切生效。
+        if pending_guard is None:
+            json_response = await self._handle_json_input_turn(
+                request, session_key, design_turn=design_turn
+            )
+            if json_response is not None:
+                return json_response
 
         if (
             pending_guard is None
@@ -1794,6 +1812,84 @@ class AgentService:
                 if value:
                     names.append(value)
         return names
+
+    async def _handle_json_input_turn(
+        self, request: AgentRequest, session_key: str, *, design_turn: bool
+    ) -> AgentResponse | None:
+        """用户 JSON 输入这一轮（工单 #64）。
+
+        返回 ``None`` 表示「这一轮不是 JSON 输入」，交给后面的流程。
+
+        **这一轮只做服务端能确定的事**：
+
+        1. **确定性校验**：语法、数组位置、规模上限（1 MB / 5,000 行 /
+           50 个字段，任一超限**拒绝并提示**，不截取通过）、字段类型与缺失；
+        2. **存一份**：原始记录数组只落在会话输入记录里（ADR 0004 §8 的
+           豁免：这是用户数据，不是模拟业务数值）；
+        3. **换成安全摘要**：本轮消息替换成「摘要 + 引用」——
+           落库的聊天消息里不留完整数组（规格第 21 条）。
+
+        校验不通过时**什么都不存**，也不调用模型：明确告诉用户哪里不对。
+        """
+        payload = routing_rules.detect_json_payload(request.message)
+        if payload is None:
+            return None
+        array_path = routing_rules.extract_array_path(request.message)
+        note = routing_rules.strip_json_payload(request.message)
+        record, error = user_json_service.submit(
+            session_id=session_key, text=payload, array_path=array_path
+        )
+        if error is not None:
+            # 没通过校验：原始数据不落库，消息里也不留数组。
+            request.message = "\n".join(
+                part for part in (note, "（JSON 未通过校验，未保存）") if part
+            )
+            logger.warning(
+                "[agent.chat] step=json_input_rejected conversationId=%s code=%s",
+                request.conversationId,
+                error.code,
+            )
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=request.state,
+                reply=error.message,
+                designSessionId=request.context.designSessionId,
+                error=AgentError(
+                    code=error.code,
+                    message=error.message,
+                    details=dict(error.details or {}),
+                ),
+                debug={"jsonInput": {"accepted": False, "code": error.code}},
+            )
+
+        summary = user_json_service.safe_summary(record)
+        # 落库的用户消息只留摘要与引用：完整数组不复制到消息里。
+        request.message = "\n".join(part for part in (note, summary) if part)
+        reference = user_json_service.reference(record)
+        issues = user_json_service.data_issues(record)
+        logger.info(
+            "[agent.chat] step=json_input_accepted conversationId=%s inputId=%s "
+            "version=%d rows=%d",
+            request.conversationId,
+            record.inputId,
+            record.inputVersion,
+            record.recordCount,
+        )
+        if design_turn:
+            # 设计流程接管：模型只看字段结构、缺失与类型统计与有上限的样本，
+            # 方案由用户确认后才把输入、映射与规则原子切生效。
+            return None
+        reply = f"已收到你的 JSON 数据并保存：{summary}。"
+        if issues:
+            reply += "数据里有几处要说明：" + "；".join(issues[:3]) + "。"
+        reply += "请告诉我你想用它做什么样的报表。"
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=request.state,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            debug={"jsonInput": {"accepted": True, **reference}},
+        )
 
     def _classify_intent(self, request: AgentRequest) -> UserIntent:
         """编辑态的规则层意图判定（工单 #58）。

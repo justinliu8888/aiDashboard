@@ -47,6 +47,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.data.machine_room_energy import METRIC_DEVICE_ENERGY, METRIC_TOTAL_ENERGY
 from app.services.data_source_mode import (
     SOURCE_MODE_KEY,
+    SOURCE_MODE_USER_JSON,
     SourceMode,
     source_mode_of_definition,
     source_mode_of_region,
@@ -1511,6 +1512,49 @@ def _source_mode_of_region(region: dict[str, Any], definition_mode: SourceMode) 
     return region_mode if region_mode.recorded else definition_mode
 
 
+def _generate_user_json_payloads(
+    definition: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """用户 JSON 模式的载荷：用**完整已校验数据**渲染。
+
+    数据从**已保存的原始输入**里取（生效组合绑定的那一版），
+    不用模型看到的样本，也不重新随机选图（规格第 22 / 43 / 48 条）。
+
+    没有绑定输入、或绑定的输入找不到了 → **明确失败**，
+    不拿模拟数字冒充用户的真实数据（规格第 49 条）。
+    """
+    from app.services.effective_combination import combination_of_definition
+    from app.services.json_payload_service import build_user_json_payloads
+    from app.services.user_json_service import user_json_service
+
+    combination = combination_of_definition(definition)
+    input_id = combination.get("inputId")
+    input_version = combination.get("inputVersion")
+    if not input_id or input_version is None:
+        raise SimulatedDataError(
+            "JSON_INPUT_MISSING",
+            "这份报表声明使用用户 JSON 数据，但没有绑定输入记录。",
+        )
+    record = user_json_service.get(str(input_id), int(input_version))
+    if record is None:
+        raise SimulatedDataError(
+            "JSON_INPUT_MISSING",
+            "绑定的用户 JSON 输入记录不存在，无法渲染。",
+        )
+    rows = user_json_service.rows_of(record)
+    metadata = definition.get("metadata") or {}
+    issues = ((metadata.get("jsonInputIssues") or {}).get("dataIssues")) or []
+    payloads = build_user_json_payloads(
+        definition=definition,
+        rows=rows,
+        combination=combination,
+        issues=list(issues),
+    )
+    for payload in payloads.values():
+        payload[SOURCE_MODE_KEY] = SOURCE_MODE_USER_JSON
+    return payloads
+
+
 def generate_simulated_data(
     definition: dict[str, Any], preview_context: dict[str, Any]
 ) -> dict[str, dict[str, Any]]:
@@ -1536,11 +1580,16 @@ def generate_simulated_data(
             "INVALID_DEFINITION", "报表定义缺少 regions 列表。"
         )
 
+    definition_mode = source_mode_of_definition(definition)
+    if definition_mode.is_user_json:
+        # 用户 JSON 模式：数字来自用户粘贴并经服务端校验的数据，
+        # 不是造数器编出来的示例值（ADR 0004 §8）。
+        return _generate_user_json_payloads(definition)
+
     ctx = _build_context(definition, preview_context)
     base = _build_base(definition, ctx)
     room_name = resolve_room_name(room_id_of_definition(definition))
     buckets = _buckets_for_grain(ctx, base, ctx.grain)
-    definition_mode = source_mode_of_definition(definition)
 
     result: dict[str, dict[str, Any]] = {}
     for region in regions:
