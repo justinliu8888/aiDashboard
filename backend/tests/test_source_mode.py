@@ -25,6 +25,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from app.services.data_source_mode import (
     DEFAULT_SOURCE_MODE,
     SOURCE_MODE_KEY,
@@ -39,7 +41,10 @@ from app.services.preview_service import (
     build_report_preview_payload,
 )
 from app.services.report_template_service import build_template_design
-from app.services.simulated_data_service import generate_simulated_data
+from app.services.simulated_data_service import (
+    SimulatedDataError,
+    generate_simulated_data,
+)
 from app.services.simulated_field_semantics import (
     SIMULATION_ASSUMPTION_NOTE,
     VALUE_TYPE_ENERGY,
@@ -123,12 +128,12 @@ def test_source_mode_is_recorded_in_three_places_with_the_same_value():
     assert binding[SOURCE_MODE_KEY] == SOURCE_MODE_USER_JSON
     assert binding["previewSpec"][SOURCE_MODE_KEY] == SOURCE_MODE_USER_JSON
 
-    payload = _preview(definition)
-    region_payload = payload["regions"][0]["payload"]
-    # 载荷级：来源模式随载荷走。
-    assert region_payload[SOURCE_MODE_KEY] == SOURCE_MODE_USER_JSON
-    # ``dataSource`` 语义不动：载荷仍由模拟造数器产出。
-    assert region_payload["dataSource"] == "simulated"
+    # 工单 #64 起，用户 JSON 模式的载荷来自**用户自己提供并经服务端校验的
+    # 数据**（契约表 §4.3）。没有绑定输入记录时**明确失败**，
+    # 不拿模拟数字冒充用户的真实数据（规格第 29 / 49 条）。
+    # 绑定了输入时的渲染见 ``tests/test_ticket64_json_input.py``。
+    with pytest.raises(SimulatedDataError):
+        _preview(definition)
 
 
 def test_source_mode_is_never_guessed_from_titles_or_prompts():
