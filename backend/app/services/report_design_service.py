@@ -954,15 +954,21 @@ class ReportDesignService:
             return self._failure_response(request, self.load_state(request), code="TEMPLATE_REVISION_CONFLICT",
                                           message="模板已变化，本次没有覆盖它，请刷新后重试。")
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[report_design] 模板确认失败")
+            # 日志只记**原因类型**与调用栈，不记异常原文（#61）：上游异常
+            # 文本可能带用户数据（用户 JSON 里的字段值、用户名、路径）。
+            log_failure(logger, "[report_design] 模板确认失败", exc)
             if operation_id:
-                self._fail_operation(operation_id, "TEMPLATE_CONFIRM_FAILED", _reason_text(exc))
-            # 失败原因**原样**透传：下游已经写清了「哪个板块出了什么事」，
-            # 这里再概括成一句通用文案就把可定位的信息丢掉了。
+                self._fail_operation(
+                    operation_id, "TEMPLATE_CONFIRM_FAILED", safe_reason(exc)
+                )
+            # 用户可见的回复**不带异常原文**（#61）：给的是能行动的提示。
+            # 可定位的原因留在日志（原因类型 + 调用栈）与操作记录里。
+            reason = _safe_failure_reason(exc)
             return self._failure_response(request, state, code="TEMPLATE_CONFIRM_FAILED",
                                           message=(
-                                              f"模板未能安全转换为草稿：{_reason_text(exc)}"
-                                              "当前模板保持原样，请修改方案或重试。"
+                                              "模板未能安全转换为草稿，"
+                                              + (f"{reason}，" if reason else "")
+                                              + "当前模板保持原样，请修改方案或重试。"
                                           ))
 
     def restart_design(
@@ -1247,15 +1253,18 @@ class ReportDesignService:
                 subject_id=request.context.subjectId,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[report_design] 生成模板失败")
-            self._fail_operation(operation_id, "TEMPLATE_BUILD_FAILED", str(exc))
+            log_failure(logger, "[report_design] 生成模板失败", exc)
+            self._fail_operation(operation_id, "TEMPLATE_BUILD_FAILED", safe_reason(exc))
+            # 用户可见的回复**不带异常原文**（#61）：给能行动的提示。
+            reason = _safe_failure_reason(exc)
             return self._failure_response(
                 request,
                 state,
                 code="TEMPLATE_BUILD_FAILED",
                 message=(
-                    f"这次没能生成模板：{_reason_text(exc)}"
-                    "方案保持原样，请修改后重试。"
+                    "这次没能生成模板，"
+                    + (f"{reason}，" if reason else "")
+                    + "方案保持原样，请修改后重试。"
                 ),
                 retryable=True,
             )
@@ -1272,15 +1281,17 @@ class ReportDesignService:
                 template_data, current_plan, request.context.subjectId
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[report_design] 模板转草稿失败")
-            self._fail_operation(operation_id, "TEMPLATE_BUILD_FAILED", str(exc))
+            log_failure(logger, "[report_design] 模板转草稿失败", exc)
+            self._fail_operation(operation_id, "TEMPLATE_BUILD_FAILED", safe_reason(exc))
+            reason = _safe_failure_reason(exc)
             return self._failure_response(
                 request,
                 state,
                 code="TEMPLATE_BUILD_FAILED",
                 message=(
-                    f"这次没能把方案转换成报表草稿：{_reason_text(exc)}"
-                    "方案保持原样，请修改后重试。"
+                    "这次没能把方案转换成报表草稿，"
+                    + (f"{reason}，" if reason else "")
+                    + "方案保持原样，请修改后重试。"
                 ),
                 retryable=True,
             )
@@ -1316,29 +1327,33 @@ class ReportDesignService:
                 write_confirmation,
             )
         except (DesignPlanInvalidError, DesignOperationStateError) as exc:
-            logger.warning("[report_design] 提交草稿被拒：%s", exc)
-            self._fail_operation(operation_id, "TEMPLATE_COMMIT_REJECTED", str(exc))
+            log_failure(logger, "[report_design] 提交草稿被拒", exc)
+            self._fail_operation(
+                operation_id, "TEMPLATE_COMMIT_REJECTED", safe_reason(exc)
+            )
             return self._failure_response(
                 request,
                 state,
                 code="TEMPLATE_COMMIT_REJECTED",
                 message=(
-                    f"这次草稿没能保存下来：{_reason_text(exc)}"
+                    "这次草稿没能保存下来，"
                     "方案保持原样，请重试。"
                 ),
                 retryable=True,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[report_design] 提交草稿失败")
+            log_failure(logger, "[report_design] 提交草稿失败", exc)
             # 提交异常回滚后，操作会停在 PROCESSING：必须显式失败收尾，
             # 否则这条消息会一直显示「处理中」，用户也拿不到重试入口。
-            self._fail_operation(operation_id, "TEMPLATE_COMMIT_FAILED", str(exc))
+            self._fail_operation(
+                operation_id, "TEMPLATE_COMMIT_FAILED", safe_reason(exc)
+            )
             return self._failure_response(
                 request,
                 state,
                 code="TEMPLATE_COMMIT_FAILED",
                 message=(
-                    f"这次草稿没能保存下来：{_reason_text(exc)}"
+                    "这次草稿没能保存下来，"
                     "方案保持原样，请重试。"
                 ),
                 retryable=True,
@@ -2218,7 +2233,7 @@ class ReportDesignService:
             head += f"包含板块：{titles}。"
         if _reply_source_mode(plan=plan).is_user_json:
             head += (
-                "请在左侧对话区查看完整方案；确认后我会用你提交的 JSON"
+                "请在左侧对话区查看完整方案；确认后我会用你提交的 JSON "
                 "把这份报表渲染出来（用户提供的数据，未经业务核验）。"
             )
         else:
