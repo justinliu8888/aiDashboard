@@ -45,6 +45,12 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.data.machine_room_energy import METRIC_DEVICE_ENERGY, METRIC_TOTAL_ENERGY
+from app.services.data_source_mode import (
+    SOURCE_MODE_KEY,
+    SourceMode,
+    source_mode_of_definition,
+    source_mode_of_region,
+)
 from app.services.edit_time_resolver import DEFAULT_TIMEZONE
 from app.services.mock_data_service import (
     ROOM_A_DEVICES,
@@ -53,6 +59,17 @@ from app.services.mock_data_service import (
     hash_float,
     resolve_room_name,
     room_id_of_definition,
+)
+from app.services.simulated_field_semantics import (
+    SEMANTIC_KIND_ALARMS,
+    SEMANTIC_KIND_CABINET_STATUS,
+    SEMANTIC_KIND_COST,
+    SEMANTIC_KIND_ENERGY,
+    SEMANTIC_KIND_GENERIC,
+    SEMANTIC_KIND_POWER,
+    SEMANTIC_KIND_PUE,
+    description_of,
+    metric_family_seed_key,
 )
 
 
@@ -68,13 +85,16 @@ SIMULATED_ELECTRICITY_PRICE_PER_KWH = 0.7
 ALARM_ROW_COUNT = 5
 
 #: 区域量身份（``previewSpec.kind`` / ``metrics[].kind``）。
-KIND_ENERGY = "energy"
-KIND_COST = "cost"
-KIND_PUE = "pue"
-KIND_POWER = "power"
-KIND_ALARMS = "alarms"
-KIND_CABINET_STATUS = "cabinet_status"
-KIND_GENERIC = "generic"
+#:
+#: 语义类别集中在 ``simulated_field_semantics``（模拟字段描述契约），
+#: 这里只是**转出**同一组常量，方便本模块与外部按旧名字引用。
+KIND_ENERGY = SEMANTIC_KIND_ENERGY
+KIND_COST = SEMANTIC_KIND_COST
+KIND_PUE = SEMANTIC_KIND_PUE
+KIND_POWER = SEMANTIC_KIND_POWER
+KIND_ALARMS = SEMANTIC_KIND_ALARMS
+KIND_CABINET_STATUS = SEMANTIC_KIND_CABINET_STATUS
+KIND_GENERIC = SEMANTIC_KIND_GENERIC
 
 KNOWN_KINDS = (
     KIND_ENERGY,
@@ -748,7 +768,12 @@ def _resolve_kind(region: dict[str, Any], spec: dict[str, Any]) -> str:
 def _resolve_metrics(
     region: dict[str, Any], spec: dict[str, Any], kind: str
 ) -> list[dict[str, Any]]:
-    """区域的指标清单（多指标消费 ``metrics[]``，不是只看主量）。"""
+    """区域的指标清单（多指标消费 ``metrics[]``，不是只看主量）。
+
+    描述侧的三个字段（``bindingKind`` / ``simulatedId`` /
+    ``deterministicScope``）**原样带过来** —— 载荷层照着它们说清「这一项
+    是目录内指标还是目录外模拟」。
+    """
     raw_metrics = spec.get("metrics") or []
     metrics: list[dict[str, Any]] = []
     for item in raw_metrics:
@@ -757,16 +782,18 @@ def _resolve_metrics(
         metric_kind = str(item.get("kind") or "").strip().lower()
         if metric_kind not in KNOWN_KINDS:
             metric_kind = kind
-        metrics.append(
-            {
-                "metricKey": str(item.get("metricKey") or metric_kind),
-                "label": str(item.get("label") or region.get("name") or "指标"),
-                "kind": metric_kind,
-                "unit": str(item.get("unit") or spec.get("unit") or ""),
-                "capabilityPending": bool(item.get("capabilityPending")),
-                "pendingReason": item.get("pendingReason"),
-            }
-        )
+        resolved = {
+            "metricKey": str(item.get("metricKey") or metric_kind),
+            "label": str(item.get("label") or region.get("name") or "指标"),
+            "kind": metric_kind,
+            "unit": str(item.get("unit") or spec.get("unit") or ""),
+            "capabilityPending": bool(item.get("capabilityPending")),
+            "pendingReason": item.get("pendingReason"),
+        }
+        for key in ("bindingKind", "simulatedId", "deterministicScope"):
+            if key in item:
+                resolved[key] = item[key]
+        metrics.append(resolved)
     if metrics:
         return metrics
     metric = (region.get("component") or {}).get("metric") or {}
@@ -844,24 +871,11 @@ def _metric_family(kind: str, metric_key: str, unit: str) -> str:
     同比（``yoyPercent``）按量族给，不是按区域给 —— 同一个量的同比只能有
     一个，否则同一份报表内部自相矛盾。
 
-    判据：
-
-    1. ``energy``（耗电）与 ``cost``（电费 = 耗电 × 单价）是**同一个基础量**
-       → 同一族（``energy``）：总耗电卡与总电费卡的同比必须相同；
-    2. ``pue`` / ``power`` / ``alarms`` / ``cabinet_status`` 各自一族
-       （PUE、实时功率、告警是各自的量，同比也各自不同）；
-    3. ``generic``（量身份认不出来）先看**单位**：``kWh`` 是能耗、``元`` 是能耗
-       折算出来的电费 → 都归能耗族；其余按 ``metricKey`` 分族（同一个指标键
-       是同一个量，不同指标键不是同一个量）。
+    判据集中在 ``simulated_field_semantics.metric_family_seed_key``（**全仓库
+    只有这一处来源**）：描述里的 ``deterministicScope.seedKey`` 与这里的量族
+    必须是同一个东西，否则声明与实际会对不上。
     """
-    if kind in (KIND_ENERGY, KIND_COST):
-        return "energy"
-    if kind == KIND_GENERIC:
-        text = str(unit or "").strip().lower()
-        if text in ("kwh", "元", "cny", "rmb"):
-            return "energy"
-        return f"generic:{metric_key}"
-    return kind
+    return metric_family_seed_key(kind, metric_key, unit)
 
 
 def _yoy_for(ctx: _Context, family: str) -> float:
@@ -873,50 +887,23 @@ def _yoy_for(ctx: _Context, family: str) -> float:
     return round(hash_float(f"yoy/{ctx.seed_scope}/{family}", -8.0, 20.0), 1)
 
 
-# ---------------------------------------------------------------- 列分类
+# ---------------------------------------------------------------- 列语义
 
 
-def _column_value_kind(label: str, field_ref: str) -> str:
-    """按**列名**判断这一列该出什么样的值。
+def _column_value_types(columns: list[dict[str, Any]]) -> list[str]:
+    """每一列的**值形态** —— 按**描述**读，不按列名或标题猜。
 
-    顺序敏感：先判告警级别/状态/时间，再判设备，最后才落到数值与兜底。
+    描述落在 ``previewSpec.columns[]``（转换层写、这里读）。历史定义里没有
+    描述时，按**字段身份 / 声明单位**解析一份（``description_of``）——
+    仍然不看显示名里有没有「耗电」「率」这种字样。
+
+    ADR 0004 §5.4：表格列必须来自方案声明，系统**不得按标题猜**。
     """
-    text = f"{label or ''} {field_ref or ''}".lower()
-    if any(k in text for k in ("级别", "等级", "严重", "severity", "level")):
-        return "level"
-    if any(k in text for k in ("状态", "status", "运行情况")):
-        return "status"
-    if any(k in text for k in ("时间", "时刻", "日期", "timestamp", "datetime", "time", "date")):
-        return "time"
-    if any(k in text for k in ("设备编号", "设备id", "机柜编号", "资产编号", "deviceid", "assetid")):
-        return "device_id"
-    if any(k in text for k in ("设备类型", "类型", "devicetype")):
-        return "device_type"
-    if any(k in text for k in ("设备名称", "设备名", "机柜名称", "机柜", "名称", "devicename", "device")):
-        return "device_name"
-    if any(k in text for k in ("pue", "能效")):
-        return "pue"
-    if any(k in text for k in ("功率", "power")):
-        return "power"
-    if any(k in text for k in ("电费", "费用", "成本", "金额", "cost", "fee")):
-        return "cost"
-    if any(k in text for k in ("能耗", "耗电", "用电", "电量", "kwh", "energy")):
-        return "energy"
-    if any(k in text for k in ("占比", "比例", "比率", "率", "percent", "ratio", "share")):
-        return "percent"
-    if any(k in text for k in ("数量", "次数", "台数", "条数", "count", "num")):
-        return "count"
-    if any(k in text for k in ("耗时", "时长", "duration")):
-        return "duration"
-    if any(k in text for k in ("温度", "temperature", "℃")):
-        return "temperature"
-    if any(k in text for k in ("电压", "voltage")):
-        return "voltage"
-    if any(k in text for k in ("电流", "current")):
-        return "current"
-    if any(k in text for k in ("描述", "说明", "详情", "备注", "desc", "note", "message")):
-        return "description"
-    return "text"
+    value_types: list[str] = []
+    for column in columns:
+        description = description_of(column)
+        value_types.append(description.valueType)
+    return value_types
 
 
 # ---------------------------------------------------------------- 值生成
@@ -1037,18 +1024,21 @@ def _metric_card_payload(
             # 电费按 2 位小数：总耗电（1 位）× 单价（1 位）= 2 位，两个卡片严格相等。
             precision = max(int(precision), 2)
         value = round(float(value), int(precision))
-        metric_payloads.append(
-            {
-                "metricKey": item["metricKey"],
-                "label": item["label"],
-                "kind": item["kind"],
-                "unit": item.get("unit") or "",
-                "value": value,
-                "precision": int(precision),
-                "capabilityPending": bool(item["capabilityPending"]),
-                "pendingReason": item.get("pendingReason"),
-            }
-        )
+        metric_payload = {
+            "metricKey": item["metricKey"],
+            "label": item["label"],
+            "kind": item["kind"],
+            "unit": item.get("unit") or "",
+            "value": value,
+            "precision": int(precision),
+            "capabilityPending": bool(item["capabilityPending"]),
+            "pendingReason": item.get("pendingReason"),
+        }
+        # 目录内 / 目录外随载荷带出去：前端与下游据此知道这一项的来源。
+        for key in ("bindingKind", "simulatedId"):
+            if item.get(key) is not None:
+                metric_payload[key] = item[key]
+        metric_payloads.append(metric_payload)
         if primary_value is None:
             primary_value = value
             primary_unit = item.get("unit") or ""
@@ -1072,7 +1062,12 @@ def _metric_card_payload(
 
 
 def _columns_of(region: dict[str, Any], spec: dict[str, Any]) -> list[dict[str, Any]]:
-    """区域声明的列：优先 ``previewSpec.columns``（03 号票定稿），否则用组件列。"""
+    """区域声明的列：优先 ``previewSpec.columns``（转换层定稿），否则用组件列。
+
+    列的**语义描述**（``semanticKind`` / ``valueType`` / ``deterministicScope``）
+    跟着列一起读；历史定义没有描述时按声明事实补一份（见
+    :func:`_column_value_types`）。
+    """
     raw = spec.get("columns")
     if not isinstance(raw, list) or not raw:
         raw = (region.get("component") or {}).get("columns") or []
@@ -1083,14 +1078,16 @@ def _columns_of(region: dict[str, Any], spec: dict[str, Any]) -> list[dict[str, 
         field_ref = str(item.get("fieldRef") or "")
         if not field_ref:
             continue
-        columns.append(
-            {
-                "id": item.get("id"),
-                "label": item.get("label"),
-                "fieldRef": field_ref,
-                "format": item.get("format"),
-            }
-        )
+        column = {
+            "id": item.get("id"),
+            "label": item.get("label"),
+            "fieldRef": field_ref,
+            "format": item.get("format"),
+        }
+        # 已经记着描述就原样带（转换层写的），没记的补一份。
+        description = description_of(item)
+        column.update(description.as_dict())
+        columns.append(column)
     return columns
 
 
@@ -1163,10 +1160,7 @@ def _table_payload(
             "MISSING_COLUMNS",
             f"区域 {region.get('id')!r} 是表格，但没有声明任何列，无法生成行。",
         )
-    kinds = [
-        _column_value_kind(str(c.get("label") or ""), str(c.get("fieldRef") or ""))
-        for c in columns
-    ]
+    kinds = _column_value_types(columns)
     has_device = any(k in kinds for k in ("device_name", "device_id", "device_type"))
     has_time = "time" in kinds
     has_energy = "energy" in kinds
@@ -1507,6 +1501,16 @@ def _text_payload(
 # ---------------------------------------------------------------- 公开入口
 
 
+def _source_mode_of_region(region: dict[str, Any], definition_mode: SourceMode) -> SourceMode:
+    """这一个区域的来源模式：区域级记录优先，没记录就用定义级。
+
+    区域级与定义级**不一致**是校验层的失败项（契约表 §1.4）—— 造数这一层
+    不改写谁的值，只按服务端记录的那一份来标。
+    """
+    region_mode = source_mode_of_region(region)
+    return region_mode if region_mode.recorded else definition_mode
+
+
 def generate_simulated_data(
     definition: dict[str, Any], preview_context: dict[str, Any]
 ) -> dict[str, dict[str, Any]]:
@@ -1536,6 +1540,7 @@ def generate_simulated_data(
     base = _build_base(definition, ctx)
     room_name = resolve_room_name(room_id_of_definition(definition))
     buckets = _buckets_for_grain(ctx, base, ctx.grain)
+    definition_mode = source_mode_of_definition(definition)
 
     result: dict[str, dict[str, Any]] = {}
     for region in regions:
@@ -1594,5 +1599,10 @@ def generate_simulated_data(
                 "UNSUPPORTED_COMPONENT",
                 f"区域 {region_id!r} 的组件类型 {ctype!r} 无法生成模拟数据。",
             )
+        # 来源模式随载荷带出去（契约表 §1.1：``regions[].payload.sourceMode``）。
+        #
+        # 区域级记录优先，没记录就用定义级 —— 一份报表不混两种来源的数字，
+        # 真混了由校验层拦（``validation_service`` 的来源模式一致性规则）。
+        payload[SOURCE_MODE_KEY] = _source_mode_of_region(region, definition_mode).mode
         result[region_id] = payload
     return result
