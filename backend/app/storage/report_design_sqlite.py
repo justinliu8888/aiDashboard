@@ -11,7 +11,7 @@
     report_design_operations   一次设计操作（认领 → 提交 / 失败）
     report_design_plan_versions 每一版方案正文的版本记录（工单 #63）
 
-两张表都不对旧表建外键：设计行可能先于聊天会话行写入，
+这些表都不对旧表建外键：设计行可能先于聊天会话行写入，
 由协调者的 write_turn 回调在同一个事务里补上会话行。
 """
 from __future__ import annotations
@@ -162,7 +162,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_report_design_plan_versions_id
 CREATE INDEX IF NOT EXISTS idx_report_design_plan_versions_session
     ON report_design_plan_versions (session_id, sequence);
 """
-
 
 
 def _now() -> str:
@@ -1155,11 +1154,6 @@ class SqliteReportDesignRepository:
     # ---------- 内部 ----------
 
     @staticmethod
-    def _version_id(session_id: str, plan_id: str, plan_revision: int) -> str:
-        """版本记录的稳定 ID（格式见 ``report_design_repository``）。"""
-        return plan_version_id(session_id, plan_id, plan_revision)
-
-    @staticmethod
     def _next_version_sequence(conn: sqlite3.Connection, session_id: str) -> int:
         """同一会话里的下一个保存序号（从 1 起递增）。"""
         row = conn.execute(
@@ -1211,7 +1205,7 @@ class SqliteReportDesignRepository:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                SqliteReportDesignRepository._version_id(session_id, plan_id, revision),
+                plan_version_id(session_id, plan_id, revision),
                 session_id,
                 plan_id,
                 revision,
@@ -1245,7 +1239,7 @@ class SqliteReportDesignRepository:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                SqliteReportDesignRepository._version_id(session_id, plan_id, revision),
+                plan_version_id(session_id, plan_id, revision),
                 session_id,
                 plan_id,
                 revision,
