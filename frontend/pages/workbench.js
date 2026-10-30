@@ -2977,6 +2977,9 @@ function buildTotalsByUnit(regions) {
     if (region?.componentType !== "METRIC_CARD") continue;
     const p = region.payload || {};
     const unit = String(p.unit || "").trim();
+    // 没有值就是没有值：null / 空串**不是 0**（Number(null) === 0 会把
+    // 「不知道」说成「零」）。指标卡没值 → 这一格不参与总量。
+    if (p.value == null || p.value === "") continue;
     const value = Number(p.value);
     if (!unit || !Number.isFinite(value)) continue;
     if (!totals.has(unit)) totals.set(unit, value);
