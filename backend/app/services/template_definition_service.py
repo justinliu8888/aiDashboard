@@ -724,13 +724,19 @@ def build_template_definition(
     # 用户 JSON 输入（工单 #64）：会话里提交过 JSON 就走 JSON 模式。
     # 绑定的是**最新一版**输入记录 —— 组合随定义一起提交，
     # 提交失败 / 冲突时旧生效组合原样保留。
+    #
+    # 优先级：调用方显式声明的来源模式 → 会话里的 JSON 输入 → 方案里记录的值
+    # → 默认口径（模拟示例）。
+    declared_mode = resolve_source_mode(
+        source_mode or (plan or {}).get(SOURCE_MODE_KEY)
+    )
     json_binding = _resolve_json_binding()
-    if json_binding is not None:
+    if declared_mode.recorded:
+        mode = declared_mode
+    elif json_binding is not None:
         mode = resolve_source_mode(SOURCE_MODE_USER_JSON)
     else:
-        mode = resolve_source_mode(
-            source_mode or (plan or {}).get(SOURCE_MODE_KEY)
-        )
+        mode = declared_mode
     window = (plan.get("requirements") or {}).get("timeRange")
     seed = build_definition_draft(current.title, subject_id, timeRange=window,
                                   componentRequests=["total"])
