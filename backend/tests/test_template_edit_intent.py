@@ -483,3 +483,73 @@ def test_out_of_catalog_add_does_not_produce_a_plan(post_chat, definition):
         payload["debug"]["contextEngineIntent"]
         == UserIntent.OUT_OF_CATALOG_ADD.value
     )
+
+
+# ==========================================================================
+# P1 澄清额度真正按「事项」计（契约表 §7.2 / §7.4）
+# ==========================================================================
+#
+# 修复前：额度用完一轮后，换**任何一件新的修改**都被回成
+# 「这项修改我已经追问过 1 轮」—— 上一轮的额度键被钉死，新事项再也追不到。
+# 修复后：额度键由**当前这一轮**的「意图:目标卡片」推导，
+# 键变了 → 新事项 → 自然重开；键没变 → 同一件事 → 第二轮仍被挡住。
+
+
+def test_same_item_second_ask_is_still_blocked(post_chat, definition):
+    """同一件事连问两次：第二次仍被额度上限挡住（只问一轮）。"""
+    first = _post(post_chat, definition, "删除")
+
+    assert "你想删除哪个 section" in first["reply"], "第一轮应该真的抛出追问"
+    assert first["uiActions"] != ["template_edit_clarification_limit"]
+
+    second = _post(post_chat, definition, "删除")
+
+    assert "追问过 1 轮" in second["reply"]
+    assert second["questions"] == []
+    assert second["uiActions"] == ["template_edit_clarification_limit"]
+    # 额度没有被重开：同一项仍然只问过一轮。
+    assert session_service.load_clarification("conv_test").rounds == 1
+
+
+def test_new_item_reopens_the_clarification_quota(post_chat, definition):
+    """换一件事：额度自然重开，仍然能追问（契约表 §7.4）。
+
+    这是修复前被挡住的那条路：第一轮追问过「删除哪个 section」之后，
+    用户改口提另一件事（改粒度），以前会被回成「追问过 1 轮」。
+    """
+    first = _post(post_chat, definition, "删除")
+
+    assert "你想删除哪个 section" in first["reply"]
+    assert session_service.load_clarification("conv_test").key.startswith(
+        "DELETE_SECTION"
+    )
+
+    # 换一件完全不同的事：改另一张卡片的编译粒度。
+    second = _post(post_chat, definition, "把小时趋势改成按秒粒度")
+
+    assert second["uiActions"] != ["template_edit_clarification_limit"], (
+        "新事项被上一事项的澄清额度挡住了"
+    )
+    assert "追问过 1 轮" not in second["reply"]
+    assert second["questions"], "新事项应该重新被追问"
+    # 额度记到了**新事项**的键上。
+    state = session_service.load_clarification("conv_test")
+    assert state.key.startswith("CHANGE_COMPILATION_GRAIN")
+    assert state.rounds == 1
+
+
+def test_new_item_after_the_quota_is_exhausted_can_still_be_asked(
+    post_chat, definition
+):
+    """额度用尽之后换一件事，仍然能追问（额度用尽不清掉额度本身）。"""
+    _post(post_chat, definition, "删除")
+    exhausted = _post(post_chat, definition, "删除")
+
+    assert "追问过 1 轮" in exhausted["reply"]
+
+    # 换一件事：不受上一件事已经用尽的额度影响。
+    second = _post(post_chat, definition, "把小时趋势改成按秒粒度")
+
+    assert second["uiActions"] != ["template_edit_clarification_limit"]
+    assert "追问过 1 轮" not in second["reply"]
+    assert second["questions"], "新事项应该重新被追问"
