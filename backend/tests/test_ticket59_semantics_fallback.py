@@ -53,6 +53,7 @@ from app.services.simulated_field_semantics import (
     VALUE_TYPE_LEVEL,
     VALUE_TYPE_PERCENT,
     VALUE_TYPE_POWER,
+    VALUE_TYPE_PUE,
     VALUE_TYPE_STATUS,
     VALUE_TYPE_TEXT,
     VALUE_TYPE_TIME,
@@ -420,6 +421,107 @@ def test_every_canonical_entry_has_a_known_value_type():
     """规范字段目录里的每一项的值形态都在取值域内。"""
     for identity, entry in CANONICAL_FIELD_CATALOG.items():
         assert entry["valueType"] in VALUE_TYPE_VALUES, identity
+
+
+# --------------------------------------------------------------------------
+# ④ 词表补齐：产品自己登记的名字都该收得着
+# --------------------------------------------------------------------------
+
+
+#: 产品侧登记的**耗电措辞**（指标别名表 + 意图模式表）—— 每一个在产品里
+#: 都指向区间电量（kWh）。
+PRODUCT_REGISTERED_ENERGY_NAMES = [
+    "设备耗电", "设备耗电量", "设备用电", "单机耗电", "分设备耗电",
+    "总用电", "总用电量", "总能耗", "总电量", "耗电总量",
+    "电量汇总", "整体能耗", "机房能耗", "每日耗电", "能耗",
+]
+
+
+@pytest.mark.parametrize("label", PRODUCT_REGISTERED_ENERGY_NAMES)
+def test_product_registered_energy_names_resolve_to_kwh(label: str):
+    """产品自己登记的耗电措辞 → **energy**（kWh），不再是占位文本。"""
+    description = _describe(
+        {"id": "col_x", "label": label, "fieldRef": "section_1_col_x"}
+    )
+
+    assert description.semanticSource == "vocabulary"
+    assert description.valueType == VALUE_TYPE_ENERGY
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        # 独立复核点名的三个「产品自己登记的名字」。
+        ("设备耗电", VALUE_TYPE_ENERGY),
+        ("功率", VALUE_TYPE_POWER),
+        ("占比", VALUE_TYPE_PERCENT),
+        # 其余产品侧登记的名字。
+        ("电费成本", VALUE_TYPE_COST),
+        ("总用电", VALUE_TYPE_ENERGY),
+        ("总能耗", VALUE_TYPE_ENERGY),
+        ("用电量", VALUE_TYPE_ENERGY),
+        ("pue", VALUE_TYPE_PUE),
+    ],
+)
+def test_the_names_the_product_registers_are_now_in_the_vocabulary(
+    label: str, expected: str
+):
+    """④ 词表**补齐产品侧登记的列名**（只做加法）。
+
+    复核实测：``设备耗电`` / ``功率`` / ``占比`` 这三个**产品自己登记的名字**
+    改前出的是「示例值 N（口径待确认）」—— 该出数字（kWh / kW / %）却没出。
+    """
+    description = _describe(
+        {"id": "col_x", "label": label, "fieldRef": "section_1_col_x"}
+    )
+
+    assert description.semanticSource == "vocabulary"
+    assert description.valueType == expected
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "排名", "同比", "环比", "本月耗电量排行榜", "耗电 (桶)",
+    ],
+)
+def test_names_with_no_unique_quantity_stay_unresolved(label: str):
+    """**量口径不唯一**的名字仍然落 unresolved（不补就是对的）。
+
+    - ``排名``：契约表 §3.2 的 18 个值形态里没有 rank，产品里它是**展示要求**
+      （topN / 排序），不是一列的量纲；
+    - ``同比`` / ``环比``：产品里是**指标卡的 yoyPercent**（两个窗口比的
+      聚合口径），不是一个可单列的标量；产品自己的派生列标签是
+      「日增长率 (%)」，那个名字在词表里；
+    - ``本月耗电量排行榜``：含「耗电」不等于能耗列（按标题猜的典型形态）；
+    - ``耗电 (桶)``：``桶`` 不是已知单位 → 不剥标注 → 精确命中不了。
+    """
+    description = _describe(
+        {"id": "col_x", "label": label, "fieldRef": "section_1_col_x"}
+    )
+
+    assert description.semanticSource == "unresolved"
+    assert description.valueType == VALUE_TYPE_TEXT
+
+
+def test_the_vocabulary_additions_do_not_relax_the_matching():
+    """补词是**只做加法**：判定逻辑没变，护栏一条没松。
+
+    - 显示名仍要**精确命中**（含「耗电」但不在词表里的仍 unresolved）；
+    - 词表里的每一项仍指向规范字段目录里的**具体身份**；
+    - 没进词表的名字不会被「猜」成能耗列。
+    """
+    # 精确命中：多一个字就命中不了。
+    assert describe_simulated_field(
+        {"id": "col_x", "label": "设备耗电排行榜", "fieldRef": "section_1_col_x"}
+    ).semanticSource == "unresolved"
+    # 精确命中：少一个字同样命中不了。
+    assert describe_simulated_field(
+        {"id": "col_x", "label": "耗电合计", "fieldRef": "section_1_col_x"}
+    ).semanticSource == "unresolved"
+    # 词表里的每一项仍指向目录里的具体身份。
+    for label, canonical in PRODUCT_COLUMN_VOCABULARY.items():
+        assert canonical in CANONICAL_FIELD_CATALOG, label
 
 
 # --------------------------------------------------------------------------
