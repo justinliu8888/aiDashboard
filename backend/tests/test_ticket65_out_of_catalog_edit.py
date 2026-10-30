@@ -467,6 +467,54 @@ def test_out_of_catalog_trend_gives_multiple_points(definition):
     assert all(isinstance(value, (int, float)) for value in region["payload"]["yValues"])
 
 
+def test_out_of_catalog_add_on_a_template_bound_definition():
+    """真实报表（方案 → 模板 → 定义）上加目录外指标：新板块照样出数。
+
+    新板块的板块 id 接着已有���排下去，不与别人的重号。
+    """
+    plan = _plan([
+        {
+            "id": "section_1", "title": "总耗电概览",
+            "metricIntents": ["总耗电"], "componentType": "metric_card",
+        },
+        {
+            "id": "section_2", "title": "设备耗电排名",
+            "metricIntents": ["设备耗电"], "componentType": "table",
+        },
+    ])
+    template = build_template_design(plan, subject_id="room_a")
+    draft = build_template_definition(
+        template.model_dump(mode="json"), plan, "room_a",
+    )
+    before_ids = {item["id"] for item in draft.regions}
+
+    result = template_edit_engine.apply(
+        plan=template_edit_engine.parse(
+            message="加个冰箱明细",
+            definition=draft,
+            selected_region_id=None,
+            scope=SCOPE,
+        ),
+        definition=draft,
+        scope=SCOPE,
+    )
+    updated = result.draftAfterEdit.model_dump(mode="json")
+    added = next(item for item in updated["regions"] if item["id"] not in before_ids)
+    assert added["templateBinding"]["sectionId"] == "section_3"
+    assert added["templateBinding"]["metricRefs"] == []
+    assert added["templateBinding"]["previewSpec"]["metrics"][0]["bindingKind"] == "simulated"
+
+    payload = preview(updated)
+    region = next(
+        item for item in payload["regions"] if item["regionId"] == added["id"]
+    )
+    assert region["capabilityPending"] is True
+    assert region["payload"]["rows"]
+
+    outcome = validate_definition(updated)
+    assert outcome.passed is True, outcome.issues
+
+
 # ==========================================================================
 # 接口层主缝：真实 POST /api/agent/chat 编排（真实服务 + 真实会话库）
 # ==========================================================================
