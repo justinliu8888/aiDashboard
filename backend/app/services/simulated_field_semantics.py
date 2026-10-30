@@ -784,6 +784,57 @@ def resolve_metric_semantics(
     )
 
 
+# ---------------------------------------------------------- 别名命中 ≠ 识别成功
+#
+# **形状型**口径（告警 / 机柜状态 / 功率 / PUE）—— 它们定义的是指标的
+# **形态**，不是某个已登记指标的值口径（kWh / 元）。
+_SHAPE_METRIC_KINDS = (
+    SEMANTIC_KIND_ALARMS,
+    SEMANTIC_KIND_CABINET_STATUS,
+    SEMANTIC_KIND_POWER,
+    SEMANTIC_KIND_PUE,
+)
+
+
+def intent_names_registered_metric(
+    intent: str, metric_ref: str, metrics: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    """用户说的指标名**本身**是不是那个已登记指标（**识别成功**）。
+
+    **别名命中 ≠ 识别成功**（规格第 6 条 / 契约表 §3.5）。别名的匹配是
+    **子串**：「设备耗电率」包含别名「设备耗电」—— 但用户问的是**比率**，
+    不是 kWh 的耗电量。口径对不上就**不能**静默映射到已登记指标，得按
+    目录外处理（先澄清口径，或标显式假设）。
+
+    口径对不上有两种情形：
+
+    1. **口径不清**（「设备耗电率」到底是耗电量、占比还是功率？）——
+       已登记指标的口径是定死的（kWh / 元 / PUE），说不清就不可能是它；
+    2. **口径是另一种形状**（功率 kW / 告警 / 机柜状态 / PUE）——
+       与命中的已登记指标形状对不上时，说的是另一个指标。
+
+    「设备耗电」「设备耗电排名」这类**只加了展示要求**的说法，量口径
+    没变 → 仍然命中已登记指标（既有行为不变）。
+
+    **判定谓词只有这一份**：编辑侧（``template_edit_engine``）与方案侧
+    （``report_template_service``）用**同一套** —— 两处各写一份必然漂移。
+    """
+    text = str(intent or "").strip()
+    if not text:
+        return False
+    semantics = resolve_metric_semantics(intent=text)
+    if semantics.status == "ambiguous":
+        # 口径不清：说不清是哪个口径，就不是口径定死的已登记指标。
+        return False
+    if semantics.kind in _SHAPE_METRIC_KINDS:
+        label = str((metrics.get(metric_ref) or {}).get("label") or "")
+        metric_kind = resolve_metric_semantics(intent=label).kind if label else ""
+        if metric_kind != semantics.kind:
+            # 形状对不上（说功率却命中了 kWh 的耗电）→ 是另一个指标。
+            return False
+    return True
+
+
 def simulated_metric_id(section_id: str, index: int) -> str:
     """目录外指标的**稳定模拟身份**（契约表 §3.5）。
 

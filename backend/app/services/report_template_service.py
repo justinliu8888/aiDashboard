@@ -62,6 +62,7 @@ from app.services.mock_data_service import resolve_room_name
 from app.services.scope_service import authorized_subject_ids, is_subject_authorized
 from app.services.simulated_field_semantics import (
     KIND_GENERIC,
+    intent_names_registered_metric,
     out_of_catalog_reason,
     resolve_metric_semantics,
 )
@@ -324,6 +325,27 @@ def _resolve_room(subject_text: Any, subject_id: Any = None) -> tuple[str | None
     return None, f"当前账号没有「{text}」的授权范围。"
 
 
+def _candidate_refs(intent: str) -> list[str]:
+    """这个指标意图**可能**命中的已登记指标引用（按优先级）。
+
+    两层匹配（和 ``_match_metric`` 一样）：
+
+        1. 指标目录自己的别名（``match_metric_by_alias``）；
+        2. 目录别名之外的**常见措辞**（``_INTENT_PATTERNS``）。
+
+    两层都给出来，是因为**两层都只是子串命中** —— 命中的引用还得过
+    「口径对不对得上」那关（``_match_metric`` 里的判定）。
+    """
+    refs: list[str] = []
+    alias_ref = match_metric_by_alias(intent)
+    if alias_ref:
+        refs.append(alias_ref)
+    pattern_ref = _match_intent_by_pattern(intent)
+    if pattern_ref and pattern_ref not in refs:
+        refs.append(pattern_ref)
+    return refs
+
+
 def _match_metric(intents: list[str]) -> tuple[str | None, dict[str, Any] | None, str | None]:
     """按区域里的指标意图匹配指标口径。
 
@@ -337,19 +359,28 @@ def _match_metric(intents: list[str]) -> tuple[str | None, dict[str, Any] | None
     「设备耗电」）。用户说的是同一件事，不能因为用词不同就把一个
     **算得出数的**指标判成「没有对应指标」。
 
+    **别名命中 ≠ 识别成功**（规格第 6 条 / 契约表 §3.5）：两层的匹配都是
+    **子串** ——「设备耗电**率**」包含别名「设备耗电」，但方案要的是**比率**，
+    不是 kWh 的耗电量。口径对不上就**不静默映射**到已登记指标：这一条意图
+    按**目录外**处理（``metricRefs`` 为空、``bindingKind = "simulated"``），
+    由既有那条「匹配不到口径」的出口接住。
+
+    判定用的是**共享语义层**那一份谓词（``intent_names_registered_metric``），
+    与编辑入口（``template_edit_engine``）**同一套** —— 两处各写一份必然漂移。
+
     匹配不到口径不算错误 —— 那个区域会变成占位，并说明
     「当前能力里没有这个指标」。
     """
     for intent in intents:
-        ref = match_metric_by_alias(intent)
-        if not ref:
-            ref = _match_intent_by_pattern(intent)
-        if not ref:
-            continue
-        metric = get_metric(ref)
-        if metric is None:
-            return None, None, f"指标「{intent}」没有登记，算不出数值。"
-        return ref, metric, None
+        for ref in _candidate_refs(intent):
+            metric = get_metric(ref)
+            if metric is None:
+                return None, None, f"指标「{intent}」没有登记，算不出数值。"
+            if not intent_names_registered_metric(intent, ref, {ref: metric}):
+                # 口径对不上 → 这一条意图是**目录外指标**，不静默映射到
+                # 已登记指标。继续看下一条意图有没有真命中的。
+                continue
+            return ref, metric, None
     return None, None, None
 
 
