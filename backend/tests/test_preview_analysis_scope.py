@@ -12,7 +12,8 @@
       3. 环比文案说「较前一日」，不说「相较昨日」/「同比」。
 
 用例不硬编码具体数值：Mock 数据按「昨天」生成，总量每天会变，
-所有期望值都由当天的快照算出来。
+所有期望值都由当天的快照算出来；耗电最高的设备名同样不写死，
+按当天的排名表首行推导。
 """
 from __future__ import annotations
 
@@ -247,8 +248,14 @@ def test_seven_day_ranking_rows_are_window_sums():
     card_value = regions[REGION_IDS["total"]]["value"]
     rows = _ranking_rows(regions)
     assert abs(round(sum(r["energyKwh"] for r in rows), 1) - card_value) < 2.0
-    # 单日的 UPS-01 是 846.0；七天窗口必须明显更大
-    assert rows[0]["energyKwh"] > 1000
+    # 七天窗口的首行设备必须明显大于它当天的单日耗电（写死具体数值会随 mock 的逻辑日期漂移）
+    snap = _room_snapshot()
+    top_device_id = rows[0]["deviceId"]
+    single_day = next(
+        (d.energyKwh for d in snap.deviceRanking if d.deviceId == top_device_id), None
+    )
+    assert single_day is not None, f"排名表首行设备不在当日快照里：{top_device_id}"
+    assert rows[0]["energyKwh"] > single_day * 3
 
 
 # ------------------------------------------------------------- 标准日报不回归
@@ -278,7 +285,11 @@ def test_standard_daily_report_not_regressed():
 
     analysis = _analysis(regions)
     assert f"{snap.totalEnergyKwh}" in analysis
-    assert "UPS-01" in analysis, "未过滤的日报本就应提到耗电最高的设备"
+    # 耗电最高的设备随 mock 的逻辑日期变化（今天落到 PDU-01，之前是 UPS-01），
+    # 因此按当天的排名表首行推导，不写死设备名
+    top_device_name = rows[0].get("deviceName")
+    assert top_device_name, "排名表首行应带设备名"
+    assert top_device_name in analysis, "未过滤的日报本就应提到耗电最高的设备"
     assert result["snapshot"]["totalEnergyKwh"] == snap.totalEnergyKwh
 
 
