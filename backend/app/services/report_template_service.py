@@ -53,9 +53,18 @@ from app.data.machine_room_energy import (
     METRIC_PUE,
     METRIC_TOTAL_ENERGY,
 )
+from app.services.data_source_mode import (
+    SourceMode,
+    resolve_source_mode,
+)
 from app.services.metric_mock_service import get_metric, match_metric_by_alias
 from app.services.mock_data_service import resolve_room_name
 from app.services.scope_service import authorized_subject_ids, is_subject_authorized
+from app.services.simulated_field_semantics import (
+    KIND_GENERIC,
+    out_of_catalog_reason,
+    resolve_metric_semantics,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -116,6 +125,13 @@ SCOPE_PLACEHOLDER_REASON = (
 #: 与前端角标分类用的是同一套词（授权 / 权限 / 越权）—— 关键词稳，
 #: 整句文案会变。
 _SCOPE_KEYWORDS = ("授权", "权限", "越权")
+
+#: 目录外指标的占位原因前缀。
+#:
+#: 这句只说**真实能力**还差什么（目录里没有登记这个指标），**不说**
+#: 「模拟渲染做不到」—— 模拟模式下这一块照样出数、照样能看版式
+#: （工单 #59 的验收：真实目录的限制不得被说成渲染限制）。
+OUT_OF_CATALOG_REASON_PREFIX = "能力待接通："
 
 
 def _reason_is_scope(reason: Any) -> bool:
@@ -370,31 +386,25 @@ def _metric_is_backed(metric: Mapping[str, Any]) -> tuple[bool, str | None]:
 def classify_metric_kind(*, intent: str, metric_ref: str | None = None) -> str:
     """把方案的指标意图归一化成**语义量身份**。
 
-    身份来自**指标口径**；口径对不上时再按方案的指标意图归一化 ——
-    「实时功率」「告警列表」「机柜状态」这些系统还没接通的量，身份是
-    **认得出来的**，区域因此能标「能力待接通」，而不是只说「没接到数据」。
+    - **已登记指标** → 目录登记的量身份（``METRIC_KIND_BY_REF``），不猜；
+    - **目录外指标** → 通用模拟策略（``generic``）或**形状型**身份
+      （告警列表 / 机柜状态 / 实时功率 / PUE）。
+
+    目录外指标**不给**能耗量族（``energy`` / ``cost``）：那两个量族是
+    「总耗电」「总电费」这类**已登记指标**的量族，共用同一份基础样本 ——
+    给了就等于把陌生指标静默映射成「总耗电」（规格决定 6：目录外指标默认
+    走通用模拟策略）。
 
     认不出来时给 ``generic``：陌生指标照样有明确标注的示例，
     **不按区域标题猜真实口径**。
     """
-    if metric_ref and metric_ref in METRIC_KIND_BY_REF:
-        return METRIC_KIND_BY_REF[metric_ref]
-    text = (intent or "").strip().lower()
-    if not text:
-        return "generic"
-    if "功率" in text:
-        return "power"
-    if "告警" in text or "报警" in text:
-        return "alarms"
-    if ("机柜" in text or "机架" in text or "柜位" in text) and "状态" in text:
-        return "cabinet_status"
-    if "电费" in text or "成本" in text:
-        return "cost"
-    if "pue" in text or "电能使用效率" in text:
-        return "pue"
-    if "能耗" in text or "耗电" in text or "用电" in text or "电量" in text:
-        return "energy"
-    return "generic"
+    if metric_ref:
+        if metric_ref in METRIC_KIND_BY_REF:
+            return METRIC_KIND_BY_REF[metric_ref]
+        # 目录里没有这条引用 → 通用模拟策略。**不按单位猜**：
+        # 按单位猜就是把陌生指标静默映射成「总耗电」。
+        return KIND_GENERIC
+    return resolve_metric_semantics(intent=intent).kind
 
 
 def _column_key(section_id: str, column_id: str, index: int) -> str:
@@ -471,6 +481,7 @@ def _build_region(
     room_id: str | None,
     room_reason: str | None,
     window: _Window,
+    source_mode: SourceMode,
 ) -> TemplateRegion:
     """把方案里的一个板块变成一个模板区域。
 
@@ -479,6 +490,10 @@ def _build_region(
 
     定义层面不产生任何业务数值 —— 数值由草稿阶段的模拟业务数据渲染产生
     （ADR 0004）。这一层给的是**绑定描述符**与**定稿栏目**。
+
+    ``source_mode`` 是**服务端记录的来源模式**（模拟示例 / 用户 JSON）：
+    它只影响**说明文案**（真实目录的限制在两种模式下怎么表述），
+    不放宽授权判定，也不改变「指标绑没绑上」这件事。
     """
     section = dict(section or {})
     section_id = str(section.get("id") or f"section_{index + 1}")
@@ -542,12 +557,21 @@ def _build_region(
             data=_text_payload(section, resolve_room_name(room_id) if room_id else ""),
         )
 
-    metric_ref, metric, intent_reason = _match_metric(intents)
+    metric_ref, metric, _ = _match_metric(intents)
     if metric_ref is None or metric is None:
-        # 目录里没有这个指标 —— 身份认得出来就标「能力待接通」，
-        # 认不出来给 generic（照实标，不编口径）。
+        # 目录里没有这个指标 —— **模拟模式下这一块照样出数**（通用模拟策略）。
+        #
+        # 区域仍然是「能力待接通」（真实能力确实还差一个登记），但说明里
+        # **不把真实目录的限制说成「模拟渲染做不到」**：模拟示例照常出数，
+        # 用户先看到的是版式。
+        #
+        # 上游那句「算不出数值」也不能直接用 —— 它说的是**真实数据**算不出，
+        # 而这一块在模拟模式下是有数的。两件事分开说。
+        reason = out_of_catalog_reason(
+            source_mode.mode, intent=intents[0] if intents else ""
+        )
         return placeholder(
-            intent_reason or "能力待接通：当前已接通的能力里没有对应指标。",
+            reason,
             capability_pending=True,
         )
 
@@ -619,6 +643,7 @@ def build_template_design(
     plan: Mapping[str, Any],
     *,
     subject_id: Any = None,
+    source_mode: Any = None,
 ) -> TemplateDesign:
     """从已确认的文字方案生成模板设计。
 
@@ -632,6 +657,10 @@ def build_template_design(
 
     这一步**不取真实数、不算数值**：区域带的是指标绑定与时间窗与**定稿栏目**，
     数值由草稿阶段的模拟业务数据渲染产生（ADR 0004）。
+
+    ``source_mode`` 是**服务端记录的来源模式**（模拟示例 / 用户 JSON）。
+    不传就用默认口径（模拟示例）；它由调用方（数据输入那条链路）决定，
+    **不靠标题、板块名或提示词猜**。
     """
     plan = dict(plan or {})
     requirements = dict(plan.get("requirements") or {})
@@ -643,6 +672,7 @@ def build_template_design(
 
     room_id, room_reason = _resolve_room(requirements.get("subject"), subject_id)
     window = _resolve_window(requirements.get("timeRange"))
+    mode = resolve_source_mode(source_mode or plan.get("sourceMode"))
 
     regions: list[TemplateRegion] = []
     for index, section in enumerate(sections):
@@ -653,6 +683,7 @@ def build_template_design(
                 room_id=room_id,
                 room_reason=room_reason,
                 window=window,
+                source_mode=mode,
             )
         )
 

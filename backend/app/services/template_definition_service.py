@@ -22,9 +22,27 @@ from app.data.machine_room_energy import METRIC_DEVICE_ENERGY, METRIC_TOTAL_ENER
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.report_plan import COMPONENT_TYPE_VALUES, PlanContractError
 from app.schemas.template_design import TemplateDesign, TemplateRegion
+from app.services.data_source_mode import (
+    DEFAULT_SOURCE_MODE,
+    SOURCE_MODE_KEY,
+    record_source_mode,
+    resolve_source_mode,
+    source_mode_of_region,
+)
 from app.services.report_draft_service import build_definition_draft
 from app.services.report_template_service import classify_metric_kind
 from app.services.metric_mock_service import get_metric
+from app.services.simulated_field_semantics import (
+    BINDING_KIND_CATALOG,
+    BINDING_KIND_SIMULATED,
+    SCOPE_METRIC_FAMILY,
+    describe_simulated_columns,
+    deterministic_scope,
+    metric_family_seed_key,
+    out_of_catalog_reason,
+    resolve_metric_semantics,
+    simulated_metric_id,
+)
 
 
 #: 方案组件类型 → 草稿区域形状。
@@ -166,21 +184,28 @@ def _build_preview_spec(
     capability_pending: bool,
     pending_reason: str | None,
     columns: list[dict[str, Any]],
+    source_mode: str = DEFAULT_SOURCE_MODE,
+    region_id: str = "",
 ) -> dict[str, Any]:
     """生成区域的**纯结构**示意语义描述。
 
-    形状（跨工单契约「模拟语义与能力」）::
+    形状（契约表 §1 / §3）::
 
         {
             "role": "SUMMARY" | "TREND" | "DETAIL" | "DESCRIPTION" | ...,
             "kind": "energy" | "cost" | "pue" | "power" | "alarms"
                     | "cabinet_status" | "generic",
             "unit": str | None,
+            "sourceMode": "simulated" | "user_json",
             "capabilityPending": bool,
-            "columns": [ {"id", "label", "fieldRef", "format"?} ],
+            "clarification": {"question", "candidates"} | None,
+            "columns": [ {"id", "label", "fieldRef", "format"?,
+                          "semanticKind", "valueType",
+                          "deterministicScope"} ],
             "metrics": [
                 {"metricKey", "label", "kind", "unit",
-                 "capabilityPending", "pendingReason"}, ...
+                 "capabilityPending", "pendingReason",
+                 "bindingKind", "simulatedId", "deterministicScope"}, ...
             ],
         }
 
@@ -200,34 +225,61 @@ def _build_preview_spec(
     不替它补 —— 混单位的一张表按区域单位乱填会写错单位。方案没声明格式
     时那一列就没有单位标注（不写错的单位）。
 
+    **列与指标的语义描述**（``semanticKind`` / ``valueType`` /
+    ``deterministicScope``；指标另有 ``bindingKind`` / ``simulatedId``）是
+    **描述驱动**的那一半：造数器按描述造数，不按列名或标题猜值类型
+    （工单 #59）。
+
     这里**不保存任何样例业务结果** —— 只有结构、单位与原因。
     """
     metrics: list[dict[str, Any]] = []
+    clarification: dict[str, Any] | None = None
     if metric_refs:
         for metric_ref in metric_refs:
             catalog = get_metric(metric_ref) or {}
             label = str(catalog.get("label") or metric_ref)
             kind = classify_metric_kind(intent=label, metric_ref=metric_ref)
+            unit = _resolve_unit(catalog, kind)
             metrics.append({
                 "metricKey": metric_ref,
                 "label": label,
                 "kind": kind,
-                "unit": _resolve_unit(catalog, kind),
+                "unit": unit,
                 "capabilityPending": bool(capability_pending),
                 "pendingReason": pending_reason if capability_pending else None,
+                # 目录内指标：绑的是真实目录里的口径，``simulatedId`` 为空。
+                "bindingKind": BINDING_KIND_CATALOG,
+                "simulatedId": None,
+                "deterministicScope": deterministic_scope(
+                    SCOPE_METRIC_FAMILY,
+                    metric_family_seed_key(kind, metric_ref, unit or ""),
+                ),
             })
     else:
         for index, intent in enumerate(intents):
-            kind = classify_metric_kind(intent=intent)
+            semantics = resolve_metric_semantics(intent=intent)
+            kind = semantics.kind
+            unit = semantics.unit or _KIND_DEFAULT_UNITS.get(kind)
             metrics.append({
                 # 陌生指标也给一个**稳定**的身份键，不靠标题猜。
                 "metricKey": f"metric.{kind}.{_slug(section_id)}_{index + 1}",
+                # 用户原话保留：系统不悄悄把「电脑耗电率」改名成别的指标。
                 "label": intent,
                 "kind": kind,
-                "unit": _KIND_DEFAULT_UNITS.get(kind),
+                "unit": unit,
                 "capabilityPending": bool(capability_pending),
                 "pendingReason": pending_reason if capability_pending else None,
+                # 目录外指标：**不伪造 metricRef**，只给一个稳定的模拟身份。
+                "bindingKind": BINDING_KIND_SIMULATED,
+                "simulatedId": simulated_metric_id(section_id, index),
+                "deterministicScope": deterministic_scope(
+                    SCOPE_METRIC_FAMILY,
+                    metric_family_seed_key(kind, f"metric.{kind}.{_slug(section_id)}_{index + 1}", unit or ""),
+                ),
             })
+            if index == 0 and semantics.clarification:
+                # 含义不清：给出**最关键的语义区别**，并按显式假设出数。
+                clarification = semantics.clarification
     primary = metrics[0] if metrics else {}
     if not metrics and capability_pending:
         # 一个指标都认不出来，但这一块确实接不到数 → 给一个**明确标注**的
@@ -239,14 +291,27 @@ def _build_preview_spec(
             "unit": None,
             "capabilityPending": True,
             "pendingReason": pending_reason,
+            "bindingKind": BINDING_KIND_SIMULATED,
+            "simulatedId": simulated_metric_id(section_id, 0),
+            "deterministicScope": deterministic_scope(
+                SCOPE_METRIC_FAMILY,
+                metric_family_seed_key("generic", f"metric.generic.{_slug(section_id)}_1", ""),
+            ),
         })
     return {
         "role": role,
         "kind": str(primary.get("kind") or "generic"),
         "unit": primary.get("unit"),
+        # 来源模式：服务端记录的事实，贯穿模型、校验、会话恢复与渲染。
+        SOURCE_MODE_KEY: source_mode,
         "capabilityPending": any(item["capabilityPending"] for item in metrics),
+        # 含义不清的指标：给出澄清选项（目录外指标都**照样出数**，
+        # 只是把「口径还没确认」这件事写明）。
+        "clarification": clarification,
         "columns": (
-            [dict(column) for column in columns]
+            describe_simulated_columns(
+                columns, region_id=region_id, section_id=section_id
+            )
             if component_type == "table" else []
         ),
         "metrics": metrics,
@@ -315,8 +380,22 @@ def _align_resample_grain(region: dict[str, Any], grain: str) -> None:
 
 def build_template_definition(
     template: dict[str, Any], plan: dict[str, Any], subject_id: str,
+    *, source_mode: Any = None,
 ) -> ReportDefinitionDraft:
+    """把模板设计转换成报表定义草稿。
+
+    ``source_mode`` 是**服务端记录的来源模式**（模拟示例 / 用户 JSON）。
+    读取顺序：显式参数 → 方案里记录的值 → 默认口径（模拟示例）。
+    判定**不靠标题、板块名或提示词猜**。
+
+    记录下来的模式落在三处（模型、恢复、渲染都读它）：
+    定义级 ``metadata.sourceMode``、区域级 ``templateBinding.sourceMode``、
+    区域级 ``templateBinding.previewSpec.sourceMode``。
+    """
     current = TemplateDesign.model_validate(template)
+    mode = resolve_source_mode(
+        source_mode or (plan or {}).get(SOURCE_MODE_KEY)
+    )
     window = (plan.get("requirements") or {}).get("timeRange")
     seed = build_definition_draft(current.title, subject_id, timeRange=window,
                                   componentRequests=["total"])
@@ -426,9 +505,18 @@ def build_template_definition(
             # 方案声明的组件类型与**定稿栏目**原样保留：空壳 + 占位原因，
             # 不降级成纯文字区域（#39 硬要求）。**不编任何数值** ——
             # 数值由模拟业务数据渲染，能力待接通的还要标出来。
+            #
+            # 目录外指标（没有绑上任何口径）的占位原因**按来源模式**重写：
+            # 真实目录的限制与「模拟能不能出数」是两件事，两种模式下都不许
+            # 把前者说成后者。
+            placeholder_reason = region.placeholderReason or _DEFAULT_PENDING_REASON
+            if not region.metricRefs and region.capabilityPending:
+                placeholder_reason = out_of_catalog_reason(
+                    mode.mode, intent=intents[0] if intents else ""
+                )
             converted = _empty_shell(
                 kind, title=title,
-                reason=region.placeholderReason or _DEFAULT_PENDING_REASON,
+                reason=placeholder_reason,
                 columns=declared_columns,
             )
             converted["context"] = _plan_context(plan_time_window, plan_grain)
@@ -459,6 +547,8 @@ def build_template_definition(
             capability_pending=bool(region.capabilityPending),
             pending_reason=region.placeholderReason,
             columns=declared_columns,
+            source_mode=mode.mode,
+            region_id=str(region.id or ""),
         )
         converted.update({
             "id": region.id, "name": title,
@@ -468,6 +558,8 @@ def build_template_definition(
                 "placeholderReason": region.placeholderReason,
                 "dataSourceLabel": region.dataSourceLabel,
                 "metricRefs": list(region.metricRefs),
+                # 来源模式：服务端记录的事实，模型 / 校验 / 会话恢复 / 渲染共用。
+                SOURCE_MODE_KEY: mode.mode,
                 # bound 区域：指标已绑定、当前显示的是模拟业务数据 → 原因从
                 # **模板层** ``data.pendingReason`` 原样透传（#38 产出，#39 取用）。
                 # 本票**不另写文案**，全链路只有一处来源。
@@ -493,16 +585,20 @@ def build_template_definition(
             "sectionId": None, "dataStatus": "text",
             "placeholderReason": None, "dataSourceLabel": None,
             "metricRefs": [], "pendingReason": None,
+            SOURCE_MODE_KEY: mode.mode,
             "previewSpec": _build_preview_spec(
                 section_id="", role=str(fallback.get("role") or ""),
                 component_type="text", intents=[], metric_refs=[],
                 capability_pending=False, pending_reason=None, columns=[],
+                source_mode=mode.mode,
             ),
         }
         regions = [fallback]
 
     seed.regions = regions
     seed.intentBindings = []
+    # 定义级来源模式：会话恢复时按它判断「这份报表的数字从哪来」。
+    record_source_mode(seed.metadata, mode.mode)
     seed.metadata["templateBinding"] = {
         "templateId": current.id, "templateRevision": current.revision,
         "planId": current.planId, "planRevision": current.planRevision,
@@ -577,6 +673,9 @@ def adapt_preview_spec(
     **不按区域标题猜真实口径**，也**不回写**旧方案 / 旧定义。
 
     已有 ``previewSpec`` 的定义原样返回（本函数不做二次加工）。
+
+    历史定义没有来源模式记录 → 用**默认口径**（模拟示例，ADR 0004），
+    并把这一事实写进描述里（不替历史定义编一个来源）。
     """
     binding = region.get("templateBinding") or {}
     if not isinstance(binding, Mapping):
@@ -585,6 +684,7 @@ def adapt_preview_spec(
     if isinstance(existing, Mapping) and existing:
         return dict(existing)
 
+    mode = source_mode_of_region(region)
     component = region.get("component") or {}
     if not isinstance(component, Mapping):
         component = {}
@@ -621,4 +721,6 @@ def adapt_preview_spec(
         ),
         pending_reason=str(reason) if reason else None,
         columns=columns,
+        source_mode=mode.mode,
+        region_id=str(region.get("id") or ""),
     )
