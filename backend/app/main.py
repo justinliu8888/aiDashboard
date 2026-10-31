@@ -22,8 +22,14 @@ logging.basicConfig(
 )
 try:
     configure_app_file_logging()
-except OSError:
-    logging.getLogger(__name__).exception("无法写入后端文件日志，继续使用控制台日志")
+except OSError as exc:
+    # 异常原文不进日志（#61）：留栈不留原文 —— 异常对象换成 None，
+    # 消息正文仍是不含敏感信息的事实陈述。写文件失败不影响启动，
+    # 继续用控制台日志。
+    logging.getLogger(__name__).exception(
+        "无法写入后端文件日志，继续使用控制台日志",
+        exc_info=(type(exc), None, exc.__traceback__),
+    )
 
 app = FastAPI(title="智能报表 AI 后端", version="1.0.0")
 
