@@ -1049,3 +1049,67 @@ def test_ac3_session_fact_read_failure_reason_has_no_exception_text(
     assert SECRET_EXC not in (facts.reason or "")
     assert "RuntimeError" in (facts.reason or "")
     assert SECRET_EXC not in caplog.text
+
+
+def test_ac1_rule_block_reason_has_no_user_words(caplog, monkeypatch):
+    """规则阻断的原因里嵌着**用户说的指标名** —— 不进日志（#61 AC#1）。
+
+    这条原因不是固定文案：「指标「设备心情值」未在指标目录中登记」里
+    那个指标名是从用户原话里抽出来的 → 原样进日志就是用户原话。
+    """
+    caplog.set_level(logging.INFO, logger="app")
+    monkeypatch.setattr(context_engine, "_client", None)
+
+    canary = "设备心情值" + "Z9"
+    decision = asyncio.run(
+        context_engine.route(_request(f"统计 {canary} 报表"))
+    )
+
+    # 这条路径确实走到了（否则断言没意义）
+    assert decision.engineStage == "rule_block"
+    text = caplog.text
+    assert "step=rule_block" in text
+    # 只留原因码与长度
+    assert "reasonLength=" in text
+    assert "CAPABILITY_NOT_SUPPORTED" in text
+    # 用户原话与抽出来的指标名都不许出现
+    assert canary not in text
+    assert "设备心情值" not in text
+
+
+def test_ac1_blocked_draft_assembly_logs_no_model_text(caplog, monkeypatch):
+    """草稿组装被阻断时，阻断说明里的**载荷字段值**不进日志（#61 AC#1）。
+
+    阻断说明会带模型写的指标名（可能含用户数据）→ 日志只留错误码与原因类型，
+    与 `template_preview_flow` 里同一个 `DefinitionBuildError` 的写法一致。
+    """
+    caplog.set_level(logging.INFO, logger="app")
+    agent, _fake = _agentscope_agent(monkeypatch, "{}")
+
+    canary = "自定义指标" + "ABC999"
+    request = AgentRequest(
+        conversationId="conv_ac1_block",
+        state=AgentState.ANALYZING,
+        message="生成一份能耗日报",
+        context=AgentRequestContext(
+            projectId="project_001",
+            subjectRef="machine_room",
+            subjectId="room_a",
+        ),
+    )
+    response = agent._assemble_generate_response(
+        request,
+        {"reportName": "能耗日报", "roomId": "room_a", "metricRefs": [canary]},
+    )
+
+    # 业务行为不变：组装被阻断时如实阻断（不退回默认草稿）
+    assert response.state.value == "BLOCKED_OR_UNSUPPORTED"
+    assert response.blocks and response.blocks[0].code == "METRIC_NOT_REGISTERED"
+    # 用户**看得见**的那句仍然点名是哪个指标（用户要能动手改）——
+    # 这一条不是日志，#61 管的是日志与上游异常原文。
+    assert canary in response.blocks[0].message
+
+    text = caplog.text
+    assert "草稿组装被阻断" in text
+    assert canary not in text
+    assert "message=" not in text

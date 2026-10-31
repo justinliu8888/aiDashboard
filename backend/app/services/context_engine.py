@@ -28,7 +28,6 @@ from app.schemas.edit_plan import EditIntent, EditPlan
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.services import routing_rules
 from app.services.report_log_safety import (
-    capped_reason,
     log_failure,
     log_info,
     log_warning,
@@ -726,14 +725,16 @@ class ContextEngine:
                     "reason": blocked.reason,
                 },
             )
-            # 规则阻断的原因是我们自己写的固定文案：按上限截断后保留。
+            # 规则阻断的原因**不是**固定文案 —— 它把用户说的指标名**嵌在句子里**
+            # （「指标「XXX」未在指标目录中登记」）→ 原样进日志就是用户原话
+            # （#61 AC#1）。只留**原因码**（固定的枚举）与原因**长度**。
             log_info(
                 logger,
                 "[context_engine] step=rule_block conversationId=%s code=%s "
-                "reason=%s elapsed_total_ms=%.1f",
+                "reasonLength=%d elapsed_total_ms=%.1f",
                 request.conversationId,
                 blocked.blockCode,
-                capped_reason(blocked.reason),
+                len(blocked.reason or ""),
                 (perf_counter() - total_started) * 1000,
             )
             return blocked

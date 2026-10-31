@@ -44,7 +44,6 @@ from app.services.report_draft_service import (
     compose_unsupported_style_disclosure,
 )
 from app.services.report_log_safety import (
-    capped_reason,
     log_failure,
     log_info,
     log_warning,
@@ -700,12 +699,14 @@ class AgentScopeReportAgent:
         except DefinitionBuildError as exc:
             # 条件不被目录 / 指标 / 授权范围支持：明确阻断，
             # 不能退回默认草稿 —— 那会让用户拿到一份统计的是别的东西的报表。
-            # 阻断说明是我们自己写的固定文案（会展示给用户），按上限截断后保留。
+            # 阻断说明里带着**载荷字段值**（指标名 / 数据源名，可能含用户数据）
+            # → **不进日志**（#61 AC#1）；只留错误码与原因类型 ——
+            # 与 template_preview_flow 里同一个 `DefinitionBuildError` 的写法一致。
             log_warning(
                 logger,
-                "草稿组装被阻断 code=%s message=%s",
+                "草稿组装被阻断 code=%s errorType=%s",
                 exc.code,
-                capped_reason(exc.message),
+                type(exc).__name__,
             )
             return self._blocked_generate_response(request, exc)
         except Exception as exc:  # noqa: BLE001

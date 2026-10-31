@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -238,3 +239,21 @@ def test_script_path_clarification_is_unchanged(post_chat, definition):
     assert pending is not None
     candidate = pending["operations"][0]["operation"]["metricCandidate"]
     assert candidate["status"] == "out_of_catalog"
+
+
+def test_caliber_menu_log_keeps_no_user_words(monkeypatch, post_chat, definition, caplog):
+    """菜单替换那条日志不许带**用户原话**（#61 AC#1）。
+
+    指标意图是从用户原话里摘出来的（「电脑耗电率」）→ 只留长度；
+    选项值是**规则层封闭词表**（耗电量 / 占比 / 功率），不是用户原话 → 留着有排查价值。
+    """
+    caplog.set_level(logging.INFO, logger="app")
+    monkeypatch.setattr(agent_service, "_agent", _SlugOptionAgent())
+
+    _post(post_chat, definition, "新增一个电脑耗电率指标")
+
+    text = caplog.text
+    assert "step=caliber_menu_replaced" in text
+    assert "intentLength=" in text
+    assert "电脑耗电率" not in text
+    assert "耗电量" in text
