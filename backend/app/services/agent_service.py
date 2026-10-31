@@ -1674,6 +1674,13 @@ class AgentService:
 
         record = session_service.repository.get_session(session_key)
         stored = (record.snapshot or {}).get("definition") if record else None
+        # 本轮要带回来的示意载荷按**同一份方案**生成（方案只对**历史定义**
+        # 缺 previewSpec 时的只读适配有用；这里传它是为了跟读会话那条路
+        # 完全同源）。
+        stored_plan = (record.snapshot or {}).get("reportPlan") if record else None
+        plan_for_preview = (
+            stored_plan if isinstance(stored_plan, dict) else None
+        )
         try:
             if not isinstance(stored, dict):
                 raise ValueError("服务端没有保存原草稿")
@@ -1741,7 +1748,9 @@ class AgentService:
                 or "修改校验未通过，草稿没有变化；请重新核对目标或数据能力。",
                 code="EDIT_VALIDATION_FAILED",
             )
-        return self._remember_choice(self._build_template_edit_response(request, result))
+        return self._remember_choice(
+            self._build_template_edit_response(request, result, plan=plan_for_preview)
+        )
 
     def _try_answer_readonly_query(
         self, request: AgentRequest, definition: ReportDefinitionDraft
@@ -2636,7 +2645,11 @@ class AgentService:
         )
 
     def _build_template_edit_response(
-        self, request: AgentRequest, result: EditResult
+        self,
+        request: AgentRequest,
+        result: EditResult,
+        *,
+        plan: dict[str, Any] | None = None,
     ) -> AgentResponse:
         """把 TemplateEditEngine 的 EditResult 包成 AgentResponse。"""
         intent_value = result.plan.intent.value
@@ -2727,7 +2740,7 @@ class AgentService:
             )
 
         # 正常应用成功：返回新草稿 + ChangeSet + 三按钮
-        return AgentResponse(
+        response = AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.USER_EDITING_TEMPLATE,
             reply=result.reply or "已更新草稿，请确认。",
@@ -2740,6 +2753,23 @@ class AgentService:
             questions=self._editing_confirm_questions(),
             uiActions=["template_edit_applied", "confirm_template_edit"],
             debug=debug,
+        )
+        # 右侧那块画的是什么：与设计轮**同一个入口**生成示意载荷
+        # （report_design_service._attach_report_preview_payload → 内部走
+        # preview_service.build_report_preview_payload）。
+        #
+        # 工单 #66 C2 F-3：这一轮原来**不带**载荷，前端收到 null → 右侧
+        # 保持旧载荷不刷新。这里按**新定义**（含新增区域）补上，载荷生成
+        # 口径与「确认方案」「点同意」两轮完全一致，不另起一套。
+        #
+        # 只多挂这一个字段：其它字段、字段位置、取值域一个字都不动。
+        # 载荷**不落库**（模拟业务数值不进会话库，见
+        # session_service._persisted_response_payload）。
+        return report_design_service._attach_report_preview_payload(
+            request,
+            response,
+            definition=result.draftAfterEdit,
+            plan=plan,
         )
 
     def _editing_prompt_response(
