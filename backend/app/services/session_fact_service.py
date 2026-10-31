@@ -132,7 +132,12 @@ class SessionFactService:
             return SessionFacts(
                 status=FactStatus.UNAVAILABLE,
                 sessionExists=False,
-                reason=f"读取当前对话的服务端记录失败，暂时无法确认：{exc}",
+                # 异常原文不进用户可见的消息（#61 AC#3）：上游异常的文本
+                # 可能带路径 / 凭据，只留原因类型，其余进日志。
+                reason=(
+                    "读取当前对话的服务端记录失败，暂时无法确认"
+                    f"（{type(exc).__name__}）"
+                ),
             )
 
         if record is None:

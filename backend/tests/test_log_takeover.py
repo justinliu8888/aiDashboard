@@ -1000,3 +1000,52 @@ def test_ac1_contract_error_section_title_not_logged(caplog):
     # 只留标识：板块序号与 id
     assert "sectionIndex=0" in text
     assert "sectionId=section_ac1" in text
+
+
+# ----------------------------------------------------------------------
+# 补漏（统筹收口）：用户可见的原因里也不许有上游异常原文
+# ----------------------------------------------------------------------
+
+
+def test_ac3_concierge_failure_reason_has_no_exception_text(caplog, monkeypatch):
+    """concierge 兜底原因只留异常类型，不留原文。
+
+    与「模型路由失败」那条兜底同口径（见上面那条 fallback 用例）。
+    """
+    caplog.set_level(logging.INFO, logger="app")
+    monkeypatch.setattr(context_engine, "_client", object())
+
+    async def _raise(**kwargs: Any) -> str:
+        raise RuntimeError("上游异常 " + SECRET_EXC)
+
+    monkeypatch.setattr(context_engine, "_chat_json_stream", _raise)
+
+    decision = asyncio.run(
+        context_engine._run_concierge(_request("生成昨日能耗日报"))
+    )
+
+    assert SECRET_EXC not in (decision.reason or "")
+    assert "RuntimeError" in (decision.reason or "")
+    assert SECRET_EXC not in caplog.text
+
+
+def test_ac3_session_fact_read_failure_reason_has_no_exception_text(
+    caplog, monkeypatch
+):
+    """读会话记录失败时，用户可见的原因里没有上游异常原文。"""
+    caplog.set_level(logging.INFO, logger="app")
+
+    def _raise(session_id: str):
+        raise RuntimeError("上游异常 " + SECRET_EXC)
+
+    monkeypatch.setattr(session_service.repository, "get_session", _raise)
+
+    facts = SessionFactService().load(session_id="sess_ac3")
+
+    assert facts.status.value == "UNAVAILABLE"
+    # 业务行为不变：如实说「暂时无法确认」
+    assert "暂时无法确认" in (facts.reason or "")
+    # 原文不出现，类型留下
+    assert SECRET_EXC not in (facts.reason or "")
+    assert "RuntimeError" in (facts.reason or "")
+    assert SECRET_EXC not in caplog.text

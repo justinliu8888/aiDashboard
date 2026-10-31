@@ -1164,7 +1164,10 @@ class ContextEngine:
             return ConciergeDecision(
                 action=ConciergeAction.DEEP_ROUTE,
                 userIntent=UserIntent.UNKNOWN,
-                reason=f"concierge failed: {exc}",
+                # 异常原文既不进日志，也不进路由原因（#61 AC#2/AC#3）：
+                # 只留原因类型 —— 与下面那条「模型路由失败」兜底同口径
+                # （见 test_leak1_context_engine_fallback_reason_has_no_exception_text）。
+                reason=f"concierge failed: {safe_reason(exc)}",
                 confidence=0,
             )
 
