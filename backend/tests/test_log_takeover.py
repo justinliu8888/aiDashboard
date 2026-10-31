@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ import pytest
 
 from app.agents.agentscope_report_agent import AgentScopeReportAgent
 from app.config import get_settings
+from app.logging_config import configure_app_file_logging
 from app.schemas.agent import (
     AgentRequest,
     AgentRequestContext,
@@ -1191,5 +1193,90 @@ def test_ac2_session_report_plan_read_failure_keeps_stack_but_not_original(
     # 级别没被降下来（原来是 ERROR）
     failure = [
         r for r in caplog.records if "read_report_plan_failed" in r.getMessage()
+    ]
+    assert failure and failure[0].levelno == logging.ERROR
+
+
+import importlib.util
+from app.logging_config import configure_app_file_logging
+
+
+# ----------------------------------------------------------------------
+# 第四处残留：app/main.py —— 文件日志配置失败时的那条诊断日志
+# ----------------------------------------------------------------------
+
+
+def _run_main_module_with_failing_file_logging(monkeypatch, bad_log_path):
+    """在隔离的模块对象里重跑 ``app/main.py`` 的模块级代码，让它真的写不了日志文件。
+
+    ``app/main.py`` 里那段 ``try/except`` 是**模块级**代码（导入时执行一次），
+    要重跑它只能重新执行这个模块文件。这里用 ``importlib`` 在一个**新的**模块
+    对象里执行仓库里那份源码：
+
+    - 不动 ``sys.modules["app.main"]`` —— 已经 import 过它的用例不受影响；
+    - 执行的就是 ``backend/app/main.py`` 这份源码，不是抄出来的副本；
+    - 模块名仍叫 ``app.main`` → 日志器名与线上一致。
+    """
+    real_configure = configure_app_file_logging
+
+    def _boom():
+        # 真实实现 + 不可写的目标目录 → 真的抛 OSError（NotADirectoryError）
+        return real_configure(bad_log_path)
+
+    monkeypatch.setattr(
+        "app.logging_config.configure_app_file_logging", _boom
+    )
+    spec = importlib.util.spec_from_file_location(
+        "app.main", Path(__file__).resolve().parents[1] / "app" / "main.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_main_file_logging_failure_keeps_stack_but_not_original(
+    caplog, monkeypatch, tmp_path
+):
+    """写不了后端文件日志时 —— 上游异常原文与本地绝对路径都不进日志。
+
+    这处 ``logger.exception``（``app/main.py``）是仓库最早提交引入的**存量代码**：
+    没显式给 ``exc_info``，走默认的 ``exc_info=True``，traceback 末行会把上游
+    异常的**原文**一起打出来（实测形态：``NotADirectoryError: [Errno 20]
+    Not a directory: <本地绝对路径>``）—— 本地绝对路径就跟着泄漏了。
+
+    这里用**真实形态的写文件失败**驱动真实路径：把日志目标指到一条「父路径
+    是文件」的路径上，让真的 ``mkdir`` 抛 ``NotADirectoryError``（``OSError``
+    的子类），而不是拿假异常凑数。
+    """
+    caplog.set_level(logging.INFO, logger="app")
+
+    # 目标日志文件的父路径是一个「文件」→ mkdir 抛 NotADirectoryError
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("x", encoding="utf-8")
+    bad_log_path = blocker / "sub" / "backend.log"
+
+    # 先自己撞一次同样的失败，把上游异常的原文抓出来（源码里不写死这个串，
+    # 也不把它写进断言 —— 断言时用它本身当 canary）
+    with pytest.raises(OSError) as excinfo:
+        configure_app_file_logging(bad_log_path)
+    upstream_message = str(excinfo.value)
+
+    _run_main_module_with_failing_file_logging(monkeypatch, bad_log_path)
+
+    text = caplog.text
+    # 这条路径确实走到了（否则断言没意义）
+    assert "无法写入后端文件日志，继续使用控制台日志" in text
+    # 上游异常原文不进日志 —— 这正是这处残留的根因
+    assert upstream_message not in text
+    # 本地绝对路径不进日志
+    assert str(tmp_path) not in text
+    assert str(blocker) not in text
+    assert str(bad_log_path) not in text
+    # 留栈不留原文：调用栈还在（不是把异常整个吞掉）
+    assert "Traceback (most recent call last):" in text
+    # 级别没被降下来（原来是 ERROR）
+    failure = [
+        r for r in caplog.records
+        if "无法写入后端文件日志" in r.getMessage()
     ]
     assert failure and failure[0].levelno == logging.ERROR
