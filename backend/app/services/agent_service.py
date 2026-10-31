@@ -1504,9 +1504,13 @@ class AgentService:
             replaced = True
         if replaced:
             logger.info(
-                "[agent.chat] step=caliber_menu_replaced conversationId=%s intent=%s options=%s",
+                "[agent.chat] step=caliber_menu_replaced conversationId=%s "
+                "intentLength=%d options=%s",
                 request.conversationId,
-                intent,
+                # 指标意图是**从用户原话里摘出来的词**，不进日志（#61 AC#1）：
+                # 只留长度；选项值是规则层的封闭词表（耗电量 / 占比 / 功率），
+                # 不是用户原话，可以记。
+                len(intent),
                 [item["value"] for item in options],
             )
             response.debug = {
