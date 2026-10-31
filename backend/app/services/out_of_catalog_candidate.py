@@ -255,6 +255,45 @@ def _match_clarification_choice(
     return None
 
 
+def ambiguous_caliber_candidates(intent: str) -> list[dict[str, Any]]:
+    """含义不清的指标意图 → **规则层**的口径选项（工单 #66）。
+
+    澄清菜单的选项**必须来自规则层**：模型自造的选项（比如
+    ``pc_energy_abs`` 这种 slug）既过不了菜单闸门（闸门只认 ``value``），
+    也命中不了 ``_match_clarification_choice``（按候选 **显示名** 子串匹配）
+    —— 用户无论选 ``value`` 还是 ``label`` 都解不开这一轮。
+
+    - 含义确实不清（``ambiguous``）→ 返回
+      ``[{"value": 候选 label, "label": "<label>（<unit>）—— <hint>"}]``；
+    - 其余情况 → 返回 ``[]``（调用方据此**一律不动**模型给的选项）。
+
+    候选**一个词都不改**：``value`` 取候选的 ``label``，与
+    ``_match_clarification_choice`` 命中的是**同一份**候选 —— 用户选完
+    直接就能解出候选，不必再澄清一轮。
+    """
+    text = str(intent or "").strip()
+    if not text:
+        return []
+    semantics = resolve_metric_semantics(intent=text)
+    if not semantics.is_ambiguous:
+        return []
+    candidates = list((semantics.clarification or {}).get("candidates") or [])
+    options: list[dict[str, Any]] = []
+    for item in candidates:
+        label = str(item.get("label") or "").strip()
+        if not label:
+            continue
+        unit = str(item.get("unit") or "").strip()
+        hint = str(item.get("hint") or "").strip()
+        display = label
+        if unit:
+            display += f"（{unit}）"
+        if hint:
+            display += f" —— {hint}"
+        options.append({"value": label, "label": display})
+    return options
+
+
 def resolve_out_of_catalog_candidate(
     intent: str, *, answer: str = "",
 ) -> OutOfCatalogCandidate | None:
