@@ -45,6 +45,19 @@ _SLUG_OPTIONS = [
 #: 规则层候选（``simulated_field_semantics.clarification_candidates``）。
 _RULE_LABELS = ["耗电量", "占比", "功率"]
 
+#: 规则层候选的**显示名**（``value`` 是简称，``label`` 是带单位与解释的完整话）。
+#:
+#: 这两条**分开断言**：``value`` 对、``label`` 错的「半吊子」状态（选项看着是规则层
+#: 的、点下去却按别的口径走）单靠断言 ``value`` **抓不到** —— 独立复核 F3 实测过。
+_RULE_OPTION_LABELS = [
+    "耗电量（kWh） —— 一段时间内消耗的电能",
+    "占比（%） —— 占总量的比例",
+    "功率（kW） —— 瞬时功率",
+]
+
+#: 模型自造选项的显示名（**不该**出现在被接管的菜单里）。
+_MODEL_OPTION_LABELS = ["电脑绝对能耗量", "电脑能耗占比"]
+
 #: 规则层那句口径问句（与脚本路径显示的那句**逐字一致**）。
 _RULE_CALIBER_QUESTION = (
     "「电脑耗电率」这个说法有多种口径，你要哪一种：耗电量（kWh）、占比（%）、功率（kW）？"
@@ -168,6 +181,8 @@ def test_model_slug_options_are_replaced_by_the_rule_caliber_options(
     assert question["selectionOnly"] is True
     values = [option["value"] for option in question["options"]]
     assert values == _RULE_LABELS
+    # 显示名也要是规则层那一份（只断言 value 抓不到「value 对、label 错」）。
+    assert [option["label"] for option in question["options"]] == _RULE_OPTION_LABELS
     # 模型自造的 slug 一个都不许留在菜单里。
     assert "pc_energy_abs" not in values
     assert "pc_energy_ratio" not in values
@@ -183,6 +198,9 @@ def test_choosing_a_rule_caliber_option_closes_the_clarification(
 
     first = _post(post_chat, definition, "新增一个电脑耗电率指标")
     value = _options(first)[0]["value"]
+    # 菜单项的显示名也是规则层那一份（不是「value 对、label 错」的半吊子状态）。
+    assert [option["label"] for option in _options(first)] == _RULE_OPTION_LABELS
+    assert value == "耗电量"
 
     body = _post(post_chat, definition, value)
 
@@ -214,6 +232,8 @@ def test_other_clarification_paths_keep_the_model_options(
 
     values = [option["value"] for option in _options(body)]
     assert values == ["pc_energy_abs", "pc_energy_ratio"]
+    # 显示名也是模型自己的（不许被换成规则层那三条）。
+    assert [option["label"] for option in _options(body)] == _MODEL_OPTION_LABELS
     assert (body.get("debug") or {}).get("caliberMenuSource") is None
 
     # 口径确实 ambiguous，但模型这轮问的是粒度 → 选项仍然是模型的。
@@ -224,6 +244,7 @@ def test_other_clarification_paths_keep_the_model_options(
 
     values = [option["value"] for option in _options(body)]
     assert values == ["pc_energy_abs", "pc_energy_ratio"]
+    assert [option["label"] for option in _options(body)] == _MODEL_OPTION_LABELS
     assert (body.get("debug") or {}).get("caliberMenuSource") is None
 
 
@@ -306,6 +327,10 @@ def test_caliber_menu_replaces_the_question_together_with_the_options(
     )
     values = [option["value"] for option in question["options"]]
     assert values == _RULE_LABELS
+    # 显示名与选项**同源**（口径问句里列的那三个，正是这三个 label 的前半段）。
+    assert [option["label"] for option in question["options"]] == _RULE_OPTION_LABELS
+    for option in question["options"]:
+        assert option["label"].startswith(f"{option['value']}（")
     # 问句与选项**同源**：两者都是规则层那句口径问句。
     assert question["prompt"] == _RULE_CALIBER_QUESTION
     assert body["reply"] == _RULE_CALIBER_QUESTION
@@ -327,6 +352,7 @@ def test_caliber_menu_replaces_the_question_for_change_metric_too(
         q for q in _questions(body) if q["id"] == "template_edit_clarification"
     )
     assert [option["value"] for option in question["options"]] == _RULE_LABELS
+    assert [option["label"] for option in question["options"]] == _RULE_OPTION_LABELS
     assert question["prompt"] == _RULE_CALIBER_QUESTION
     assert body["reply"] == _RULE_CALIBER_QUESTION
 
