@@ -427,3 +427,158 @@ def test_edit_accept_payload_in_user_json_mode_is_not_null():
     payload = accepted.get("reportPreviewPayload")
     assert payload is not None, accepted
     assert len(payload["regions"]) == 2, payload["regions"]
+
+
+# --------------------------------------------------------------------------
+# F-3 判据 2：「点同意」那一轮（_save_placeholder）也要带载荷
+# --------------------------------------------------------------------------
+
+
+def _drive_to_agree(harness, *, user_json: bool = False) -> dict[str, Any]:
+    """走真实链路到「点同意」那一轮，返回那一轮的响应体。
+
+    出方案 → 确认方案 → 点「修改」→ 提目录外新增 → 点「接受修改」→ 点「同意」。
+    """
+    _confirmed, _accepted = _drive_to_edit_accept(harness, user_json=user_json)
+    return harness.send("同意", state="USER_EDITING_TEMPLATE")
+
+
+def test_agree_response_carries_the_preview_payload_with_the_new_region():
+    """「点同意」那一轮：载荷**非 null**，且**含新增的那块区域**。
+
+    工单 #66 C2 F-3 判据 2：界面上的「点同意」走的是
+    ``_save_placeholder``（``SAVE_DEFINITION_DRAFT``）那一轮 —— 草稿刚在这
+    一轮落库，右侧该显示新载荷，不该等整页刷新。
+    """
+    with acceptance_harness(model=ScriptedModel(plan_candidate())) as harness:
+        agreed = _drive_to_agree(harness)
+
+        assert agreed.get("state") == "SAVE_DEFINITION_DRAFT", agreed
+        payload = agreed.get("reportPreviewPayload")
+        assert payload is not None, agreed
+        region_ids = [region["regionId"] for region in payload["regions"]]
+        assert len(region_ids) == 2, region_ids
+        assert any("冰箱" in region_id for region_id in region_ids), region_ids
+        added = next(
+            region for region in payload["regions"]
+            if "冰箱" in region["regionId"]
+        )
+        assert added["payload"]["rows"], added
+
+
+def test_agree_payload_context_matches_the_saved_definition():
+    """载荷里的定义版本与**落库后**那份定义**一致**（前端不会判成过期版本）。"""
+    with acceptance_harness(model=ScriptedModel(plan_candidate())) as harness:
+        agreed = _drive_to_agree(harness)
+
+        payload = agreed.get("reportPreviewPayload") or {}
+        context = payload.get("previewContext") or {}
+        draft = (
+            (agreed.get("domainObjects") or {}).get("reportDefinitionDraft") or {}
+        )
+        metadata = draft.get("metadata") or {}
+        binding = metadata.get("templateBinding") or {}
+
+    assert context, payload
+    assert context["definitionId"] == binding["definitionId"], (
+        context, binding,
+    )
+    assert context["definitionVersion"] == binding["definitionVersion"], (
+        context, binding,
+    )
+    # 前端的口径：binding.definitionVersion ?? metadata.revision
+    frontend_version = (
+        binding["definitionVersion"]
+        if binding.get("definitionVersion") is not None
+        else metadata.get("revision")
+    )
+    assert context["definitionVersion"] == frontend_version
+
+
+def test_agree_payload_shares_the_context_of_the_edit_accept_round():
+    """「点同意」与「接受修改」两轮**共用同一份**冻结上下文（数字不跳）。"""
+    with acceptance_harness(model=ScriptedModel(plan_candidate())) as harness:
+        _confirmed, accepted = _drive_to_edit_accept(harness)
+        agreed = harness.send("同意", state="USER_EDITING_TEMPLATE")
+
+        accept_context = (accepted.get("reportPreviewPayload") or {}).get(
+            "previewContext"
+        ) or {}
+        agree_context = (agreed.get("reportPreviewPayload") or {}).get(
+            "previewContext"
+        ) or {}
+
+    assert accept_context and agree_context
+    assert agree_context["definitionId"] == accept_context["definitionId"]
+    assert agree_context["definitionVersion"] == accept_context["definitionVersion"]
+    assert agree_context["windowStart"] == accept_context["windowStart"]
+    assert agree_context["windowEnd"] == accept_context["windowEnd"]
+
+
+def test_agree_payload_matches_the_restored_session_payload():
+    """「点同意」那一轮的载荷与**读会话**时重新生成的载荷一致。"""
+    with acceptance_harness(model=ScriptedModel(plan_candidate())) as harness:
+        agreed = _drive_to_agree(harness)
+        restored = (harness.read_session().get("snapshot") or {}).get(
+            "reportPreviewPayload"
+        )
+
+    assert restored is not None
+    assert agreed["reportPreviewPayload"] == restored
+
+
+def test_agree_payload_is_not_persisted():
+    """「点同意」那一轮的载荷**不落库**（模拟业务数值不进会话库）。"""
+    with acceptance_harness(model=ScriptedModel(plan_candidate())) as harness:
+        agreed = _drive_to_agree(harness)
+
+        stored = harness.persisted_snapshot()
+        messages = [
+            message.payload
+            for message in harness.assistant_messages()
+            if message.payload
+        ]
+
+    assert "reportPreviewPayload" not in stored
+    for payload in messages:
+        preview = payload.get("reportPreviewPayload")
+        if isinstance(preview, dict):
+            assert "regions" not in preview, preview
+            assert set(preview) == {"previewContext"}, preview
+    assert agreed["reportPreviewPayload"]["regions"]
+
+
+def test_agree_response_carries_no_extra_top_level_field():
+    """「点同意」那一轮：顶层**没有**多出任何别的字段（只多挂载荷）。"""
+    with acceptance_harness(model=ScriptedModel(plan_candidate())) as harness:
+        agreed = _drive_to_agree(harness)
+
+    assert set(agreed) == set(AgentResponse.model_fields), sorted(agreed)
+    assert set(agreed["reportPreviewPayload"]) == {"previewContext", "regions"}
+
+
+def test_save_round_without_a_draft_carries_no_payload():
+    """**没有草稿可保存**的那一轮（协议错误）明确**不带**载荷。
+
+    ``_save_placeholder`` 的错误分支（``SAVE_MISSING_DRAFT``）不该凭空造一份
+    示意 —— 那一轮连定义都没有。
+    """
+    with acceptance_harness(model=ScriptedModel(plan_candidate())) as harness:
+        agreed = _drive_to_agree(harness)
+        assert agreed.get("reportPreviewPayload") is not None
+
+        # 绕过草稿再点一次「同意」：服务端存着的草稿被清掉 → 走错误分支。
+        record = harness.session_record()
+        stored = dict(record.snapshot or {})
+        stored.pop("definition", None)
+        stored.pop("policy", None)
+        harness.repository.upsert_session(
+            session_id=harness.session_id,
+            state=record.state,
+            snapshot=stored,
+        )
+
+        missing = harness.send("同意", state="USER_EDITING_TEMPLATE")
+
+    assert missing.get("reportPreviewPayload") is None, missing
+    assert missing.get("error"), missing
