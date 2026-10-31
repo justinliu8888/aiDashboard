@@ -45,6 +45,11 @@ from app.services.context_engine import (
 )
 from app.services.report_design_service import report_design_service
 from app.services.session_fact_service import SessionFactService
+from app.services.session_context import (
+    bind_session_key,
+    clear_session_key,
+    current_session_key,
+)
 from app.services.session_service import session_service
 from app.storage.models import SessionRecord
 from app.storage.report_design_repository import DESIGN_PHASE_PLAN_WAITING_CONFIRM
@@ -1153,9 +1158,18 @@ def test_ac2_session_report_plan_read_failure_keeps_stack_but_not_original(
     upstream_message = str(excinfo.value)
 
     caplog.set_level(logging.INFO, logger="app")
-    plan = agent_service._session_report_plan(
-        _request("生成昨日能耗日报", conversation_id="conv_leak3")
-    )
+    request = _request("生成昨日能耗日报", conversation_id="conv_leak3")
+    # 请求级会话上下文：跟真实链路一样先绑定 session key（别的用例可能留下了
+    # 残留的 ContextVar，这里绑成自己的，断言才是确定的），用完还原。
+    previous_key = current_session_key()
+    bind_session_key(request)
+    try:
+        plan = agent_service._session_report_plan(request)
+    finally:
+        if previous_key is None:
+            clear_session_key()
+        else:
+            bind_session_key(_request("还原会话上下文", conversation_id=previous_key))
 
     # 业务行为不变：读不到方案就当没有方案
     assert plan is None
