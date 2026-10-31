@@ -2929,6 +2929,26 @@ class AgentService:
             uiActions=["continue_editing"],
         )
 
+    @staticmethod
+    def _session_report_plan(request: AgentRequest) -> dict[str, Any] | None:
+        """会话快照里**那份文字方案**（没有就 None）。
+
+        载荷生成要用它做**历史定义**的只读语义适配（方案里的板块 → 区域），
+        跟读会话那条路（``sessions.py`` 的 ``_with_report_preview_payload``）
+        同源：那边取的是 ``snapshot["reportPlan"]``，这边取的是同一个键。
+        """
+        session_key = current_session_key() or request.conversationId
+        try:
+            record = session_service.repository.get_session(session_key)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[agent.chat] step=read_report_plan_failed sessionId=%s", session_key
+            )
+            return None
+        snapshot = (record.snapshot if record else None) or {}
+        plan = snapshot.get("reportPlan")
+        return plan if isinstance(plan, dict) else None
+
     def _save_placeholder(
         self, request: AgentRequest, route: RouteDecision
     ) -> AgentResponse:
@@ -2972,7 +2992,7 @@ class AgentService:
             or f"已保存草稿（{saved.definitionId}，revision={saved.revision}），"
             "下一步进入后端校验。"
         )
-        return AgentResponse(
+        response = AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.SAVE_DEFINITION_DRAFT,
             reply=reply,
@@ -3002,6 +3022,27 @@ class AgentService:
                 ),
             ],
             uiActions=["save_definition_draft", "advance_to_validating"],
+        )
+        # 右侧那块画的是什么：与「确认方案」「接受修改」**同一个入口**生成示意
+        # 载荷（report_design_service._attach_report_preview_payload → 内部走
+        # preview_service.build_report_preview_payload），不另起一套。
+        #
+        # 工单 #66 C2 F-3（判据 2）：界面上的「点同意」走的就是这条
+        # （template_edit_confirm → 同意 → _save_placeholder），草稿刚在这一轮
+        # 落库 —— 这一轮**也要**带载荷，否则右侧要等整页刷新才出现新板块。
+        #
+        # 载荷按**刚落库的那份定义**生成 —— 就是响应里 reportDefinitionDraft
+        # 那一份（已回填 definitionId / revision），与前端的版本校对
+        # （binding.definitionVersion ?? meta.revision）**同源**，不会被判成
+        # 过期版本。时间窗沿用会话里冻结的那一份（previewContext）。
+        #
+        # 只多挂这一个字段；载荷**不落库**（模拟业务数值不进会话库，见
+        # session_service._persisted_response_payload）。
+        return report_design_service._attach_report_preview_payload(
+            request,
+            response,
+            definition=definition,
+            plan=self._session_report_plan(request),
         )
 
     # ---------- 节点 6-11 自动推进 ----------
