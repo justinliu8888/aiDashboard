@@ -81,7 +81,7 @@ from app.services.session_service import CLARIFICATION_KEY_UPDATED, session_serv
 from app.services.edit_reference_resolver import resolve_visible_reference
 from app.services.edit_time_resolver import extract_change_value, resolve_time_expression
 from app.services.metric_mock_service import list_metrics
-from app.services.out_of_catalog_candidate import ambiguous_caliber_candidates
+from app.services.out_of_catalog_candidate import ambiguous_caliber_menu
 from app.services.scope_service import filter_visible
 from app.services.template_edit_engine import EditResult, template_edit_engine
 from app.tools.context import ToolScope
@@ -145,6 +145,13 @@ DELEGATION_ALTERNATIVES = (
 ORDER_DEPENDENT_REASONS = frozenset({
     "ordinal", "relative_previous", "demonstrative_without_selection",
 })
+
+#: **口径相关**的编辑意图 —— 只有模型这一轮声明的是这些，才允许把澄清
+#: 菜单接管成口径菜单（工单 #66 独立复核 F-7）。
+#:
+#: 模型的**所有**澄清都用同一个 ``question.id``，光看 id 区分不出口径与
+#: 粒度 / 时间窗 / 参考对象 → 只能看模型自己声明的意图。
+CALIBER_INTENTS = frozenset({"ADD_SECTION", "CHANGE_METRIC"})
 
 logger = logging.getLogger(__name__)
 
@@ -1473,14 +1480,27 @@ class AgentService:
         **显示名**子串匹配）—— 用户无论选 ``value`` 还是 ``label`` 都
         解不开这一轮。
 
-        **只有三个条件同时成立才替换**：
+        **四个条件同时成立才替换**：
 
         1. 规则层这份计划的目录外候选确实是 ``ambiguous``（含义不清）；
         2. 这个问题就是**口径澄清**（``template_edit_clarification``）；
-        3. 这个问题确实带选项（没有选项就不该凭空造一个菜单）。
+        3. 这个问题确实带选项（没有选项就不该凭空造一个菜单）；
+        4. **模型这一轮问的就是口径** —— 模型自己声明的意图
+           （``debug.editingIntent``）是 ``ADD_SECTION`` 或 ``CHANGE_METRIC``。
 
-        其余澄清路径（粒度 / 范围 / 参考对象等）**一律不动** —— 那些是
-        模型该自己拿主意的地方；问句正文（reply / prompt）也**不改**。
+        **为什么要有第 4 条**（独立复核 F-7）：模型的**所有**澄清都用
+        同一个 ``question.id``（``agentscope_report_agent.ask()``），
+        光看 id **区分不出**口径与粒度 / 时间窗 / 参考对象 / 展示形式
+        → 曾经出现过「请选择这张卡片的时间粒度：」配着「耗电量 / 占比 /
+        功率」，用户点下去被当成口径答案、**粒度丢失**。模型问什么由
+        模型决定，服务端**不可预先假定**。
+
+        其余澄清路径（粒度 / 范围 / 参考对象等）**一律不动** —— 选项、
+        问句、回复都保持模型给的。
+
+        **接管时问句与选项同源成对替换**（F-7）：只换选项会让问句与选项
+        打架 → 选项与**问句**（``question.prompt`` 与 ``response.reply``）
+        一起换成规则层那一句口径问句，两者出自同一份规则候选。
         """
         if rule_plan is None:
             return response
@@ -1491,8 +1511,17 @@ class AgentService:
         if str(metric_candidate.get("status") or "") != "ambiguous":
             return response
         intent = str(getattr(operation, "metricIntent", "") or "").strip()
-        options = ambiguous_caliber_candidates(intent)
-        if not options:
+        # 口径问句与口径选项**成对**、**同出一源**（F-7）。
+        menu = ambiguous_caliber_menu(intent)
+        options = list(menu.get("options") or [])
+        question_text = str(menu.get("question") or "")
+        if not options or not question_text:
+            return response
+        # 条件 4：模型这一轮问的是不是**口径**。
+        editing_intent = str(
+            ((response.debug or {}).get("editingIntent") or "")
+        ).strip()
+        if editing_intent not in CALIBER_INTENTS:
             return response
         replaced = False
         for question in response.questions:
@@ -1501,8 +1530,11 @@ class AgentService:
             question.options = [
                 QuestionOption.model_validate(item) for item in options
             ]
+            # 问句与选项**同源**：一起换，永不打架（F-7）。
+            question.prompt = question_text
             replaced = True
         if replaced:
+            response.reply = question_text
             logger.info(
                 "[agent.chat] step=caliber_menu_replaced conversationId=%s "
                 "intentLength=%d options=%s",

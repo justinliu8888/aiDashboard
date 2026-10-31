@@ -255,6 +255,56 @@ def _match_clarification_choice(
     return None
 
 
+def ambiguous_caliber_menu(intent: str) -> dict[str, Any]:
+    """含义不清的指标意图 → **规则层的口径问句 + 口径选项**（同源成对）。
+
+    工单 #66 独立复核（F-7）查出的范围越界：**只换选项、不换问句**会让
+    用户看到「请选择这张卡片的时间粒度：」配着「耗电量 / 占比 / 功率」——
+    **问句与选项打架**，用户点下去被当成口径答案。
+
+    所以口径澄清的**问句与选项必须成对**、且**同出一源**：
+    两者都由这一份规则候选装配（``simulated_field_semantics`` 的
+    ``clarification_question`` + ``clarification_candidates``）。
+
+    - 含义确实不清（``ambiguous``）→ 返回
+      ``{"question": "「…」这个说法有多种口径，你要哪一种：…？",
+      "options": [{"value": 候选 label, "label": "<label>（<unit>）—— <hint>"}]}``；
+    - 其余情况 → 返回 ``{"question": "", "options": []}``
+      （调用方据此**一律不动**模型给的问句与选项）。
+
+    问句正文与脚本路径（``FakeReportAgent``）显示的那句**逐字一致** ——
+    那是既有业务输出，一个字都不许变。
+    """
+    text = str(intent or "").strip()
+    if not text:
+        return {"question": "", "options": []}
+    semantics = resolve_metric_semantics(intent=text)
+    if not semantics.is_ambiguous:
+        return {"question": "", "options": []}
+    clarification = semantics.clarification or {}
+    candidates = list(clarification.get("candidates") or [])
+    options: list[dict[str, Any]] = []
+    for item in candidates:
+        label = str(item.get("label") or "").strip()
+        if not label:
+            continue
+        unit = str(item.get("unit") or "").strip()
+        hint = str(item.get("hint") or "").strip()
+        display = label
+        if unit:
+            display += f"（{unit}）"
+        if hint:
+            display += f" —— {hint}"
+        options.append({"value": label, "label": display})
+    if not options:
+        return {"question": "", "options": []}
+    # 问句与选项**同一个来源**：规则层的候选装配。
+    question = str(clarification.get("question") or "").strip()
+    if not question:
+        question = clarification_question(text, candidates)
+    return {"question": question, "options": options}
+
+
 def ambiguous_caliber_candidates(intent: str) -> list[dict[str, Any]]:
     """含义不清的指标意图 → **规则层**的口径选项（工单 #66）。
 
@@ -270,28 +320,11 @@ def ambiguous_caliber_candidates(intent: str) -> list[dict[str, Any]]:
     候选**一个词都不改**：``value`` 取候选的 ``label``，与
     ``_match_clarification_choice`` 命中的是**同一份**候选 —— 用户选完
     直接就能解出候选，不必再澄清一轮。
+
+    口径问句与口径选项**成对**的出口在 :func:`ambiguous_caliber_menu`；
+    这里只取其中那一半（调用方只要选项时用它）。
     """
-    text = str(intent or "").strip()
-    if not text:
-        return []
-    semantics = resolve_metric_semantics(intent=text)
-    if not semantics.is_ambiguous:
-        return []
-    candidates = list((semantics.clarification or {}).get("candidates") or [])
-    options: list[dict[str, Any]] = []
-    for item in candidates:
-        label = str(item.get("label") or "").strip()
-        if not label:
-            continue
-        unit = str(item.get("unit") or "").strip()
-        hint = str(item.get("hint") or "").strip()
-        display = label
-        if unit:
-            display += f"（{unit}）"
-        if hint:
-            display += f" —— {hint}"
-        options.append({"value": label, "label": display})
-    return options
+    return list(ambiguous_caliber_menu(intent)["options"])
 
 
 def resolve_out_of_catalog_candidate(

@@ -45,25 +45,43 @@ _SLUG_OPTIONS = [
 #: 规则层候选（``simulated_field_semantics.clarification_candidates``）。
 _RULE_LABELS = ["耗电量", "占比", "功率"]
 
+#: 规则层那句口径问句（与脚本路径显示的那句**逐字一致**）。
+_RULE_CALIBER_QUESTION = (
+    "「电脑耗电率」这个说法有多种口径，你要哪一种：耗电量（kWh）、占比（%）、功率（kW）？"
+)
+
 
 class _SlugOptionAgent:
     """替身业务 Agent：只复刻「模型自造 slug 选项」这一个现场。
 
     **不是** ``FakeReportAgent`` 的实例 —— 真实模型路径正是这样走的：
     规则快路对 ambiguous 计划返回 ``None``，澄清菜单由模型给出。
+
+    工单 #66 独立复核（F-7）补的第二现场：**模型这一轮问的是粒度**，
+    但 ``question.id`` 仍是 ``template_edit_clarification``（模型的**所有**
+    澄清都用同一个 id）→ 靠 ``editing_intent`` 区分。
     """
 
-    def __init__(self, question_id: str = "template_edit_clarification") -> None:
+    def __init__(
+        self,
+        question_id: str = "template_edit_clarification",
+        *,
+        editing_intent: str = "ADD_SECTION",
+        ask_grain: bool = False,
+    ) -> None:
         self.question_id = question_id
+        self.editing_intent = editing_intent
+        self.ask_grain = ask_grain
         self.calls: list[str] = []
 
     def handle(self, request) -> AgentResponse:
         self.calls.append(request.message)
-        question = (
-            "请确认你想新增的「电脑耗电率」具体指什么？"
-            if self.question_id == "template_edit_clarification"
-            else "请选择当前数据源支持的粒度："
-        )
+        if self.ask_grain:
+            question = "请选择这张卡片的时间粒度："
+        elif self.question_id == "template_edit_clarification":
+            question = "请确认你想新增的「电脑耗电率」具体指什么？"
+        else:
+            question = "请选择当前数据源支持的粒度："
         return AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.USER_EDITING_TEMPLATE,
@@ -80,7 +98,7 @@ class _SlugOptionAgent:
             uiActions=["ask_template_edit_detail"],
             debug={
                 "editOutcome": "clarification",
-                "editingIntent": "ADD_SECTION",
+                "editingIntent": self.editing_intent,
                 "editingTargetRegionId": None,
             },
         )
@@ -257,3 +275,118 @@ def test_caliber_menu_log_keeps_no_user_words(monkeypatch, post_chat, definition
     assert "intentLength=" in text
     assert "电脑耗电率" not in text
     assert "耗电量" in text
+
+
+# ==========================================================================
+# 4. 工单 #66 独立复核 F-7：接管条件收紧 + 问句与选项同源
+# ==========================================================================
+#
+# F-7 的现场（复核实测，用户在界面上真实看到的样子）：
+#
+#     问句：请选择这张卡片的时间粒度：
+#     选项：['耗电量', '占比', '功率']      ← 被口径选项接管了
+#
+# 用户点第一项「耗电量」→ 回答被当成**口径答案**解开（用户要的**粒度丢了**）。
+#
+# 根因：模型的**所有**澄清都用同一个 ``question.id``，
+# 只看 id 区分不出口径与粒度 / 时间窗 / 参考对象 → 接管条件必须再问一句
+# 「模型这一轮问的是不是口径」，并让**问句与选项同源成对替换**。
+
+
+def test_caliber_menu_replaces_the_question_together_with_the_options(
+    monkeypatch, post_chat, definition
+):
+    """模型问口径时：**问句与选项一起**换成规则层那一句 —— 同源成对。"""
+    monkeypatch.setattr(agent_service, "_agent", _SlugOptionAgent())
+
+    body = _post(post_chat, definition, "新增一个电脑耗电率指标")
+
+    question = next(
+        q for q in _questions(body) if q["id"] == "template_edit_clarification"
+    )
+    values = [option["value"] for option in question["options"]]
+    assert values == _RULE_LABELS
+    # 问句与选项**同源**：两者都是规则层那句口径问句。
+    assert question["prompt"] == _RULE_CALIBER_QUESTION
+    assert body["reply"] == _RULE_CALIBER_QUESTION
+    assert question["prompt"] == body["reply"]
+    assert (body.get("debug") or {}).get("caliberMenuSource") == "rule_candidates"
+
+
+def test_caliber_menu_replaces_the_question_for_change_metric_too(
+    monkeypatch, post_chat, definition
+):
+    """``CHANGE_METRIC`` 同样算口径相关（不只是 ``ADD_SECTION``）。"""
+    monkeypatch.setattr(
+        agent_service, "_agent", _SlugOptionAgent(editing_intent="CHANGE_METRIC")
+    )
+
+    body = _post(post_chat, definition, "新增一个电脑耗电率指标")
+
+    question = next(
+        q for q in _questions(body) if q["id"] == "template_edit_clarification"
+    )
+    assert [option["value"] for option in question["options"]] == _RULE_LABELS
+    assert question["prompt"] == _RULE_CALIBER_QUESTION
+    assert body["reply"] == _RULE_CALIBER_QUESTION
+
+
+def test_grain_question_keeps_the_model_options_entirely(
+    monkeypatch, post_chat, definition
+):
+    """**核心护栏**：模型这轮问的是粒度 → 一个字段都不许动。
+
+    复核实测的越界现场：模型的 ``question.id`` 与口径澄清**同为**
+    ``template_edit_clarification`` → 只看 id 会把粒度菜单接管成口径菜单。
+    """
+    agent = _SlugOptionAgent(
+        editing_intent="CHANGE_COMPILATION_GRAIN", ask_grain=True
+    )
+    monkeypatch.setattr(agent_service, "_agent", agent)
+
+    body = _post(post_chat, definition, "新增一个电脑耗电率指标，按天粒度")
+
+    question = next(
+        q for q in _questions(body) if q["id"] == "template_edit_clarification"
+    )
+    # 选项是模型自己的（slug 原样），一个都不许被换成口径候选。
+    values = [option["value"] for option in question["options"]]
+    assert values == ["pc_energy_abs", "pc_energy_ratio"]
+    # 标签也是模型自己写的那个 —— 不许被换成「耗电量（kWh） —— …」。
+    assert [option["label"] for option in question["options"]] == [
+        "电脑绝对能耗量", "电脑能耗占比",
+    ]
+    # 问句与回复也保持模型的。
+    assert question["prompt"] == "请选择这张卡片的时间粒度："
+    assert body["reply"] == "请选择这张卡片的时间粒度："
+    # 没有接管 → 不许有接管标记。
+    assert (body.get("debug") or {}).get("caliberMenuSource") is None
+
+
+def test_grain_answer_is_not_taken_as_a_caliber_answer(
+    monkeypatch, post_chat, definition
+):
+    """用户回答粒度 → **不得**被当成口径答案解开（粒度不许丢）。"""
+    agent = _SlugOptionAgent(
+        editing_intent="CHANGE_COMPILATION_GRAIN", ask_grain=True
+    )
+    monkeypatch.setattr(agent_service, "_agent", agent)
+
+    first = _post(post_chat, definition, "新增一个电脑耗电率指标，按天粒度")
+    value = _options(first)[0]["value"]
+
+    body = _post(post_chat, definition, value)
+
+    pending = (body.get("domainObjects") or {}).get("pendingEditPlan")
+    candidate = None
+    if pending:
+        for operation in pending.get("operations") or []:
+            found = (operation.get("operation") or {}).get("metricCandidate")
+            if found:
+                candidate = found
+                break
+    # 用户点的是**粒度**菜单里的第一项 —— 它**不得**被当成口径答案。
+    status = str((candidate or {}).get("status") or "")
+    assert status != "out_of_catalog", (
+        "用户回答粒度却被当成口径答案解开了（粒度丢失）"
+    )
