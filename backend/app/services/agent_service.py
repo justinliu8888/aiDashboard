@@ -117,19 +117,9 @@ TEMPLATE_EDIT_HINT_WORDS = (
     "section", "区域", "面板", "卡片", "模块",
 )
 
-# 只读能力查询的疑问词。命中之后才尝试用确定性证据直接回答，
-# 避免把「把趋势图改成折线图」这类修改请求误判成查询。
-READONLY_QUESTION_WORDS = (
-    "哪些", "什么", "怎么", "能不能", "可不可以", "能否", "是否",
-    "有没有", "支持", "吗", "？", "?",
-)
-
-# 明确的改动动词：出现这些词就是在下指令，不是在提问。
-# 「这个能按分钟看吗」是提问，「改成按分钟粒度」是指令；
-# 即使指令后面带问号（「改成按分钟粒度，可以吗」），也仍然是指令。
-EDIT_COMMAND_WORDS = (
-    "改成", "改为", "换成", "换为", "调成", "设为", "设定为",
-)
+# 只读能力查询的疑问词与「要改这块卡」的动词，**由 routing_rules 独家持有**：
+# 见 ``routing_rules.READONLY_QUESTION_WORDS`` / ``routing_rules.EDIT_COMMAND_WORDS``。
+# 这两张表与意图门那一套**故意不同**（各判各的），理由写在 routing_rules 里。
 
 # 「你自己决定 / 别问了」：用户把选择权交回给系统。
 #
@@ -1747,11 +1737,23 @@ class AgentService:
 
         这里只覆盖两类有登记证据的问题：可展示方式、已登记的编译粒度。
         其余能力问题无法用确定性证据回答，交给受约束的 ReAct 查证。
+
+        这一轮**只回答、不执行**：句子里带的命令动词（导出 / 保存 / 发布 /
+        重新开始……）由 :func:`_note_unexecuted_commands` 如实说明「没执行」。
         """
         message = request.message.strip()
         if not message or not self._is_readonly_question(message):
             return None
 
+        answer = self._answer_readonly_query(request, definition, message)
+        if answer is None:
+            return None
+        return self._note_unexecuted_commands(message, answer)
+
+    def _answer_readonly_query(
+        self, request: AgentRequest, definition: ReportDefinitionDraft, message: str
+    ) -> AgentResponse | None:
+        """快路正文：只用确定性证据回答，不改草稿、不产生待确认计划。"""
         scope = ToolScope(
             project_id=request.context.projectId,
             subject_ref=request.context.subjectRef,
@@ -1821,10 +1823,39 @@ class AgentService:
 
         疑问词只是必要条件：「改成按分钟粒度，可以吗」带着问号，
         但用户是在下指令。有明确改动动词的，一律按指令处理。
+
+        词表由 :mod:`app.services.routing_rules` 独家持有（那边与意图门那套
+        放在一起，理由见那边的注释）；这里只调用，不各留一份。
         """
-        if any(word in message for word in EDIT_COMMAND_WORDS):
+        if any(word in message for word in routing_rules.EDIT_COMMAND_WORDS):
             return False
-        return any(word in message for word in READONLY_QUESTION_WORDS)
+        return any(word in message for word in routing_rules.READONLY_QUESTION_WORDS)
+
+    @staticmethod
+    def _note_unexecuted_commands(message: str, response: AgentResponse) -> AgentResponse:
+        """句子里带了命令动词、而这一轮只做了回答 → 如实说明「没执行」。
+
+        代码审查 R1 §3.4：用户在编辑态选中一张卡片说「导出这个可以展示吗」，
+        快路把整句当成咨询答了展示方式，「导出」这半句**既没执行、也没提示** ——
+        那就是说假话。
+
+        只说**「没有执行」**这一层意思：有没有导出按钮这类事实**没核实过**，
+        不许替产品下结论（「这是界面上的操作」「这个我做不了」都不许说）。
+        句子里有多个没执行的命令动词就都提。
+
+        原有回答**逐字保留**，只在末尾补这一句。
+        动词确实被这一轮执行了的（例如快路没回答、而是走了编辑分支），
+        **不适用**这里 —— 那条路径根本不会走到本函数。
+        """
+        verbs = routing_rules.command_verbs_in(message)
+        if not verbs:
+            return response
+        quoted = "".join(f"「{verb}」" for verb in verbs)
+        response.reply = (
+            f"{response.reply}"
+            f"你说的{quoted}这一轮没有执行，我这一轮只做了回答。"
+        )
+        return response
 
     def _readonly_target_region(
         self, request: AgentRequest, definition: ReportDefinitionDraft

@@ -935,6 +935,38 @@ def has_operation_command(message: str) -> bool:
     return any(word in text for word in _OPERATION_VERBS)
 
 
+def command_verbs_in(message: str) -> tuple[str, ...]:
+    """这句里带了哪些**命令动词**（:data:`_OPERATION_VERBS`）。
+
+    给「这一轮没有执行」那层实话用：命中几个就提几个，调用方按出现顺序排列。
+
+    长词优先、互不重叠：「重新生成」里含「生成」，只算「重新生成」一个 ——
+    否则同一处命令会被报成两个。
+    """
+    text = (message or "").strip()
+    if not text:
+        return ()
+    hits: list[tuple[int, int, str]] = []
+    for verb in _OPERATION_VERBS:
+        start = text.find(verb)
+        while start != -1:
+            hits.append((start, start + len(verb), verb))
+            start = text.find(verb, start + 1)
+    # 同一处起点取最长的词；再按出现位置从前往后挑不重叠的。
+    hits.sort(key=lambda item: (item[0], -item[1]))
+    picked: list[tuple[int, int, str]] = []
+    for start, end, verb in hits:
+        if any(not (end <= taken_start or start >= taken_end)
+               for taken_start, taken_end, _ in picked):
+            continue
+        picked.append((start, end, verb))
+    ordered: list[str] = []
+    for _, _, verb in sorted(picked, key=lambda item: item[0]):
+        if verb not in ordered:
+            ordered.append(verb)
+    return tuple(ordered)
+
+
 def mentions_report_object(message: str) -> bool:
     """这句话有没有指向**报表业务对象**。
 
@@ -970,6 +1002,42 @@ def is_readonly_question(message: str) -> bool:
     # 认不出一句提问，后果是「提问」被当成「修改」——
     # 设计流程里那会平白多出一版方案，所以这里按大小写不敏感匹配。
     return mentions_report_object(text)
+
+
+# --------------------------------------------------------------------------
+# 确定性快路的「只读提问」判定词表
+# --------------------------------------------------------------------------
+#
+# 这两张表**只**服务于确定性快路（``agent_service._try_answer_readonly_query``），
+# 与上面意图门那一套**故意不同**，各判各的、不合并：
+#
+#   - **意图门**问的是「这条消息是**命令**还是**咨询**」：有命令动词就是命令；
+#     必须是疑问句**且**指向报表业务对象（:func:`mentions_report_object`）
+#     才算咨询。
+#   - **确定性快路**问的是「这条消息是不是**在问这块卡片的能力**」
+#     （可展示方式 / 可用粒度）：它**不要求**指向报表业务对象 ——
+#     「这个可以展示吗」就该答。它排除的只是「**要改这块卡**」的那几个动词；
+#     「导出 / 保存 / 发布 / 重新开始」这些**不是对卡片的改动**，
+#     所以**不在**快路的排除表里。
+#
+# 放在本模块是为了让它们与意图门那套**同处一地**：漂移风险从「跨文件复制
+# 粘贴」降成「同文件内两个具名集合」。
+#
+# 词表**内容一个字都不许改**（改了就是改既有业务输出）—— 只搬家、只改引用。
+
+# 只读能力查询的疑问词。命中之后才尝试用确定性证据直接回答，
+# 避免把「把趋势图改成折线图」这类修改请求误判成查询。
+READONLY_QUESTION_WORDS = (
+    "哪些", "什么", "怎么", "能不能", "可不可以", "能否", "是否",
+    "有没有", "支持", "吗", "？", "?",
+)
+
+# 明确的改动动词：出现这些词就是在下指令，不是在提问。
+# 「这个能按分钟看吗」是提问，「改成按分钟粒度」是指令；
+# 即使指令后面带问号（「改成按分钟粒度，可以吗」），也仍然是指令。
+EDIT_COMMAND_WORDS = (
+    "改成", "改为", "换成", "换为", "调成", "设为", "设定为",
+)
 
 
 # --------------------------------------------------------------------------
