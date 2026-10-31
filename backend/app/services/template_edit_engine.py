@@ -51,7 +51,7 @@ from app.services.out_of_catalog_candidate import (
     selection_for_existing_type,
     split_metric_intent,
 )
-from app.services.report_template_service import DATA_SOURCE_LABEL
+from app.services.report_template_service import DATA_SOURCE_LABEL, pending_reason
 from app.services.scope_service import filter_visible
 from app.services.simulated_field_semantics import (
     SCOPE_METRIC_FAMILY,
@@ -2048,7 +2048,10 @@ class TemplateEditEngine:
                 # 目录外指标**没有**真实口径：这里不写 metricRef。
                 "metricRefs": [],
                 "sourceMode": mode.mode,
-                "pendingReason": None,
+                # 区域级占位文案按**来源模式**分叉：复用模板层那一份
+                # （report_template_service.pending_reason），不另起说法。
+                # 目录外指标的区域级数值同样是「模拟示例 / 用户提供的数据」。
+                "pendingReason": pending_reason(mode.mode),
             },
         }
         context = self._region_context(definition)
@@ -2713,7 +2716,8 @@ class TemplateEditEngine:
             # 目录外指标**没有**真实口径：这里不写 metricRef。
             "metricRefs": [],
             "sourceMode": mode.mode,
-            "pendingReason": None,
+            # 同上：区域级占位文案复用模板层那一份（按来源模式分叉）。
+            "pendingReason": pending_reason(mode.mode),
         })
         target["templateBinding"] = binding
         # 示意语义描述复用 #59 的能力层：语义类别 / 单位 / 稳定模拟身份 /
