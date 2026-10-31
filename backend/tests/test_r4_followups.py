@@ -418,6 +418,72 @@ def test_the_same_item_is_not_asked_a_second_time(post_chat):
     assert state.rounds == 1, "同一件事的额度不该被重开"
 
 
+def test_the_quota_is_not_carried_over_after_the_pending_question_is_cleared(post_chat):
+    """条件②不成立时，额度键**不得**沿用上一轮（契约表 §7.4 v1.20.0）。
+
+    契约表 §7.4 v1.20.0：「『上一轮存在针对同一意图的待澄清追问』=
+    **两个条件同时成立**：① 会话里记着上一轮的额度键（`clarificationKey`），
+    且它的**意图部分**与这一轮判出的意图**相同**；② 上一轮**确实抛出过**
+    一个待澄清追问（`pendingEditRequest` 仍在）。**两个条件缺一不可**」。
+
+    本例走的是「① 成立、② 不成立」：r1 真的追问 → r2 额度用尽，
+    这一轮的待澄清追问被清掉（**② 从此不成立**），但额度键还留着
+    「意图:目标为空」那一档（**① 仍然成立**）→ r3 把目标补上。
+
+    ② 不成立 → 「例外之二」不成立 → r3 按**新事项**处理：额度键由这一轮
+    派生（不沿用上一轮那个空目标键），轮次从 0 起 → 仍能追问一轮。
+
+    去掉条件②（`_derive_clarification_key` 沿用分支里的 ``prior_pending``
+    前提）之后：r3 会沿用上一轮的键 → 撞上上一轮已用尽的额度 → 被挡住，
+    「同一件事只问一轮」就变成了「这件事再也问不出来」。
+    """
+    from app.services.agent_service import _derive_clarification_key
+
+    # 派生层：条件②不成立 → 额度键由这一轮派生，不沿用上一轮那个空目标键。
+    assert _derive_clarification_key(
+        intent="CHANGE_VISUALIZATION",
+        target="region_hourly_trend",
+        prior_key="CHANGE_VISUALIZATION:",
+        prior_pending=False,
+    ) == "CHANGE_VISUALIZATION:region_hourly_trend", (
+        "条件②不成立时不得沿用上一轮的额度键"
+    )
+
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+
+    first = _post(post_chat, definition, "改成柱状图")
+    assert first["questions"], "第一轮应该真的追问"
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_VISUALIZATION:"
+    assert state.rounds == 1
+
+    second = _post(post_chat, definition, "改成柱状图")
+    assert second["uiActions"] == ["template_edit_clarification_limit"]
+    # 额度用尽 → 待澄清追问被清掉 → **条件②不成立**；额度键还在（条件①成立）。
+    assert "pendingEditRequest" not in session_service.load_collected_info("conv_test")
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_VISUALIZATION:"
+    assert state.rounds == 1
+
+    third = _post(post_chat, definition, "把小时趋势改成柱状图")
+
+    # 条件②不成立 → 沿用分支不触发 → 新事项：轮次从 0 起 → 仍能追问一轮。
+    assert third["uiActions"] != ["template_edit_clarification_limit"], (
+        "条件②不成立却沿用了上一轮的额度，这一轮被上一轮的额度挡住了："
+        f"uiActions={third['uiActions']}"
+    )
+    assert "ask_template_edit_detail" in third["uiActions"]
+    assert third["questions"], "新事项应该重新被追问"
+    assert "追问过 1 轮" not in third["reply"], (
+        "新事项的额度从 0 起，不该说成上一轮已经追问过"
+    )
+    state = session_service.load_clarification("conv_test")
+    assert state.key == "CHANGE_VISUALIZATION:region_hourly_trend", (
+        "额度键不该沿用上一轮那个空目标的键"
+    )
+    assert state.rounds == 1, "新事项的轮次从 0 起算成 1"
+
+
 def test_the_exhausted_reply_does_not_claim_the_target_is_unknown(post_chat):
     """被挡住时的文案不许说假话（契约表 §8 不变量 8）。
 
