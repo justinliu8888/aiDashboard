@@ -165,9 +165,12 @@ def _read_session_record(session_id: str) -> tuple[Any | None, str]:
     """
     try:
         record = session_service.repository.get_session(session_id)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "[recorded_progress] 读取会话记录失败 sessionId=%s", session_id, exc_info=True
+            "[recorded_progress] 读取会话记录失败 sessionId=%s errorType=%s",
+            session_id,
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
         )
         return None, "服务端会话记录读取失败，无法确认当前进度。"
     if record is None:
@@ -203,9 +206,12 @@ def _check_permission(
         return None
     try:
         workspace = session_service.repository.get_workspace(workspace_id)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "[recorded_progress] 读取项目失败 workspaceId=%s", workspace_id, exc_info=True
+            "[recorded_progress] 读取项目失败 workspaceId=%s errorType=%s",
+            workspace_id,
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
         )
         return None
     if workspace is None:
@@ -331,9 +337,12 @@ def _extract_clarification(session_id: str | None) -> dict[str, Any]:
         return {"exists": False, "rounds": 0, "maxRounds": 0, "lastQuestion": ""}
     try:
         clarification = session_service.load_clarification(session_id)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "[recorded_progress] 读取澄清进度失败 sessionId=%s", session_id, exc_info=True
+            "[recorded_progress] 读取澄清进度失败 sessionId=%s errorType=%s",
+            session_id,
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
         )
         return {"exists": False, "rounds": 0, "maxRounds": 0, "lastQuestion": ""}
     if clarification is None:
@@ -365,11 +374,12 @@ def _extract_saved_definition(record: Any) -> dict[str, Any]:
     saved = None
     try:
         saved = definition_save_service.get(recorded_id)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "[recorded_progress] 读取已保存定义失败 definitionId=%s",
+            "[recorded_progress] 读取已保存定义失败 definitionId=%s errorType=%s",
             recorded_id,
-            exc_info=True,
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
         )
     return {
         "exists": True,

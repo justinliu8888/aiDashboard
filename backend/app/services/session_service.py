@@ -322,9 +322,15 @@ class SessionService:
                 request=request,
                 message_count=count,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # 落库失败不能影响主链路
-            logger.exception("[session_service] 落库失败 sessionId=%s", session_id)
+            # 异常原文不进日志（#61）：留栈不留原文。
+            logger.exception(
+                "[session_service] 落库失败 sessionId=%s errorType=%s",
+                session_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
 
     def _state_to_store(self, session_id: str, response: AgentResponse) -> str:
@@ -932,9 +938,13 @@ class SessionService:
         """
         try:
             self._repo.set_pending_choice(session_id, choice)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # 异常原文不进日志（#61）：留栈不留原文。
             logger.exception(
-                "[session_service] 写选择锁失败 sessionId=%s", session_id
+                "[session_service] 写选择锁失败 sessionId=%s errorType=%s",
+                session_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
             )
 
     def load_pending_choice(self, session_id: str) -> dict[str, Any] | None:

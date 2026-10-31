@@ -154,8 +154,13 @@ def _with_report_preview_payload(
         payload = build_report_preview_payload(definition, context, plan=plan)
     except (SimulatedDataError, PreviewContextError) as exc:
         code = str(getattr(exc, "code", "") or "REPORT_PREVIEW_PAYLOAD_FAILED")
+        # 异常原文不进日志（#61）：这条异常的消息里带着时间窗/粒度等
+        # 载荷字段的值（可能含用户数据）—— 只留错误码、原因类型与调用栈。
         logger.warning(
-            "[sessions] 恢复会话时示意载荷生成失败 code=%s reason=%s", code, exc
+            "[sessions] 恢复会话时示意载荷生成失败 code=%s errorType=%s",
+            code,
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
         )
         # 失败原因随这次响应回去（响应级，不落库）：用户刷新后仍看得见
         # 「为什么右侧是空的」，而不是只剩一片空白。

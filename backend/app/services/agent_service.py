@@ -242,8 +242,12 @@ def _build_agent():
             logger.info("使用 AgentScopeReportAgent（火山方舟）")
             return AgentScopeReportAgent()
         except Exception as e:  # noqa: BLE001
+            # 异常原文不进日志（#61）：异常对象换成 None —— 调用栈还在，
+            # 异常消息没了。只留原因类型。
             logger.exception(
-                "AgentScopeReportAgent 初始化失败，降级 FakeAgent：%s", e
+                "AgentScopeReportAgent 初始化失败，降级 FakeAgent errorType=%s",
+                type(e).__name__,
+                exc_info=(type(e), None, e.__traceback__),
             )
             return FakeReportAgent()
     logger.info("使用 FakeReportAgent")
@@ -370,10 +374,13 @@ class AgentService:
                 response = await handle(request)
             else:
                 response = self._agent.handle(request)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # 异常原文不进日志（#61）：留栈不留原文。
             logger.exception(
-                "[agent.chat] step=readonly_query_failed conversationId=%s",
+                "[agent.chat] step=readonly_query_failed conversationId=%s errorType=%s",
                 request.conversationId,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
             )
             response = self._query_failure_response(request)
         response.debug = {
@@ -493,10 +500,12 @@ class AgentService:
                 AgentState(raw["state"])
                 return [_question_from_pending(raw["question"])]
             except (KeyError, TypeError, ValueError):
+                # 待确认菜单的原文（题干 / 选项）可能带用户原话与模型文本，
+                # 整包不进日志（#61 AC#1）：只留容器类型这个派生信息。
                 logger.warning(
-                    "[agent.chat] step=pending_choice_invalid conversationId=%s raw=%s",
+                    "[agent.chat] step=pending_choice_invalid conversationId=%s rawType=%s",
                     request.conversationId,
-                    raw,
+                    type(raw).__name__,
                 )
         return []
 
@@ -610,10 +619,12 @@ class AgentService:
                 pending_state = AgentState(pending_raw["state"])
                 pending = (pending_state, _question_from_pending(pending_raw["question"]))
             except (KeyError, ValueError):
+                # 待确认菜单的原文（题干 / 选项）可能带用户原话与模型文本，
+                # 整包不进日志（#61 AC#1）：只留容器类型这个派生信息。
                 logger.warning(
-                    "[agent.chat] step=pending_choice_invalid conversationId=%s raw=%s",
+                    "[agent.chat] step=pending_choice_invalid conversationId=%s rawType=%s",
                     request.conversationId,
-                    pending_raw,
+                    type(pending_raw).__name__,
                 )
                 session_service.save_pending_choice(session_key, None)
         if session_service.load_pending_plan(session_key):
@@ -998,7 +1009,7 @@ class AgentService:
             },
         )
         logger.info(
-            "[agent.chat] step=context_route_done conversationId=%s elapsed_ms=%.1f state=%s intent=%s action=%s target=%s ready=%s missing=%s reason=%r",
+            "[agent.chat] step=context_route_done conversationId=%s elapsed_ms=%.1f state=%s intent=%s action=%s target=%s ready=%s missing=%s reasonLength=%d",
             request.conversationId,
             (perf_counter() - route_started) * 1000,
             request.state.value,
@@ -1007,7 +1018,9 @@ class AgentService:
             route.targetState.value if route.targetState else None,
             route.isReadyForNextStep,
             route.missingInfo,
-            route.reason,
+            # 路由原因可能夹带用户原话（规则层阻断时点名的指标）与模型原文
+            # （Concierge 给的 reason）—— 整句不进日志（#61 AC#1），只留长度。
+            len(route.reason or ""),
         )
 
         state_before_apply = request.state.value
@@ -1708,8 +1721,14 @@ class AgentService:
             result = template_edit_engine.apply(
                 plan=plan, definition=definition, scope=scope
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("待确认编辑计划执行失败 planId=%s", pending.planId)
+        except Exception as exc:  # noqa: BLE001
+            # 异常原文不进日志（#61）：留栈不留原文。
+            logger.exception(
+                "待确认编辑计划执行失败 planId=%s errorType=%s",
+                pending.planId,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return self._edit_notice(
                 request, "本轮修改执行遇到技术问题，草稿没有变化；请重新发起修改。",
                 code="EDIT_EXECUTION_FAILED",
@@ -1922,8 +1941,13 @@ class AgentService:
                 subject_ref=request.context.subjectRef,
                 subject_id=request.context.subjectId,
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[agent.chat] step=metric_scope_lookup_failed")
+        except Exception as exc:  # noqa: BLE001
+            # 异常原文不进日志（#61）：留栈不留原文。
+            logger.exception(
+                "[agent.chat] step=metric_scope_lookup_failed errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return []
         names: list[str] = []
         for item in metrics:
@@ -2174,8 +2198,13 @@ class AgentService:
                 ),
                 definitionDraft=definition.model_dump(mode="json"),
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[agent.chat] step=issue_analysis_preview_failed")
+        except Exception as exc:  # noqa: BLE001
+            # 异常原文不进日志（#61）：留栈不留原文。
+            logger.exception(
+                "[agent.chat] step=issue_analysis_preview_failed errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         for item in record.regions or []:
             if item.get("regionId") != region_id:
@@ -2878,10 +2907,12 @@ class AgentService:
         reply = route.reply or message
         code = route.blockCode or "OUT_OF_SCOPE"
         logger.info(
-            "[agent.chat] step=blocked_by_route conversationId=%s code=%s message=%r",
+            "[agent.chat] step=blocked_by_route conversationId=%s code=%s messageLength=%d",
             request.conversationId,
             code,
-            message,
+            # 阻断说明会点名用户要的指标（用户原话），回复正文同理 ——
+            # 整句不进日志（#61 AC#1），只留长度。
+            len(message or ""),
         )
         return AgentResponse(
             conversationId=request.conversationId,

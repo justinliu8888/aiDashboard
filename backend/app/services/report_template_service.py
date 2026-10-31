@@ -309,8 +309,13 @@ def _resolve_window(time_range: Any) -> _Window:
 
     try:
         resolved = resolve_time_window(time_range)
-    except Exception:  # noqa: BLE001
-        logger.exception("[report_template] 时间窗解析失败")
+    except Exception as exc:  # noqa: BLE001
+        # 异常原文不进日志（#61）：留栈不留原文。
+        logger.exception(
+            "[report_template] 时间窗解析失败 errorType=%s",
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
+        )
         resolved = None
     if not isinstance(resolved, dict):
         return _default_window()

@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,13 +31,21 @@ from app.schemas.agent import (
     AgentRequestContext,
     AgentState,
 )
+from app.services import recorded_progress_service
 from app.services import report_diagnostics_service as diagnostics
 from app.services import report_log_safety as safety
+from app.services.agent_service import _build_agent, agent_service
 from app.services.context_engine import (
+    RouteDecision,
     RoutingAction,
     UserIntent,
     context_engine,
 )
+from app.services.report_design_service import report_design_service
+from app.services.session_fact_service import SessionFactService
+from app.services.session_service import session_service
+from app.storage.models import SessionRecord
+from app.storage.report_design_repository import DESIGN_PHASE_PLAN_WAITING_CONFIRM
 
 
 #: 敏感串在**运行时**拼出来，不写在源码字面量里。
@@ -715,3 +725,278 @@ def test_exact_content_does_not_change_business_storage_behaviour(
         assert SECRET_EXC not in row[0]
     finally:
         conn.close()
+
+
+# ----------------------------------------------------------------------
+# AC#2 补漏：既有失败日志里的上游异常原文
+#
+# 这一组的口径是**留栈不留原文**：
+#   - 异常消息（上游异常原文）不进日志；
+#   - 出错**类型**还在（errorType=ValueError）；
+#   - 调用**栈**还在（traceback 行在）——
+#     证明不是「把异常整个吞掉」，只是把异常对象换成了 None。
+#
+# 跟 :func:`safety.log_failure` 的既有用例互补：那一条钉的是公共件，
+# 这一组钉的是**既有调用点**（各服务里原来写着的 logger.exception）。
+# ----------------------------------------------------------------------
+
+#: canary 在**运行时**拼出来，源码里不出现完整字面量。
+#: 原因：失败日志带调用栈，调用栈会打印源码行 —— 源码里写死的 canary
+#: 会跟着栈一起出现在日志里，测出来的就不是「异常原文没泄漏」了。
+CANARY_USER = "用户原话：工号" + "ABC123"
+
+
+def _raise_with_canary(*_args: Any, **_kwargs: Any) -> Any:
+    """按运行时传入的消息抛异常（源码行里不出现消息本身）。"""
+    raise ValueError(CANARY_USER)
+
+
+def _exploding_module(name: str) -> types.ModuleType:
+    """一个 import 就会炸的模块：异常消息带 canary。"""
+
+    class _Exploding(types.ModuleType):
+        def __getattr__(self, attr: str) -> Any:
+            raise ValueError(CANARY_USER)
+
+    return _Exploding(name)
+
+
+def test_ac2_agent_init_failure_keeps_type_and_stack_but_not_original(
+    caplog, monkeypatch
+):
+    """AC#2 补漏：AgentScope 初始化失败 —— 原文不进日志，类型与栈还在。"""
+    caplog.set_level(logging.INFO, logger="app")
+    settings = get_settings()
+    monkeypatch.setattr(settings, "agent_impl", "agentscope")
+    monkeypatch.setitem(
+        sys.modules,
+        "app.agents.agentscope_report_agent",
+        _exploding_module("app.agents.agentscope_report_agent"),
+    )
+
+    agent = _build_agent()
+
+    # 降级行为逐字未变：仍然退回 FakeAgent
+    assert agent.__class__.__name__ == "FakeReportAgent"
+
+    text = caplog.text
+    # 异常原文不进日志
+    assert CANARY_USER not in text
+    # 出错类型还在
+    assert "errorType=ValueError" in text
+    # 调用栈还在 —— 是「留栈不留原文」，不是把异常整个吞掉
+    assert "Traceback (most recent call last):" in text
+    assert "in _build_agent" in text
+    # 级别没被降下来（原来是 ERROR）
+    failure = [r for r in caplog.records if "初始化失败" in r.getMessage()]
+    assert failure and failure[0].levelno == logging.ERROR
+
+
+def test_ac2_recorded_progress_read_failure_keeps_stack_but_not_original(
+    caplog, monkeypatch
+):
+    """AC#2 补漏：显式 ``exc_info=True`` 的地方也是留栈不留原文。"""
+    caplog.set_level(logging.INFO, logger="app")
+    monkeypatch.setattr(
+        session_service.repository, "get_session", _raise_with_canary
+    )
+
+    result = recorded_progress_service.describe_recorded_progress("sess_ac2")
+
+    # 读不到就如实说读不到（业务行为没变）
+    assert result["availability"] == "UNAVAILABLE"
+
+    text = caplog.text
+    assert CANARY_USER not in text
+    assert "errorType=ValueError" in text
+    assert "Traceback (most recent call last):" in text
+    assert "in _read_session_record" in text
+    # 级别不变（原来是 WARNING）
+    failure = [r for r in caplog.records if "读取会话记录失败" in r.getMessage()]
+    assert failure and failure[0].levelno == logging.WARNING
+
+
+def test_ac2_session_fact_invalid_draft_value_not_logged(caplog, monkeypatch):
+    """AC#2 补漏：校验错误的消息带着**出错字段的值** —— 不进日志。"""
+    caplog.set_level(logging.INFO, logger="app")
+    record = SessionRecord(
+        id="sess_ac2",
+        state="ANALYZING",
+        snapshot={"definition": {"regions": CANARY_USER}},
+    )
+    monkeypatch.setattr(
+        session_service.repository, "get_session", lambda session_id: record
+    )
+
+    facts = SessionFactService().load(session_id="sess_ac2")
+
+    # 解析不了就如实说解析不了（业务行为没变）
+    assert facts.status.value == "UNAVAILABLE"
+
+    text = caplog.text
+    assert CANARY_USER not in text
+    assert "errorType=ValidationError" in text
+    assert "Traceback (most recent call last):" in text
+
+
+def test_ac2_report_design_state_read_failure_keeps_stack_but_not_original(
+    caplog, monkeypatch
+):
+    """AC#2 补漏：设计状态读失败 —— 原文不进日志，类型与栈还在。"""
+    caplog.set_level(logging.INFO, logger="app")
+    monkeypatch.setattr(
+        report_design_service.repository, "load", _raise_with_canary
+    )
+
+    state = report_design_service.load_state(
+        _request("生成昨日能耗日报", conversation_id="conv_ac2")
+    )
+
+    # 读不到就按「没有设计状态」处理（业务行为没变）
+    assert state is None
+
+    text = caplog.text
+    assert CANARY_USER not in text
+    assert "errorType=ValueError" in text
+    assert "Traceback (most recent call last):" in text
+    assert "in load_state" in text
+    # 级别没被降下来（原来是 ERROR）
+    failure = [r for r in caplog.records if "读设计状态失败" in r.getMessage()]
+    assert failure and failure[0].levelno == logging.ERROR
+
+
+# ----------------------------------------------------------------------
+# AC#1 补漏：用户原话 / 模型原文 / 原始字典整包进日志
+# ----------------------------------------------------------------------
+
+
+def test_ac1_pending_choice_raw_dict_not_logged(caplog, monkeypatch):
+    """AC#1 补漏：待确认菜单的原始字典不整包进日志（查询回带菜单那条）。"""
+    caplog.set_level(logging.INFO, logger="app")
+    monkeypatch.setattr(
+        session_service,
+        "load_pending_choice",
+        lambda session_id: {"state": "NOT_A_STATE", "question": CANARY_USER},
+    )
+
+    questions = agent_service._preserved_menu(
+        _request("生成昨日能耗日报"), None
+    )
+
+    # 菜单读不出来就不给菜单（业务行为没变）
+    assert questions == []
+
+    text = caplog.text
+    assert CANARY_USER not in text
+    assert "step=pending_choice_invalid" in text
+    # 只留派生信息：容器类型
+    assert "rawType=dict" in text
+
+
+def test_ac1_pending_choice_raw_dict_not_logged_in_chat(caplog, monkeypatch):
+    """AC#1 补漏：chat 入口那处同样不整包 dump。"""
+    caplog.set_level(logging.INFO, logger="app")
+    monkeypatch.setattr(
+        session_service,
+        "load_pending_choice",
+        lambda session_id: {"state": "NOT_A_STATE", "question": CANARY_USER},
+    )
+
+    asyncio.run(agent_service.chat(_request("生成昨日能耗日报")))
+
+    text = caplog.text
+    assert CANARY_USER not in text
+    assert "step=pending_choice_invalid" in text
+    assert "rawType=dict" in text
+
+
+def test_ac1_blocked_by_route_message_not_logged(caplog):
+    """AC#1 补漏：阻断说明会点名用户要的指标 —— 不进日志。"""
+    caplog.set_level(logging.INFO, logger="app")
+    route = RouteDecision(
+        routingAction=RoutingAction.BLOCK,
+        reply=CANARY_USER,
+        blockCode="CAPABILITY_NOT_SUPPORTED",
+        blockMessage=CANARY_USER,
+    )
+
+    response = agent_service._blocked_by_route(
+        _request("生成昨日能耗日报"), route
+    )
+
+    # 用户可见的回复逐字未变
+    assert response.reply == CANARY_USER
+
+    text = caplog.text
+    assert CANARY_USER not in text
+    assert "step=blocked_by_route" in text
+    assert "messageLength=" in text
+
+
+def test_ac1_context_route_reason_not_logged(caplog, monkeypatch):
+    """AC#1 补漏：路由原因可能夹带模型原文与用户原话 —— 只留长度。"""
+    caplog.set_level(logging.INFO, logger="app")
+
+    async def _route(request: Any, emit: Any = None) -> RouteDecision:
+        return RouteDecision(
+            routingAction=RoutingAction.CONTINUE_CURRENT,
+            reason=CANARY_USER,
+        )
+
+    monkeypatch.setattr(context_engine, "route", _route)
+
+    asyncio.run(agent_service.chat(_request("生成昨日能耗日报")))
+
+    text = caplog.text
+    assert CANARY_USER not in text
+    assert "step=context_route_done" in text
+    assert "reasonLength=" in text
+
+
+def test_ac1_contract_error_section_title_not_logged(caplog):
+    """AC#1 补漏：模型写的板块标题不进日志，但用户可见文案逐字未变。"""
+    caplog.set_level(logging.INFO, logger="app")
+    plan = {
+        "id": "plan_ac1",
+        "sections": [
+            {
+                "id": "section_ac1",
+                "title": CANARY_USER,
+                "metricIntents": ["总耗电"],
+                "componentType": "radar",
+            }
+        ],
+    }
+    request = AgentRequest(
+        conversationId="conv_ac1",
+        state=AgentState.ANALYZING,
+        message="确认",
+        messageId="msg_ac1",
+        context=AgentRequestContext(
+            projectId="project_001",
+            subjectRef="machine_room",
+            subjectId="room_a",
+            designSessionId="sess_ac1",
+        ),
+    )
+
+    response = report_design_service.confirm_plan(
+        request,
+        state={
+            "reportPlan": plan,
+            "designPhase": DESIGN_PHASE_PLAN_WAITING_CONFIRM,
+        },
+    )
+
+    # 失败码与用户可见文案逐字未变（板块名照旧透传给用户）
+    assert response.error is not None
+    assert response.error.code == "PLAN_COMPONENT_TYPE_INVALID"
+    assert CANARY_USER in response.error.message
+
+    text = caplog.text
+    # 板块标题（模型原文）不进日志
+    assert CANARY_USER not in text
+    assert "方案组件类型非法" in text
+    # 只留标识：板块序号与 id
+    assert "sectionIndex=0" in text
+    assert "sectionId=section_ac1" in text
