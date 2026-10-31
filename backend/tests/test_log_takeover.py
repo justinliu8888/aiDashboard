@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -46,6 +48,7 @@ from app.services.session_fact_service import SessionFactService
 from app.services.session_service import session_service
 from app.storage.models import SessionRecord
 from app.storage.report_design_repository import DESIGN_PHASE_PLAN_WAITING_CONFIRM
+from app.storage.sqlite_store import SqliteSessionRepository
 
 
 #: 敏感串在**运行时**拼出来，不写在源码字面量里。
@@ -1113,3 +1116,66 @@ def test_ac1_blocked_draft_assembly_logs_no_model_text(caplog, monkeypatch):
     assert "草稿组装被阻断" in text
     assert canary not in text
     assert "message=" not in text
+
+
+# ----------------------------------------------------------------------
+# 第三处漏网：#61 修好之后被 #66 F-3 重新引入的那处
+# ----------------------------------------------------------------------
+
+
+def test_ac2_session_report_plan_read_failure_keeps_stack_but_not_original(
+    caplog, monkeypatch, tmp_path
+):
+    """会话方案读取失败 —— 上游异常原文与本地绝对路径都不进日志。
+
+    这处 ``logger.exception``（``agent_service._session_report_plan``）是
+    #66 F-3（``dec95a0``）重新引入的：没显式给 ``exc_info``，走默认的
+    ``exc_info=True``，traceback 末行会把上游异常的**原文**一起打出来
+    （实测形态：``sqlite3.OperationalError: unable to open database file:
+    <本地绝对路径>``）—— 本地绝对路径 / 用户信息就跟着泄漏了。
+
+    这里用**真实形态的 SQLite 失败**驱动真实路径：临时目录里造一个打不开的
+    库路径，让真的 SQLite 抛 ``OperationalError``，而不是拿假异常凑数。
+    """
+    # 只读目录：sqlite3 连不上（真实 OperationalError，不是 monkeypatch 的假异常）
+    locked_dir = tmp_path / "locked"
+    locked_dir.mkdir()
+    os.chmod(locked_dir, 0o555)
+    bad_db_path = locked_dir / "sessions.db"
+
+    repository = SqliteSessionRepository(bad_db_path)
+    monkeypatch.setattr(session_service, "_repo", repository)
+
+    # 先自己撞一次同样的失败，把上游异常的原文抓出来（源码里不写死这个串，
+    # 也不把它写进断言 —— 断言时用它本身当 canary）
+    with pytest.raises(sqlite3.OperationalError) as excinfo:
+        repository.get_session("sess_leak3")
+    upstream_message = str(excinfo.value)
+
+    caplog.set_level(logging.INFO, logger="app")
+    plan = agent_service._session_report_plan(
+        _request("生成昨日能耗日报", conversation_id="conv_leak3")
+    )
+
+    # 业务行为不变：读不到方案就当没有方案
+    assert plan is None
+
+    text = caplog.text
+    # 这条路径确实走到了（否则断言没意义）
+    assert "step=read_report_plan_failed" in text
+    # 上游异常原文不进日志 —— 这正是这处漏网的根因
+    assert upstream_message not in text
+    # 本地绝对路径不进日志
+    assert str(bad_db_path) not in text
+    assert str(tmp_path) not in text
+    # 原因类型还在（留栈不留原文）
+    assert "errorType=OperationalError" in text
+    # 调用栈还在 —— 是「留栈不留原文」，不是把异常整个吞掉
+    assert "Traceback (most recent call last):" in text
+    # 标识不许少
+    assert "sessionId=conv_leak3" in text
+    # 级别没被降下来（原来是 ERROR）
+    failure = [
+        r for r in caplog.records if "read_report_plan_failed" in r.getMessage()
+    ]
+    assert failure and failure[0].levelno == logging.ERROR
