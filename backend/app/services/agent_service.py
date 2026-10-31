@@ -3051,9 +3051,13 @@ class AgentService:
         session_key = current_session_key() or request.conversationId
         try:
             record = session_service.repository.get_session(session_key)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # 异常原文不进日志（#61）：留栈不留原文。
             logger.exception(
-                "[agent.chat] step=read_report_plan_failed sessionId=%s", session_key
+                "[agent.chat] step=read_report_plan_failed sessionId=%s errorType=%s",
+                session_key,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
             )
             return None
         snapshot = (record.snapshot if record else None) or {}
