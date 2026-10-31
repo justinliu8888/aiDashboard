@@ -409,10 +409,10 @@ def _safe_failure_reason(exc: BaseException) -> str:
     return f"{label}不符合方案契约" if label else ""
 
 
-def _plan_contract_error(sections: Any) -> str | None:
+def _plan_contract_error(sections: Any) -> PlanContractError | None:
     """检查方案板块的契约（组件类型 + 取数板块的指标意图）。
 
-    返回可读原因（点名板块）；合法时返回 ``None``。
+    返回**异常对象**（合法时返回 ``None``）。
 
     这是**确认前的最后一道关**，也是「方案落库前」的兜底：模型适配层与
     领域层已经各有一道校验，这里再挡一次，是为了拦住绕过那两层的路径
@@ -420,6 +420,11 @@ def _plan_contract_error(sections: Any) -> str | None:
 
     判据直接调用方案契约层的 ``validate_section_contract`` —— 编排层
     **不保留第二份实现**，否则两份判据会漂移。
+
+    返回对象而不是字符串，是为了让调用方能拿到**结构化**的板块标识
+    （序号 + id）：契约错误的消息里带着**模型写的板块标题**，可能夹带
+    用户原话 —— 日志只记序号与 id（#61 AC#1），给用户看的那句仍是
+    原样透传（:func:`_reason_text`）。
     """
     if not isinstance(sections, list):
         return None
@@ -427,7 +432,7 @@ def _plan_contract_error(sections: Any) -> str | None:
         try:
             validate_section_contract(section, index=index)
         except PlanContractError as exc:
-            return _reason_text(exc)
+            return exc
     return None
 
 
@@ -637,8 +642,12 @@ class ReportDesignService:
         """读会话的设计状态；没进过设计流程返回 None。"""
         try:
             return self.repository.load(self.session_key(request))
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读设计状态失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读设计状态失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
 
     def is_new_build(self, request: AgentRequest) -> bool:
@@ -664,8 +673,12 @@ class ReportDesignService:
         session_key = self.session_key(request)
         try:
             existing = session_service.repository.get_session(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读会话失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读会话失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return False
         if existing is None:
             return True
@@ -1023,8 +1036,12 @@ class ReportDesignService:
             self.repository.reset_design_phase(
                 self.session_key(request), write_restart
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 阶段复位失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 阶段复位失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return self._failure_response(
                 request,
                 state,
@@ -1196,8 +1213,12 @@ class ReportDesignService:
             claim = self.repository.claim_operation(
                 session_key, message_id, current_revision
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 认领确认操作失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 认领确认操作失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return self._failure_response(
                 request,
                 state,
@@ -1235,15 +1256,24 @@ class ReportDesignService:
         # ---- 方案契约检查（事务外，生成草稿前的最后一道关） ----
         contract_error = _plan_contract_error(current_plan.get("sections"))
         if contract_error:
-            logger.info("[report_design] 方案组件类型非法：%s", contract_error)
+            # 契约错误的消息里带着**模型写的板块标题**，可能夹带用户原话
+            # —— 整句不进日志（#61 AC#1）。日志只留板块序号与 id 这两个标识。
+            logger.info(
+                "[report_design] 方案组件类型非法 errorType=%s sectionIndex=%s sectionId=%s",
+                type(contract_error).__name__,
+                contract_error.section_index,
+                contract_error.section_id,
+            )
+            # 给用户看的那句与落库的原因**逐字未变**（仍是原样透传）。
+            contract_reason = _reason_text(contract_error)
             self._fail_operation(
-                operation_id, "PLAN_COMPONENT_TYPE_INVALID", contract_error
+                operation_id, "PLAN_COMPONENT_TYPE_INVALID", contract_reason
             )
             return self._failure_response(
                 request,
                 state,
                 code="PLAN_COMPONENT_TYPE_INVALID",
-                message=f"{contract_error}方案保持原样，请修改后重试。",
+                message=f"{contract_reason}方案保持原样，请修改后重试。",
                 retryable=True,
             )
 
@@ -1405,15 +1435,23 @@ class ReportDesignService:
             confirmation = self.repository.find_confirmation(
                 session_key, plan_id, int(plan_revision)
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 查确认关系失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 查确认关系失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         if not confirmation:
             return None
         try:
             return self.repository.load_template(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读已提交模板失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读已提交模板失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
 
     def _current_session_state(self, session_key: str) -> AgentState | None:
@@ -1425,8 +1463,12 @@ class ReportDesignService:
         """
         try:
             record = session_service.repository.get_session(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读会话失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读会话失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         if record is None:
             return None
@@ -1443,8 +1485,12 @@ class ReportDesignService:
         """
         try:
             record = session_service.repository.get_session(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读会话失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读会话失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         snapshot = (record.snapshot if record else None) or {}
         raw = snapshot.get("definition")
@@ -1453,16 +1499,24 @@ class ReportDesignService:
             # 草稿：宁可回初版，也不要把「没有草稿」当成结果。
             try:
                 stored = self.repository.load(session_key) or {}
-            except Exception:  # noqa: BLE001
-                logger.exception("[report_design] 读设计存储失败")
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "[report_design] 读设计存储失败 errorType=%s",
+                    type(exc).__name__,
+                    exc_info=(type(exc), None, exc.__traceback__),
+                )
                 return None
             raw = stored.get("definitionDraft")
         if not isinstance(raw, dict):
             return None
         try:
             return ReportDefinitionDraft(**raw)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读当前草稿失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读当前草稿失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
 
     async def _handle_design_turn(
@@ -1495,8 +1549,12 @@ class ReportDesignService:
             claim = self.repository.claim_operation(
                 session_key, message_id, expected_revision
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 认领操作失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 认领操作失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return self._failure_response(
                 request,
                 state,
@@ -1665,7 +1723,12 @@ class ReportDesignService:
                 write_turn,
             )
         except (DesignPlanInvalidError, DesignOperationStateError) as exc:
-            logger.warning("[report_design] 提交方案被拒：%s", exc)
+            # 异常原文不进日志（#61）：只留原因类型与调用栈。
+            logger.warning(
+                "[report_design] 提交方案被拒 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             self._fail_operation(operation_id, "PLAN_COMMIT_REJECTED", str(exc))
             return self._failure_response(
                 request,
@@ -1674,8 +1737,12 @@ class ReportDesignService:
                 message="这次方案没能保存下来，方案保持原样，请重试。",
                 retryable=True,
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 提交方案失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 提交方案失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             # 提交异常回滚后，操作可能停在 PROCESSING：必须显式失败收尾，
             # 否则这条消息会一直显示「处理中」，用户也拿不到可理解的重试入口。
             self._fail_operation(operation_id, "PLAN_COMMIT_FAILED", "提交方案失败")
@@ -1753,8 +1820,12 @@ class ReportDesignService:
                 question,
                 write_turn,
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 提交澄清失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 提交澄清失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             self._fail_operation(operation_id, "PLAN_CLARIFICATION_FAILED", "提交澄清失败")
             return self._failure_response(
                 request,
@@ -1805,8 +1876,13 @@ class ReportDesignService:
             self.repository.fail_operation(
                 operation_id, {"code": code, "message": message}
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 失败收尾没能落库 operation=%s", operation_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 失败收尾没能落库 operation=%s errorType=%s",
+                operation_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
 
     def _failure_response(
         self,
@@ -2094,8 +2170,12 @@ class ReportDesignService:
         elif isinstance(draft, dict):
             try:
                 draft_obj = ReportDefinitionDraft(**draft)
-            except Exception:  # noqa: BLE001
-                logger.exception("[report_design] 草稿结构无法还原")
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "[report_design] 草稿结构无法还原 errorType=%s",
+                    type(exc).__name__,
+                    exc_info=(type(exc), None, exc.__traceback__),
+                )
                 draft_obj = None
         else:
             draft_obj = None
@@ -2153,8 +2233,12 @@ class ReportDesignService:
         """
         try:
             record = session_service.repository.get_session(self.session_key(request))
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读示意上下文失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读示意上下文失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         snapshot = (record.snapshot if record else None) or {}
         context = snapshot.get("previewContext")
@@ -2268,8 +2352,12 @@ class ReportDesignService:
         session_key = current_session_key() or request.conversationId
         try:
             records = session_service.repository.list_messages(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读历史消息失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读历史消息失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return []
         history: list[dict[str, Any]] = []
         for record in records[-6:]:
@@ -2291,8 +2379,12 @@ class ReportDesignService:
         """
         try:
             records = session_service.repository.list_messages(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读原始请求失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读原始请求失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         for record in records:
             if record.role != "user":
