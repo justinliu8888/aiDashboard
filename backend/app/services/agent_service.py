@@ -81,6 +81,7 @@ from app.services.session_service import CLARIFICATION_KEY_UPDATED, session_serv
 from app.services.edit_reference_resolver import resolve_visible_reference
 from app.services.edit_time_resolver import extract_change_value, resolve_time_expression
 from app.services.metric_mock_service import list_metrics
+from app.services.out_of_catalog_candidate import ambiguous_caliber_candidates
 from app.services.scope_service import filter_visible
 from app.services.template_edit_engine import EditResult, template_edit_engine
 from app.tools.context import ToolScope
@@ -899,6 +900,10 @@ class AgentService:
         # ``None``，流程照旧落到模型支路（下面那段）。
         template_edit = None
         classified_intent: UserIntent | None = None
+        # 工单 #66：规则快路**已经解析好的**那份编辑计划留一份给装配层
+        # （口径澄清的选项要来自规则层）。**不重新 parse** —— 两处各解析
+        # 一次，口径就会漂。
+        rule_holder: dict[str, Any] = {}
         if pending_guard is None:
             intent = self._classify_intent(request)
             classified_intent = intent
@@ -921,7 +926,9 @@ class AgentService:
                     },
                 )
                 return intent_response
-            template_edit = await self._try_handle_template_edit(request)
+            template_edit = await self._try_handle_template_edit(
+                request, rule_holder=rule_holder
+            )
         if template_edit is not None:
             await _emit(
                 emit,
@@ -1207,6 +1214,13 @@ class AgentService:
             response = await handle(request)
         else:
             response = self._agent.handle(request)
+        # 工单 #66：**口径澄清**的选项一律来自规则层候选 —— 模型自造的
+        # slug 选项既过不了菜单闸门，也命中不了规则层的口径匹配。
+        # 只在规则层判定该指标确实 ambiguous、且问题就是口径澄清时替换；
+        # 其余澄清路径（粒度 / 范围 / 参考对象）不动。
+        response = self._apply_rule_caliber_menu(
+            request, response, rule_holder.get("plan")
+        )
         log_timeline_step("business_agent_done")
         await _emit(
             emit,
@@ -1448,6 +1462,58 @@ class AgentService:
         if reference.reason in ORDER_DEPENDENT_REASONS:
             return bool(context.visibleRegionIds) and not reference.staleRegionIds
         return True
+
+    def _apply_rule_caliber_menu(
+        self, request: AgentRequest, response: AgentResponse, rule_plan: Any | None,
+    ) -> AgentResponse:
+        """把**口径澄清**的选项换成**规则层**的候选（工单 #66）。
+
+        模型自造的选项（比如 ``pc_energy_abs`` 这种 slug）既过不了菜单
+        闸门（闸门只认 ``value``），也命中不了规则层的口径匹配（按候选
+        **显示名**子串匹配）—— 用户无论选 ``value`` 还是 ``label`` 都
+        解不开这一轮。
+
+        **只有三个条件同时成立才替换**：
+
+        1. 规则层这份计划的目录外候选确实是 ``ambiguous``（含义不清）；
+        2. 这个问题就是**口径澄清**（``template_edit_clarification``）；
+        3. 这个问题确实带选项（没有选项就不该凭空造一个菜单）。
+
+        其余澄清路径（粒度 / 范围 / 参考对象等）**一律不动** —— 那些是
+        模型该自己拿主意的地方；问句正文（reply / prompt）也**不改**。
+        """
+        if rule_plan is None:
+            return response
+        operation = getattr(rule_plan, "operation", None)
+        metric_candidate = getattr(operation, "metricCandidate", None) or {}
+        if not isinstance(metric_candidate, dict):
+            return response
+        if str(metric_candidate.get("status") or "") != "ambiguous":
+            return response
+        intent = str(getattr(operation, "metricIntent", "") or "").strip()
+        options = ambiguous_caliber_candidates(intent)
+        if not options:
+            return response
+        replaced = False
+        for question in response.questions:
+            if question.id != "template_edit_clarification" or not question.options:
+                continue
+            question.options = [
+                QuestionOption.model_validate(item) for item in options
+            ]
+            replaced = True
+        if replaced:
+            logger.info(
+                "[agent.chat] step=caliber_menu_replaced conversationId=%s intent=%s options=%s",
+                request.conversationId,
+                intent,
+                [item["value"] for item in options],
+            )
+            response.debug = {
+                **(response.debug or {}),
+                "caliberMenuSource": "rule_candidates",
+            }
+        return response
 
     def _finalize_template_edit(
         self, request: AgentRequest, response: AgentResponse
@@ -2306,9 +2372,15 @@ class AgentService:
         return self._normalize_query_answer(request, response, None)
 
     async def _try_handle_template_edit(
-        self, request: AgentRequest
+        self, request: AgentRequest,
+        rule_holder: dict[str, Any] | None = None,
     ) -> AgentResponse | None:
-        """明确规则走确定性快路径；不明确的编辑交给业务 Agent 查证。"""
+        """明确规则走确定性快路径；不明确的编辑交给业务 Agent 查证。
+
+        ``rule_holder`` 是**出参**：快路解析好的编辑计划留一份给装配层
+        （工单 #66 —— 口径澄清的选项要来自规则层）。快路自己返回 ``None``
+        （交给模型支路）时，这份计划照样留得住。
+        """
         if request.state not in {
             AgentState.WAITING_USER_CONFIRM,
             AgentState.USER_EDITING_TEMPLATE,
@@ -2502,6 +2574,10 @@ class AgentService:
             if composite is not None:
                 composite.confidence = plan.confidence
                 plan = composite
+        if rule_holder is not None:
+            # 规则层这份计划留一份给装配层（工单 #66）：口径澄清的选项
+            # 必须来自规则层候选。**这里不再 parse 第二次**。
+            rule_holder["plan"] = plan
         if plan.intent == EditIntent.SUGGEST_VISUALIZATION:
             return self._build_template_edit_response(
                 request, template_edit_engine.apply(
