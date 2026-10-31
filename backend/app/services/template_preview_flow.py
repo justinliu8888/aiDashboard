@@ -294,10 +294,12 @@ class TemplatePreviewFlow:
         except DefinitionBuildError as exc:
             # 组装层明确拒绝（数据源 / 粒度 / 授权 / 组件不支持）：
             # 必须阻断并说明原因，不能退回一份「看起来对、其实不是那件事」的草稿。
+            # 拒绝原因里带着数据源名、粒度、指标名等载荷字段（可能含用户
+            # 数据）—— 不进日志（#61 AC#1），只留错误码与原因类型。
             logger.warning(
-                "[template_preview_flow] 组装被拒绝 code=%s message=%s",
+                "[template_preview_flow] 组装被拒绝 code=%s errorType=%s",
                 exc.code,
-                exc.message,
+                type(exc).__name__,
             )
             return AgentResponse(
                 conversationId=request.conversationId,
