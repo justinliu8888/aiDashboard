@@ -199,7 +199,7 @@ export function probe(input) {
     ...readRegions(api, input.definition, read),
   };
 
-  // 第 2 轮：下一轮响应（同意轮不带载荷 → null；恢复会话轮带重新生成的那份）。
+  // 第 2 轮：下一轮响应（同意轮**也带载荷** → 非 null；恢复会话轮带重新生成的那份）。
   if (input.hasNext) {
     if (input.definitionAfter !== undefined && input.definitionAfter !== null) {
       session.definition = input.definitionAfter;
