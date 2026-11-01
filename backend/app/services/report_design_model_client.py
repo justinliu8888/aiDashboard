@@ -62,7 +62,11 @@ class ReportDesignModelClient:
                 # 单次请求的超时也用方案设计的时限：
                 # 短问答的时限套在完整方案生成上会稳定超时。
                 timeout=self._timeout,
-                max_retries=0,
+                # **重试一次**（SDK 自带的重试）：方案设计这一轮要跑四五十秒，
+                # 期间上游偶尔会把长连接掐断（实测在 TLS 读响应头那一步断开）。
+                # 不重试的话，用户看到的就是「请求失败：network error」，
+                # 整轮白等。重试只覆盖连接类错误与 5xx/429，不会重试 4xx 业务错误。
+                max_retries=1,
             )
         else:
             logger.warning("[report_design] 未配置 VOLC_API_KEY，方案设计不可用")

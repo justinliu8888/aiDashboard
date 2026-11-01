@@ -68,6 +68,17 @@
 已登记指标，也不共享能耗量的那份基础样本。含义不清时（``电脑耗电率``）
 给出**最关键的语义区别**（耗电量？占比？功率？），用户仍要求先做时按
 **显式假设**出数，并写明「仅模拟展示、业务口径待确认」。
+
+**通用形态推断（目录外的新名字）**
+
+上面的兜底链是**列**的判定（口径认不出来就明确记成「未声明」）。**指标
+名字**这一侧另有一层：任何新名字都要能**说清单位、出得出值**。
+
+这一层认的是**量纲**（单位符号 / 计数单位 / 比率后缀），**不认任何业务
+词** —— 没有「PUE」「功率」「耗电」这类特判、关键词表或样例映射。
+认得出就给单位与值形态；认不出就给**通用数值 + 空单位**，
+**推断不出来绝不能变成「不支持」**（见 :func:`infer_shape_from_name` 与
+:func:`describe_simulated_metric`）。
 """
 from __future__ import annotations
 
@@ -638,6 +649,171 @@ def description_of(column: Mapping[str, Any] | None) -> SimulatedFieldDescriptio
     return describe_simulated_field(column)
 
 
+# ---------------------------------------------------------------- 通用形态推断
+#
+# 目录外的新名字要**能出数、能说清单位**，但**不许按业务词特判**：
+# 不为 PUE / 功率 / 冰箱 / 任何具体例子写关键词表、样例映射表。
+#
+# 这里认的是**量纲** —— 单位符号、计数单位、比率后缀。三者都不是业务口径，
+# 而是「这是个什么量」的通用形态。判据只有**形态**（括号里的单位、独立成词
+# 的单位符号、数字后面缀着的单位、比率后缀），**不认任何业务词**：
+# 名字里没有「PUE」就没有 PUE，没有「功率」就没有 kW。
+#
+# 认得出 → 给单位与值形态；认不出 → **通用数值 + 空单位**，
+# **绝不**变成「不支持」（推断不出来不是「不支持」的理由）。
+
+#: 量纲词 → (规范单位写法, 值形态)。
+#:
+#: **只放量纲，不放业务口径名**：这里没有「PUE」「功率」「耗电」这类词 ——
+#: 认出来靠的是「这是个什么量」，不是「认这个词」。
+GENERIC_UNIT_SHAPES: dict[str, tuple[str, str]] = {
+    # 电能
+    "kwh": ("kWh", VALUE_TYPE_ENERGY),
+    "mwh": ("MWh", VALUE_TYPE_ENERGY),
+    # 功率
+    "kw": ("kW", VALUE_TYPE_POWER),
+    "mw": ("MW", VALUE_TYPE_POWER),
+    # 比例
+    "%": ("%", VALUE_TYPE_PERCENT),
+    "％": ("%", VALUE_TYPE_PERCENT),
+    # 金额
+    "元": ("元", VALUE_TYPE_COST),
+    "千元": ("千元", VALUE_TYPE_COST),
+    "万元": ("万元", VALUE_TYPE_COST),
+    "亿元": ("亿元", VALUE_TYPE_COST),
+    "cny": ("元", VALUE_TYPE_COST),
+    "rmb": ("元", VALUE_TYPE_COST),
+    # 温度
+    "℃": ("℃", VALUE_TYPE_TEMPERATURE),
+    "°c": ("℃", VALUE_TYPE_TEMPERATURE),
+    # 时长
+    "分钟": ("分钟", VALUE_TYPE_DURATION),
+    "min": ("分钟", VALUE_TYPE_DURATION),
+    "小时": ("小时", VALUE_TYPE_DURATION),
+    # 计数（**只在括号里或数字后面认** —— 名字里到处是「个」「台」，
+    # 到处认会认错：「各个设备」「工作台」都不是计数）
+    "台": ("台", VALUE_TYPE_COUNT),
+    "个": ("个", VALUE_TYPE_COUNT),
+    "条": ("条", VALUE_TYPE_COUNT),
+    "次": ("次", VALUE_TYPE_COUNT),
+    "件": ("件", VALUE_TYPE_COUNT),
+    "套": ("套", VALUE_TYPE_COUNT),
+    "只": ("只", VALUE_TYPE_COUNT),
+    "人": ("人", VALUE_TYPE_COUNT),
+    "人次": ("人次", VALUE_TYPE_COUNT),
+    "户": ("户", VALUE_TYPE_COUNT),
+}
+
+#: 括号里写着的单位（「耗电 (kWh)」「工单数（条）」）。
+_PARENTHESIZED_UNIT_PATTERN = re.compile(r"[（(]\s*([^（()）]+?)\s*[）)]")
+
+#: 独立成词的单位符号。
+#:
+#: **只放有辨识度的多字母写法**：单字母（``V`` / ``A`` / ``W``）在自由文本里
+#: 太常见（「A 机房」里的 A），拿来认单位会到处认错。
+_ASCII_UNIT_PATTERN = re.compile(
+    r"(?<![A-Za-z])(?:kwh|mwh|kw|mw|cny|rmb|min)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: 数字后面缀着的单位（「工单 12 条」「负载 3 台」）。
+_NUMBERED_UNIT_PATTERN = re.compile(
+    r"(?<=\d)\s*("
+    + "|".join(
+        re.escape(token)
+        for token in sorted(GENERIC_UNIT_SHAPES, key=len, reverse=True)
+        if not token.isascii()
+    )
+    + r")"
+)
+
+#: 比率后缀（**比率是通用量纲**，不是业务口径）。
+#:
+#: 只认「本身就是比率」的词：裸「率」**不认** —— 「功率」「频率」也以「率」
+#: 收尾，按比率认会把量纲写错（写错的数字比不写更坏）。
+_RATIO_SUFFIXES = ("占比", "比例", "比率", "份额")
+
+
+def _unit_shape(token: str) -> tuple[str, str]:
+    """量纲词 → (规范单位, 值形态)。认不出就是 ``("", "")``。"""
+    key = str(token or "").strip().lower()
+    if not key:
+        return "", ""
+    return GENERIC_UNIT_SHAPES.get(key, ("", ""))
+
+
+def infer_shape_from_name(name: str) -> tuple[str, str]:
+    """**通用形态推断**：名字 → (单位, 值形态)。
+
+    判据只有形态，四条：
+
+    1. 括号里写着的单位（「耗电 (kWh)」）；
+    2. 独立成词的单位符号（``kWh`` / ``kW`` / ``%`` / ``min``）；
+    3. 数字后面缀着的单位（「工单 12 条」）；
+    4. 比率后缀（「占比」「比例」「比率」「份额」）。
+
+    认不出就是 ``("", "")`` —— 调用方据此给「通用数值 + 空单位」，
+    **不因此判「不支持」**。
+    """
+    text = str(name or "").strip()
+    if not text:
+        return "", ""
+    for match in _PARENTHESIZED_UNIT_PATTERN.finditer(text):
+        found = _unit_shape(match.group(1))
+        if found[1]:
+            return found
+    ascii_hit = _ASCII_UNIT_PATTERN.search(text)
+    if ascii_hit:
+        found = _unit_shape(ascii_hit.group(0))
+        if found[1]:
+            return found
+    numbered_hit = _NUMBERED_UNIT_PATTERN.search(text)
+    if numbered_hit:
+        found = _unit_shape(numbered_hit.group(1))
+        if found[1]:
+            return found
+    for marker in _RATIO_SUFFIXES:
+        if text.endswith(marker):
+            return ("%", VALUE_TYPE_PERCENT)
+    return "", ""
+
+
+def describe_simulated_metric(
+    name: str,
+    *,
+    unit: str = "",
+    region_id: str = "",
+    section_id: str = "",
+) -> SimulatedFieldDescription:
+    """给**任意**新名字一份模拟字段描述。
+
+    - **label 就是这个名字本身**：用户原话保留，系统不替用户改名；
+    - 单位：声明的单位优先，没有就从名字里**推断量纲**；
+    - 值形态：由量纲决定（kWh → 能耗、% → 百分比、条 → 计数……）；
+    - 语义类别：目录外指标一律 ``generic`` —— 认成能耗 / 电费就等于
+      静默映射到「总耗电」这类已登记指标。
+
+    推断不出来 → 通用数值 + 空单位，**不猜业务口径、也不判不支持**。
+    """
+    text = str(name or "").strip()
+    declared = str(unit or "").strip()
+    inferred_unit, inferred_type = infer_shape_from_name(text)
+    effective_unit = declared or inferred_unit
+    value_type = inferred_type or UNIT_VALUE_TYPES.get(declared.strip().lower()) or ""
+    if not value_type:
+        value_type = VALUE_TYPE_TEXT
+    return SimulatedFieldDescription(
+        semanticKind=SEMANTIC_KIND_GENERIC,
+        valueType=value_type,
+        deterministicScope=deterministic_scope(SCOPE_REGION, region_id or section_id),
+        unit=effective_unit,
+        semanticSource=(
+            "inferred" if inferred_type
+            else ("unit" if declared else "unresolved")
+        ),
+    )
+
+
 # ---------------------------------------------------------------- 量族
 
 
@@ -862,6 +1038,20 @@ def resolve_metric_semantics(
             unit=unit,
             note=(
                 f"{SIMULATION_ASSUMPTION_NOTE}：暂按「{label}（{unit}）」示例出数，"
+                "真实口径待确认。"
+            ),
+        )
+
+    # 通用形态推断：名字里认得出**量纲**就给单位（kWh / % / 条 / ℃…）。
+    # 认不出 → 通用数值 + 空单位（下面那一条），**不判「不支持」**。
+    inferred_unit, _ = infer_shape_from_name(text)
+    if inferred_unit:
+        return MetricSemantics(
+            kind=SEMANTIC_KIND_GENERIC,
+            status="out_of_catalog",
+            unit=inferred_unit,
+            note=(
+                f"{SIMULATION_ASSUMPTION_NOTE}：暂按「{inferred_unit}」这一量纲示例出数，"
                 "真实口径待确认。"
             ),
         )

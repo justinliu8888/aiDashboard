@@ -73,22 +73,23 @@ PENDING_EDIT_MENU_QUESTION_ID = "pending_edit_plan_confirm"
 PLAN_VERSION_ID_KEY = "planVersionId"
 
 
-def derive_lock_scope(question_id: str, prompt: str) -> str:
+def derive_lock_scope(question_id: str, prompt: str, options: Any = None) -> str:
     """按契约表 §5.2 的阶段判据推出输入锁范围。
 
     判据只看**服务端当前这一份有效菜单**的身份，不看历史消息：
 
-    - ``pending_edit_plan_confirm``（待确认修改计划）→ 锁输入；
-    - ``template_edit_confirm`` 且提示语是「请选择下一步操作：」
-      （模板已生成、等待下一步操作选择）→ 锁输入；
-    - 其余（历史菜单、确认态、编辑态的普通提示）→ 只锁菜单，不锁输入。
+    - **有待答选项**（``options`` 非空）→ 锁输入（``input_and_menu``）：
+      用户得先从这张卡片里选一个，输入框、发送按钮、Enter 与快捷入口
+      一起锁住；
+    - **没有选项**（纯文本题 / 说明题）→ 只锁菜单，不锁输入。
+
+    判据的落点是**服务端当前这一份有效菜单**，不是历史消息 ——
+    菜单被答掉之后就不再锁。
+
+    显式指定优先：调用方写了 ``lockScope`` 就不推导（见
+    ``AgentQuestion._derive_lock_scope``）。
     """
-    if question_id == PENDING_EDIT_MENU_QUESTION_ID:
-        return LOCK_SCOPE_INPUT_AND_MENU
-    if (
-        question_id == LOCKED_INPUT_MENU_QUESTION_ID
-        and prompt == LOCKED_INPUT_MENU_PROMPT
-    ):
+    if options:
         return LOCK_SCOPE_INPUT_AND_MENU
     return LOCK_SCOPE_MENU_ONLY
 
@@ -299,6 +300,20 @@ class AgentQuestion(BaseModel):
     # 输入锁范围（契约表 §5.1）。缺省按 "menu_only" 处理。
     lockScope: str = LOCK_SCOPE_MENU_ONLY
 
+    # ---------- 「其他」自由文本（卡片内纠错入口） ----------
+    #
+    # ``allowsOther=True`` 时，这张卡片除了选项列表，还提供**一个**「其他」
+    # 项与一个**卡片内**的文本输入框。用户在里面写的内容按**这张卡片的
+    # 答案（纠正）**处理 —— 承接上文的同一个待办，不是另一条无关消息。
+    #
+    # 「其他」**不是**选项列表里的一个普通 value：选了「其他」却没填内容
+    # 等于没回答。前端按 ``allowsOther`` 渲染「其他」这一项与输入框。
+    allowsOther: bool = False
+    #: 「其他」这一项的显示文案。
+    otherLabel: str = "其他"
+    #: 卡片内输入框的提示文案（可空）。
+    otherPlaceholder: str = ""
+
     @model_validator(mode="before")
     @classmethod
     def _derive_lock_scope(cls, data: Any) -> Any:
@@ -314,10 +329,14 @@ class AgentQuestion(BaseModel):
         - 存量的老记录没有这个键 → 按 "menu_only" 处理（契约表 §5.3
           「旧数据的默认行为」），由读回菜单的那一处显式补上；
         - 「已选继续调整 / 修改」这类明确不锁的场景 → 写 "none"。
+
+        判据本身：**有待答选项就锁输入**，没有选项就只锁菜单。
         """
         if isinstance(data, dict) and "lockScope" not in data:
             derived = derive_lock_scope(
-                str(data.get("id") or ""), str(data.get("prompt") or "")
+                str(data.get("id") or ""),
+                str(data.get("prompt") or ""),
+                data.get("options"),
             )
             if derived != LOCK_SCOPE_MENU_ONLY:
                 return {**data, "lockScope": derived}

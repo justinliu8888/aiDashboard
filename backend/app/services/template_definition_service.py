@@ -26,6 +26,7 @@ from app.schemas.template_design import TemplateDesign, TemplateRegion
 from app.services.data_source_mode import (
     DEFAULT_SOURCE_MODE,
     SOURCE_MODE_KEY,
+    SOURCE_MODE_SIMULATED,
     SOURCE_MODE_USER_JSON,
     record_source_mode,
     resolve_source_mode,
@@ -46,13 +47,14 @@ from app.services.json_input_service import (
 )
 from app.services.report_draft_service import build_definition_draft
 from app.services.report_template_service import classify_metric_kind
-from app.services.metric_mock_service import get_metric
+from app.services.metric_mock_service import get_metric, match_metric_by_alias
 from app.services.simulated_field_semantics import (
     BINDING_KIND_CATALOG,
     BINDING_KIND_SIMULATED,
     SCOPE_METRIC_FAMILY,
     describe_simulated_columns,
     deterministic_scope,
+    intent_names_registered_metric,
     metric_family_seed_key,
     out_of_catalog_reason,
     resolve_metric_semantics,
@@ -101,6 +103,15 @@ _KIND_DEFAULT_UNITS: dict[str, str] = {
 #: 与 ``report_template_service`` 的说法**完全一致** —— 全仓库只有这一套
 #: 口径：能力没接通就说「能力待接通」，不用旧的说法。
 _DEFAULT_PENDING_REASON = "能力待接通：当前已接通的能力里没有对应指标。"
+
+#: 指标登记了、但这一块暂时执行不了（数据源没有对应字段）时的占位原因。
+#:
+#: 这一块**照样出数**（模拟业务数据）—— 构建定义这一层不做真实字段准入，
+#: 不能因为「取不到真实值」就让整份定义失败、让用户看不到版式。
+_NOT_EXECUTABLE_REASON = (
+    "能力待接通：这一块暂时取不到真实数值，当前按模拟业务数据出数，"
+    "接入真实数据后自动替换。"
+)
 
 #: 定义组件类型 → 方案组件类型（历史定义的只读适配用）。
 _DEFINITION_COMPONENT_TYPES: dict[str, str] = {
@@ -249,7 +260,9 @@ def _build_preview_spec(
     """
     metrics: list[dict[str, Any]] = []
     clarification: dict[str, Any] | None = None
-    if metric_refs:
+    # A catalog binding may cover only one intent; it cannot replace the confirmed plan.
+    plan_driven = source_mode == SOURCE_MODE_SIMULATED and bool(intents)
+    if metric_refs and not plan_driven:
         for metric_ref in metric_refs:
             catalog = get_metric(metric_ref) or {}
             label = str(catalog.get("label") or metric_ref)
@@ -272,12 +285,22 @@ def _build_preview_spec(
             })
     else:
         for index, intent in enumerate(intents):
-            semantics = resolve_metric_semantics(intent=intent)
+            metric_ref = match_metric_by_alias(intent) if plan_driven else None
+            catalog = get_metric(metric_ref) if metric_ref else None
+            if catalog and not intent_names_registered_metric(intent, metric_ref, {metric_ref: catalog}):
+                catalog = None
+            semantics = resolve_metric_semantics(
+                intent=intent,
+                registered_kind=classify_metric_kind(intent=intent, metric_ref=metric_ref) if catalog else None,
+                registered_unit=str(catalog.get("unit") or "") if catalog else "",
+            )
             kind = semantics.kind
             unit = semantics.unit or _KIND_DEFAULT_UNITS.get(kind)
+            catalog_binding = bool(catalog and metric_ref in metric_refs)
+            metric_key = metric_ref if catalog_binding else f"metric.{kind}.{_slug(section_id)}_{index + 1}"
             metrics.append({
                 # 陌生指标也给一个**稳定**的身份键，不靠标题猜。
-                "metricKey": f"metric.{kind}.{_slug(section_id)}_{index + 1}",
+                "metricKey": metric_key,
                 # 用户原话保留：系统不悄悄把「电脑耗电率」改名成别的指标。
                 "label": intent,
                 "kind": kind,
@@ -285,11 +308,11 @@ def _build_preview_spec(
                 "capabilityPending": bool(capability_pending),
                 "pendingReason": pending_reason if capability_pending else None,
                 # 目录外指标：**不伪造 metricRef**，只给一个稳定的模拟身份。
-                "bindingKind": BINDING_KIND_SIMULATED,
-                "simulatedId": simulated_metric_id(section_id, index),
+                "bindingKind": BINDING_KIND_CATALOG if catalog_binding else BINDING_KIND_SIMULATED,
+                "simulatedId": None if catalog_binding else simulated_metric_id(section_id, index),
                 "deterministicScope": deterministic_scope(
                     SCOPE_METRIC_FAMILY,
-                    metric_family_seed_key(kind, f"metric.{kind}.{_slug(section_id)}_{index + 1}", unit or ""),
+                    metric_family_seed_key(kind, metric_key, unit or ""),
                 ),
             })
             if index == 0 and semantics.clarification:
@@ -914,20 +937,26 @@ def build_template_definition(
         declared_columns = _declared_columns(region, section)
         intents = [
             str(item).strip()
-            for item in (region.metricIntents or section.get("metricIntents") or [])
+            for item in (section.get("metricIntents") if "metricIntents" in section else region.metricIntents) or []
             if str(item).strip()
         ]
-        if region.dataStatus == "bound":
+        # 构建定义这一层**不做真实字段准入**：绑不上的指标不是错误 ——
+        # 目录外的指标名（工厂里任何新东西）照样产出**合法定义**（模拟绑定），
+        # 不丢弃、不报错。这一块照样有示意数据可看。
+        executable_binding = (
+            region.dataStatus == "bound"
+            and len(region.metricRefs) == 1
+            and region.metricRefs[0] in supported_refs
+        )
+        # 绑得上就用真实引用；绑不上（目录外 / 暂时执行不了）用模拟绑定。
+        binding_metric_refs = list(region.metricRefs) if (
+            region.dataStatus != "bound" or executable_binding
+        ) else []
+        if region.dataStatus == "bound" and executable_binding:
             if kind == "text":
                 # 纯说明板块不绑定指标 —— 模板层不该把它标成 bound。
                 raise PlanContractError(
                     f"板块 {index + 1}「{title}」是纯说明板块，不应该有指标绑定。",
-                    section_id=section_id, section_title=title, section_index=index,
-                )
-            if len(region.metricRefs) != 1 or region.metricRefs[0] not in supported_refs:
-                raise PlanContractError(
-                    f"板块 {index + 1}「{title}」没有可安全执行的指标绑定，"
-                    f"草稿无法与方案对齐。",
                     section_id=section_id, section_title=title, section_index=index,
                 )
             device = region.metricRefs[0] == METRIC_DEVICE_ENERGY["metricRef"]
@@ -976,7 +1005,9 @@ def build_template_definition(
                 }
             elif kind == "metric_card":
                 converted["component"]["metric"]["label"] = title
-        elif region.dataStatus == "placeholder":
+        elif region.dataStatus == "placeholder" or (
+            region.dataStatus == "bound" and not executable_binding
+        ):
             # 方案声明的组件类型与**定稿栏目**原样保留：空壳 + 占位原因，
             # 不降级成纯文字区域（#39 硬要求）。**不编任何数值** ——
             # 数值由模拟业务数据渲染，能力待接通的还要标出来。
@@ -985,7 +1016,11 @@ def build_template_definition(
             # 真实目录的限制与「模拟能不能出数」是两件事，两种模式下都不许
             # 把前者说成后者。
             placeholder_reason = region.placeholderReason or _DEFAULT_PENDING_REASON
-            if not region.metricRefs and region.capabilityPending:
+            if region.dataStatus == "bound":
+                # 指标登记了、但这一块暂时执行不了（数据源没有对应字段）：
+                # **照样出数**（模拟业务数据），不因此让整份定义失败。
+                placeholder_reason = _NOT_EXECUTABLE_REASON
+            elif not region.metricRefs and region.capabilityPending:
                 placeholder_reason = out_of_catalog_reason(
                     mode.mode, intent=intents[0] if intents else ""
                 )
@@ -1018,7 +1053,7 @@ def build_template_definition(
             role=str(converted.get("role") or ""),
             component_type=kind,
             intents=intents,
-            metric_refs=list(region.metricRefs),
+            metric_refs=binding_metric_refs,
             capability_pending=bool(region.capabilityPending),
             pending_reason=region.placeholderReason,
             columns=declared_columns,
@@ -1029,17 +1064,28 @@ def build_template_definition(
             "id": region.id, "name": title,
             "layout": {"placement": _plan_placement(kind, index=index)},
             "templateBinding": {
-                "sectionId": region.sectionId, "dataStatus": region.dataStatus,
-                "placeholderReason": region.placeholderReason,
+                "sectionId": region.sectionId,
+                # 绑不上的那一块按**模拟**渲染：状态如实记成占位，
+                # 指标引用清空（不假装绑着某个真实口径）。
+                "dataStatus": (
+                    region.dataStatus
+                    if (region.dataStatus != "bound" or executable_binding)
+                    else "placeholder"
+                ),
+                "placeholderReason": (
+                    region.placeholderReason
+                    if (region.dataStatus != "bound" or executable_binding)
+                    else _NOT_EXECUTABLE_REASON
+                ),
                 "dataSourceLabel": region.dataSourceLabel,
-                "metricRefs": list(region.metricRefs),
+                "metricRefs": list(binding_metric_refs),
                 # 来源模式：服务端记录的事实，模型 / 校验 / 会话恢复 / 渲染共用。
                 SOURCE_MODE_KEY: mode.mode,
                 # bound 区域：指标已绑定、当前显示的是模拟业务数据 → 原因从
                 # **模板层** ``data.pendingReason`` 原样透传（#38 产出，#39 取用）。
                 # 本票**不另写文案**，全链路只有一处来源。
                 "pendingReason": (region.data or {}).get("pendingReason")
-                if region.dataStatus == "bound" else None,
+                if (region.dataStatus == "bound" and executable_binding) else None,
                 # 纯结构的示意语义：量身份、单位、列定义、能力标记。
                 # 造数器（#50）与示意载荷（#51）按它造数，不猜口径。
                 "previewSpec": preview_spec,

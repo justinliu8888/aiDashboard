@@ -25,7 +25,7 @@ import logging
 import threading
 import uuid
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from pydantic import ValidationError
 
@@ -199,6 +199,68 @@ def resolve_placeholders(definition: dict[str, Any]) -> dict[str, Any]:
         if isinstance(name, str) and "{{" in name:
             region["name"] = render_template(name, room_id)
     return definition
+
+
+def _definition_identity(definition: Any) -> tuple[str, int]:
+    """草稿的**定义版本身份**：``(定义 id, 定义版本)``。
+
+    模板态的草稿带 ``metadata.templateBinding``（模板转换层落的），
+    身份取它登记的 ``definitionId`` / ``definitionVersion``（= 方案 id +
+    方案版本）；历史草稿没有它，就退回定义自身的 ``metadata.id`` /
+    ``metadata.revision``。
+
+    与 ``preview_service.resolve_preview_context`` 取身份**同一套口径**：
+    两边算出同一个身份，前端才不会把这份载荷当成过期版本。
+    """
+    if not isinstance(definition, Mapping):
+        return ("", 0)
+    metadata = definition.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    binding = metadata.get("templateBinding")
+    binding = binding if isinstance(binding, Mapping) else {}
+    definition_id = str(
+        binding.get("definitionId") or metadata.get("id") or ""
+    ).strip()
+    version = binding.get("definitionVersion")
+    if version is None:
+        version = metadata.get("revision")
+    try:
+        version = int(version)
+    except (TypeError, ValueError):
+        version = 0
+    return (definition_id, version)
+
+
+def _definition_is_older(previous: Any, incoming: Any) -> bool:
+    """这一轮带回来的草稿是不是**比库里那份旧**。
+
+    判据分三层，**先看定义版本，再看草稿版本号**：
+
+        1. **定义 id 不同** → 不是同一份定义（重新开始 / 换了一份方案），
+           这一轮带回来的就是新的，不算回滚；
+        2. **定义 id 相同、定义版本不同** → 方案改版后重新生成的那份，
+           版本高的更新 —— 这一轮带回来的赢；
+        3. **定义版本相同** → 同一份草稿的多次编辑，按草稿自己的版本号
+           比；迟到的旧回复（版本号更小）不回滚已应用的新草稿。
+
+    第 2 条是这套判据存在的理由：方案改一版、重新确认后生成的是**全新**
+    的草稿（草稿版本号从 0 重新起算），拿版本号去比会把这份新草稿当成
+    「旧稿」挡掉 —— 用户刷新页面看到的就是上一版方案的草稿，而不是刚
+    确认的那一份。
+    """
+    previous_id, previous_version = _definition_identity(previous)
+    incoming_id, incoming_version = _definition_identity(incoming)
+    if previous_id != incoming_id:
+        return False
+    if previous_version != incoming_version:
+        return incoming_version < previous_version
+    previous_revision = int(
+        ((previous or {}).get("metadata") or {}).get("revision") or 0
+    )
+    incoming_revision = int(
+        ((incoming or {}).get("metadata") or {}).get("revision") or 0
+    )
+    return previous_revision > incoming_revision
 
 
 class SessionService:
@@ -392,9 +454,7 @@ class SessionService:
                 # 保留库里那份，不能因为一次交互就把草稿丢掉。
                 snapshot["definition"] = previous
             elif isinstance(previous, dict) and isinstance(incoming, dict):
-                previous_revision = int((previous.get("metadata") or {}).get("revision") or 0)
-                incoming_revision = int((incoming.get("metadata") or {}).get("revision") or 0)
-                if previous_revision > incoming_revision:
+                if _definition_is_older(previous, incoming):
                     # 迟到的只读/重复确认回复不能把已应用的新草稿回滚。
                     snapshot["definition"] = previous
             snapshot = self._carry_over_business_objects(snapshot, previous_snapshot)

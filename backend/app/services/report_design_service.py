@@ -37,7 +37,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from app.agents.report_plan_agent import (
     KIND_CLARIFICATION,
@@ -48,6 +48,7 @@ from app.agents.report_plan_agent import (
 from app.schemas.agent import (
     DESIGN_ACTION_CONFIRM_PLAN,
     DESIGN_ACTION_CONFIRM_TEMPLATE,
+    LOCK_SCOPE_MENU_ONLY,
     AgentError,
     AgentQuestion,
     AgentRequest,
@@ -127,6 +128,32 @@ UI_ACTION_PLAN_CONFIRM_PENDING = "plan_confirm_pending"
 UI_ACTION_PLAN_RETRY = "plan_retry"
 #: 模板已就绪。刻意与旧的确认报表动作分开。
 UI_ACTION_TEMPLATE_READY = "template_ready"
+
+# --------------------------------------------------------------------------
+# 文字阶段的追问卡片
+# --------------------------------------------------------------------------
+#
+# 「有把握就生成，没把握就追问」：追问**不只是一句话**，还要给用户能直接
+# 点的选项，外加一个「其他」—— 用户随时可以自己说，不被这几个选项框住。
+#
+# 选项的内容由**领域层**给（``report_plan_service`` 解析出来的那几个具体
+# 候选：指哪一块板块 / 这张表展示什么），这里只负责把它变成一张卡片。
+#
+# 「其他」那三个字段（``allowsOther`` / ``otherLabel`` /
+# ``otherPlaceholder``）的**形状已冻结**，由编辑编排那条线在
+# ``AgentQuestion`` 上加；这里按冻结形状传，传了就是那三个值。
+# --------------------------------------------------------------------------
+
+#: 文字阶段追问卡片的 id。
+CLARIFICATION_QUESTION_ID = "plan_clarification"
+
+#: 「其他」那一项的显示名。
+CLARIFICATION_OTHER_LABEL = "其他"
+
+#: 「其他」那一项的输入提示：说清楚**要什么**，不是内部字段。
+CLARIFICATION_OTHER_PLACEHOLDER = (
+    "写下你要的展示内容（例如：按设备、按天、最近 7 天）"
+)
 
 
 # --------------------------------------------------------------------------
@@ -278,23 +305,55 @@ def _definition_dict(
     return None
 
 
+def _clarification_question(
+    question: str, *, options: Sequence[str] = ()
+) -> AgentQuestion:
+    """文字阶段的**追问卡片**。
+
+    - **选项是用户直接能懂的**：指哪一块板块 / 这张表展示什么 —— 由领域层
+      解析出来，不是内部编号、不是规则 ID、不是一份泛化计划；
+    - **带「其他」**：用户随时可以自己说，不被这几个选项框住
+      （``allowsOther`` / ``otherLabel`` / ``otherPlaceholder`` 的形状已冻结，
+      由编辑编排那条线在 ``AgentQuestion`` 上加）；
+    - **不锁输入**（``lockScope = menu_only``）：追问本来就允许自由作答 ——
+      那句问话常常还写着「说清楚列名就行」，锁住输入框就自相矛盾了。
+      锁只是引导，真正的边界在后端对确认与权限的校验。
+    """
+    values: list[str] = []
+    for item in options or ():
+        text = str(item or "").strip()
+        if text and text not in values:
+            values.append(text)
+    return AgentQuestion(
+        id=CLARIFICATION_QUESTION_ID,
+        prompt=question,
+        expects="SINGLE_CHOICE",
+        options=[{"value": value, "label": value} for value in values],
+        selectionOnly=False,
+        lockScope=LOCK_SCOPE_MENU_ONLY,
+        allowsOther=True,
+        otherLabel=CLARIFICATION_OTHER_LABEL,
+        otherPlaceholder=CLARIFICATION_OTHER_PLACEHOLDER,
+    )
+
+
 # --------------------------------------------------------------------------
 # 来源模式口径（工单 #64 F3）
 #
 # 右侧那块画的是什么，取决于**服务端记录的来源模式**（契约表 §4.3）：
 #
 # - 模拟示例（simulated）：系统按固定种子造的示例业务数据（ADR 0004）。
-#   **既有文案一个字不改** —— 那是既有业务输出。
+#   只说明当前模拟展示，不承诺未来接入真实数据。
 # - 用户 JSON（user_json）：用户自己提供的数据，**未经业务核验**。
 #   这里**不说**「模拟业务数据」—— 那是事实性错误（画的是用户自己的
 #   数据，不是造出来的）；也**不说**「接入真实数据后会自动替换」/
 #   「已接上真实数据」—— 那同样是不存在的事实。
 # --------------------------------------------------------------------------
 
-#: 右侧渲染口径 —— 模拟示例（ADR 0004）。既有文案，**逐字不改**。
+#: 右侧渲染口径只描述当前草稿的模拟示意。
 _RENDER_NOTE_SIMULATED = (
     "右侧这份报表用系统生成的**模拟业务数据**渲染，是用来核对版式的"
-    "示意，接入真实数据后会自动替换。"
+    "全虚拟示意；只有明确要求名称占位的指标只显示名称、不出数值。"
 )
 
 #: 右侧渲染口径 —— 用户 JSON。用户自己的数据，**未经业务核验**。
@@ -925,7 +984,8 @@ class ReportDesignService:
                 reply=(
                     f"已按第 {plan_revision} 版方案「{title}」生成报表草稿。"
                     f"{_render_note(mode)}"
-                    "请确认草稿后继续校验、试运行；尚未接通的指标会标注「能力待接通」。"
+                    "请确认草稿后继续校验、试运行。"
+                    + ("尚未接通的指标会标注「能力待接通」。" if mode.is_user_json else "")
                 ),
                 domainObjects=AgentResponseDomainObjects(
                     reportDefinitionDraft=draft, reportPolicyDraft=build_policy_draft(template["title"]),
@@ -934,6 +994,7 @@ class ReportDesignService:
                 questions=[AgentQuestion(
                     id="template_edit_confirm", prompt="请选择下一步操作：", expects="SINGLE_CHOICE",
                     selectionOnly=True, options=[{"value": v, "label": v} for v in ("同意", "修改", "重新开始")],
+                    allowsOther=True, otherLabel="其他", otherPlaceholder="直接输入修改要求",
                 )],
                 uiActions=["confirm_framework", "draft_ready"],
             )
@@ -1642,6 +1703,7 @@ class ReportDesignService:
                 operation_id=operation_id,
                 expected_revision=expected_revision,
                 question=question,
+                options=getattr(exc, "options", ()) or (),
                 state=state,
             )
         except PlanColumnsUnresolvedError as exc:
@@ -1780,12 +1842,16 @@ class ReportDesignService:
         operation_id: str,
         expected_revision: int | None,
         question: str,
+        options: Sequence[str] = (),
         state: dict[str, Any] | None,
     ) -> AgentResponse:
         """提交一次必要追问。
 
         追问不是技术失败：阶段不动，上一成功方案保留，
         这一轮的消息与操作状态同事务落库。
+
+        追问**带一张卡片**：具体选项 + 「其他」。只回一句纯文本的话，
+        用户得自己猜该怎么答；给了选项，他点一下就能继续。
         """
         if not question:
             self._fail_operation(operation_id, "PLAN_CLARIFICATION_EMPTY", "澄清内容为空")
@@ -1808,6 +1874,7 @@ class ReportDesignService:
             domainObjects=AgentResponseDomainObjects(
                 reportPlan=current_plan if isinstance(current_plan, dict) else None
             ),
+            questions=[_clarification_question(question, options=options)],
             uiActions=[UI_ACTION_PLAN_CLARIFICATION],
             debug={"designPhase": phase, "planClarification": True},
         )
@@ -2142,6 +2209,9 @@ class ReportDesignService:
         # 来源模式：定义里服务端记录的那一份；没有就按会话里的 JSON 输入
         # 记录与方案记录兜底（工单 #64 F3）。
         mode = _reply_source_mode(definition=draft, plan=plan)
+        if not mode.is_user_json:
+            # 全虚拟示意不受真实能力接通状态影响，回复不展示该类说明。
+            placeholder_note = ""
 
         reply = (
             f"已按第 {plan_revision} 版方案「{title}」生成报表草稿。"
@@ -2160,7 +2230,8 @@ class ReportDesignService:
             reply += "。"
         elif placeholder_note:
             reply += f"{placeholder_note}。"
-        reply += pending_notes_reply(template)
+        if mode.is_user_json:
+            reply += pending_notes_reply(template)
         if duplicate:
             reply += "（这一版方案之前已经确认过，直接沿用已生成的草稿，没有重复生成。）"
 
@@ -2198,6 +2269,7 @@ class ReportDesignService:
             questions=[AgentQuestion(
                 id="template_edit_confirm", prompt="请选择下一步操作：", expects="SINGLE_CHOICE",
                 selectionOnly=True, options=[{"value": v, "label": v} for v in ("同意", "修改", "重新开始")],
+                allowsOther=True, otherLabel="其他", otherPlaceholder="直接输入修改要求",
             )],
             uiActions=["confirm_framework", "draft_ready"],
             debug={

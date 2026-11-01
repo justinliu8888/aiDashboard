@@ -266,9 +266,17 @@ def test_script_path_clarification_is_unchanged(post_chat, definition):
     assert question["selectionOnly"] is False
     assert question["lockScope"] == "none"
     assert [option["value"] for option in question["options"]] == [
-        "删除这个 section", "改标题", "改指标", "改数据源",
-        "改展示方式", "改时间范围", "改 compilation 粒度",
+        "删除这张卡片", "改标题", "改指标", "改数据源",
+        "改展示方式", "改时间范围", "改统计粒度",
     ]
+    # 选项是**用户看得见**的：里面不许有内部术语（section / compilation）。
+    # 说法换成了业务词，但取值仍能被引擎认出来（「删除」命中删除动词、
+    # 「粒度」命中粒度话题词），语义没变。
+    labels = " ".join(
+        f"{option.get('value', '')} {option.get('label', '')}" for option in question["options"]
+    )
+    for leaked in ("section", "compilation"):
+        assert leaked not in labels, f"选项里漏出了内部术语：{leaked}"
     assert (body.get("domainObjects") or {}).get("pendingEditPlan") is None
 
     # 脚本路径的澄清是自由文本（不锁菜单）：「耗电量」直接走通。

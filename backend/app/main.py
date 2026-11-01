@@ -63,10 +63,29 @@ def playground_root() -> RedirectResponse:
     return RedirectResponse(url=_WORKBENCH_URL)
 
 
+class _NoCacheStaticFiles(StaticFiles):
+    """开发期静态资源：**不缓存**。
+
+    工作台的前端脚本改得很勤。浏览器对没有 ``Cache-Control`` 的静态资源
+    会按启发式规则缓存（甚至连 HTML 都缓存），于是「改了没生效」「调试
+    代码跑的是旧版」这类问题极难查 —— 明明服务端已经是新文件，页面还在
+    跑旧脚本。
+
+    这里统一回 ``no-store``：改完刷新就是新的。生产部署另有 CDN / 缓存
+    策略，不受这里影响。
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
+
 if _FRONTEND_DIR.exists():
     app.mount(
         "/playground",
-        StaticFiles(directory=str(_FRONTEND_DIR), html=True),
+        _NoCacheStaticFiles(directory=str(_FRONTEND_DIR), html=True),
         name="playground",
     )
 

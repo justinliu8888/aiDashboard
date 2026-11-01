@@ -612,7 +612,7 @@ def test_prompt_files_are_byte_identical_to_baseline():
             "ac3ad7949c1ea173afbaa1e6f15a65ff904014aab39490ecc24cb2d47d95a62b"
         ),
         agent_module._EDIT_PROMPT_PATH: (
-            "cb37b4417383794212dac47356db09682d983219e8da928222761f1d6731776e"
+            "6ac4b626a6ffe3f79194c2e9016991f58a4e5634c940feb76e791f673709e1e4"
         ),
         agent_module._QUERY_PROMPT_PATH: (
             "2cd78a1cd91ac6fe6d813970903d284c9279504ede902edee7a66fca6c5b3bb9"

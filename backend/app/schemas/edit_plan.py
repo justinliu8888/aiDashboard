@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class EditIntent(str, Enum):
@@ -18,6 +18,11 @@ class EditIntent(str, Enum):
     DELETE_SECTION = "DELETE_SECTION"
     RENAME_SECTION = "RENAME_SECTION"
     ADD_SECTION = "ADD_SECTION"
+    #: 在**已有区块**里**追加**一个/多个指标（保留原有指标）。
+    #:
+    #: 与 ``CHANGE_METRIC``（替换）严格分开：用户说「再加 X」是**追加**，
+    #: 只有明确说「替换 / 只留 / 换成」才是替换。
+    ADD_METRIC = "ADD_METRIC"
     CHANGE_DATA_SOURCE = "CHANGE_DATA_SOURCE"
     CHANGE_VISUALIZATION = "CHANGE_VISUALIZATION"
     SUGGEST_VISUALIZATION = "SUGGEST_VISUALIZATION"
@@ -27,6 +32,54 @@ class EditIntent(str, Enum):
     CHANGE_TOP_N = "CHANGE_TOP_N"
     CHANGE_SORT = "CHANGE_SORT"
     UNKNOWN = "UNKNOWN"
+
+
+# --------------------------------------------------------------------------
+# 展示模式（写进定义，供渲染层读）
+# --------------------------------------------------------------------------
+
+#: 这一项**有数值**：按虚拟示例出数。
+DISPLAY_MODE_SIMULATED = "simulated"
+
+#: 这一项**只占位**：只显示名称，不塞数值。
+#:
+#: 只有用户**明确**要求「先占位 / 先加标签」时才用；默认一律是有数值的那一种。
+DISPLAY_MODE_PLACEHOLDER_ONLY = "placeholder_only"
+
+DISPLAY_MODES = (DISPLAY_MODE_SIMULATED, DISPLAY_MODE_PLACEHOLDER_ONLY)
+
+
+class EditMetricAddition(BaseModel):
+    """要**追加**到某个已有区块里的一个指标。
+
+    「追加」与「替换」是两种不同的意图：追加**保留**该区块原有指标，
+    把新指标加进去；替换才把原来的换掉。
+
+    每个待追加指标至少能表达：用户原话意图、显示名、单位、展示模式。
+    """
+
+    #: 用户原话里的指标意图（系统不替用户改写口径）。
+    intent: str = ""
+    #: 显示名（用户看到的名字）。
+    label: str = ""
+    #: 单位；空串 = 口径还没确认。
+    unit: str = ""
+    #: 展示模式：``simulated``（有数值）/ ``placeholder_only``（只占位）。
+    displayMode: str = DISPLAY_MODE_SIMULATED
+    #: 目录内指标的引用；目录外指标**不伪造**它。
+    metricRef: str | None = None
+    #: 目录外指标的**服务端解析结果**（候选）：
+    #: ``{"intent", "kind", "unit", "status", "note"}``。
+    metricCandidate: dict[str, Any] | None = None
+    #: 面向用户的补充说明（写进建议文案）。
+    note: str = ""
+
+    @field_validator("displayMode", mode="before")
+    @classmethod
+    def _normalize_display_mode(cls, value: Any) -> str:
+        """取值域只认两个；认不出来按「有数值」处理。"""
+        text = str(value or "").strip().lower()
+        return text if text in DISPLAY_MODES else DISPLAY_MODE_SIMULATED
 
 
 class EditTarget(BaseModel):
@@ -75,6 +128,14 @@ class EditOperation(BaseModel):
     #: 接受时用它判过期：候选是基于旧版本草稿做的，服务端直接拒绝
     #: （工单 #65，契约表 §4.2）。为空 = 不做这项校验（当场解析当场应用）。
     baseDefinitionRevision: int | None = None
+
+    # ADD_METRIC
+    #
+    #: 要**追加**到目标区块里的指标（一个或多个）。
+    #:
+    #: 一次可以追加多个 —— 引擎把它们当**一次原子修改**处理：
+    #: 全部成功才落到草稿，任一步失败则整体不生效，原草稿不变。
+    addMetrics: list[EditMetricAddition] = Field(default_factory=list)
 
     #: 选型依据：``{"ruleId", "componentType", "detail", "explain"}``。
     #:

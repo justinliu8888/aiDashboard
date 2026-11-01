@@ -37,6 +37,8 @@ class FakeElement {
     this.attributes = new Map();
     this.listeners = new Map();
     this.disabled = false;
+    this.hidden = false;
+    this.value = "";
     // 行内样式：图表条形宽度要用它。真实浏览器里 style 是 CSSStyleDeclaration，
     // 桩里只保留被写进去的属性就够了。
     this.style = {};
@@ -112,6 +114,16 @@ class FakeElement {
     const list = this.listeners.get(String(event.type)) || [];
     for (const handler of list.slice()) handler.call(this, event);
     return true;
+  }
+
+  focus() {
+    this.ownerDocument.activeElement = this;
+  }
+
+  change(value, options = {}) {
+    if (this.disabled && !options.ignoreDisabled) return false;
+    this.value = value;
+    return this.dispatchEvent({ type: "change", target: this });
   }
 
   /** 真实浏览器里 disabled 的按钮点不动。 */
@@ -223,16 +235,15 @@ test("渲染出主题、需求、板块、假设、未接受建议与参考来�
 
 test("未接受的建议被单独标注，不会混进板块", () => {
   const { root } = makeRoot();
-  Plan.render(root, viewWith({
-    reportPlan: { ...SAMPLE_PLAN, suggestions: ["增加周对比趋势"] },
-  }), { onAction() {} });
-
-  const suggestions = oneClass(root, "plan-suggestions");
-  assert.ok(suggestions.textContent.includes("尚未接受"));
-  assert.ok(suggestions.textContent.includes("增加周对比趋势"));
-
-  const sections = oneClass(root, "plan-sections");
-  assert.ok(!sections.textContent.includes("增加周对比趋势"), "未接受的建议不应出现在板块里");
+  Plan.render(root, viewWith({ reportPlan: { ...SAMPLE_PLAN, suggestions: ["增加周对比趋势"] } }), {});
+  const body = oneClass(root, "plan-markdown");
+  const headings = walk(body).filter(node => node.tagName === "H2").map(node => node.textContent);
+  assert.deepEqual(headings, ["需求", "板块与展示建议", "假设", "未接受的额外建议", "参考来源"]);
+  assert.ok(body.textContent.includes("以下建议尚未接受，不会自动进入上方板块。"));
+  const sectionHeading = walk(body).find(node => node.tagName === "H3");
+  assert.equal(sectionHeading.textContent, "1. PUE 总览");
+  assert.ok(!oneClass(root, "plan-ascii").textContent.includes("增加周对比趋势"));
+  assert.ok(body.textContent.includes("增加周对比趋势"));
 });
 
 test("板块按顺序渲染，图表类型有中文标签", () => {
@@ -248,11 +259,13 @@ test("板块按顺序渲染，图表类型有中文标签", () => {
     },
   }), { onAction() {} });
 
-  const sections = byClass(root, "plan-section");
+  const sections = walk(oneClass(root, "plan-markdown")).filter(node => node.tagName === "H3");
   assert.equal(sections.length, 3);
   assert.ok(sections[0].textContent.includes("总览"));
-  assert.ok(sections[1].textContent.includes("折线图"));
-  assert.ok(sections[2].textContent.includes("表格"));
+  assert.equal(sections[1].textContent, "2. 趋势");
+  assert.equal(sections[2].textContent, "3. 明细");
+  assert.ok(textOf(root).includes("展示方式：折线图"));
+  assert.ok(textOf(root).includes("展示方式：表格"));
 });
 
 test("没有方案时渲染占位说明，不报错", () => {
@@ -280,10 +293,10 @@ test("render 只往宿主容器里加自己的一层，不清掉已有节点（�
   assert.ok(textOf(root).includes("旧菜单"), "render 不应动宿主页面已有内容");
 });
 
-test("没有方案时不渲染确认按钮", () => {
+test("没有方案时不渲染方案操作下拉框", () => {
   const { root } = makeRoot();
   Plan.render(root, { designPhase: "PLAN_NEEDED", busy: false, canConfirm: true }, { onAction() {} });
-  assert.equal(byClass(root, "plan-confirm").length, 0, "没有方案就不该有确认按钮");
+  assert.equal(byClass(root, "plan-action-select").length, 0, "没有方案就不该有方案操作下拉框");
 });
 
 test("参考来源显示名称与版本", () => {
@@ -301,7 +314,7 @@ test("参考来源显示名称与版本", () => {
   assert.ok(text.includes("结构接近"));
 });
 
-test("未知图表类型回落中文兜底，原始值仍按文本保留（不执行）", () => {
+test("未知图表类型在 Markdown 正文中显示中文兜底", () => {
   const { doc, root } = makeRoot();
   Plan.render(root, viewWith({
     reportPlan: {
@@ -310,13 +323,8 @@ test("未知图表类型回落中文兜底，原始值仍按文本保留（不�
     },
   }), { onAction() {} });
 
-  // 界面上是中文兜底，不是裸英文 key
-  const tag = oneClass(root, "plan-component-type");
-  assert.equal(tag.textContent, "未知组件类型");
-  assert.ok(!textOf(root).includes("custom_widget"), "界面文字里不该出现裸英文 key");
-  // 原始值仍在，但是**作为文本**存在属性里（不是 HTML，不会被执行）
-  assert.equal(tag.getAttribute("data-plan-component-type"), "custom_widget");
-  assert.equal(tag.getAttribute("title"), "custom_widget");
+  assert.ok(oneClass(root, "plan-markdown").textContent.includes("展示方式：未知组件类型"));
+  assert.ok(!textOf(root).includes("custom_widget"));
   assert.equal(doc.innerHTMLWrites.length, 0, "模块不应该使用 innerHTML");
 });
 
@@ -335,14 +343,14 @@ test("错误对象取 message 字段", () => {
   assert.ok(textOf(root).includes("模型暂时不可用"));
 });
 
-test("busy 时显示处理中，并禁用确认按钮", () => {
+test("busy 时显示处理中，并禁用方案操作下拉框", () => {
   const { root } = makeRoot();
   Plan.render(root, viewWith({ busy: true }), { onAction() {} });
   assert.ok(textOf(root).includes("处理中"));
 
-  const button = oneClass(root, "plan-confirm");
+  const button = oneClass(root, "plan-action-select");
   assert.equal(button.disabled, true);
-  assert.equal(button.getAttribute("data-plan-can-confirm"), "false");
+  assert.equal(oneClass(root, "plan-module").getAttribute("data-plan-can-confirm"), "false");
 });
 
 // ---------------------------------------------------------------- 确认
@@ -352,7 +360,7 @@ test("确认回调只带 designAction / planId / basePlanRevision", () => {
   const calls = [];
   Plan.render(root, viewWith(), { onAction: (payload) => calls.push(payload) });
 
-  oneClass(root, "plan-confirm").click();
+  oneClass(root, "plan-action-select").change("confirm");
   assert.equal(calls.length, 1);
   assert.deepEqual(Object.keys(calls[0]).sort(), ["basePlanRevision", "designAction", "planId"]);
   assert.deepEqual(calls[0], {
@@ -372,21 +380,21 @@ test("canConfirm 缺省为 false：不给 true 就不能确认", () => {
     error: null,
   }, { onAction: (payload) => calls.push(payload) });
 
-  const button = oneClass(root, "plan-confirm");
+  const button = oneClass(root, "plan-action-select");
   assert.equal(button.disabled, true);
-  button.click();
+  button.change("confirm");
   assert.equal(calls.length, 0);
 });
 
-test("canConfirm=false 时不能确认（强行触发点击也不会发出去）", () => {
+test("canConfirm=false 时不能确认（强行触发 change 也不会发出去）", () => {
   const { root } = makeRoot();
   const calls = [];
   Plan.render(root, viewWith({ canConfirm: false }), { onAction: (payload) => calls.push(payload) });
 
-  const button = oneClass(root, "plan-confirm");
+  const button = oneClass(root, "plan-action-select");
   assert.equal(button.disabled, true);
-  button.click();
-  button.click({ ignoreDisabled: true }); // 绕过 DOM 禁用，模拟被外部强行触发
+  button.change("confirm");
+  button.change("confirm", { ignoreDisabled: true }); // 绕过 DOM 禁用，模拟被外部强行触发
   assert.equal(calls.length, 0);
 });
 
@@ -395,9 +403,9 @@ test("busy=true 时即使 canConfirm=true 也不能确认", () => {
   const calls = [];
   Plan.render(root, viewWith({ busy: true, canConfirm: true }), { onAction: (payload) => calls.push(payload) });
 
-  const button = oneClass(root, "plan-confirm");
+  const button = oneClass(root, "plan-action-select");
   assert.equal(button.disabled, true);
-  button.click({ ignoreDisabled: true });
+  button.change("confirm", { ignoreDisabled: true });
   assert.equal(calls.length, 0);
 });
 
@@ -405,22 +413,22 @@ test("方案更新后，回调携带新版本号", () => {
   const { root } = makeRoot();
   const calls = [];
   Plan.render(root, viewWith(), { onAction: (payload) => calls.push(payload) });
-  oneClass(root, "plan-confirm").click();
+  oneClass(root, "plan-action-select").change("confirm");
   assert.equal(calls[0].basePlanRevision, 1);
 
   const updated = { ...SAMPLE_PLAN, revision: 2, topic: "PUE 专题报表（已更新）" };
   Plan.render(root, viewWith({ reportPlan: updated }), { onAction: (payload) => calls.push(payload) });
-  oneClass(root, "plan-confirm").click();
+  oneClass(root, "plan-action-select").change("confirm");
 
   assert.equal(calls.length, 2);
   assert.equal(calls[1].basePlanRevision, 2);
   assert.equal(calls[1].planId, "plan_example_pue");
 });
 
-test("没有 onAction 回调时点击确认不报错", () => {
+test("没有 onAction 回调时选择确认不报错", () => {
   const { root } = makeRoot();
   Plan.render(root, viewWith(), {});
-  assert.doesNotThrow(() => oneClass(root, "plan-confirm").click());
+  assert.doesNotThrow(() => oneClass(root, "plan-action-select").change("confirm"));
 });
 
 test("确认不发 HTTP、不触发 __advance__", () => {
@@ -437,7 +445,7 @@ test("确认不发 HTTP、不触发 __advance__", () => {
   try {
     const { root } = makeRoot();
     Plan.render(root, viewWith(), { onAction() {} });
-    oneClass(root, "plan-confirm").click();
+    oneClass(root, "plan-action-select").change("confirm");
     assert.equal(fetchCalls, 0, "确认动作不应发 HTTP 请求");
     assert.equal(xhrCalls, 0, "确认动作不应发 HTTP 请求");
     assert.equal(advanceCalls, 0, "确认动作不应触发 __advance__");
@@ -472,14 +480,14 @@ test("clear 只清自己的内容，不动宿主页面里的其它节点", () =>
   assert.equal(textOf(root), "宿主内容");
 });
 
-test("clear 之后确认事件失效（再点也不会回调）", () => {
+test("clear 之后确认事件失效（再选择也不会回调）", () => {
   const { root } = makeRoot();
   const calls = [];
   Plan.render(root, viewWith(), { onAction: (payload) => calls.push(payload) });
-  const button = oneClass(root, "plan-confirm");
+  const button = oneClass(root, "plan-action-select");
 
   Plan.clear(root);
-  button.click({ ignoreDisabled: false });
+  button.change("confirm");
   assert.equal(calls.length, 0, "clear 之后不应再能发出确认动作");
 });
 
@@ -540,7 +548,7 @@ test("缺少 planId 时不能确认", () => {
   Plan.render(root, viewWith({ reportPlan: { ...SAMPLE_PLAN, id: "" } }), {
     onAction: (payload) => calls.push(payload),
   });
-  oneClass(root, "plan-confirm").click({ ignoreDisabled: true });
+  oneClass(root, "plan-action-select").change("confirm", { ignoreDisabled: true });
   assert.equal(calls.length, 0);
 });
 
@@ -578,7 +586,7 @@ test("浏览器侧暴露 window.WorkbenchPlan", () => {
 //
 // 所以要验的是：
 //   - 草稿阶段只有折叠视图：没有「确认方案」，也没有模板中间页的两个按钮；
-//   - 待确认阶段方案正文完整展开，有「确认方案」按钮；
+//   - 待确认阶段方案正文完整展开，有「确认方案」选项；
 //   - 后端即使还把内部模板作为中间产物带回来，前端也不渲染模板中间页；
 //   - 需求稿 §3.3 保护的图表渲染代码还在（导出面上有 renderChart）。
 //
@@ -687,14 +695,15 @@ test("草稿阶段：折叠视图里是完整的已确认方案", () => {
   assert.ok(text.includes("PUE 专题报表"), "应含方案主题");
   assert.ok(text.includes("PUE 总览"), "应含板块");
   assert.ok(text.includes("PUE 统计口径待核实"), "应含假设");
-  assert.equal(byClass(details, "plan-section").length, 1, "应含 1 个板块卡");
+  assert.equal(byClass(details, "plan-markdown").length, 1, "应保留 Markdown 正文");
+  assert.equal(byClass(details, "plan-ascii").length, 1, "应保留布局示意");
 });
 
 // T4 —— 草稿阶段没有任何动作入口
 test("草稿阶段：没有确认入口，也没有模板中间页的两个按钮", () => {
   const { root } = makeRoot();
   Plan.render(root, viewWith({ designPhase: "DRAFT_READY", canConfirm: false }), {});
-  assert.equal(byClass(root, "plan-confirm").length, 0, "不应有「确认方案」");
+  assert.equal(byClass(root, "plan-action-select").length, 0, "不应有「确认方案」");
   for (const className of FORBIDDEN_TEMPLATE_CLASSES) {
     assert.equal(byClass(root, className).length, 0, "不应有 ." + className);
   }
@@ -704,12 +713,12 @@ test("草稿阶段：没有确认入口，也没有模板中间页的两个按�
 });
 
 // T5 —— 待确认阶段仍然完整展开 + 有「确认方案」
-test("待确认方案阶段：方案正文展开，有「确认方案」按钮，没有折叠视图", () => {
+test("待确认方案阶段：方案正文展开，有「确认方案」选项，没有折叠视图", () => {
   const { root } = makeRoot();
   Plan.render(root, viewWith(), {});
   assert.equal(walk(root).filter((node) => node.tagName === "DETAILS").length, 0);
-  assert.equal(byClass(root, "plan-confirm").length, 1);
-  assert.equal(oneClass(root, "plan-confirm").getAttribute("data-plan-can-confirm"), "true");
+  assert.equal(byClass(root, "plan-action-select").length, 1);
+  assert.equal(oneClass(root, "plan-module").getAttribute("data-plan-can-confirm"), "true");
 });
 
 // T6 —— 后端仍回传 templateDesign 也不渲染模板中间页（防模板态复活）
@@ -800,22 +809,18 @@ test("板块显示展示目的与选型理由", () => {
     },
   }), {});
 
-  const section = oneClass(root, "plan-section");
+  const section = oneClass(root, "plan-markdown");
   assert.ok(section.textContent.includes("总量"), "应显示展示目的");
   assert.ok(section.textContent.includes("看总量，指标卡最直观"), "应显示选型理由");
-  assert.equal(
-    oneClass(root, "plan-display-intent").getAttribute("data-plan-display-intent"),
-    "total"
-  );
+  assert.ok(section.textContent.includes("展示目的：总量"));
 });
 
 test("没有选型字段时什么都不显示（不猜后端字段）", () => {
   const { root } = makeRoot();
   Plan.render(root, viewWith(), {});
 
-  assert.equal(byClass(root, "plan-display-intent").length, 0, "没有 displayIntent 就不显示展示目的");
-  assert.equal(byClass(root, "plan-selection-reason").length, 0, "没有 selectionReason 就不显示理由");
-  assert.equal(byClass(root, "plan-explicit-type").length, 0, "没有 explicitComponentType 就不显示指定类型");
+  const text = oneClass(root, "plan-markdown").textContent;
+  for (const label of ["展示目的：", "选择理由：", "用户指定："]) assert.ok(!text.includes(label));
 });
 
 test("用户指定的展示类型单独标出，不与系统选型混为一谈", () => {
@@ -837,10 +842,7 @@ test("用户指定的展示类型单独标出，不与系统选型混为一谈",
     },
   }), {});
 
-  const explicit = oneClass(root, "plan-explicit-type");
-  assert.equal(explicit.getAttribute("data-plan-explicit-type"), "bar_chart");
-  assert.ok(explicit.textContent.includes("柱状图"), "应显示指定类型的中文名");
-  assert.ok(explicit.textContent.includes("用户指定"), "应标明这是用户指定的");
+  assert.ok(oneClass(root, "plan-markdown").textContent.includes("用户指定：柱状图"));
 });
 
 test("表格板块显示它声明的栏目", () => {
@@ -864,15 +866,13 @@ test("表格板块显示它声明的栏目", () => {
     },
   }), {});
 
-  const columns = byClass(root, "plan-column");
-  assert.equal(columns.length, 2, "应显示 2 个栏目");
-  assert.ok(columns[0].textContent.includes("设备名称"));
-  assert.ok(columns[1].textContent.includes("告警级别"));
-  assert.equal(columns[0].getAttribute("data-plan-column-id"), "col_device");
-  assert.equal(columns[0].getAttribute("data-plan-column-field-ref"), "section_alarm.device_name");
-  // 取值键是技术键：放在 title 里（悬停可见），不和栏目名挤在一行
-  assert.equal(columns[0].getAttribute("title"), "section_alarm.device_name");
-  assert.ok(!columns[0].textContent.includes("section_alarm.device_name"), "取值键不与栏目名挤在一行");
+  const text = oneClass(root, "plan-markdown").textContent;
+  assert.ok(text.includes("栏目：设备名称、告警级别"));
+  assert.ok(text.includes("C1：设备名称"));
+  assert.ok(text.includes("C2：告警级别"));
+  assert.ok(!text.includes("section_alarm.device_name"), "技术取值键不混入正文");
+  assert.equal(oneClass(root, "plan-ascii").textContent,
+    "+----+----+\n| C1 | C2 |\n+----+----+\n|    |    |\n+----+----+\n");
 });
 
 test("方案里没有栏目声明时不显示栏目（不按标题猜列）", () => {
@@ -886,7 +886,8 @@ test("方案里没有栏目声明时不显示栏目（不按标题猜列）", ()
     },
   }), {});
 
-  assert.equal(byClass(root, "plan-columns").length, 0, "没有声明就不显示栏目");
+  assert.ok(!oneClass(root, "plan-markdown").textContent.includes("栏目："));
+  assert.equal(oneClass(root, "plan-ascii").textContent, "[ table columns to be confirmed ]\n");
 });
 
 test("栏目没有显示名时整项跳过（不拿 id 当栏目名）", () => {
@@ -909,9 +910,11 @@ test("栏目没有显示名时整项跳过（不拿 id 当栏目名）", () => {
     },
   }), {});
 
-  const columns = byClass(root, "plan-column");
-  assert.equal(columns.length, 1, "只有有显示名的栏目才显示");
-  assert.ok(columns[0].textContent.includes("告警级别"));
+  const text = oneClass(root, "plan-markdown").textContent;
+  assert.ok(text.includes("栏目：告警级别"));
+  assert.ok(text.includes("C1：告警级别"));
+  assert.ok(!text.includes("C2："));
+  assert.ok(!text.includes("col_device"));
 });
 
 test("选型与栏目里的 HTML 只作为文本显示", () => {
@@ -966,7 +969,7 @@ test("展示目的的标签映射", () => {
 //   total / trend / comparison / composition / records（纯说明板块为 null）。
 // 后端将来加新枚举时，前端不许回落英文 key（用户看不懂，而且裸英文正说明
 // 「后端枚举与前端映射没同步」），也不许猜成某个已知取值（那是错误语义）。
-// 兜底必须：显示中文 + 不丢信息 + 原始值可追溯。
+// 当前 Markdown 正文只验证中文兜底，不再要求旧标签的 data-* / title 属性。
 
 const INTENT_SECTIONS = {
   total: "总量",
@@ -994,10 +997,7 @@ test("展示目的的五个已知取值各自显示中文", () => {
       },
     }), {});
 
-    const tag = oneClass(root, "plan-display-intent");
-    assert.equal(tag.textContent, label, `displayIntent=${intent} 应显示「${label}」`);
-    assert.equal(tag.getAttribute("data-plan-display-intent"), intent, "原始取值要留在 data-* 里");
-    assert.equal(tag.getAttribute("title"), null, "已知取值是中文，不需要 title 兜底");
+    assert.ok(oneClass(root, "plan-markdown").textContent.includes("展示目的：" + label));
     assert.ok(Plan.isKnownDisplayIntent(intent), `${intent} 算已知取值`);
   }
 });
@@ -1019,12 +1019,11 @@ test("展示目的为 null 时不渲染这一项（板块本身照常渲染）",
     },
   }), {});
 
-  assert.equal(byClass(root, "plan-display-intent").length, 0, "null 展示目的不渲染这一项");
-  assert.equal(byClass(root, "plan-section").length, 1, "板块卡片本身照常渲染");
+  assert.ok(!oneClass(root, "plan-markdown").textContent.includes("展示目的："));
   assert.ok(textOf(root).includes("口径说明"), "板块标题照常显示");
 });
 
-test("未知展示目的回落中文兜底，原始取值可追溯", () => {
+test("未知展示目的在 Markdown 正文中回落中文兜底", () => {
   const { root } = makeRoot();
   Plan.render(root, viewWith({
     reportPlan: {
@@ -1041,17 +1040,10 @@ test("未知展示目的回落中文兜底，原始取值可追溯", () => {
     },
   }), {});
 
-  const tag = oneClass(root, "plan-display-intent");
-  // 中文：用户看到的是人话，不是裸英文 key
-  assert.equal(tag.textContent, "未知展示目的", "未知取值要显示中文兜底");
-  assert.ok(!tag.textContent.includes("ranking"), "界面文字里不该出现裸英文 key");
-  assert.ok(!/[a-zA-Z]/.test(tag.textContent), "兜底文字里不该有英文字母");
-  // 不丢信息：这一项照常渲染出来（不是整行消失）
-  assert.equal(byClass(root, "plan-section").length, 1, "板块卡片照常渲染");
-  assert.ok(textOf(root).includes("设备耗电排名"), "板块标题照常显示");
-  // 可追溯：原始取值两处都留着
-  assert.equal(tag.getAttribute("data-plan-display-intent"), "ranking", "原始取值要留在 data-* 里");
-  assert.equal(tag.getAttribute("title"), "ranking", "原始取值要能从 title 里查到");
+  const text = oneClass(root, "plan-markdown").textContent;
+  assert.ok(text.includes("展示目的：未知展示目的"));
+  assert.ok(text.includes("设备耗电排名"));
+  assert.ok(!text.includes("ranking"));
 });
 
 test("未知展示目的不猜成某个已知取值", () => {
@@ -1093,15 +1085,13 @@ test("未知展示目的里的文本只作为文本显示（不执行模型 HTML
   assert.ok(!tags.includes("IMG"), "不该由模型文本生成 img 元素");
   assert.ok(textOf(root).includes(nasty), "模型文本应当原样以文本显示");
 
-  const tag = oneClass(root, "plan-display-intent");
-  assert.equal(tag.textContent, "未知展示目的", "未知取值仍然显示中文兜底");
-  assert.equal(tag.getAttribute("title"), nasty, "原始取值原样留在 title 里");
+  assert.ok(oneClass(root, "plan-markdown").textContent.includes("展示目的：未知展示目的"));
 });
 
 // ---------------------------------------------------------------- 组件类型的未知值兜底
 //
 // 与展示目的同一类问题：组件类型也是封闭枚举，未知取值不该回落裸英文 key。
-// 兜底要求同样是四条：中文可见、不丢信息、不猜、原始值可追溯。
+// 正文验证中文可见与不猜；原始类型仍由图表渲染接口单独验证。
 //
 // ⚠️ 显示与逻辑必须分离：componentType 在别处还当判断用
 // （renderChart 用原始值决定画 SVG 折线还是柱条），显示兜底不许改到那条路。
@@ -1127,15 +1117,12 @@ test("组件类型的已知取值译法不变（锁死）", () => {
       },
     }), {});
 
-    const tag = oneClass(root, "plan-component-type");
-    assert.equal(tag.textContent, label, `componentType=${type} 应显示「${label}」`);
-    assert.equal(tag.getAttribute("data-plan-component-type"), type, "原始取值要留在 data-* 里");
-    assert.equal(tag.getAttribute("title"), null, "已知取值是中文，不需要 title 兜底");
+    assert.ok(oneClass(root, "plan-markdown").textContent.includes("展示方式：" + label));
     assert.ok(Plan.isKnownComponentType(type), `${type} 算已知取值`);
   }
 });
 
-test("未知组件类型回落中文兜底，原始取值可追溯", () => {
+test("未知组件类型在 Markdown 正文中回落中文兜底", () => {
   const { root } = makeRoot();
   Plan.render(root, viewWith({
     reportPlan: {
@@ -1146,17 +1133,10 @@ test("未知组件类型回落中文兜底，原始取值可追溯", () => {
     },
   }), {});
 
-  const tag = oneClass(root, "plan-component-type");
-  // 中文：用户看到的是人话，不是裸英文 key
-  assert.equal(tag.textContent, "未知组件类型", "未知类型要显示中文兜底");
-  assert.ok(!tag.textContent.includes("heatmap"), "界面文字里不该出现裸英文 key");
-  assert.ok(!/[a-zA-Z]/.test(tag.textContent), "兜底文字里不该有英文字母");
-  // 不丢信息：标签照常渲染出来（不是整行不渲染）
-  assert.equal(byClass(root, "plan-section").length, 1, "板块卡片照常渲染");
-  assert.ok(textOf(root).includes("热力分布"), "板块标题照常显示");
-  // 可追溯：原始取值两处都留着
-  assert.equal(tag.getAttribute("data-plan-component-type"), "heatmap", "原始取值要留在 data-* 里");
-  assert.equal(tag.getAttribute("title"), "heatmap", "原始取值要能从 title 里查到");
+  const text = oneClass(root, "plan-markdown").textContent;
+  assert.ok(text.includes("展示方式：未知组件类型"));
+  assert.ok(text.includes("热力分布"));
+  assert.ok(!text.includes("heatmap"));
 });
 
 test("未知组件类型不猜成某个已知类型", () => {
@@ -1176,7 +1156,7 @@ test("组件类型的兜底标签本身是中文常量", () => {
   assert.notEqual(Plan.COMPONENT_TYPE_UNKNOWN_LABEL, Plan.DISPLAY_INTENT_UNKNOWN_LABEL);
 });
 
-test("用户指定的未知组件类型也走中文兜底，原始取值可追溯", () => {
+test("用户指定的未知组件类型在 Markdown 正文中也走中文兜底", () => {
   const { root } = makeRoot();
   Plan.render(root, viewWith({
     reportPlan: {
@@ -1193,12 +1173,9 @@ test("用户指定的未知组件类型也走中文兜底，原始取值可追�
     },
   }), {});
 
-  const tag = oneClass(root, "plan-explicit-type");
-  assert.ok(tag.textContent.includes("用户指定"), "仍要标明这是用户指定的");
-  assert.ok(tag.textContent.includes("未知组件类型"), "未知类型要显示中文兜底");
-  assert.ok(!tag.textContent.includes("heatmap"), "界面文字里不该出现裸英文 key");
-  assert.equal(tag.getAttribute("data-plan-explicit-type"), "heatmap", "原始取值要留在 data-* 里");
-  assert.equal(tag.getAttribute("title"), "heatmap", "原始取值要能从 title 里查到");
+  const text = oneClass(root, "plan-markdown").textContent;
+  assert.ok(text.includes("用户指定：未知组件类型"));
+  assert.ok(!text.includes("heatmap"));
 });
 
 test("未知组件类型里的文本只作为文本显示（不执行模型 HTML）", () => {
@@ -1217,9 +1194,7 @@ test("未知组件类型里的文本只作为文本显示（不执行模型 HTML
   const tags = walk(root).map((node) => node.tagName);
   assert.ok(!tags.includes("IMG"), "不该由模型文本生成 img 元素");
 
-  const tag = oneClass(root, "plan-component-type");
-  assert.equal(tag.textContent, "未知组件类型", "未知类型仍然显示中文兜底");
-  assert.equal(tag.getAttribute("title"), nasty, "原始取值原样留在 title 里");
+  assert.ok(oneClass(root, "plan-markdown").textContent.includes("展示方式：未知组件类型"));
 });
 
 test("renderChart 的类型判断读原始 componentType（显示兜底不改渲染逻辑）", () => {
@@ -1280,4 +1255,185 @@ test("工作台把方案挂进左侧对话流，而不是页面里的静态容�
     /chatScroll\.appendChild\(planBubble\)/.test(WORKBENCH_JS),
     "方案气泡应当挂到左侧对话流（#chat-scroll）里"
   );
+});
+
+// ---------------------------------------------------------------- Markdown 与卡片内输入
+
+test("Markdown 下载保留标题、正文与 ASCII 代码块，不泄露方案身份", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith(), {});
+  const body = oneClass(root, "plan-markdown");
+  assert.equal(body.tagName, "ARTICLE");
+  assert.equal(walk(body).find(node => node.tagName === "H1").textContent, "PUE 专题报表");
+  assert.ok(body.textContent.includes("所有展示数据均为虚拟数据。"));
+  const download = oneClass(root, "plan-markdown-download");
+  assert.equal(download.getAttribute("download"), "PUE 专题报表.md");
+  const href = download.getAttribute("href");
+  assert.ok(href.startsWith("data:text/markdown;charset=utf-8,"));
+  const markdown = decodeURIComponent(href.slice(href.indexOf(",") + 1));
+  assert.ok(markdown.startsWith("# PUE 专题报表\n\n版本：1\n"));
+  assert.ok(markdown.includes("## 板块与展示建议\n\n### 1. PUE 总览"));
+  assert.ok(markdown.includes("```text\n[ K1   ]\n```"));
+  assert.ok(markdown.includes("- K1：PUE"));
+  assert.ok(!markdown.includes("plan_example_pue"));
+});
+
+test("各展示类型渲染 ASCII 布局示意，指标说明位于图外", () => {
+  const expected = {
+    metric_card: "[ K1   ]\n",
+    line_chart: "value\n  |       *---*\n  |   *--*     *\n  |--*\n  +---------------- time\n",
+    bar_chart: "K1 | ######\nK2 | ##########\nK3 | ####\n   +-------------- value\n",
+    pie_chart: "composition\n+---------------------+\n|   K1   | K2 |  K3   |\n+---------------------+\n",
+    table: "[ table columns to be confirmed ]\n",
+    text: "[ text / content ]\n",
+  };
+  for (const [componentType, ascii] of Object.entries(expected)) {
+    const { root } = makeRoot();
+    Plan.render(root, viewWith({ reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [{ id: "s1", title: "示意", metricIntents: ["PUE"], componentType }],
+    } }), {});
+    const diagram = oneClass(root, "plan-ascii");
+    assert.equal(diagram.tagName, "PRE");
+    assert.equal(diagram.textContent, ascii, componentType);
+    assert.match(diagram.textContent, /^[\x00-\x7f]*$/);
+    assert.ok(oneClass(root, "plan-markdown").textContent.includes("K1：PUE"));
+  }
+});
+
+test("选择其他修改只展开卡片内输入，选择确认收起输入并发出确认载荷", () => {
+  const { doc, root } = makeRoot();
+  const calls = [];
+  Plan.render(root, viewWith({ collapsible: true }), { onAction: payload => calls.push(payload) });
+  const card = oneClass(root, "plan-card-details");
+  const select = oneClass(card, "plan-action-select");
+  assert.equal(select.tagName, "SELECT");
+  assert.equal(select.getAttribute("aria-label"), "方案操作");
+  assert.deepEqual(select.childNodes.map(node => [node.getAttribute("value"), node.textContent]),
+    [["", "请选择方案操作"], ["confirm", "确认方案"], ["modify", "其他修改"]]);
+  const other = oneClass(card, "plan-other-answer");
+  const input = oneClass(other, "plan-other-input");
+  assert.equal(input.tagName, "TEXTAREA");
+  assert.equal(other.hidden, true);
+  select.change("");
+  assert.equal(calls.length, 0);
+  select.change("modify");
+  assert.equal(other.hidden, false);
+  assert.equal(doc.activeElement, input);
+  assert.equal(calls.length, 0);
+  select.change("confirm");
+  assert.equal(other.hidden, true);
+  assert.deepEqual(calls, [{ designAction: "CONFIRM_PLAN", planId: "plan_example_pue", basePlanRevision: 1 }]);
+});
+
+test("空输入与纯空白修改不发动作，卡片内提示填写要求", () => {
+  for (const text of ["", " \n\t "]) {
+    const { root } = makeRoot();
+    const calls = [];
+    Plan.render(root, viewWith(), { onAction: payload => calls.push(payload) });
+    oneClass(root, "plan-action-select").change("modify");
+    oneClass(root, "plan-other-input").value = text;
+    oneClass(root, "plan-other-submit").click();
+    const status = walk(oneClass(root, "plan-other-answer")).find(node => node.getAttribute("role") === "status");
+    assert.equal(status.textContent, "请先填写修改要求。");
+    assert.equal(calls.length, 0);
+  }
+});
+
+test("提交修改只携带当前方案身份、版本与去首尾空白的原始文本", () => {
+  const { root } = makeRoot();
+  const calls = [];
+  Plan.render(root, viewWith({
+    reportPlan: { ...SAMPLE_PLAN, id: "plan_updated", revision: 3 },
+    versionId: "version_record_3",
+    collapsible: true,
+  }), { onAction: payload => calls.push(payload) });
+  const card = oneClass(root, "plan-card-details");
+  oneClass(card, "plan-action-select").change("modify");
+  oneClass(card, "plan-other-input").value = "  增加周对比\n保留 PUE 总览  ";
+  oneClass(card, "plan-other-submit").click();
+  assert.deepEqual(calls, [{
+    designAction: "MODIFY_PLAN", planId: "plan_updated", basePlanRevision: 3,
+    text: "增加周对比\n保留 PUE 总览",
+  }]);
+});
+
+test("Enter 提交修改，Shift+Enter 保留换行而不提交", () => {
+  const { root } = makeRoot();
+  const calls = [];
+  Plan.render(root, viewWith(), { onAction: payload => calls.push(payload) });
+  oneClass(root, "plan-action-select").change("modify");
+  const input = oneClass(root, "plan-other-input");
+  input.value = "改成折线图";
+  let prevented = 0;
+  input.dispatchEvent({ type: "keydown", key: "Enter", shiftKey: true, preventDefault() { prevented += 1; } });
+  assert.equal(prevented, 0);
+  assert.equal(calls.length, 0);
+  input.dispatchEvent({ type: "keydown", key: "Enter", shiftKey: false, preventDefault() { prevented += 1; } });
+  assert.equal(prevented, 1);
+  assert.deepEqual(calls, [{
+    designAction: "MODIFY_PLAN", planId: "plan_example_pue", basePlanRevision: 1, text: "改成折线图",
+  }]);
+});
+
+test("不可操作的卡片禁用所有输入，强制触发修改也不发载荷", () => {
+  for (const overrides of [{ canConfirm: false }, { busy: true }, { reportPlan: { ...SAMPLE_PLAN, id: "" } }]) {
+    const { root } = makeRoot();
+    const calls = [];
+    Plan.render(root, viewWith(overrides), { onAction: payload => calls.push(payload) });
+    const select = oneClass(root, "plan-action-select");
+    const input = oneClass(root, "plan-other-input");
+    const submit = oneClass(root, "plan-other-submit");
+    for (const node of [select, input, submit]) assert.equal(node.disabled, true);
+    select.change("modify", { ignoreDisabled: true });
+    assert.equal(oneClass(root, "plan-other-answer").hidden, true);
+    input.value = "增加趋势";
+    submit.click({ ignoreDisabled: true });
+    input.dispatchEvent({ type: "keydown", key: "Enter", preventDefault() {} });
+    assert.deepEqual(calls, []);
+  }
+});
+
+test("历史卡片保留旧版 Markdown，收起外壳且所有操作失效", () => {
+  const { root } = makeRoot();
+  const calls = [];
+  Plan.render(root, viewWith({
+    isHistory: true, canConfirm: false, collapsible: true, cardExpanded: false,
+    cardTitle: "历史版本 · 版本 1",
+  }), { onAction: payload => calls.push(payload) });
+  const card = oneClass(root, "plan-card-details");
+  assert.equal(card.getAttribute("data-plan-card"), "history");
+  assert.equal(card.hasAttribute("open"), false);
+  assert.ok(oneClass(card, "plan-markdown").textContent.includes("PUE 专题报表"));
+  assert.ok(oneClass(root, "plan-status").textContent.includes("历史版本"));
+  for (const className of ["plan-action-select", "plan-other-input", "plan-other-submit"]) {
+    assert.equal(oneClass(card, className).disabled, true);
+  }
+  oneClass(card, "plan-action-select").change("confirm", { ignoreDisabled: true });
+  oneClass(card, "plan-other-input").value = "改写旧版本";
+  oneClass(card, "plan-other-submit").click({ ignoreDisabled: true });
+  assert.deepEqual(calls, []);
+});
+
+test("重绘与 clear 解绑旧卡片的选择、提交和键盘事件", () => {
+  const { root } = makeRoot();
+  const calls = [];
+  Plan.render(root, viewWith(), { onAction: payload => calls.push(payload) });
+  const stale = [oneClass(root, "plan-action-select"), oneClass(root, "plan-other-input"), oneClass(root, "plan-other-submit")];
+  Plan.render(root, viewWith({ reportPlan: { ...SAMPLE_PLAN, revision: 2 } }), {
+    onAction: payload => calls.push(payload),
+  });
+  const current = [oneClass(root, "plan-action-select"), oneClass(root, "plan-other-input"), oneClass(root, "plan-other-submit")];
+  current[0].change("confirm");
+  assert.equal(calls[0].basePlanRevision, 2);
+  Plan.clear(root);
+  for (const [select, input, submit] of [stale, current]) {
+    select.change("confirm", { ignoreDisabled: true });
+    select.change("modify", { ignoreDisabled: true });
+    input.value = "增加趋势";
+    submit.click({ ignoreDisabled: true });
+    input.dispatchEvent({ type: "keydown", key: "Enter", preventDefault() {} });
+  }
+  assert.equal(calls.length, 1);
+  assert.equal(textOf(root), "");
 });

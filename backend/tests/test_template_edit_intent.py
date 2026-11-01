@@ -545,7 +545,7 @@ def test_same_item_second_ask_is_still_blocked(post_chat, definition):
     """同一件事连问两次：第二次仍被额度上限挡住（只问一轮）。"""
     first = _post(post_chat, definition, "删除")
 
-    assert "你想删除哪个 section" in first["reply"], "第一轮应该真的抛出追问"
+    assert "你想删掉哪张卡片" in first["reply"], "第一轮应该真的抛出追问"
     assert first["uiActions"] != ["template_edit_clarification_limit"]
 
     second = _post(post_chat, definition, "删除")
@@ -565,7 +565,7 @@ def test_new_item_reopens_the_clarification_quota(post_chat, definition):
     """
     first = _post(post_chat, definition, "删除")
 
-    assert "你想删除哪个 section" in first["reply"]
+    assert "你想删掉哪张卡片" in first["reply"]
     assert session_service.load_clarification("conv_test").key.startswith(
         "DELETE_SECTION"
     )

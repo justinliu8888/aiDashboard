@@ -573,7 +573,7 @@ def test_pending_edit_menu_has_no_separate_inquiry_option(post_chat, definition)
     ).json()
 
     values = [option["value"] for option in payload["questions"][0]["options"]]
-    assert values == ["接受修改", "继续调整", "取消"]
+    assert values == ["接受修改", "撤回上一步", "继续修改"]
     assert "询问" not in values
 
 
@@ -583,7 +583,11 @@ def test_pending_edit_menu_has_no_separate_inquiry_option(post_chat, definition)
 
 
 def test_lock_scope_derivation_follows_the_contract():
-    """阶段判据：契约表 §5.2。"""
+    """阶段判据：契约表 §5.2。
+
+    判据是**有没有待答选项**：有选项就锁输入（用户得先选一个），
+    没有选项（纯文本题）就只锁菜单。显式给的值不被推导覆盖。
+    """
     design_menu = AgentQuestion(
         id="template_edit_confirm",
         prompt="请选择下一步操作：",
@@ -605,11 +609,18 @@ def test_lock_scope_derivation_follows_the_contract():
         selectionOnly=True,
         options=[{"value": "接受修改", "label": "接受修改"}],
     )
+    free_text_menu = AgentQuestion(
+        id="edit_reference_clarification",
+        prompt="请指出要改的卡片名称：",
+        expects="TEXT",
+    )
 
     assert design_menu.lockScope == LOCK_SCOPE_INPUT_AND_MENU
     assert pending_plan_menu.lockScope == LOCK_SCOPE_INPUT_AND_MENU
-    # 确认编辑后的草稿不是「等待下一步操作选择」→ 不锁输入。
-    assert edit_confirm_menu.lockScope == LOCK_SCOPE_MENU_ONLY
+    # 有待答选项的卡片一律锁输入。
+    assert edit_confirm_menu.lockScope == LOCK_SCOPE_INPUT_AND_MENU
+    # 没有选项的题（纯文本）不锁输入。
+    assert free_text_menu.lockScope == LOCK_SCOPE_MENU_ONLY
     # 显式给的值不被推导覆盖（老数据按 menu_only 处理）。
     explicit = AgentQuestion(
         id="template_edit_confirm",

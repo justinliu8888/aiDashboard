@@ -651,146 +651,6 @@
     return box;
   }
 
-  function renderTopic(doc, view) {
-    const box = makeBlock(doc, "div", "", "plan-topic-wrap");
-    const title = makeText(doc, "h3", STYLE.topic, view.topic || "（未命名方案）");
-    title.setAttribute("class", "plan-topic");
-    box.appendChild(title);
-    const metaParts = [];
-    if (view.planId) metaParts.push("方案 ID：" + view.planId);
-    if (view.revision !== null) metaParts.push("版本 " + view.revision);
-    if (metaParts.length) {
-      const meta = makeText(doc, "p", STYLE.meta, metaParts.join(" · "));
-      meta.setAttribute("class", "plan-meta");
-      box.appendChild(meta);
-    }
-    return box;
-  }
-
-  function renderRequirements(doc, view) {
-    const box = makeBlock(doc, "div", "", "plan-requirements");
-    box.appendChild(makeText(doc, "div", STYLE.blockTitle, "需求"));
-
-    const rows = [];
-    rows.push(["指标", view.metrics.length ? view.metrics.join("、") : "未指定"]);
-    rows.push(["对象", view.subject || "未指定"]);
-    rows.push(["时间范围", view.timeRange || "未指定"]);
-    rows.push(["排除项", view.exclusions.length ? view.exclusions.join("、") : "无"]);
-
-    for (const [key, value] of rows) {
-      const row = makeBlock(doc, "div", STYLE.row, "plan-requirement");
-      row.appendChild(makeText(doc, "span", STYLE.rowKey, key + "："));
-      row.appendChild(makeText(doc, "span", "", value));
-      box.appendChild(row);
-    }
-    return box;
-  }
-
-  function renderSections(doc, view) {
-    const box = makeBlock(doc, "div", "", "plan-sections");
-    box.appendChild(makeText(doc, "div", STYLE.blockTitle, "板块与图表建议"));
-
-    if (!view.sections.length) {
-      box.appendChild(makeText(doc, "div", STYLE.empty, "暂无板块。"));
-      return box;
-    }
-
-    for (const section of view.sections) {
-      const item = isPlainObject(section) ? section : {};
-      const card = makeBlock(doc, "div", STYLE.section, "plan-section");
-
-      const head = makeBlock(doc, "div", STYLE.sectionHead, "plan-section-head");
-      const title = makeText(doc, "span", STYLE.sectionTitle, safeText(item.title) || "（未命名板块）");
-      title.setAttribute("class", "plan-section-title");
-      head.appendChild(title);
-
-      const typeLabel = componentTypeLabel(item.componentType);
-      if (typeLabel) {
-        const tag = makeText(doc, "span", STYLE.tag, typeLabel);
-        tag.setAttribute("class", "plan-component-type");
-        tag.setAttribute("data-plan-component-type", safeText(item.componentType));
-        // 未知类型：标签上是中文兜底，原始 key 放进 title（悬停可见）——
-        // 既不把英文外露到界面上，又不把「后端加了新类型」这件事藏起来。
-        if (!isKnownComponentType(item.componentType)) {
-          tag.setAttribute("title", safeText(item.componentType));
-        }
-        head.appendChild(tag);
-      }
-
-      // 展示目的：用户想看什么（总量 / 趋势 / 对比 / 构成 / 明细）。
-      const intentLabel = displayIntentLabel(item.displayIntent);
-      if (intentLabel) {
-        const tag = makeText(doc, "span", STYLE.tag, intentLabel);
-        tag.setAttribute("class", "plan-display-intent");
-        tag.setAttribute("data-plan-display-intent", safeText(item.displayIntent));
-        // 未知取值：标签上是中文兜底，原始 key 放进 title（悬停可见）——
-        // 既不把英文外露到界面上，又不把「后端加了新枚举」这件事藏起来。
-        // 已知取值不加 title：它的中文已经是人话，原文在 data-* 里就够追溯了。
-        if (!isKnownDisplayIntent(item.displayIntent)) {
-          tag.setAttribute("title", safeText(item.displayIntent));
-        }
-        head.appendChild(tag);
-      }
-
-      // 用户明确指定的展示类型：与系统按意图选出的类型分开标，
-      // 免得把「用户指定」看成「系统自己决定的」。
-      const explicitLabel = componentTypeLabel(item.explicitComponentType);
-      if (explicitLabel) {
-        const tag = makeText(doc, "span", STYLE.tag, "用户指定：" + explicitLabel);
-        tag.setAttribute("class", "plan-explicit-type");
-        tag.setAttribute("data-plan-explicit-type", safeText(item.explicitComponentType));
-        // 同上：用户指定的类型不认识时，标签是中文兜底，原始 key 留在 title 里。
-        if (!isKnownComponentType(item.explicitComponentType)) {
-          tag.setAttribute("title", safeText(item.explicitComponentType));
-        }
-        head.appendChild(tag);
-      }
-      card.appendChild(head);
-
-      const intents = stringList(item.metricIntents);
-      const metrics = makeText(
-        doc,
-        "div",
-        STYLE.sectionMetrics,
-        "指标意图：" + (intents.length ? intents.join("、") : "未指定")
-      );
-      metrics.setAttribute("class", "plan-section-metrics");
-      card.appendChild(metrics);
-
-      // 选型理由：系统为什么这么画。没有这一项就不显示，不自造。
-      const reason = safeText(item.selectionReason);
-      if (reason) {
-        const reasonBox = makeText(doc, "div", STYLE.reason, "选型理由：" + reason);
-        reasonBox.setAttribute("class", "plan-selection-reason");
-        reasonBox.setAttribute("data-plan-selection-reason", reason);
-        card.appendChild(reasonBox);
-      }
-
-      // 表格板块声明的栏目：方案里写清楚这张表要展示哪些列。
-      const columns = Array.isArray(item.columns) ? item.columns : [];
-      if (columns.length) {
-        const columnBox = makeBlock(doc, "div", STYLE.columnBlock, "plan-columns");
-        columnBox.appendChild(makeText(doc, "div", STYLE.columnTitle, "栏目"));
-        const list = makeBlock(doc, "div", STYLE.columnList, "plan-column-list");
-        for (const column of columns) {
-          const chip = makeBlock(doc, "span", STYLE.column, "plan-column");
-          chip.setAttribute("data-plan-column-id", safeText(column.id));
-          chip.setAttribute("data-plan-column-field-ref", safeText(column.fieldRef));
-          // 给人看的是栏目名；取值键（fieldRef）是技术键，
-          // 放 title 里（悬停可见），不跟名字挤在一行 —— 窄栏里挤在一起会被拦腰截断。
-          if (safeText(column.fieldRef)) chip.setAttribute("title", safeText(column.fieldRef));
-          chip.appendChild(makeText(doc, "span", STYLE.columnLabel, safeText(column.label)));
-          list.appendChild(chip);
-        }
-        columnBox.appendChild(list);
-        card.appendChild(columnBox);
-      }
-
-      box.appendChild(card);
-    }
-    return box;
-  }
-
   // ---------------------------------------------------------------- 图表渲染
   //
   // renderChart 把一组数据点画成折线图（SVG）或柱条图。
@@ -880,100 +740,171 @@
     return box;
   }
 
-  function renderStringList(doc, title, items, className, note) {
-    const box = makeBlock(doc, "div", "", className);
-    box.appendChild(makeText(doc, "div", STYLE.blockTitle, title));
-    if (note) box.appendChild(makeText(doc, "p", STYLE.note, note));
-    if (!items.length) {
-      box.appendChild(makeText(doc, "div", STYLE.empty, "无。"));
-      return box;
-    }
-    const list = makeBlock(doc, "ul", STYLE.list, "plan-list");
-    for (const item of items) {
-      const li = makeBlock(doc, "li", STYLE.listItem, "plan-list-item");
-      li.appendChild(makeText(doc, "span", "", item));
-      list.appendChild(li);
-    }
-    box.appendChild(list);
-    return box;
+  function markdownLine(value) {
+    return safeText(value).replace(/[\r\n]+/g, " ");
   }
 
-  function renderSuggestions(doc, view) {
-    return renderStringList(
-      doc,
-      "未接受的额外建议",
-      view.suggestions,
-      "plan-suggestions",
-      "以下建议尚未接受，不会自动进入上方板块。"
-    );
-  }
-
-  function renderReferences(doc, view) {
-    const box = makeBlock(doc, "div", "", "plan-references");
-    box.appendChild(makeText(doc, "div", STYLE.blockTitle, "参考来源"));
-
-    if (!view.referenceTemplates.length) {
-      box.appendChild(makeText(doc, "div", STYLE.empty, "暂无参考来源。"));
-      return box;
-    }
-
-    const list = makeBlock(doc, "ul", STYLE.list, "plan-reference-list");
-    for (const template of view.referenceTemplates) {
-      const item = isPlainObject(template) ? template : {};
-      const li = makeBlock(doc, "li", STYLE.listItem, "plan-reference");
-      const name = safeText(item.name) || "(未命名来源)";
-      const version = typeof item.version === "number" && isFinite(item.version) ? " v" + item.version : "";
-      li.appendChild(makeText(doc, "span", "", name + version));
-      const reason = safeText(item.reason);
-      if (reason) {
-        li.appendChild(makeText(doc, "span", STYLE.sectionMetrics, "（" + reason + "）"));
+  function sectionAscii(section) {
+    const keys = section.metricIntents.map((_, index) => "K" + (index + 1));
+    switch (section.componentType) {
+      case "metric_card": {
+        const rows = [];
+        for (let i = 0; i < keys.length; i += 2) {
+          rows.push(keys.slice(i, i + 2).map(key => "[ " + key.padEnd(4) + " ]").join("  "));
+        }
+        return rows.join("\n") || "[ metric ]";
       }
-      list.appendChild(li);
+      case "line_chart":
+        return "value\n  |       *---*\n  |   *--*     *\n  |--*\n  +---------------- time";
+      case "bar_chart":
+        return "K1 | ######\nK2 | ##########\nK3 | ####\n   +-------------- value";
+      case "pie_chart":
+        return "composition\n+---------------------+\n|   K1   | K2 |  K3   |\n+---------------------+";
+      case "table": {
+        const cells = section.columns.map((_, index) => " C" + (index + 1) + " ");
+        if (!cells.length) return "[ table columns to be confirmed ]";
+        const rule = "+" + cells.map(cell => "-".repeat(cell.length)).join("+") + "+";
+        return rule + "\n|" + cells.join("|") + "|\n" + rule + "\n|" + cells.map(cell => " ".repeat(cell.length)).join("|") + "|\n" + rule;
+      }
+      default:
+        return "[ text / content ]";
     }
-    box.appendChild(list);
+  }
+
+  function planMarkdown(plan) {
+    const view = normalizeView({ reportPlan: plan });
+    const lines = ["# " + markdownLine(view.topic || "报表方案"), ""];
+    if (view.revision !== null) lines.push("版本：" + view.revision, "");
+    lines.push("## 需求", "",
+      "- 对象：" + markdownLine(view.subject || "未指定"),
+      "- 时间范围：" + markdownLine(view.timeRange || "未指定"),
+      "- 指标：" + (view.metrics.map(markdownLine).join("、") || "未指定"),
+      "- 排除项：" + (view.exclusions.map(markdownLine).join("、") || "无"),
+      "", "所有展示数据均为虚拟数据。", "", "## 板块与展示建议", "");
+    for (const [index, section] of view.sections.entries()) {
+      lines.push("### " + (index + 1) + ". " + markdownLine(section.title || "未命名板块"), "",
+        "- 展示方式：" + componentTypeLabel(section.componentType),
+        "- 指标：" + (section.metricIntents.map(markdownLine).join("、") || "未指定"));
+      if (section.displayIntent) lines.push("- 展示目的：" + displayIntentLabel(section.displayIntent));
+      if (section.explicitComponentType) lines.push("- 用户指定：" + componentTypeLabel(section.explicitComponentType));
+      if (section.selectionReason) lines.push("- 选择理由：" + markdownLine(section.selectionReason));
+      if (section.columns.length) lines.push("- 栏目：" + section.columns.map(c => markdownLine(c.label)).join("、"));
+      lines.push("", "布局示意（不代表数值）：", "", "```text", sectionAscii(section), "```", "");
+      section.metricIntents.forEach((label, i) => lines.push("- K" + (i + 1) + "：" + markdownLine(label)));
+      section.columns.forEach((column, i) => lines.push("- C" + (i + 1) + "：" + markdownLine(column.label)));
+      lines.push("");
+    }
+    if (!view.sections.length) lines.push("暂无板块。", "");
+    for (const [title, items] of [["假设", view.assumptions], ["未接受的额外建议", view.suggestions]]) {
+      lines.push("## " + title, "");
+      if (title === "未接受的额外建议") lines.push("以下建议尚未接受，不会自动进入上方板块。", "");
+      lines.push(...(items.length ? items.map(item => "- " + markdownLine(item)) : ["无。"]), "");
+    }
+    lines.push("## 参考来源", "");
+    for (const reference of view.referenceTemplates) {
+      if (!isPlainObject(reference)) continue;
+      lines.push("- " + markdownLine(reference.name || "未命名来源") +
+        (reference.version != null ? " v" + markdownLine(reference.version) : "") +
+        (reference.reason ? "：" + markdownLine(reference.reason) : ""));
+    }
+    if (!view.referenceTemplates.length) lines.push("暂无参考来源。");
+    return lines.join("\n") + "\n";
+  }
+
+  function renderPlanMarkdown(doc, view) {
+    const markdown = planMarkdown(view.reportPlan);
+    const box = makeBlock(doc, "article", "font-size:13px;line-height:1.75;", "plan-markdown");
+    let code = null;
+    let list = null;
+    for (const line of markdown.split("\n")) {
+      if (line.startsWith("```")) {
+        if (code) { code = null; } else {
+          code = makeBlock(doc, "pre", "font-family:monospace;white-space:pre;overflow:auto;padding:10px 0;margin:8px 0;line-height:1.5;", "plan-ascii");
+          box.appendChild(code);
+        }
+        list = null;
+        continue;
+      }
+      if (code) { code.textContent += line + "\n"; continue; }
+      if (!line) { list = null; continue; }
+      const heading = /^(#{1,3}) (.*)$/.exec(line);
+      if (heading) {
+        list = null;
+        const depth = heading[1].length;
+        box.appendChild(makeText(doc, "h" + depth, depth === 1 ? STYLE.topic : STYLE.blockTitle, heading[2]));
+      } else if (line.startsWith("- ")) {
+        if (!list) { list = makeBlock(doc, "ul", STYLE.list, ""); box.appendChild(list); }
+        list.appendChild(makeText(doc, "li", STYLE.listItem, line.slice(2)));
+      } else {
+        list = null;
+        box.appendChild(makeText(doc, "p", "margin:6px 0;", line));
+      }
+    }
+    const download = makeText(doc, "a", "display:inline-block;margin-top:10px;color:#2563eb;", "下载 .md 文件");
+    download.setAttribute("class", "plan-markdown-download");
+    download.setAttribute("download", (view.topic || "报表方案").replace(/[\\/:*?"<>|]/g, "_") + ".md");
+    download.setAttribute("href", "data:text/markdown;charset=utf-8," + encodeURIComponent(markdown));
+    box.appendChild(download);
     return box;
   }
 
   function renderActions(doc, view, state) {
     const box = makeBlock(doc, "div", STYLE.actions, "plan-actions");
-
-    // 模板中间页整页下线（#40）：这里**不再**有模板中间页的那两个按钮
-    // （确认 / 修改），也不换成任何提示语 —— 规格明写「不替换成单行模板提示」。
-    // 文字方案的「确认方案」入口保留（这是唯一的人工确认入口）。
+    box.setAttribute("style", "margin-top:16px;");
     const enabled = canConfirmNow(view);
-    const button = makeBlock(
-      doc,
-      "button",
-      enabled ? STYLE.button : STYLE.buttonDisabled,
-      "plan-confirm"
-    );
-    button.setAttribute("type", "button");
-    button.setAttribute(MODULE_ATTR, "confirm");
-    button.setAttribute("data-plan-can-confirm", enabled ? "true" : "false");
-    button.textContent = "确认方案";
-    button.disabled = !enabled;
-    if (!enabled) {
-      if (view.isHistory) {
-        // 历史卡片：入口**失效**（只是引导，真正的边界在后端的版本校验 —— 契约表 §8 不变量 6）。
-        button.setAttribute("title", HISTORY_CONFIRM_HINT);
-      } else {
-        button.setAttribute("title", view.busy ? "处理中，暂不可确认方案" : "当前不可确认方案");
-      }
+    const select = makeBlock(doc, "select", "width:100%;padding:9px 12px;border:1px solid #cbd5e1;border-radius:8px;background:white;font-size:13px;", "plan-action-select");
+    select.setAttribute("aria-label", "方案操作");
+    select.disabled = !enabled;
+    for (const [value, label] of [["", "请选择方案操作"], ["confirm", "确认方案"], ["modify", "其他修改"]]) {
+      const option = makeText(doc, "option", "", label);
+      option.setAttribute("value", value);
+      select.appendChild(option);
     }
-
-    // 点击时再查一次当前状态：即便 DOM 被绕过（disabled 被强制触发），
-    // 也不会在没有确认资格时把确认动作发出去。
-    const handler = function () {
+    const other = makeBlock(doc, "div", "margin-top:10px;", "plan-other-answer");
+    other.hidden = true;
+    const input = makeBlock(doc, "textarea", "box-sizing:border-box;width:100%;padding:9px 12px;border:1px solid #cbd5e1;border-radius:8px;font:inherit;resize:vertical;", "plan-other-input");
+    input.setAttribute("rows", "3");
+    input.setAttribute("placeholder", "说说这份方案应该怎么改…");
+    input.setAttribute("aria-label", "方案修改要求");
+    input.disabled = !enabled;
+    const submit = makeText(doc, "button", enabled ? STYLE.button : STYLE.buttonDisabled, "提交修改");
+    submit.setAttribute("class", "plan-other-submit");
+    submit.setAttribute("type", "button");
+    submit.disabled = !enabled;
+    const error = makeText(doc, "div", STYLE.hint, "");
+    error.setAttribute("role", "status");
+    other.appendChild(input);
+    other.appendChild(submit);
+    other.appendChild(error);
+    const submitOther = function () {
       if (!state.confirmable()) return;
-      const payload = confirmPayload(state.view);
-      if (!payload) return;
-      state.emit(payload);
+      const text = String(input.value || "").trim();
+      if (!text) { error.textContent = "请先填写修改要求。"; return; }
+      state.emit({ designAction: "MODIFY_PLAN", planId: view.planId, basePlanRevision: view.revision, text });
     };
-    button.addEventListener("click", handler);
-    state.listeners.push({ node: button, type: "click", handler: handler });
-
-    box.appendChild(button);
-
+    const changed = function () {
+      if (!state.confirmable()) return;
+      other.hidden = select.value !== "modify";
+      if (select.value === "modify") {
+        input.focus();
+        other.scrollIntoView?.({ block: "nearest" });
+      }
+      if (select.value === "confirm") {
+        const payload = confirmPayload(state.view);
+        if (payload) state.emit(payload);
+      }
+    };
+    const keydown = function (event) {
+      if (event.isComposing) return;
+      if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submitOther(); }
+    };
+    const edited = function () { error.textContent = ""; };
+    for (const [node, type, handler] of [[select, "change", changed], [submit, "click", submitOther], [input, "keydown", keydown], [input, "input", edited]]) {
+      node.addEventListener(type, handler);
+      state.listeners.push({ node, type, handler });
+    }
+    box.appendChild(select);
+    box.appendChild(other);
     if (view.isHistory) {
       box.appendChild(makeText(doc, "span", STYLE.hint, HISTORY_CONFIRM_HINT));
     } else if (view.busy) {
@@ -994,12 +925,7 @@
     details.setAttribute("data-plan-collapsed", view.planExpanded ? "false" : "true");
     if (view.planExpanded) details.setAttribute("open", "");
     details.appendChild(makeText(doc, "summary", STYLE.blockTitle, "查看已确认的文字方案"));
-    details.appendChild(renderTopic(doc, view));
-    details.appendChild(renderRequirements(doc, view));
-    details.appendChild(renderSections(doc, view));
-    details.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
-    details.appendChild(renderSuggestions(doc, view));
-    details.appendChild(renderReferences(doc, view));
+    details.appendChild(renderPlanMarkdown(doc, view));
     return details;
   }
 
@@ -1031,12 +957,7 @@
     }
 
     // 待确认阶段：文字方案完整展开，末尾跟动作区。
-    body.appendChild(renderTopic(doc, view));
-    body.appendChild(renderRequirements(doc, view));
-    body.appendChild(renderSections(doc, view));
-    body.appendChild(renderStringList(doc, "假设", view.assumptions, "plan-assumptions", null));
-    body.appendChild(renderSuggestions(doc, view));
-    body.appendChild(renderReferences(doc, view));
+    body.appendChild(renderPlanMarkdown(doc, view));
     body.appendChild(renderActions(doc, view, state));
     return body;
   }
@@ -1196,6 +1117,7 @@
     //  ECharts 可用时走 ECharts，ECharts 不可用时才落到这里画 SVG）。
     // 需求稿 §3.3 点名保护这段代码，不得因为「没有调用方」而删掉。
     renderChart,
+    planMarkdown,
     render,
     clear,
   };

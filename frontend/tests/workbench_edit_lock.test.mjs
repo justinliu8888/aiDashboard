@@ -367,7 +367,7 @@ function loadSyncApi(dom) {
       // syncInputControls 里的 $ 与 document 由用例注入。
       "var $ = function (id) { return document.getElementById(id); };",
     ],
-    globals: { document: dom.document },
+    globals: { document: dom.document, hasPendingPlan: () => false },
   });
   return sandbox;
 }
@@ -400,28 +400,28 @@ test("syncInputControls：选了「修改」之后（菜单失效）输入框恢
   assert.equal(dom.quick.disabled, false);
 });
 
-test("syncInputControls：只有菜单锁（menu_only）时输入框仍然可用", () => {
+test("syncInputControls：menu_only 菜单也锁普通聊天，只能从卡片回答", () => {
   const dom = makeWorkbenchDom();
   const sandbox = loadSyncApi(dom);
   sandbox.lockedChoice = { id: "template_edit_confirm", lockScope: "menu_only", options: [{ value: "同意" }] };
 
   sandbox.__api.syncInputControls();
 
-  assert.equal(dom.input.disabled, false);
-  assert.equal(dom.send.disabled, false);
-  assert.equal(dom.input.placeholder, "可以先问只读问题，或从上方下拉框选择");
+  assert.equal(dom.input.disabled, true);
+  assert.equal(dom.send.disabled, true);
+  assert.equal(dom.input.placeholder, "请先选择下一步操作");
   assert.equal(dom.quick.disabled, true, "有菜单时快捷入口仍然不给点");
 });
 
-test("syncInputControls：老会话的菜单（没有 lockScope）不锁输入", () => {
+test("syncInputControls：老会话菜单没有 lockScope 也锁普通聊天", () => {
   const dom = makeWorkbenchDom();
   const sandbox = loadSyncApi(dom);
   sandbox.lockedChoice = OLD_MENU_WITHOUT_LOCK_SCOPE;
 
   sandbox.__api.syncInputControls();
 
-  assert.equal(dom.input.disabled, false);
-  assert.equal(dom.send.disabled, false);
+  assert.equal(dom.input.disabled, true);
+  assert.equal(dom.send.disabled, true);
 });
 
 // ==========================================================================
@@ -439,4 +439,3 @@ test("页面里没有独立的「询问」按钮（要继续咨询先选「继�
   // 「继续调整」这个入口是既有的（待确认修改计划的三个选项之一）。
   assert.equal(js.includes("继续调整"), true);
 });
-

@@ -479,6 +479,7 @@ function renderPlanModule() {
     planCards.current = null;
     planBubble = null;
     planRoot = null;
+    syncInputControls();
     return;
   }
   const { root, fresh } = mountPlanHost();
@@ -519,6 +520,8 @@ function renderPlanModule() {
     };
   }
   if (fresh) anchorPlanBubble();
+  // The response can add a menu after request cleanup has unlocked ordinary chat.
+  syncInputControls();
 }
 
 /**
@@ -710,8 +713,14 @@ function restorePlanVersions(snapshot, versions) {
 /** 确认回调：模块只交回意图，真正的请求由上层发。 */
 function handlePlanAction(action) {
   if (isBusy() || !action) return;
-  if (!action || action.designAction !== "CONFIRM_PLAN") return;
   if (!planCanConfirm()) return;
+  if (action.planId !== planState.reportPlan?.id || action.basePlanRevision !== planState.reportPlan?.revision) return;
+  if (action.designAction === "MODIFY_PLAN") {
+    const text = String(action.text || "").trim();
+    if (text) sendMessage(text, { fromPlan: true });
+    return;
+  }
+  if (action.designAction !== "CONFIRM_PLAN") return;
   sendMessage("确认", {
     designAction: {
       designAction: "CONFIRM_PLAN",
@@ -743,6 +752,11 @@ function isBusy() {
 //   none            不锁
 //   menu_only       只锁下拉框与快捷入口；输入框与发送按钮保持可用
 //   input_and_menu  输入框 + 发送按钮 + Enter + 快捷入口 + 下拉框全锁
+//
+// 「下拉框锁」的实现口径：**下拉框锁定到当前有效菜单** —— 页面上只有那份
+// 有效菜单的下拉框能点，其余下拉框（历史轮回放出来的）一律禁用。
+// 有效菜单自己的下拉框必须留着可点：它是这张卡唯一的作答入口，
+// 把它也锁死，用户就一条路都走不通了。
 //
 // 「模板已生成、等待下一步操作选择」这一阶段服务端写 input_and_menu；
 // 老会话的菜单没有这个键 → 按 menu_only 处理（等于今天的行为）。
@@ -778,22 +792,26 @@ function isInputLocked(question) {
  * 单独抽成一个纯函数：界面锁定只是**引导**（规格第 56 条），
  * 真正的边界在后端对确认与权限的校验。这里只决定「看起来能不能打字」。
  */
-function inputControlState(lockedChoice, busy) {
+function inputControlState(lockedChoice, busy, planWaiting = false) {
   const scope = lockScopeOf(lockedChoice);
-  const locked = scope === LOCK_SCOPE_INPUT_AND_MENU;
+  const locked = scope === LOCK_SCOPE_INPUT_AND_MENU || Boolean(lockedChoice?.options?.length) || lockedChoice?.allowsOther === true || planWaiting;
   return {
     scope,
     inputLocked: locked,
     inputDisabled: Boolean(busy) || locked,
     sendDisabled: Boolean(busy) || locked,
-    quickDisabled: Boolean(busy) || Boolean(lockedChoice),
+    quickDisabled: Boolean(busy) || Boolean(lockedChoice) || planWaiting,
     placeholder: locked
-      ? INPUT_LOCK_HINT
+      ? (planWaiting ? "请在方案卡片内确认或填写修改要求" : INPUT_LOCK_HINT)
       : lockedChoice
         ? "可以先问只读问题，或从上方下拉框选择"
         : "描述报表需求，或输入修改要求…",
-    hint: locked ? INPUT_LOCK_HINT : "",
+    hint: locked ? (planWaiting ? "请在方案卡片内确认或填写修改要求" : INPUT_LOCK_HINT) : "",
   };
+}
+
+function hasPendingPlan() {
+  return planState.designPhase === "PLAN_WAITING_CONFIRM" && Boolean(planState.reportPlan?.id);
 }
 
 // 锁住时在输入框下面挂一条**看得见**的提示。
@@ -817,15 +835,9 @@ function syncInputLockHint(controls) {
 
 function syncInputControls() {
   const busy = isBusy();
-  const controls = inputControlState(lockedChoice, busy);
+  const controls = inputControlState(lockedChoice, busy, hasPendingPlan());
   const input = $("chat-input");
-  // 待确认菜单存在时**不锁输入**：只读提问要能发出去（工单 02 / 规格 #12）。
-  // 旧版本在这里把输入整个锁死，用户在待确认期间问一句都问不了。
-  // 执行侧的约束由后端负责——自由输入不能绕过接受修改 / 确认报表。
-  //
-  // 例外只有一个：服务端说「现在正等下一步操作选择」（lockScope=
-  // input_and_menu）时，输入框、发送按钮与 Enter 一起锁住，并提示
-  // 「请先选择下一步操作」（规格第 74~76 条）。
+  // Pending choices are answered inside their card, never through ordinary chat.
   input.disabled = controls.inputDisabled;
   input.placeholder = controls.placeholder;
   const send = $("btn-send");
@@ -854,11 +866,39 @@ function syncInputControls() {
   }
   selects.forEach((select, index) => {
     const isActive = activeIndex >= 0 ? index === activeIndex : index === selects.length - 1;
-    select.disabled = busy || !lockedChoice?.options?.length || !isActive;
+    select.disabled = busy || !(lockedChoice?.options?.length || lockedChoice?.allowsOther) || !isActive;
   });
+  // 「重新开始」入口跟下拉框同一条规则：只有当前有效菜单那一个能点。
   const restarts = document.querySelectorAll(".question-restart");
+  let menuRestartIndex = -1;
+  if (activeId) {
+    for (let i = restarts.length - 1; i >= 0; i--) {
+      if (restarts[i].dataset.questionId === activeId) {
+        menuRestartIndex = i;
+        break;
+      }
+    }
+  }
   restarts.forEach((button, index) => {
-    button.disabled = busy || !lockedChoice?.options?.length || index !== restarts.length - 1;
+    const isActive = menuRestartIndex >= 0 ? index === menuRestartIndex : index === restarts.length - 1;
+    button.disabled = busy || !lockedChoice?.options?.length || !isActive;
+  });
+  // 「其他」输入框：只对**当前待答**的那张卡开放。
+  // 已经答过的卡、历史回放出来的卡，输入框与提交按钮都是灰的 ——
+  // 答案只能写进正在等的那张卡（刷新后由服务端 pending_choice 恢复，同样只开一张）。
+  document.querySelectorAll("[data-question-other]").forEach((box) => {
+    const isCurrent = box.dataset.questionOther === (lockedChoice?.id || "") &&
+      box._questionSelect === selects[activeIndex] && Boolean(box.dataset.answerMode);
+    const input = box.querySelector(".question-other-input");
+    const submit = box.querySelector(".question-other-submit");
+    if (input) {
+      input.disabled = busy || !isCurrent;
+      input.classList.toggle("opacity-50", input.disabled);
+    }
+    if (submit) {
+      submit.disabled = busy || !isCurrent;
+      submit.classList.toggle("opacity-50", submit.disabled);
+    }
   });
 }
 
@@ -1021,12 +1061,37 @@ function toast(msg) {
 }
 
 // -------- 状态更新 --------
+//
+// 状态机取值是**内部枚举**（``ANALYZING`` / ``WAITING_USER_CONFIRM``…），
+// 直接摆在界面上用户读不懂。这里换成业务说法。
+const STATE_LABELS = {
+  IDLE: "空闲",
+  ANALYZING: "正在生成",
+  NEEDS_CLARIFICATION: "等你补充信息",
+  BLOCKED_OR_UNSUPPORTED: "当前做不到",
+  WAITING_USER_CONFIRM: "等你确认",
+  USER_EDITING_TEMPLATE: "等你提修改要求",
+  DEFINITION_DRAFT_READY: "草稿已就绪",
+  SAVE_DEFINITION_DRAFT: "正在保存草稿",
+  VALIDATING: "正在校验",
+  VALIDATION_FAILED: "校验没通过",
+  PREVIEWING: "正在预览",
+  PREVIEW_READY: "预览已就绪",
+  RENDERING: "正在渲染",
+  READY: "已就绪",
+};
+
+/** 状态 → 业务说法。未知取值回落成「处理中」，不把英文枚举露出去。 */
+function stateDisplayLabel(state) {
+  const key = String(state || "").trim().toUpperCase();
+  if (!key) return "空闲";
+  return Object.prototype.hasOwnProperty.call(STATE_LABELS, key) ? STATE_LABELS[key] : "处理中";
+}
+
 function setState(state) {
   session.state = state;
   const badge = $("state-badge");
-  const footer = $("footer-state");
-  badge.textContent = state;
-  footer.textContent = state;
+  badge.textContent = stateDisplayLabel(state);
 
   // 编辑入口的显隐跟着状态走（选了「修改」才出现）。
   syncPreviewEditability();
@@ -1046,7 +1111,7 @@ function setState(state) {
     RENDERING: "bg-indigo-50 text-indigo-700 border-indigo-200",
     READY: "bg-emerald-50 text-emerald-700 border-emerald-200",
   };
-  badge.className = "inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border mono " + (palette[state] || palette.ANALYZING);
+  badge.className = "inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border " + (palette[state] || palette.ANALYZING);
 }
 
 // --------------------------------------------------------------------------
@@ -1086,8 +1151,10 @@ const DRAFT_BADGE_TONES = {
 };
 
 function updateMeta() {
-  $("meta-rev").textContent = session.baseDefinitionRevision ?? "—";
-  $("meta-session").textContent = session.designSessionId ?? "—";
+  // 顶栏只说业务状态：版本号、会话 id 这类内部标识不摆给用户看。
+  // 草稿的版本（编辑链版本号）仍然记在会话状态里，回传时要用它做过期校验 ——
+  // 但那是给服务端看的，不是给用户看的。
+  $("meta-rev").textContent = session.definition ? "已生成，可继续修改" : "尚未生成";
 
   const draftBadge = $("draft-badge");
   const view = draftBadgeView();
@@ -1127,8 +1194,8 @@ function appendAiText(text) {
 function appendDebugTrace({ text, state, isAdvance }) {
   const title = isAdvance ? "自动推进 Debug Trace" : "请求 Debug Trace";
   const wrap = aiBubble(`
-    <div class="debug-card rounded-xl rounded-tl-sm border border-slate-200 bg-white overflow-hidden">
-      <button type="button" data-debug-toggle class="debug-header flex w-full items-center justify-between gap-2 px-3.5 py-2.5 bg-slate-50 border-b border-slate-200 text-left cursor-pointer select-none hover:bg-slate-100 transition-colors" aria-expanded="true">
+    <div class="debug-card is-collapsed rounded-xl rounded-tl-sm border border-slate-200 bg-white overflow-hidden">
+      <button type="button" data-debug-toggle class="debug-header flex w-full items-center justify-between gap-2 px-3.5 py-2.5 bg-slate-50 border-b border-slate-200 text-left cursor-pointer select-none hover:bg-slate-100 transition-colors" aria-expanded="false">
         <div class="flex items-center gap-2 min-w-0">
           <iconify-icon class="text-slate-500 shrink-0" icon="mdi:timeline-clock-outline"></iconify-icon>
           <span class="text-xs font-semibold text-slate-700 truncate">${esc(title)}</span>
@@ -1336,6 +1403,161 @@ function finishDebugTrace(card, status) {
       : "debug-status rounded-full bg-rose-50 text-rose-700 border border-rose-100 text-[10px] px-2 py-0.5";
 }
 
+// --------------------------------------------------------------------------
+// 「其他」：问题卡片里的自由文本（这是**这张卡片**的回答）
+// --------------------------------------------------------------------------
+//
+// 服务端在菜单上给 allowsOther=true 时，这张卡片除了选项列表，还提供
+// 一个「其他」入口与一个**卡片内**的输入框：用户在里面写的内容按
+// **这张卡片的答案（纠正）**处理 —— 承接上文的同一个待办，不是另一条
+// 无关消息（需求采访第二轮第 2、3 条）。
+//
+// 「其他」是下拉入口，选择后才展开输入；空内容不提交。
+//
+// 提交走既有的 sendMessage 通道，并带 fromChoice —— 那就是「这是该卡片的
+// 回答」的既有标识。后端按「消息文本不在选项里 + 这张卡允许其他」把它
+// 认成纠正，**不新增协议字段**。
+//
+// 输入框的启用状态跟着**当前待答的那张卡**走（见 syncInputControls）：
+// 已经答过的卡、历史回放出来的卡，输入框是灰的 —— 只有当前那张待答卡
+// 能写。刷新之后由服务端 pending_choice 恢复，同样只开当前那张。
+// --------------------------------------------------------------------------
+
+/** 「其他」这一项的显示文案（服务端没给就用默认的「其他」）。 */
+function otherAnswerLabel(question) {
+  const label = String(question?.otherLabel || "").trim();
+  return label || "其他";
+}
+
+/** 卡片内输入框的提示文案（服务端没给就不写提示）。 */
+function otherAnswerPlaceholder(question) {
+  return String(question?.otherPlaceholder || "").trim();
+}
+
+const OTHER_ANSWER_VALUE = "__question_other__";
+
+function inlineAnswerAction(question, value) {
+  const option = question?.options?.find((item) => String(item.value ?? item.label) === value);
+  const label = String(option?.label ?? value);
+  if (question?.allowsOther === true &&
+      (value === OTHER_ANSWER_VALUE || label === otherAnswerLabel(question) || /^(其他|OTHER)$/i.test(value))) {
+    return "other";
+  }
+  if (question?.inlineEdit === true && /^(修改|继续修改|继续调整)$/.test(label)) return "edit";
+  return "";
+}
+
+function renderQuestionOptions(question) {
+  const options = (question.options || []).filter((option) => inlineAnswerAction(question, String(option.value ?? option.label)) !== "other");
+  return options.map((option) => `<option value="${esc(option.value ?? option.label)}">${esc(option.label ?? option.value)}</option>`).join("") +
+    (question.allowsOther === true ? `<option value="${OTHER_ANSWER_VALUE}">${esc(otherAnswerLabel(question))}</option>` : "");
+}
+
+function bindQuestionSelects(container, questions) {
+  container.querySelectorAll(".question-select").forEach((select) => {
+    const question = questions.find((item) => item.id === select.dataset.questionId);
+    if (!question) return;
+    const box = Array.from(container.querySelectorAll(".question-other")).find((item) => item.dataset.questionOther === question.id);
+    if (box) box._questionSelect = select;
+    select.addEventListener("change", () => {
+      if (select.disabled || isBusy() || lockedChoice?.id !== question.id) return;
+      const mode = inlineAnswerAction(question, select.value);
+      if (box) {
+        box.dataset.answerMode = mode;
+        box.dataset.editAction = mode === "edit" ? select.value : "";
+        box.classList.toggle("hidden", !mode);
+        const label = box.querySelector(".question-other-label");
+        if (label) label.textContent = mode === "edit" ? "修改要求" : otherAnswerLabel(question);
+        const input = box.querySelector(".question-other-input");
+        if (input) input.placeholder = mode === "edit" ? "请填写具体修改要求" : otherAnswerPlaceholder(question);
+      }
+      syncInputControls();
+      if (mode) box?.querySelector(".question-other-input")?.focus();
+      else if (select.value) sendMessage(select.value, { fromChoice: true });
+    });
+  });
+}
+
+/** 「其他」区块的 HTML。服务端没给 allowsOther 就返回空串（不画这个区块）。 */
+function renderOtherAnswerHtml(question) {
+  if (question?.allowsOther !== true && question?.inlineEdit !== true) return "";
+  return `
+    <div class="question-other hidden mt-2 pt-2 border-t border-amber-100" data-question-other="${esc(question.id || "")}">
+      <div class="question-other-label text-[11px] text-amber-800 mb-1">${esc(otherAnswerLabel(question))}</div>
+      <div class="flex items-center gap-2">
+        <input type="text" disabled class="question-other-input flex-1 min-w-0 rounded-md border border-amber-200 bg-white px-2 py-1.5 text-xs text-slate-700 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-100" placeholder="${esc(otherAnswerPlaceholder(question))}" />
+        <button type="button" disabled class="question-other-submit shrink-0 rounded-md border border-amber-200 bg-amber-50 hover:bg-amber-100 text-amber-800 text-xs px-2 py-1.5">提交</button>
+      </div>
+      <div class="question-other-hint hidden text-[11px] text-amber-700 mt-1"></div>
+    </div>`;
+}
+
+/** 「其他」输入框下面那行提示（说清为什么没提交上去）。 */
+function showOtherAnswerHint(hint, text) {
+  if (!hint) return;
+  hint.textContent = text;
+  hint.classList.remove("hidden");
+}
+
+/**
+ * 「其他」输入框的交互。
+ *
+ * - Enter **只**提交这张卡的文本：事件在输入框上拦下，不冒泡成页面级发送；
+ * - 提交后清空输入框、禁用输入框与提交按钮：这张卡已经答过；
+ *   服务端给出新菜单时整张卡会被换掉。
+ */
+function bindOtherAnswers(container) {
+  const boxes = container?.querySelectorAll?.(".question-other") || [];
+  Array.prototype.forEach.call(boxes, (box) => {
+    const questionId = String(box.dataset?.questionOther || "");
+    const input = box.querySelector(".question-other-input");
+    const submit = box.querySelector(".question-other-submit");
+    const hint = box.querySelector(".question-other-hint");
+    if (!input || !submit) return;
+
+    const submitAnswer = async () => {
+      if (input.disabled || submit.disabled || isBusy() || !box.dataset.answerMode || box._questionSelect?.disabled) return;
+      const text = String(input.value || "").trim();
+      if (!text) {
+        showOtherAnswerHint(hint, "先写下你的想法，再提交。");
+        input.focus();
+        return;
+      }
+      // 只有**当前待答**的那张卡才认这个输入框：已经答过的卡与历史回放
+      // 出来的卡都不该把答案发到现在的待办上。
+      if (lockedChoice?.id !== questionId) {
+        showOtherAnswerHint(hint, "请先回答当前待确认的那张卡片。");
+        return;
+      }
+      if (hint) hint.classList.add("hidden");
+      // 这张卡已经答过：先禁掉，别重复提交。
+      input.disabled = true;
+      submit.disabled = true;
+      input.classList.add("opacity-50");
+      submit.classList.add("opacity-50");
+      // fromChoice = 这是**这张卡片**的回答（不是另一条普通聊天）。
+      const epoch = requestEpoch;
+      const result = box.dataset.answerMode === "edit"
+        ? (lockedChoice.inlineEditStarted
+          ? await sendMessage(text, { fromChoice: true, fromInline: true })
+          : await sendMessage(box.dataset.editAction, { fromChoice: true, inlineEditText: text }))
+        : await sendMessage(text, { fromChoice: true, fromOther: true });
+      if (epoch !== requestEpoch) return;
+      if (result && !result.error) input.value = "";
+      syncInputControls();
+    };
+
+    submit.addEventListener("click", submitAnswer);
+    input.addEventListener("keydown", (event) => {
+      // 卡片内的按键不冒泡：Enter 只提交这张卡的文本。
+      event.stopPropagation();
+      if (event.key !== "Enter" || event.shiftKey) return;
+      event.preventDefault();
+      submitAnswer();
+    });
+  });
+}
+
 // 草稿确认阶段只接受后端给出的单选值；选“修改”后才开放编辑输入。
 // lock=false 用于回放历史消息：渲染出选项卡，但不抢占当前输入锁
 // 返回值：实际画出来的业务菜单（没有菜单时返回 null），供历史回放判断菜单是否仍然有效。
@@ -1349,22 +1571,22 @@ function appendConfirmActions(question, { lock = true } = {}) {
     }
     return null;
   }
+  question = { ...question, inlineEdit: true };
   const wrap = aiBubble(`
     <div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3">
       <label class="block text-sm text-slate-700 leading-relaxed mb-2.5">${esc(question.prompt || "请先选择如何处理当前草稿：")}</label>
       <select class="question-select w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700" data-question-id="${esc(question.id || "")}">
         <option value="">请选择</option>
-        ${question.options.map((option) => `<option value="${esc(option.value ?? option.label)}">${esc(option.label ?? option.value)}</option>`).join("")}
+        ${renderQuestionOptions(question)}
       </select>
+      ${renderOtherAnswerHtml(question)}
     </div>
   `);
   if (lock) setChoiceLock(question);
   else businessMenuReplayed = true;
-  wrap.querySelector(".question-select").addEventListener("change", (event) => {
-    if (lockedChoice?.id === question?.id && event.target.value) {
-      sendMessage(event.target.value, { fromChoice: true });
-    }
-  });
+  bindQuestionSelects(wrap, [question]);
+  bindOtherAnswers(wrap);
+  syncInputControls();
   return question;
 }
 
@@ -1385,6 +1607,10 @@ function normalizeConfirmQuestion(question) {
     allowRestart: !!question.allowRestart,
     // 锁的范围跟着菜单一起走（契约表 §5）：归一化不能把锁弄丢。
     lockScope: question.lockScope,
+    // 「其他」也一起带过去：归一化不能把卡片内自由文本的入口弄丢。
+    allowsOther: question.allowsOther === true,
+    otherLabel: question.otherLabel,
+    otherPlaceholder: question.otherPlaceholder,
     options,
   };
 }
@@ -1445,18 +1671,37 @@ function appendAiQuestions(questions, { lock = true } = {}) {
     if (lock) appendAiText("暂时没有需要补充的信息，请直接描述你的报表需求。");
     return;
   }
+  // 回答方式 → 业务说法。
+  //
+  // 原来这里直接渲染 `q.expects`（`SINGLE_CHOICE` / `TEXT` …）——
+  // 那是内部枚举，用户读不懂。改成用户看得懂的说法：
+  //   - 已知取值 → 一句话说明这里要填什么；
+  //   - 未知取值 → **不回落英文 key**（英文 key 正是要藏的东西），不显示这一行。
+  const EXPECTS_LABELS = {
+    SINGLE_CHOICE: "选一项",
+    MULTI_CHOICE: "可以选多项",
+    TEXT: "直接填写",
+    DATE_RANGE: "选择日期范围",
+  };
+  const expectsLabel = (raw) => {
+    const key = String(raw == null ? "" : raw).trim().toUpperCase();
+    if (!key) return "";
+    return Object.prototype.hasOwnProperty.call(EXPECTS_LABELS, key) ? EXPECTS_LABELS[key] : "";
+  };
+  // 待答的那张卡（要抢选择锁的那一张）。
+  const required = list.find((q) => (q.selectionOnly || q.allowsOther) && (q.options?.length || q.allowsOther));
   const html = list
     .map((q) => {
-      const useSelect = q.selectionOnly;
+      const useSelect = q.selectionOnly || q.allowsOther;
       let controls = "";
-      if (q.options?.length && useSelect) {
+      if (useSelect && (q.options?.length || q.allowsOther)) {
         controls = `
           <div class="question-select-wrap flex items-center gap-2 mt-2">
             <select class="question-select flex-1 min-w-0 rounded-md border border-amber-200 bg-white px-2 py-1.5 text-xs text-slate-700" data-question-id="${esc(q.id || "")}">
               <option value="">请选择</option>
-              ${q.options.map((o) => `<option value="${esc(o.value || o.label)}">${esc(o.label)}</option>`).join("")}
+              ${renderQuestionOptions(q)}
             </select>
-            ${q.allowRestart ? '<button class="question-restart shrink-0 text-xs text-amber-800 underline" type="button">重新开始</button>' : ""}
+            ${q.allowRestart ? `<button class="question-restart shrink-0 text-xs text-amber-800 underline" type="button" data-question-id="${esc(q.id || "")}">重新开始</button>` : ""}
           </div>`;
       } else if (q.options?.length) {
         controls = `<div class="flex flex-wrap gap-1 mt-2">${q.options
@@ -1466,11 +1711,13 @@ function appendAiQuestions(questions, { lock = true } = {}) {
           )
           .join("")}</div>`;
       }
+      const hint = [expectsLabel(q.expects), q.required ? "必填" : ""].filter(Boolean).join(" · ");
       return `
         <div class="px-3.5 py-2.5 border border-amber-200 bg-white rounded-lg">
           <div class="font-medium text-amber-800 text-sm">${esc(q.prompt || q.text || "请选择：")}</div>
-          <div class="text-[11px] text-slate-500 mt-1">${esc(q.expects)}${q.required ? " · 必填" : ""}</div>
+          ${hint ? `<div class="text-[11px] text-slate-500 mt-1">${esc(hint)}</div>` : ""}
           ${controls}
+          ${renderOtherAnswerHtml(q)}
         </div>`;
     })
     .join("");
@@ -1488,21 +1735,17 @@ function appendAiQuestions(questions, { lock = true } = {}) {
   wrap.querySelectorAll(".opt-btn").forEach((btn) => {
     btn.addEventListener("click", () => sendMessage(btn.dataset.answer));
   });
-  const required = list.find((q) => q.selectionOnly && q.options?.length);
   if (required && lock) setChoiceLock(required);
-  wrap.querySelectorAll(".question-select").forEach((select) => {
-    select.addEventListener("change", () => {
-      // 用 id 判定而不是对象引用：恢复历史会话时回放出来的是新对象
-      if (select.value && lockedChoice?.id === select.dataset.questionId) {
-        sendMessage(select.value, { fromChoice: true });
-      }
-    });
-  });
+  bindQuestionSelects(wrap, list);
   wrap.querySelectorAll(".question-restart").forEach((button) => {
     button.addEventListener("click", () => {
       if (lockedChoice?.id === required?.id) sendMessage("重新开始", { fromChoice: true });
     });
   });
+  // 「其他」：卡片内自由文本。启用状态由 syncInputControls 按
+  // 「当前待答的那张卡」统一管（历史回放出来的卡是灰的）。
+  bindOtherAnswers(wrap);
+  syncInputControls();
 }
 
 // -------- 只读问答的展示 --------
@@ -1628,7 +1871,6 @@ function appendAiChangeSet(changeSet, { interactive = true } = {}) {
     <div class="px-3.5 py-2.5 bg-fuchsia-50 border-b border-fuchsia-100 flex items-center gap-2">
       <iconify-icon class="text-fuchsia-700" icon="mdi:file-swap-outline"></iconify-icon>
       <span class="text-sm font-semibold text-fuchsia-900">AI 变更确认</span>
-      <span class="text-[10px] text-fuchsia-700 bg-white border border-fuchsia-200 rounded px-1.5 py-px ml-auto">baseRev=${changeSet.baseDefinitionRevision}</span>
     </div>`;
 
   if (!interactive) {
@@ -1913,8 +2155,13 @@ function pendingEditMenuQuestion(question, options) {
   return {
     id: question?.id || "pending_edit_plan_confirm",
     selectionOnly: true,
+    inlineEdit: true,
     options,
     lockScope: question?.lockScope,
+    // 「其他」：这张卡允许在卡片里直接写要怎么改（纠正）。
+    allowsOther: question?.allowsOther === true,
+    otherLabel: question?.otherLabel,
+    otherPlaceholder: question?.otherPlaceholder,
   };
 }
 
@@ -1928,6 +2175,7 @@ function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
   const targetIndex = plan.targetRegionId ? visibleIds.indexOf(plan.targetRegionId) : -1;
   const targetLabel = plan.targetRegionId ? visibleRegionLabel(plan.targetRegionId) : "";
   const stale = isPendingPlanStale(plan);
+  const simulated = readReportSourceMode(session.definition, session.reportPreviewPayload) === "simulated";
 
   const operationItems = plan.operations
     .map((op) => {
@@ -1945,15 +2193,14 @@ function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
       <div class="px-3.5 py-2.5 bg-amber-50 border-b border-amber-100 flex items-center gap-2">
         <iconify-icon class="text-amber-600" icon="mdi:clipboard-text-clock-outline"></iconify-icon>
         <span class="text-sm font-semibold text-amber-900">待确认的修改</span>
-        <span class="ml-auto mono text-[10px] text-slate-500 bg-white border border-slate-200 rounded px-1.5 py-0.5">${esc(plan.planId || "no-plan-id")}</span>
       </div>
       <div class="p-3 space-y-2 text-xs text-slate-700" data-plan-body>
         <div>
           <span class="text-slate-500">目标：</span>
           ${
             targetIndex >= 0
-              ? `<span class="font-medium text-slate-800">第 ${targetIndex + 1} 个正文卡片「${esc(targetLabel)}」</span> <span class="mono text-[10px] text-slate-500">${esc(plan.targetRegionId || "")}</span>`
-              : `<span class="text-rose-600">目标卡片不在当前可见正文顺序里</span> <span class="mono text-[10px] text-slate-500">${esc(plan.targetRegionId || "")}</span>`
+              ? `<span class="font-medium text-slate-800">第 ${targetIndex + 1} 个正文卡片「${esc(targetLabel)}」</span>`
+              : `<span class="text-rose-600">目标卡片不在当前可见正文顺序里</span>`
           }
         </div>
         ${plan.summary ? `<div class="whitespace-pre-wrap">${esc(plan.summary)}</div>` : ""}
@@ -1962,9 +2209,9 @@ function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
             ? `<div><div class="text-[11px] text-slate-500 mb-1">具体改什么</div><ul class="list-disc pl-4 space-y-1">${operationItems}</ul></div>`
             : ""
         }
-        ${plan.unverified ? `<div class="text-[11px] text-amber-800">未验证能力：${esc(plan.unverified)}</div>` : ""}
-        <div class="text-[11px] text-slate-400">草稿版本 baseRev=${esc(plan.draftRevision ?? "—")}</div>
-        <div class="text-[11px] text-slate-400">当前为 Mock 预览，真实数据编译尚未完成。</div>
+        ${plan.unverified && !simulated ? `<div class="text-[11px] text-amber-800">未验证能力：${esc(plan.unverified)}</div>` : ""}
+        <div class="text-[11px] text-slate-400">草稿版本 ${esc(plan.draftRevision ?? "—")}</div>
+        <div class="text-[11px] text-slate-400">${simulated ? "展示数据均为模拟；明确要求只显示名称的项不填数值。" : "接受修改后才会更新草稿。"}</div>
       </div>
     </div>
   `);
@@ -1983,17 +2230,35 @@ function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
 
   // 选项值固定用契约里的三个中文词（发回后端的消息正文就是它），
   // 后端给了问题对象就沿用它的 id 和文案，锁的 id 才对得上 pending_choice。
-  const options = [
-    { value: EDIT_PLAN_CONTRACT.choice.accept, label: EDIT_PLAN_CONTRACT.choice.accept },
-    { value: EDIT_PLAN_CONTRACT.choice.adjust, label: EDIT_PLAN_CONTRACT.choice.adjust },
-    { value: EDIT_PLAN_CONTRACT.choice.cancel, label: EDIT_PLAN_CONTRACT.choice.cancel },
-  ].map((option, index) => {
-    const backendOption = question?.options?.[index];
-    if (!backendOption) return option;
-    const label = backendOption.label || backendOption.value || option.label;
-    return { value: option.value, label: String(label) };
-  });
+  //
+  // **按值对齐，不按序号对齐**：服务端可能在选项里多插一项
+  // （例如「先占位，只显示名称」），按序号对齐会整体错位 ——
+  // 用户看到「接受修改」，发出去的却是「继续调整」。
+  // 服务端给了哪些选项就画哪些（一个都不吞），契约里的三个词按值认。
+  const backendOptions = Array.isArray(question?.options) ? question.options : [];
+  const contractChoices = new Set(Object.values(EDIT_PLAN_CONTRACT.choice));
+  const options = backendOptions.length
+    ? backendOptions
+        .map((option) => {
+          const rawValue = String(option?.value ?? option?.label ?? "").trim();
+          const rawLabel = String(option?.label ?? option?.value ?? "").trim();
+          if (!rawValue && !rawLabel) return null;
+          // 契约里的三个词：值与文案都用契约值（后端按值认）。
+          const displayLabel = (value) => value === EDIT_PLAN_CONTRACT.choice.adjust ? "继续修改" : value === EDIT_PLAN_CONTRACT.choice.cancel ? "撤回上一步" : value;
+          if (contractChoices.has(rawValue)) return { value: rawValue, label: displayLabel(rawValue) };
+          if (contractChoices.has(rawLabel)) return { value: rawLabel, label: displayLabel(rawLabel) };
+          return { value: rawValue || rawLabel, label: rawLabel || rawValue };
+        })
+        .filter(Boolean)
+    : [
+        { value: EDIT_PLAN_CONTRACT.choice.accept, label: EDIT_PLAN_CONTRACT.choice.accept },
+        { value: EDIT_PLAN_CONTRACT.choice.cancel, label: "撤回上一步" },
+        { value: EDIT_PLAN_CONTRACT.choice.adjust, label: "继续修改" },
+      ];
   const questionId = question?.id || "pending_edit_plan_confirm";
+
+  // 菜单对象带上服务端的锁范围与「其他」入口（归一化不能把这两样弄丢）。
+  const menuQuestion = pendingEditMenuQuestion(question, options);
 
   const menu = document.createElement("div");
   menu.className = "px-3 pb-3";
@@ -2001,21 +2266,20 @@ function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
     <label class="block text-sm text-slate-700 leading-relaxed mb-2">确认后才会修改草稿，请选择：</label>
     <select class="question-select w-full rounded-md border border-amber-200 bg-white px-3 py-2 text-sm text-slate-700" data-question-id="${esc(questionId)}">
       <option value="">请选择</option>
-      ${options.map((option) => `<option value="${esc(option.value || option.label)}">${esc(option.label)}</option>`).join("")}
+      ${renderQuestionOptions(menuQuestion)}
     </select>
+    ${renderOtherAnswerHtml(menuQuestion)}
   `;
   body.appendChild(menu);
 
-  const select = menu.querySelector(".question-select");
-  select.addEventListener("change", (event) => {
-    if (lockedChoice?.id === questionId && event.target.value) {
-      sendMessage(event.target.value, { fromChoice: true });
-    }
-  });
+  bindQuestionSelects(menu, [menuQuestion]);
 
-  const menuQuestion = pendingEditMenuQuestion(question, options);
   if (lock) setChoiceLock(menuQuestion);
   else businessMenuReplayed = true;
+  // 「其他」：卡片内自由文本。启用状态由 syncInputControls 按
+  // 「当前待答的那张卡」统一管（历史回放出来的卡是灰的）。
+  bindOtherAnswers(menu);
+  syncInputControls();
   return menuQuestion;
 }
 
@@ -2070,13 +2334,15 @@ async function postAgentStream(body, debugCard, signal) {
   return finalData;
 }
 
-async function sendMessage(text, { fromChoice = false, designAction = null } = {}) {
+async function sendMessage(text, { fromChoice = false, designAction = null, fromOther = false, fromPlan = false, inlineEditText = "", fromInline = false } = {}) {
   if (!text || activeRequest || advanceTimers.size) return;
+  const inlineChoice = inlineEditText ? lockedChoice : null;
   if (
     !fromChoice &&
+    !fromPlan &&
     !designAction &&
     text !== "__advance__" &&
-    isInputLocked(lockedChoice)
+    (isInputLocked(lockedChoice) || Boolean(lockedChoice?.options?.length) || lockedChoice?.allowsOther === true || hasPendingPlan())
   ) {
     // 界面锁定只是**引导**（规格第 56 条）：这里挡的是「误发自由输入」，
     // 真正的边界在后端 —— 直接调接口在等待选择期间同样不能绕过确认。
@@ -2089,7 +2355,12 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
     const allowed =
       lockedChoice.options?.some((o) => (o.value || o.label) === text) ||
       (lockedChoice.allowRestart && text === "重新开始");
-    if (!allowed) {
+    // 「其他」：这张卡允许在卡片里写自由文本时，卡片输入框里写的内容就是
+    // **这张卡的答案**（纠正），不要求命中选项 —— 它不进选项列表，
+    // 后端按「文本不在选项里 + 这张卡允许其他」把它认成纠正。
+    const otherAnswer = fromOther && lockedChoice.allowsOther === true;
+    const inlineAnswer = fromInline && lockedChoice.inlineEdit === true && lockedChoice.inlineEditStarted === true;
+    if (!allowed && !otherAnswer && !inlineAnswer) {
       toast("请先从下拉框选择");
       return;
     }
@@ -2211,7 +2482,6 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
   if (epoch !== requestEpoch) return;
   // 方案状态跟着响应走：成功、失败、冲突都如实反映到方案卡片上。
   syncPlanFromResponse(data);
-  if (fromChoice) clearChoiceLock();
   if (data.error) {
     // JSON 输入被拒：面板里也摆一份**可修正**的提示（哪里不对、怎么改）。
     showJsonPasteErrorHint(data.error);
@@ -2219,8 +2489,15 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
     appendAgentError(data.error);
     // 失败**不**更新方案：上一版仍然有效（工单 #66）。
     appendPlanFailureNotice();
-    return;
+    if (isTemplateEditFailure(data)) {
+      setState(data.state);
+      restoreEditFailureMenu(data);
+      updateMeta();
+      renderSessionList();
+    }
+    return data;
   }
+  if (fromChoice) clearChoiceLock();
 
   // JSON 输入被收下：说清这份数据的来路（契约表 §1.1）。
   if (data.debug?.jsonInput?.accepted === true) {
@@ -2241,6 +2518,11 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
   if (data.designSessionId) session.designSessionId = data.designSessionId;
   if (!readOnlyKind && data.debug && Object.prototype.hasOwnProperty.call(data.debug, "editingTargetRegionId")) {
     session.editingTargetRegionId = data.debug.editingTargetRegionId || null;
+  }
+  // Keep the legacy action handshake at submit time, not when opening the input.
+  if (inlineEditText && !readOnlyKind && data.state === "USER_EDITING_TEMPLATE" && !readPendingEditPlan(data)) {
+    setChoiceLock({ ...inlineChoice, inlineEditStarted: true });
+    return sendMessage(inlineEditText, { fromChoice: true, fromInline: true });
   }
 
   if (readOnlyKind) {
@@ -2269,6 +2551,11 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
   };
 
   // 定义先落位（各状态共用）：示意载荷的版本校对拿它当基准。
+  //
+  // 草稿的版本取**草稿自己的 `metadata.revision`**（编辑链版本号，每改一次
+  // +1）：保存次数另记在 `metadata.savedRevision`，两者互不占用 ——
+  // 拿保存次数当草稿版本，下一次编辑会被服务端当成旧草稿拦掉。
+  // 这一轮的权威值就是响应里的 `domainObjects.reportDefinitionDraft`。
   const draftDefinition = data.domainObjects?.reportDefinitionDraft;
   if (draftDefinition) {
     session.definition = draftDefinition;
@@ -2278,8 +2565,25 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
   }
 
   // 报示意载荷：草稿确认的**同一轮**响应就带它（不做二次请求）。
-  // 旧版本的载荷（定义已经改过）直接丢掉，不覆盖新模板。
-  applyReportPreviewPayload(readReportPreviewPayload(data));
+  //
+  // 草稿与载荷说的是**同一份模板**（服务端用同一份定义生成载荷），
+  // 所以这一轮带来的载荷就是这一轮草稿的载荷 —— 以它为准，
+  // 不拿版本校对把它当过期丢掉（丢掉的后果是「草稿已经变了，
+  // 屏幕上的数字还是旧的」，右侧看着像没刷新）。
+  //
+  // 版本校对留给**会话恢复**那条路：那里的载荷是服务端按当前定义
+  // 重新生成的，对不上就说明它不该上屏。
+  const roundPayload = readReportPreviewPayload(data);
+  if (roundPayload) {
+    if (draftDefinition) {
+      session.reportPreviewPayload = roundPayload;
+      // 载荷到了，之前那条「没生成出来」的理由就不成立了。
+      session.reportPreviewError = null;
+    } else {
+      // 这一轮只来了载荷、没来草稿：照旧按版本校对收（对不上就丢掉）。
+      applyReportPreviewPayload(roundPayload);
+    }
+  }
 
   // 分发渲染
   switch (data.state) {
@@ -2343,12 +2647,20 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
       }
       break;
     case "SAVE_DEFINITION_DRAFT":
-      // 后端保存后带回了 saved definitionId / revision
+      // 后端保存后带回了草稿身份。
+      //
+      // **版本号取草稿自己的 `metadata.revision`**（编辑链版本：每改一次 +1）：
+      // 保存次数另记在 `metadata.savedRevision`，两者不是一回事 ——
+      // 拿保存次数当草稿版本，下一次编辑会被服务端当成旧草稿拦掉。
+      // 上面「定义先落位」那一步已经按草稿的权威值写好了，这里只补身份。
       {
         const saveTool = (data.toolRequests || []).find((t) => t.type === "SAVE_DEFINITION_DRAFT");
         if (saveTool?.arguments?.definitionId) {
           session.reportDefinitionId = saveTool.arguments.definitionId;
-          session.baseDefinitionRevision = saveTool.arguments.revision;
+        }
+        const savedDraft = data.domainObjects?.reportDefinitionDraft;
+        if (savedDraft?.metadata?.revision != null) {
+          session.baseDefinitionRevision = savedDraft.metadata.revision;
         }
       }
       appendAiText(data.reply || "草稿已保存，接下来进入校验。");
@@ -2425,6 +2737,7 @@ async function sendMessage(text, { fromChoice = false, designAction = null } = {
 
   updateMeta();
   renderSessionList();
+  return data;
 }
 
 /**
@@ -2485,22 +2798,22 @@ function appendReadyActions(question, { lock = true } = {}) {
     }
     return null;
   }
+  question = { ...question, inlineEdit: true };
   const wrap = aiBubble(`
     <div class="rounded-xl rounded-tl-sm border border-emerald-200 bg-white px-3.5 py-3">
       <label class="block text-sm text-slate-700 leading-relaxed mb-2.5">${esc(question.prompt)}</label>
       <select class="question-select w-full rounded-md border border-emerald-200 bg-white px-3 py-2 text-sm text-slate-700" data-question-id="${esc(question.id || "")}">
         <option value="">请选择</option>
-        ${question.options.map((option) => `<option value="${esc(option.value)}">${esc(option.label)}</option>`).join("")}
+        ${renderQuestionOptions(question)}
       </select>
+      ${renderOtherAnswerHtml(question)}
     </div>
   `);
   if (lock) setChoiceLock(question);
   else businessMenuReplayed = true;
-  wrap.querySelector(".question-select").addEventListener("change", (event) => {
-    if (lockedChoice?.id === question?.id && event.target.value) {
-      sendMessage(event.target.value, { fromChoice: true });
-    }
-  });
+  bindQuestionSelects(wrap, [question]);
+  bindOtherAnswers(wrap);
+  syncInputControls();
   return question;
 }
 
@@ -2544,7 +2857,7 @@ function applyChangeSet(cs, bubbleWrap) {
   setState("WAITING_USER_CONFIRM"); // 应用后回到确认态
   renderReportPanel(cs.changed.map((e) => e.regionId));
   updateMeta();
-  toast("变更已应用，revision → " + definition.metadata.revision);
+  toast("变更已应用，草稿版本 → " + definition.metadata.revision);
 }
 
 // -------- 渲染预览 --------
@@ -2741,6 +3054,25 @@ function appendAgentError(error) {
   appendAiText(text);
 }
 
+function isTemplateEditFailure(data) {
+  return data?.state === "USER_EDITING_TEMPLATE" && /^EDIT_/.test(String(data.error?.code || ""));
+}
+
+function restoreEditFailureMenu(data, { lock = true, pending = null } = {}) {
+  // The failed acceptance consumed the old plan; only the response's new menu is actionable.
+  lastPendingPlan = null;
+  if (lock) clearChoiceLock();
+  const questions = (data.questions || []).filter(Boolean).map((question) =>
+    pending?.id === question.id ? pending : question
+  );
+  const confirm = questions.find((question) => question.id === "template_edit_confirm");
+  if (confirm) return appendConfirmActions(confirm, { lock });
+  if (questions.length) appendAiQuestions(questions, { lock });
+  return questions.find((question) =>
+    (question.selectionOnly || question.allowsOther) && (question.options?.length || question.allowsOther)
+  ) || null;
+}
+
 /**
  * 失败时补一句：本次没更新，上一版仍然有效（工单 #66）。
  *
@@ -2903,7 +3235,9 @@ function readCapabilityNotes(region, payload, defRegion, sourceMode) {
   // 区域级标记：逐项说明已经说清楚时不再重复说；没有逐项说明时它自己出一条。
   if (!groups.size && region?.capabilityPending === true) groups.set("capability", ["该指标尚未接通"]);
   // 每个类别一条：角标文案按类别分清楚，不把所有原因都写成「能力待接通」。
-  return [...groups.entries()].map(([kind, items]) => `${KIND_LABELS[kind]}：${items.join("、")}`);
+  return [...groups.entries()]
+    .filter(([kind]) => sourceMode !== "simulated" || kind === "scope")
+    .map(([kind, items]) => `${KIND_LABELS[kind]}：${items.join("、")}`);
 }
 
 /**
@@ -3220,9 +3554,20 @@ function renderSourceNoteHtml(sourceMode) {
       WorkbenchQuery.USER_JSON_SOURCE_LABEL + "。</span>";
   }
   if (sourceMode === WorkbenchQuery.SOURCE_MODE_SIMULATED) {
-    return "<span>当前显示的是<b>模拟业务数据</b>，用于核对版式；接入真实数据后会自动替换。</span>";
+    return "<span><b>模拟业务数据</b>，仅用于核对版式；明确名称的占位项保留，不显示数值。</span>";
   }
   return "";
+}
+
+function readRegionDisplayNotes(payload, sourceMode) {
+  const raw = Array.isArray(payload?.notes) ? payload.notes : (payload?.notes == null ? [] : [payload.notes]);
+  const notes = raw.map((item) => String(item == null ? "" : item).trim()).filter(Boolean);
+  if (sourceMode !== "simulated") return notes;
+  return notes.filter((text) => {
+    // Keep placeholder and scope facts; only retire legacy simulation/compilation notices.
+    if (/占位|只显示名称|仅显示名称|没有编值|授权|权限|越权/.test(text)) return true;
+    return !/能力待接通|尚未接通|模拟业务数据|模拟示例|接入真实数据|真实(?:数据)?编译|真实数据.*编译/.test(text);
+  });
 }
 
 /**
@@ -3304,6 +3649,37 @@ function renderJsonInputIssuesHtml(definition) {
     </div>`;
 }
 
+/**
+ * 业务语言标签：草稿状态。
+ *
+ * 状态是**内部枚举**（`DRAFT` / `PUBLISHED`）。直接渲染出来用户读不懂，
+ * 也等于把内部标识摆到界面上。规则：
+ *   - 已知取值 → 中文；
+ *   - 未知取值 → **不回落英文 key**（英文 key 对用户没有意义，且正是要藏的东西），
+ *     回落成通用说法「草稿」。
+ *
+ * 卡片作用 / 展示形式 / 图表类型那几张表**不放在这里**：
+ * 那个渲染函数会被既有单测单独抽进沙箱跑，模块级符号在那儿取不到，
+ * 所以那几张表写死在那个函数内部（见 renderRegionCard 里的说明）。
+ */
+const DEFINITION_STATUS_LABELS = {
+  DRAFT: "草稿",
+  PUBLISHED: "已发布",
+  ARCHIVED: "已归档",
+};
+
+/** 枚举 → 中文标签。未知取值返回空串（调用方据此不渲染这一段）。 */
+function enumLabel(labels, raw) {
+  const key = String(raw == null ? "" : raw).trim().toUpperCase();
+  if (!key) return "";
+  return Object.prototype.hasOwnProperty.call(labels, key) ? labels[key] : "";
+}
+
+/** 草稿状态 → 中文（「草稿」…）。 */
+function definitionStatusLabel(raw) {
+  return enumLabel(DEFINITION_STATUS_LABELS, raw) || "草稿";
+}
+
 /** 面板顶部：报表名 + 一行来源说明（按来源模式说）。 */
 function renderPanelHeader(definition, payload, regionCount) {
   const header = document.createElement("div");
@@ -3318,22 +3694,21 @@ function renderPanelHeader(definition, payload, regionCount) {
       <div class="flex-1 min-w-0">
         <div class="flex items-center gap-2 flex-wrap">
           <h2 class="report-name editable-field text-lg font-semibold text-slate-900">${esc(name)}</h2>
-          <span class="inline-flex items-center rounded-md text-xs font-medium px-2 py-1 border bg-blue-50 text-blue-700 border-blue-200">${esc(definition?.schemaVersion || "1.0")}</span>
           <span class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-amber-50 text-amber-700 border-amber-200 draft-status-badge">
-            <iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>${esc(definition?.metadata?.status || "DRAFT")}
+            <iconify-icon class="text-sm" icon="mdi:robot-outline"></iconify-icon>${esc(definitionStatusLabel(definition?.metadata?.status))}
           </span>
           <span class="edit-hint text-[11px] text-slate-400 inline-flex items-center gap-1"><iconify-icon icon="mdi:pencil-outline"></iconify-icon>点击名称可直接编辑</span>
         </div>
         <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500 draft-meta-row">
-          <span>revision: <span class="mono">${definition?.metadata?.revision ?? "—"}</span></span>
-          <span>区域数: <span class="mono">${regionCount}</span></span>
-          ${windowLabel ? `<span>时间窗: <span class="mono">${esc(windowLabel)}</span></span>` : ""}
+          <span>草稿版本: <span class="mono">${definition?.metadata?.revision ?? "—"}</span></span>
+          <span>卡片数: <span class="mono">${regionCount}</span></span>
+          ${windowLabel ? `<span>时间范围: <span class="mono">${esc(windowLabel)}</span></span>` : ""}
         </div>
         ${renderGenerationInputs(definition)}
       </div>
     </div>
     ${sourceNote ? `
-    <div class="mt-3 flex items-start gap-1.5 text-[11px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5" data-simulated-note="${esc(sourceMode)}">
+    <div class="mt-3 flex items-start gap-1.5 text-[11px] leading-relaxed ${sourceMode === "simulated" ? "text-slate-500" : "text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5"}" data-simulated-note="${esc(sourceMode)}">
       <iconify-icon class="text-sm mt-px" icon="mdi:flask-outline"></iconify-icon>
       ${sourceNote}
     </div>
@@ -3390,17 +3765,69 @@ function renderRegionCard(region, definition, payload, totalsByUnit) {
   // workbench_66b_frontend.test.mjs 盯着。
   const USER_JSON_BADGE_NOTE = "用户提供的数据，未经业务核验";
 
+  // 卡片作用 / 展示形式 / 图表类型 → 中文标签。
+  //
+  // 这三张表**写死在本函数内**（理由同 USER_JSON_BADGE_NOTE）：本函数会被
+  // 接缝探针与既有单测**单独抽进沙箱**跑，那边没有模块级的符号可用。
+  //
+  // 原来的写法是直接渲染 `role: SUMMARY · component: METRIC_CARD` ——
+  // 那是内部枚举，用户读不懂，等于把内部标识摆在界面上。改成业务词：
+  //   - 已知取值 → 中文；
+  //   - 未知取值 → **不回落英文 key**（英文 key 正是要藏的东西），不渲染这一段。
+  //
+  // 这里刻意**不复用** workbench_plan.js 的 `componentTypeLabel`：那份的键是小写
+  // （metric_card），载荷里是大写（METRIC_CARD），两套取值域不一样，各自维护。
+  const ROLE_LABELS = {
+    REPORT_TITLE: "报表标题",
+    SUMMARY: "总览",
+    TREND: "趋势",
+    DETAIL: "明细",
+    TOTAL: "汇总",
+  };
+  const TYPE_LABELS = {
+    METRIC_CARD: "指标卡",
+    CHART: "图表",
+    TABLE: "表格",
+    TEXT: "文字块",
+    TEXT_HEADING: "标题",
+    SINGLE_NUMBER: "单值",
+    TIME_SERIES: "时间序列",
+    CATEGORY_RANKING: "分类排行",
+    DESCRIPTION: "说明",
+  };
+  const KIND_LABELS = {
+    LINE: "折线图",
+    BAR: "柱状图",
+    PIE: "饼图",
+  };
+  const labelOf = (labels, raw) => {
+    const key = String(raw == null ? "" : raw).trim().toUpperCase();
+    if (!key) return "";
+    return Object.prototype.hasOwnProperty.call(labels, key) ? labels[key] : "";
+  };
+
   const card = document.createElement("div");
   card.className = "bg-white rounded-xl border border-slate-200 p-5 group";
   card.dataset.regionId = region.regionId || "";
 
   const title = region.name || defRegion?.name || region.componentType || "板块";
   const chartKind = p.chartKind || defRegion?.component?.chartKind || "";
+  // 卡片头部那一行说明：「作用：总览 · 展示形式：折线图」。
+  const roleText = labelOf(ROLE_LABELS, region.role || defRegion?.role);
+  const kindText = labelOf(KIND_LABELS, chartKind);
+  // 图表卡片：chartKind 比 componentType 更具体，用它替掉泛泛的「图表」。
+  const formText = kindText || labelOf(TYPE_LABELS, region.componentType || defRegion?.component?.type);
+  const metaParts = [];
+  if (roleText) metaParts.push("作用：" + esc(roleText));
+  if (formText) metaParts.push("展示形式：" + esc(formText));
+  const metaHtml = metaParts.length
+    ? `<p class="text-xs text-slate-500 mt-0.5">${metaParts.join(" · ")}</p>`
+    : "";
   const header = `
     <div class="flex items-start justify-between gap-4">
       <div class="flex-1 min-w-0">
         <h3 class="region-name editable-field font-semibold text-slate-900">${esc(title)}</h3>
-        <p class="text-xs text-slate-500 mt-0.5">role: <span class="mono">${esc(region.role || defRegion?.role || "")}</span> · component: <span class="mono">${esc(region.componentType || defRegion?.component?.type || "")}</span>${chartKind ? ' / <span class="mono">' + esc(chartKind) + "</span>" : ""}</p>
+        ${metaHtml}
       </div>
       <div class="flex items-center gap-1 shrink-0">
         ${sourceMode === "user_json" ? `
@@ -3408,7 +3835,7 @@ function renderRegionCard(region, definition, payload, totalsByUnit) {
           <iconify-icon class="text-xs" icon="mdi:database-outline"></iconify-icon>用户数据
         </span>
         ` : sourceMode === "simulated" ? `
-        <span class="region-badge inline-flex items-center gap-1 rounded-md text-[11px] font-medium px-2 py-0.5 border bg-slate-100 text-slate-600 border-slate-200" data-region-badge="simulated" title="模拟业务数据，接入真实数据后自动替换">
+        <span class="region-badge inline-flex items-center gap-1 rounded-md text-[11px] font-medium px-2 py-0.5 border bg-slate-100 text-slate-600 border-slate-200" data-region-badge="simulated" title="模拟业务数据，仅用于核对版式">
           <iconify-icon class="text-xs" icon="mdi:flask-outline"></iconify-icon>示意
         </span>
         ` : ""}
@@ -3421,7 +3848,6 @@ function renderRegionCard(region, definition, payload, totalsByUnit) {
           </button>
         </span>
         ` : ""}
-        <span class="mono text-[10px] text-slate-500 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 shrink-0">${esc(region.regionId || "")}</span>
       </div>
     </div>`;
 
@@ -3447,10 +3873,10 @@ function renderRegionCard(region, definition, payload, totalsByUnit) {
   // （契约表 §8 不变量 8：宁可少说，不许说假话）。
   //
   // 样式沿用页面既有的说明文字（与「能力待接通」那条同一个色板），不新造一套。
-  const rawNotes = Array.isArray(p.notes) ? p.notes : (p.notes == null ? [] : [p.notes]);
-  const payloadNotes = rawNotes
-    .map((item) => String(item == null ? "" : item).trim())
-    .filter(Boolean);
+  const payloadNotes = typeof readRegionDisplayNotes === "function"
+    ? readRegionDisplayNotes(p, sourceMode)
+    : (Array.isArray(p.notes) ? p.notes : (p.notes == null ? [] : [p.notes]))
+        .map((item) => String(item == null ? "" : item).trim()).filter(Boolean);
   if (payloadNotes.length) {
     const noteBox = document.createElement("div");
     noteBox.className =
@@ -3501,7 +3927,7 @@ function renderRegionCard(region, definition, payload, totalsByUnit) {
   });
 
   card.querySelector(".btn-display-options")?.addEventListener("click", () => {
-    sendTemplateEditAction("这个 section 可以怎么展示？", defRegion.id);
+    sendTemplateEditAction("这张卡片可以怎么展示？", defRegion.id);
   });
   card.querySelector(".btn-grain-options")?.addEventListener("click", () => {
     sendTemplateEditAction("这个数据能按哪些粒度编译？", defRegion.id);
@@ -3510,7 +3936,7 @@ function renderRegionCard(region, definition, payload, totalsByUnit) {
   // 区域删除
   card.querySelector(".btn-del-region")?.addEventListener("click", () => {
     if (!confirm(`确定删除「${originalName}」吗？`)) return;
-    sendTemplateEditAction("删除这个 section", defRegion.id);
+    sendTemplateEditAction("删除这张卡片", defRegion.id);
   });
 
   return card;
@@ -3534,31 +3960,20 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
 
   if (type === "METRIC_CARD") {
     const metrics = Array.isArray(p.metrics) ? p.metrics.filter((m) => m && typeof m === "object") : [];
-    // 主量已经在大卡片上显示了，其余指标单独列出来（多指标区域不能只剩一个数）。
-    // 主量**只画一次**：它就是那个大数字，不能再出现在「其它指标」清单里。
-    const primary = readPrimaryMetric(metrics, p, ctx.defRegion);
-    const others = metrics.filter((m) => m !== primary);
-    // 大数字上方的说明用**主量指标名**（metrics[].label）：卡片标题已经是区域名
-    // （region.name），再写一遍区域名等于没写；指标名才说清这个数是什么量。
-    // 判不出主量时退回载荷给的 label。
-    const mainLabel = String(primary?.label || p.label || "指标");
-    const yoy = Number(p.yoyPercent);
-    const showYoy = p.comparisonAvailable !== false && p.yoyPercent != null && Number.isFinite(yoy);
-    container.innerHTML = `
-      <div class="rounded-lg border border-slate-200 bg-slate-50 px-5 py-4 inline-block">
-        <div class="text-[11px] text-slate-500">${esc(mainLabel)}</div>
-        <div class="text-3xl font-semibold text-slate-900 mt-1">${esc(formatMetricValue(p.value, p.precision))}<span class="text-sm font-normal text-slate-400 ml-1">${esc(unit)}</span></div>
-        ${showYoy ? `<div class="text-[11px] mt-1 ${yoy >= 0 ? "text-rose-600" : "text-emerald-600"}">${yoy >= 0 ? "↑" : "↓"} ${Math.abs(yoy)}% 较上一周期</div>` : ""}
-        ${p.windowLabel ? `<div class="text-[11px] text-slate-400 mt-1">${esc(p.windowLabel)}</div>` : ""}
-      </div>
-      ${others.length ? `
-      <div class="mt-3 grid gap-2 sm:grid-cols-2">
-        ${others.map((m) => `
+    const items = metrics.length ? metrics : [{
+      metricKey: p.metricKey, label: p.label || "指标", value: p.value,
+      precision: p.precision, unit, placeholderOnly: p.placeholderOnly,
+    }];
+    const cards = items.map((m) => {
+      const hasValue = p.placeholderOnly !== true && m.placeholderOnly !== true && m.value != null && m.value !== "";
+      return `
           <div class="rounded-lg border border-slate-200 bg-white px-3 py-2" data-region-metric="${esc(m.metricKey || m.label || "")}">
             <div class="text-[11px] text-slate-500">${esc(m.label || m.metricKey || "指标")}</div>
-            <div class="text-base font-semibold text-slate-900 mt-0.5">${esc(formatMetricValue(m.value, m.precision))}<span class="text-[11px] font-normal text-slate-400 ml-1">${esc(m.unit || "")}</span></div>
-          </div>`).join("")}
-      </div>` : ""}`;
+            <div class="text-base font-semibold text-slate-900 mt-0.5 min-h-6">${hasValue ? `${esc(formatMetricValue(m.value, m.precision))}<span class="text-[11px] font-normal text-slate-400 ml-1">${esc(m.unit || "")}</span>` : ""}</div>
+          </div>`;
+    }).join("");
+    container.innerHTML = `
+      <div class="grid gap-2 sm:grid-cols-2">${cards}</div>`;
     return;
   }
 
@@ -3576,12 +3991,17 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
         const cells = columns
           .map((c) => {
             const val = row?.[c.fieldRef];
+            // 这一格**没有值**：留空。不拿 0 / NaN / undefined 冒充一个数
+            // （用户明确说「先占位」的列就是这样：列名在，数值不在）。
+            if (val == null || val === "") {
+              return `<td class="px-3 py-2.5 text-slate-700"></td>`;
+            }
             if (c.format?.kind === "NUMBER") {
               const num = Number(val);
-              const text = Number.isFinite(num) ? num.toFixed(c.format.precision ?? 1) : val == null ? "" : String(val);
+              const text = Number.isFinite(num) ? num.toFixed(c.format.precision ?? 1) : String(val);
               return `<td class="px-3 py-2.5 text-slate-700 mono">${esc(text)}</td>`;
             }
-            return `<td class="px-3 py-2.5 text-slate-700">${esc(val ?? "")}</td>`;
+            return `<td class="px-3 py-2.5 text-slate-700">${esc(val)}</td>`;
           })
           .join("");
         return `<tr class="hover:bg-slate-50">${p.rowNumber ? `<td class="px-3 py-2.5 text-slate-400 mono">${idx + 1}</td>` : ""}${cells}</tr>`;
@@ -4052,6 +4472,11 @@ function replayAssistantMessage(data, pending = null) {
     if (!pending || !questions?.length) return questions;
     return questions.map((q) => (q.id === pending.id ? pending : q));
   };
+
+  if (isTemplateEditFailure(data)) {
+    appendAgentError(data.error);
+    return restoreEditFailureMenu(data, { lock: false, pending });
+  }
 
   // 只读问答的历史回放：照常展示回答，但不重画业务菜单、不改状态、不推进。
   const readOnlyKind = WorkbenchQuery.readOnlyAnswerKind(data);

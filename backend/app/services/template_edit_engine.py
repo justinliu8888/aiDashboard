@@ -19,7 +19,10 @@ from typing import Any
 
 from app.schemas.change_set import ChangeSet, ChangeSetEntry, ChangeSetUnchanged
 from app.schemas.edit_plan import (
+    DISPLAY_MODE_PLACEHOLDER_ONLY,
+    DISPLAY_MODE_SIMULATED,
     EditIntent,
+    EditMetricAddition,
     EditOperation,
     EditOperationStep,
     EditPlan,
@@ -43,21 +46,27 @@ from app.services.edit_time_resolver import (
 )
 from app.services.metric_mock_service import list_metrics, match_metric_by_alias
 from app.services.out_of_catalog_candidate import (
+    STATUS_OUT_OF_CATALOG,
     OutOfCatalogCandidate,
     candidate_from_dict,
     out_of_catalog_region_reason,
     resolve_out_of_catalog_candidate,
     select_component_type,
     selection_for_existing_type,
+    simulated_metric_binding,
     split_metric_intent,
 )
-from app.services.report_template_service import DATA_SOURCE_LABEL, pending_reason
+from app.services.report_template_service import (
+    DATA_SOURCE_LABEL,
+    classify_metric_kind,
+)
 from app.services.scope_service import filter_visible
 from app.services.simulated_field_semantics import (
     SCOPE_METRIC_FAMILY,
     deterministic_scope,
     intent_names_registered_metric,
     metric_family_seed_key,
+    simulated_metric_id,
 )
 from app.services.template_definition_service import adapt_preview_spec
 from app.services.validation_service import fixed_interval_error
@@ -187,8 +196,67 @@ TREND_GRAIN_TITLES = {
 }
 
 
-# 组合修改允许的意图：都只作用在同一个已有 region 上，
-# 不新增 / 删除 / 改名 region，也不改报表本身。
+#: 「追加」语义的说法 —— **新增默认是追加**。
+#:
+#: 用户说「再加 X」「还需要包括 X、Y」时，**保留**原有内容并新增；
+#: 只有明确说了「替换 / 只留 / 换成」才走替换（见 ``REPLACE_WORDS``）。
+#:
+#: 这里收的是**意图词**，不是指标名：具体指标由用户原话抽，不写死词表。
+#:
+#: 只收**明确带追加意思**的说法：光一个「增加」太宽（「把温度增加一点」
+#: 会被当成新增指标），带量词的那一档由 ``ADD_WORDS`` 负责。
+APPEND_WORDS = (
+    "追加", "再加", "还要", "还需要", "也需要", "也要加", "也加上",
+    "再增加", "再添加", "再新增", "再补", "再添",
+    "补充", "加上",
+)
+
+#: 「替换」语义的说法 —— 只有明确说了这些，追加才让位给替换。
+REPLACE_WORDS = (
+    "换成", "替换", "只留", "只保留", "改用", "不要了", "去掉", "移除",
+)
+
+#: 「把 A 换成 B」里的**替换动词**。
+#:
+#: 「不要 X，改成 Y」这句话里既有否定词（DELETE_WORDS）又有替换动词 ——
+#: 它说的是**替换**，不是删除。判据只看这两个词表的共现，**不认具体
+#: 指标名**，所以任何「不要/去掉 A，改成 B」的说法都走同一条路。
+REPLACE_CLAUSE_VERBS = (
+    "换成", "换为", "改成", "改为", "调成", "替换", "改用", "只留", "只保留", "代替",
+)
+
+#: 指标清单里表示「还要 / 并且」的连接词（剥掉它们才看得出指标名）。
+_APPEND_CONNECTORS = (
+    "还包括", "包括", "包含", "含有", "要有", "以及", "还有", "要", "有",
+)
+
+#: 指标清单里的分隔符（顿号 / 逗号 / 连词）。
+_METRIC_LIST_SEPARATORS = (
+    "、", "，", ",", "；", ";", "以及", "还有", "和",
+)
+
+#: 指标名末尾的成分词（不是指标名的一部分）。
+_METRIC_NAME_TAIL_NOISE = ("的指标", "指标", "这几项", "这些指标", "项指标")
+
+#: 只由「数量词」组成的片段 —— 「再加三个指标」里的「三个」是**数量**，
+#: 不是指标名。认出来就说明用户还没说清要加哪几个。
+_COUNT_ONLY_CHARS = set("一二三四五六七八九十两百千万个项条多少几若干数字")
+
+#: 「先占位」的说法 —— 用户**明确**要求时，新指标只显示名称不塞数值。
+PLACEHOLDER_MODE_WORDS = (
+    "占位", "只显示名称", "只显示名字", "先加标签", "加个标签", "只加标签",
+    "先显示名字", "不显示数值", "不要数值", "先不显示数值", "只显示标题",
+    "先放个名字", "先出个名字",
+)
+
+#: 「直接出数值」的说法。
+SIMULATED_MODE_WORDS = (
+    "显示出数", "显示数值", "带数值", "有数值", "直接出数", "直接显示",
+    "填上数值", "按示例出数", "照常出数", "出数值",
+)
+
+#: 组合修改允许的意图：都只作用在同一个已有 region 上，
+#: 不新增 / 删除 / 改名 region，也不改报表本身。
 COMPOSABLE_INTENTS = frozenset({
     EditIntent.CHANGE_DATA_SOURCE,
     EditIntent.CHANGE_COMPILATION_GRAIN,
@@ -359,6 +427,83 @@ def _region_label(region: dict[str, Any]) -> str:
     )
 
 
+def _source_display_label(catalogs: dict[str, dict], source_ref: str | None) -> str:
+    """数据源的业务说法（**不点内部标识**）。
+
+    目录里登记的数据源都带一句业务描述（「EAS 能耗明细：按设备、分钟级
+    采样的区间电量」），取描述的**前半句**当名字；目录里没有就退回
+    「当前数据源」，不把 ``sourceRef`` 摆给用户看。
+    """
+    catalog = catalogs.get(str(source_ref or ""))
+    description = str((catalog or {}).get("description") or "")
+    name = description.split("：")[0].strip()
+    return name or "当前数据源"
+
+
+def _metric_display_label(metrics: dict[str, dict], metric_ref: str | None) -> str:
+    """指标的业务说法（**不点内部标识**）。
+
+    目录里登记的指标带一个用户看得懂的名字（「总耗电」）；查不到就退回
+    「原指标」，不把 ``metricRef`` 摆给用户看。
+    """
+    metric = metrics.get(str(metric_ref or ""))
+    return str((metric or {}).get("label") or "原指标")
+
+
+#: 组件类型 → 用户看得懂的展示形式说法。
+#:
+#: 认不出就退回「图表」—— **不把枚举值原样摆给用户**（TABLE / BAR 这些
+#: 是内部取值，用户看不懂）。
+_COMPONENT_DISPLAY_LABELS: dict[str, str] = {
+    "TEXT": "文字说明",
+    "METRIC_CARD": "指标卡",
+    "TABLE": "表格",
+    "CHART": "图表",
+    "DATA_QUALITY": "数据质量",
+    "ANALYSIS": "分析说明",
+}
+
+
+def _component_display_label(component_type: str | None) -> str:
+    """展示形式的业务说法（**不点内部枚举**）。"""
+    key = str(component_type or "").strip().upper()
+    return _COMPONENT_DISPLAY_LABELS.get(key, "图表")
+
+
+#: 统计粒度 → 用户看得懂的说法。
+_GRAIN_DISPLAY_LABELS: dict[str, str] = {
+    "MINUTE": "分钟",
+    "HOUR": "小时",
+    "DAY": "天",
+}
+
+
+def _grain_display_label(grain: str | None) -> str:
+    """统计粒度的业务说法（**不点内部枚举**）。"""
+    key = str(grain or "").strip().upper()
+    return _GRAIN_DISPLAY_LABELS.get(key, key or "当前粒度")
+
+
+def _grain_display_labels(grains: Any) -> str:
+    """一组粒度的业务说法（**不点内部枚举**）。"""
+    items = grains if isinstance(grains, (list, tuple)) else []
+    labels = [_grain_display_label(item) for item in items]
+    return "、".join(label for label in labels if label)
+
+
+#: 排序方向 → 用户看得懂的说法。
+_SORT_DISPLAY_LABELS: dict[str, str] = {
+    "ASC": "从小到大",
+    "DESC": "从大到小",
+}
+
+
+def _sort_display_label(direction: str | None) -> str:
+    """排序方向的业务说法（**不点内部枚举**）。"""
+    key = str(direction or "").strip().upper()
+    return _SORT_DISPLAY_LABELS.get(key, key or "当前排序")
+
+
 #: 角色 → 用户的口语说法。
 #:
 #: 按**角色**给别名，不写死具体卡片名：用户说「明细」指的是明细类板块，
@@ -396,7 +541,6 @@ def _region_aliases(region: dict[str, Any]) -> list[str]:
 
 def _definition_revision(definition: ReportDefinitionDraft) -> int:
     return int((definition.metadata or {}).get("revision") or 0)
-
 
 def _bump_revision(definition: ReportDefinitionDraft) -> None:
     definition.metadata = dict(definition.metadata or {})
@@ -586,12 +730,12 @@ class TemplateEditEngine:
             EditOperationStep(
                 intent=EditIntent.CHANGE_DATA_SOURCE,
                 operation=EditOperation(sourceRef=target_ref),
-                summary=f"数据源换成 {target_ref}",
+                summary=f"数据源换成 {_source_display_label(catalogs, target_ref)}",
             ),
             EditOperationStep(
                 intent=EditIntent.CHANGE_COMPILATION_GRAIN,
                 operation=EditOperation(grain={"unit": grain_unit}),
-                summary=f"compilation 粒度改成 {grain_unit}",
+                summary=f"统计粒度改成 {grain_unit}",
             ),
         ]
         target_grains = list(target_source.get("supportedGrains") or [])
@@ -636,10 +780,14 @@ class TemplateEditEngine:
     ) -> str:
         """组合修改的面向用户摘要：写清楚改什么、来源、粒度和未验证能力。"""
         label = _region_label(region)
+        # 目标数据源有目录条目，用它的业务描述；来源数据源这里拿不到目录，
+        # 统一说「当前数据源」—— 两边都不摆 sourceRef。
+        target_label = _source_display_label({target_source: target_catalog}, target_source)
+        current_label = _source_display_label({}, current_source)
         lines = [
-            f"将「{label}」的数据源从 {current_source or '当前源'} 换成 {target_source}，"
-            f"并把 compilation 粒度改成 {grain_unit}。",
-            f"目标数据源支持的粒度：{'、'.join(target_catalog.get('supportedGrains') or []) or '未登记'}。",
+            f"将「{label}」的数据源从 {current_label} 换成 {target_label}，"
+            f"并把统计粒度改成 {_grain_display_label(grain_unit)}。",
+            f"目标数据源支持的粒度：{_grain_display_labels(target_catalog.get('supportedGrains')) or '未登记'}。",
         ]
         # 换源后指标口径可能变化，必须先说明再确认
         for node in (
@@ -681,8 +829,8 @@ class TemplateEditEngine:
             plan.intent = EditIntent.UNKNOWN
             plan.needsClarification = True
             plan.clarificationQuestion = (
-                "请告诉我要怎么改当前草稿：删除某个 section、改标题、改指标、改数据源、改图表，"
-                "还是改 compilation 粒度？"
+                "请告诉我要怎么改当前草稿：删掉某张卡片、改标题、改指标、改数据源、改图表，"
+                "还是改统计粒度？"
             )
             return plan
         catalogs, metrics = self._visible_items(scope)
@@ -717,16 +865,80 @@ class TemplateEditEngine:
             return plan
 
         # ===== 2. 删除 =====
-        if any(w in text for w in DELETE_WORDS):
+        #
+        # 「不要 X，改成 Y」是**替换**，不是删除：一句话里既出现否定词又
+        # 出现替换动词时，替换说了算 —— 用户要的是「把 X 换成 Y」，不是
+        # 「把整张卡片删掉」。
+        #
+        # 判据是通用词法（否定词 + 替换动词共现），不认具体指标名。
+        # 只有否定词、没有替换动词时，才是删除。
+        delete_hit = any(w in text for w in DELETE_WORDS)
+        replace_hit = any(w in text for w in REPLACE_CLAUSE_VERBS)
+        if delete_hit and not replace_hit:
             plan.intent = EditIntent.DELETE_SECTION
             plan.confidence = 0.9
             if target_region is None:
                 plan.needsClarification = True
-                plan.clarificationQuestion = "你想删除哪个 section？可以直接说：删掉昨日总耗电。"
+                plan.clarificationQuestion = "你想删掉哪张卡片？可以直接说：删掉昨日总耗电。"
             return plan
 
-        # ===== 3. 新增 =====
-        if any(w in text for w in ADD_WORDS):
+        # ===== 3. 在已有区块里追加指标 =====
+        #
+        # 「再加 X」「还需要包括 X、Y」是**追加**：保留该区块原有指标，把
+        # 新指标加进去；只有明确说「替换 / 只留 / 换成」才走替换。
+        #
+        # 这一段必须排在「新增卡片」**之前**：
+        #   - 句子里有「指标」两个字时，「再加三个指标」会被误当成「把指标
+        #     换成三个」（缺陷 2 的根因）；
+        #   - 句子里有「加」时，「再加 A、B、C」会被误当成**新增一张卡片**，
+        #     三个指标名挤成一个标题（缺陷 2 的另一半）。
+        #
+        # 追加的目标卡片：句子里点名的那张 > 用户当前选中的那张 >
+        # 草稿里**唯一**的那张正文卡片。三者都定不下来才追问。
+        if not any(word in text for word in REPLACE_WORDS) and any(
+            word in text for word in APPEND_WORDS
+        ):
+            append_target = target_region or self._sole_body_region(definition)
+            if append_target is not None:
+                plan.target = EditTarget(
+                    regionId=str(append_target.get("id")),
+                    matchedText=_region_label(append_target),
+                    confidence=0.9,
+                )
+            append_plan = self._plan_append_metrics(
+                text, append_target, metrics, definition,
+            )
+            if append_plan is not None:
+                return append_plan
+            if append_target is None:
+                # 看得出是要**加**东西，但没说要加到哪张卡片、也没说加哪几个
+                # → 在同一个待办里问清楚。**不能**掉到「换指标」那条路上：
+                # 「再加 X」是追加，不是替换。
+                return EditPlan(
+                    isTemplateEdit=True,
+                    intent=EditIntent.ADD_METRIC,
+                    confidence=0.6,
+                    target=EditTarget(regionId="", matchedText="", confidence=0.0),
+                    operation=EditOperation(
+                        baseDefinitionRevision=_definition_revision(definition),
+                    ),
+                    needsClarification=True,
+                    clarificationQuestion=(
+                        "要往哪张卡片上追加指标？"
+                        "说出卡片名字和你想加的指标就行（比如「总览再加 A、B」）。"
+                    ),
+                )
+
+        # ===== 4. 新增卡片 =====
+        #
+        # 触发条件有两类：
+        #   - 带量词的说法（「加一个 X」「新增 X」）；
+        #   - **句首**的「加 / 再加」后面确实是一个指标（「加 PUE」）。
+        #     只认句首：句中的「加个两度」不是新增指标。
+        add_hit = any(w in text for w in ADD_WORDS)
+        if not add_hit:
+            add_hit = self._leading_add_is_metric(text, metrics)
+        if add_hit:
             plan.intent = EditIntent.ADD_SECTION
             plan.confidence = 0.85
             # 「用户说的指标」是已登记指标还是目录外候选，**一处判定**：
@@ -767,7 +979,7 @@ class TemplateEditEngine:
             )
             missing: list[str] = []
             if not plan.operation.sectionTitle:
-                missing.append("section 标题")
+                missing.append("卡片标题")
             if not plan.operation.metricRef and not plan.operation.metricIntent:
                 missing.append("指标")
             # 目录外指标这一块**不绑数据源**（它没有真实口径），不因
@@ -777,7 +989,7 @@ class TemplateEditEngine:
             if missing:
                 plan.needsClarification = True
                 plan.clarificationQuestion = (
-                    "新增 section 还缺：" + "、".join(missing) + "。你想看什么指标、用哪个数据源？"
+                    "新增卡片还缺：" + "、".join(missing) + "。你想看什么指标、用哪个数据源？"
                 )
             elif candidate is not None and candidate.is_ambiguous:
                 # 含义不清（电脑耗电率？耗电量？占比？功率？）→ 先澄清口径，
@@ -786,7 +998,7 @@ class TemplateEditEngine:
                 plan.clarificationQuestion = candidate.clarification_question
             return plan
 
-        # ===== 4. 改数据源 =====
+        # ===== 5. 改数据源 =====
         if ("数据源" in text and ("换" in text or "改" in text)) or re.search(r"换成.+(明细|汇总|数据)", text):
             source_ref = match_source_by_alias(new_value, set(catalogs))
             plan.intent = EditIntent.CHANGE_DATA_SOURCE
@@ -799,7 +1011,7 @@ class TemplateEditEngine:
             )
             if target_region is None:
                 plan.needsClarification = True
-                plan.clarificationQuestion = "你想换哪个 section 的数据源？"
+                plan.clarificationQuestion = "你想换哪张卡片的数据源？"
                 return plan
             if not source_ref:
                 plan.needsClarification = True
@@ -819,7 +1031,7 @@ class TemplateEditEngine:
             )
             if target_region is None:
                 plan.needsClarification = True
-                plan.clarificationQuestion = "你想把哪个 section 改成这个展示形式？"
+                plan.clarificationQuestion = "你想把哪张卡片改成这个展示形式？"
             else:
                 shape = ROLE_DATA_SHAPE.get(str(target_region.get("role")), "CATEGORY_RANKING")
                 options = DISPLAY_OPTIONS_BY_SHAPE.get(shape, {}).get("options", [])
@@ -842,7 +1054,7 @@ class TemplateEditEngine:
             plan.confidence = 0.85
             if target_region is None:
                 plan.needsClarification = True
-                plan.clarificationQuestion = "你想看哪个 section 的展示方式？"
+                plan.clarificationQuestion = "你想看哪张卡片的展示方式？"
                 return plan
             shape = ROLE_DATA_SHAPE.get(str(target_region.get("role")), "CATEGORY_RANKING")
             option_bundle = DISPLAY_OPTIONS_BY_SHAPE.get(shape, {"options": [], "disabled": []})
@@ -869,7 +1081,7 @@ class TemplateEditEngine:
             )
             if target_region is None:
                 plan.needsClarification = True
-                plan.clarificationQuestion = f"你想把哪个 section 的时间范围改成「{label}」？"
+                plan.clarificationQuestion = f"你想把哪张卡片的时间范围改成「{label}」？"
             return plan
 
         # ===== 7. 改 compilation 粒度 =====
@@ -897,7 +1109,7 @@ class TemplateEditEngine:
             if target_region is None:
                 plan.needsClarification = True
                 plan.clarificationQuestion = (
-                    "你想改哪个 section 的 compilation 粒度？"
+                    "你想改哪张卡片的统计粒度？"
                 )
                 return plan
             source_ref = _region_dataset_source_ref(target_region, definition)
@@ -929,13 +1141,25 @@ class TemplateEditEngine:
             return plan
 
         # ===== 8. 改指标 =====
-        if "指标" in text or re.search(r"换成.+(耗电|电费|成本|pue|用电)", text, re.IGNORECASE):
-            # 目录外指标（#65）：换成一个目录里没有的指标同样**不再以
-            # 「未登记」拒绝** —— 转成可澄清或带显式假设的模拟候选。
-            # 与新增分支**同一处判定**：别名命中 ≠ 识别成功。
+        #
+        # 触发条件只有两种：
+        #   - 句子里点名了「指标」；
+        #   - **否定 + 替换**（「不要 X，改成 Y」）—— 替换后的新值能解析成
+        #     一个指标时，这句话就是在换指标。
+        #
+        # 这里**不认具体指标名** —— 不写「耗电/电费/pue/用电」这类清单。
+        # 新值能不能解析成一个指标，由解析器说了算；解析不出来就不在这里
+        # 硬判，落到后面的分支去。
+        #
+        # 目录外指标（#65）：换成一个目录里没有的指标同样**不再以
+        # 「未登记」拒绝** —— 转成可澄清或带显式假设的模拟候选。
+        # 与新增分支**同一处判定**：别名命中 ≠ 识别成功。
+        metric_ref, candidate = None, None
+        if "指标" in text or (delete_hit and replace_hit):
             metric_ref, candidate = self._resolve_metric_target(
                 new_value, metrics, strip_add_prefix=False,
             )
+        if "指标" in text or metric_ref or candidate:
             plan.intent = EditIntent.CHANGE_METRIC
             plan.confidence = 0.8
             plan.operation = EditOperation(
@@ -947,7 +1171,7 @@ class TemplateEditEngine:
             )
             if target_region is None:
                 plan.needsClarification = True
-                plan.clarificationQuestion = "你想换哪个 section 的指标？"
+                plan.clarificationQuestion = "你想换哪张卡片的指标？"
                 return plan
             if not metric_ref and candidate is None:
                 plan.needsClarification = True
@@ -967,7 +1191,7 @@ class TemplateEditEngine:
             plan.operation = EditOperation(topN=int(topn_match.group(1)))
             if target_region is None:
                 plan.needsClarification = True
-                plan.clarificationQuestion = "你想在哪个 section 看前 N 名？"
+                plan.clarificationQuestion = "你想在哪张卡片看前 N 名？"
             return plan
 
         if "降序" in text or "升序" in text or "按" in text and "排" in text:
@@ -977,7 +1201,7 @@ class TemplateEditEngine:
             plan.operation = EditOperation(sortDirection=direction)
             if target_region is None:
                 plan.needsClarification = True
-                plan.clarificationQuestion = "你想改哪个 section 的排序？"
+                plan.clarificationQuestion = "你想改哪张卡片的排序？"
             return plan
 
         # ===== 10. 改标题（放在最后，必须明确触发词）=====
@@ -988,7 +1212,7 @@ class TemplateEditEngine:
             plan.operation = EditOperation(newTitle=new_title)
             if target_region is None:
                 plan.needsClarification = True
-                plan.clarificationQuestion = f"你想把哪个 section 的标题改成「{new_title}」？"
+                plan.clarificationQuestion = f"你想把哪张卡片的标题改成「{new_title}」？"
             return plan
 
         # ===== 11. 兜底 =====
@@ -998,12 +1222,12 @@ class TemplateEditEngine:
         if target_region is not None:
             plan.clarificationQuestion = (
                 f"你想把「{_region_label(target_region)}」删除、改标题、改指标、"
-                "改数据源、改展示形式、改 compilation 粒度，还是改时间范围？"
+                "改数据源、改展示形式、改统计粒度，还是改时间范围？"
             )
         else:
             plan.clarificationQuestion = (
-                "请告诉我要怎么改当前草稿：删除某个 section、改标题、改指标、改数据源、改图表，"
-                "还是改 compilation 粒度？"
+                "请告诉我要怎么改当前草稿：删掉某张卡片、改标题、改指标、改数据源、改图表，"
+                "还是改统计粒度？"
             )
         return plan
 
@@ -1165,6 +1389,10 @@ class TemplateEditEngine:
         """
         source_ref = plan.operation.sourceRef
         metric_ref = plan.operation.metricRef
+        # 来源模式（模拟示例 / 用户 JSON）。**只有模拟示例模式**才放松
+        # 「真实字段准入」—— 用户 JSON 模式下的校验一律保留。
+        mode = source_mode_of_definition(draft.model_dump(mode="json"))
+        virtual_metric = bool(str(plan.operation.metricIntent or "").strip())
         if source_ref and source_ref not in catalogs:
             return _IntentOutcome.failed(
                 "当前范围无权使用该数据源。", reason="incompatible_fields",
@@ -1174,9 +1402,12 @@ class TemplateEditEngine:
                 "当前范围无权使用该指标。", reason="incompatible_fields",
             )
         if plan.intent in {EditIntent.CHANGE_DATA_SOURCE, EditIntent.ADD_SECTION} and not source_ref:
-            return _IntentOutcome.failed(
-                "请先选择授权范围内的数据源。", reason="incompatible_fields",
-            )
+            # 目录外指标**没有**真实口径，不绑数据源 —— 不因「没找到数据源」
+            # 把用户的增改请求挡回去（模拟示例模式下）。
+            if not (virtual_metric and mode.mode != "user_json"):
+                return _IntentOutcome.failed(
+                    "请先选择授权范围内的数据源。", reason="incompatible_fields",
+                )
         if plan.intent in {EditIntent.CHANGE_METRIC, EditIntent.ADD_SECTION} and not metric_ref:
             # 目录外指标（#65）：带着**候选**来的不再以「未登记」拒绝 ——
             # 它走通用模拟能力出数，并标「能力待接通 / 口径待确认」。
@@ -1240,7 +1471,7 @@ class TemplateEditEngine:
             missing = sorted(_required_source_fields(target_region, metrics) - fields)
             if missing:
                 return _IntentOutcome.failed(
-                    f"目标数据源缺少当前 section 所需字段：{'、'.join(missing)}。"
+                    f"目标数据源缺少当前卡片所需字段：{'、'.join(missing)}。"
                     "请换用兼容的数据源。",
                     reason="incompatible_fields",
                 )
@@ -1253,11 +1484,19 @@ class TemplateEditEngine:
             )
             source = catalogs.get(source_ref or "")
             if metric and source and metric["fieldRef"] not in (source.get("fields") or {}):
-                return _IntentOutcome.failed(
-                    f"当前数据源不提供指标「{metric['label']}」所需的"
-                    f" {metric['fieldRef']} 字段，请先选择兼容数据源。",
-                    reason="incompatible_fields",
-                )
+                if mode.mode == "user_json":
+                    # 真实数据模式：字段准入**保留**。
+                    # 面向用户**不点字段名**（那是内部标识）：只说清楚
+                    # 「这个指标现在取不到数，换个数据源」。
+                    return _IntentOutcome.failed(
+                        f"当前数据源取不到指标「{metric['label']}」的数据，"
+                        "请先选择兼容的数据源。",
+                        reason="incompatible_fields",
+                    )
+                # 模拟示例模式：真实字段准入**让位** —— 不能因为「数据源没
+                # 这个字段」拒绝用户的增改请求。这一项降级成**虚拟指标**：
+                # 不伪造 metricRef，按模拟示例出数并标「能力待接通」。
+                self._downgrade_to_virtual_metric(plan, metric)
 
         change_set: ChangeSet | None = None
         reply = ""
@@ -1271,6 +1510,10 @@ class TemplateEditEngine:
             change_set, reply = self._apply_rename(draft, plan, base_revision)
         elif plan.intent == EditIntent.ADD_SECTION:
             change_set, reply = self._apply_add(draft, plan, base_revision, catalogs, metrics)
+        elif plan.intent == EditIntent.ADD_METRIC:
+            change_set, reply = self._apply_add_metric(
+                draft, plan, base_revision, metrics,
+            )
         elif plan.intent == EditIntent.CHANGE_DATA_SOURCE:
             change_set, reply = self._apply_change_source(draft, plan, base_revision, catalogs)
         elif plan.intent == EditIntent.CHANGE_VISUALIZATION:
@@ -1293,7 +1536,7 @@ class TemplateEditEngine:
         if change_set is None:
             # 没找到目标 region 等情况
             return _IntentOutcome.failed(
-                reply or "没有找到要修改的 section，请再明确一下。", reason="no_change",
+                reply or "没有找到要修改的卡片，请再明确一下。", reason="no_change",
             )
 
         return _IntentOutcome(
@@ -1325,7 +1568,7 @@ class TemplateEditEngine:
         region_id = plan.target.regionId
         if not region_id:
             return self._composite_failed(
-                plan, before, "组合修改必须指明要改哪个 section。", reason_code="no_target",
+                plan, before, "组合修改必须指明要改哪张卡片。", reason_code="no_target",
             )
 
         # 组合修改只允许作用在同一个 region 上，避免跨区块的隐式耦合
@@ -1494,6 +1737,25 @@ class TemplateEditEngine:
         return None
 
     @staticmethod
+    def _sole_body_region(
+        definition: ReportDefinitionDraft,
+    ) -> dict[str, Any] | None:
+        """草稿里**只有一张**正文卡片时，返回它。
+
+        「再加 X」没点名是哪张卡片 —— 草稿里就一张时，那就是它（没有歧义，
+        不用追问）；有两张以上时返回 ``None``，由上层问清楚。
+
+        标题区（``role == "REPORT_TITLE"``）不算正文卡片：它是报表名，
+        不是能加指标的地方。
+        """
+        regions = [
+            region for region in (definition.regions or [])
+            if isinstance(region, dict)
+            and str(region.get("role") or "").upper() != "REPORT_TITLE"
+        ]
+        return regions[0] if len(regions) == 1 else None
+
+    @staticmethod
     def _parse_component_type(text: str) -> tuple[str, str, str]:
         """返回 (chartKind, componentType, 命中的原话)。
 
@@ -1551,6 +1813,7 @@ class TemplateEditEngine:
     @staticmethod
     def _apply_candidate_to_spec(
         spec: dict[str, Any], candidate: OutOfCatalogCandidate, reason: str,
+        *, simulated: bool = False,
     ) -> dict[str, Any]:
         """把**已解析的候选**（含用户拍板过的口径）写回示意语义描述。
 
@@ -1566,6 +1829,8 @@ class TemplateEditEngine:
             if candidate.unit:
                 item["unit"] = candidate.unit
             item["pendingReason"] = reason
+            if simulated:
+                item["capabilityPending"] = False
             item["deterministicScope"] = deterministic_scope(
                 SCOPE_METRIC_FAMILY,
                 metric_family_seed_key(
@@ -1578,6 +1843,8 @@ class TemplateEditEngine:
             spec["unit"] = candidate.unit
         if not candidate.is_ambiguous:
             spec["clarification"] = None
+        if simulated:
+            spec["capabilityPending"] = False
         return spec
 
     @staticmethod
@@ -1610,6 +1877,53 @@ class TemplateEditEngine:
         return resolve_out_of_catalog_candidate(intent, answer=answer)
 
     @staticmethod
+    def _leading_add_intent(text: str) -> str:
+        """**句首**的「加 / 再加」后面那一段（候选的指标意图）。
+
+        句首才认：句中的「加个两度」不是新增指标（「把温度加个两度」）。
+        """
+        value = str(text or "").strip()
+        for filler in ("帮我", "麻烦", "请", "我想", "我要", "给我"):
+            if value.startswith(filler):
+                value = value[len(filler):].strip()
+                break
+        for prefix in ("再加", "加"):
+            if value.startswith(prefix):
+                return value[len(prefix):].strip(" 　：:，,。.；;！!？?、")
+        return ""
+
+    @staticmethod
+    def _strip_metric_tail_noise(name: str) -> str:
+        """去掉指标名末尾的成分词（「三个指标」→「三个」）。"""
+        value = str(name or "").strip()
+        for noise in _METRIC_NAME_TAIL_NOISE:
+            if value.endswith(noise) and len(value) > len(noise):
+                return value[: -len(noise)].strip()
+        return value
+
+    def _leading_add_is_metric(
+        self, text: str, metrics: dict[str, dict],
+    ) -> bool:
+        """句首「加 X」里的 X 是不是一个指标（已登记或目录外候选）。
+
+        问句不算（「加了多少度？」是提问，不是新增请求）。
+        """
+        if any(mark in text for mark in ("？", "?", "吗", "多少", "几")):
+            return False
+        intent = self._leading_add_intent(text)
+        if len(intent) < 2:
+            return False
+        intent = self._strip_metric_tail_noise(intent)
+        if len(intent) < 2:
+            return False
+        if all(char in _COUNT_ONLY_CHARS for char in intent):
+            # 「再加三个指标」里的「三个」是**数量**，不是指标名。
+            return False
+        if match_metric_by_alias(intent, set(metrics)):
+            return True
+        return self._resolve_out_of_catalog(intent, strip_add_prefix=False) is not None
+
+    @staticmethod
     def _resolve_metric_target(
         text: str, metrics: dict[str, dict[str, Any]], *, strip_add_prefix: bool,
     ) -> tuple[str | None, OutOfCatalogCandidate | None]:
@@ -1636,6 +1950,168 @@ class TemplateEditEngine:
             return metric_ref, None
         # 口径对不上 → 目录外候选，**不静默映射**到已登记指标。
         return None, candidate
+
+    # ------------------------------------------------------------------
+    # 追加指标（新增默认是追加）
+    # ------------------------------------------------------------------
+
+    def _plan_append_metrics(
+        self,
+        text: str,
+        target_region: dict[str, Any] | None,
+        metrics: dict[str, dict],
+        definition: ReportDefinitionDraft,
+    ) -> EditPlan | None:
+        """「在已有区块里追加指标」的计划。
+
+        返回 ``None`` = 这句话**不是**在已有区块里追加指标（上层照既有
+        分支继续走）。返回计划但 ``needsClarification`` = 认出了追加的
+        意图，但还没说清要加哪几个 —— 同一个待办里追问，不另开一轮。
+        """
+        if target_region is None:
+            # 没有指到具体卡片 → 不是「往这张卡片里加指标」。
+            return None
+        names = self._extract_appended_metric_names(text, target_region)
+        target = EditTarget(
+            regionId=str(target_region.get("id")),
+            matchedText=_region_label(target_region),
+            confidence=0.9,
+        )
+        if not names:
+            # 看得出是要往这张卡片里加东西，但没说要加哪几个 → 问清楚。
+            plan = EditPlan(
+                isTemplateEdit=True,
+                intent=EditIntent.ADD_METRIC,
+                confidence=0.6,
+                target=target,
+                operation=EditOperation(
+                    baseDefinitionRevision=_definition_revision(definition),
+                ),
+                needsClarification=True,
+                clarificationQuestion=(
+                    f"要在「{_region_label(target_region)}」这张卡片上追加哪几个指标？"
+                    "把指标名字列出来就行。"
+                ),
+            )
+            return plan
+
+        additions: list[EditMetricAddition] = []
+        for name in names:
+            metric_ref, candidate = self._resolve_metric_target(
+                name, metrics, strip_add_prefix=False,
+            )
+            if metric_ref:
+                catalog = metrics.get(metric_ref) or {}
+                additions.append(EditMetricAddition(
+                    intent=name,
+                    label=str(catalog.get("label") or name),
+                    unit=str(catalog.get("unit") or ""),
+                    displayMode=DISPLAY_MODE_SIMULATED,
+                    metricRef=metric_ref,
+                ))
+                continue
+            if candidate is None:
+                # 这个名字认不出来 → 不猜，回去问清楚。
+                return None
+            if candidate.is_ambiguous:
+                # 含义不清 → 先澄清口径（同一个待办，不另开一轮）。
+                plan = EditPlan(
+                    isTemplateEdit=True,
+                    intent=EditIntent.ADD_METRIC,
+                    confidence=0.6,
+                    target=target,
+                    operation=EditOperation(
+                        addMetrics=[EditMetricAddition(
+                            intent=name,
+                            label=candidate.label,
+                            unit=candidate.unit,
+                            displayMode=DISPLAY_MODE_SIMULATED,
+                            metricCandidate=candidate.as_dict(),
+                        )],
+                        baseDefinitionRevision=_definition_revision(definition),
+                    ),
+                    needsClarification=True,
+                    clarificationQuestion=candidate.clarification_question,
+                )
+                return plan
+            additions.append(EditMetricAddition(
+                intent=name,
+                label=candidate.label,
+                unit=candidate.unit,
+                displayMode=DISPLAY_MODE_SIMULATED,
+                metricCandidate=candidate.as_dict(),
+            ))
+        if not additions:
+            return None
+        return EditPlan(
+            isTemplateEdit=True,
+            intent=EditIntent.ADD_METRIC,
+            confidence=0.85,
+            target=target,
+            operation=EditOperation(
+                addMetrics=additions,
+                baseDefinitionRevision=_definition_revision(definition),
+            ),
+        )
+
+    @staticmethod
+    def _split_metric_list(text: str) -> list[str]:
+        """把一段话按**清单分隔符**拆成一个个指标名。
+
+        通用文本处理，不认具体指标名：顿号 / 逗号 / 分号 / 以及 / 还有 / 和
+        都是分隔符；末尾的成分词（「的指标」「这几项」）剥掉；光有数量词
+        的片段（「三个」）是**数量**不是名字，丢掉。
+
+        拆不出名字宁可只有一项 —— 上层回去问清楚，不猜。
+        """
+        parts = [str(text or "")]
+        for separator in _METRIC_LIST_SEPARATORS:
+            expanded: list[str] = []
+            for part in parts:
+                expanded.extend(part.split(separator))
+            parts = expanded
+        names: list[str] = []
+        for part in parts:
+            name = part.strip(" 　：:，,。.；;！!？?、")
+            name = TemplateEditEngine._strip_metric_tail_noise(name)
+            if len(name) < 2:
+                continue
+            if all(char in _COUNT_ONLY_CHARS for char in name):
+                # 「再加三个指标」里的「三个」是**数量**，不是指标名。
+                continue
+            if name not in names:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def _extract_appended_metric_names(
+        text: str, region: dict[str, Any] | None,
+    ) -> list[str]:
+        """从这句话里抽出「要追加的指标清单」。
+
+        做法是**通用**的文本处理：去掉指向目标卡片的那一段 → 在「追加」
+        词上切开 → 剥掉连接词 → 按清单分隔符拆开 → 去掉成分词。
+
+        抽不出来的名字宁可没有 —— 上层回去问清楚，不猜。
+        """
+        rest = TemplateEditEngine._text_without_region_label(text, region)
+        best_index = -1
+        best_word = ""
+        for word in APPEND_WORDS:
+            index = rest.find(word)
+            if index >= 0 and index > best_index:
+                best_index = index
+                best_word = word
+        if best_index >= 0:
+            tail = rest[best_index + len(best_word):].strip()
+            head = rest[:best_index].strip()
+            rest = tail or head
+        for connector in _APPEND_CONNECTORS:
+            if rest.startswith(connector):
+                rest = rest[len(connector):].strip()
+                break
+        rest = rest.strip(" 　：:，,。.；;！!？?、")
+        return TemplateEditEngine._split_metric_list(rest)
 
     @staticmethod
     def _parse_grain(text: str, *, explicit_only: bool = False) -> str | None:
@@ -1776,7 +2252,7 @@ class TemplateEditEngine:
         before_regions = list(definition.regions)
         target = next((r for r in before_regions if r.get("id") == region_id), None)
         if target is None:
-            return None, "没有找到要删除的 section。"
+            return None, "没有找到要删除的卡片。"
         definition.regions = [r for r in before_regions if r.get("id") != region_id]
         label = _region_label(target)
         change_set = ChangeSet(
@@ -1787,7 +2263,7 @@ class TemplateEditEngine:
                     path=f"/regions/{region_id}",
                     before=target,
                     after=None,
-                    summary=f"删除「{label}」section",
+                    summary=f"删除「{label}」卡片",
                 )
             ],
             unchanged=[
@@ -1796,7 +2272,7 @@ class TemplateEditEngine:
             ],
             impact=[f"已从草稿中移除「{label}」。"],
         )
-        return change_set, f"已删除「{label}」section。请检查右侧草稿，满意后点「同意」保存。"
+        return change_set, f"已删除「{label}」这张卡片。请检查右侧草稿，满意后点「同意」保存。"
 
     @staticmethod
     def _apply_rename(
@@ -1808,7 +2284,7 @@ class TemplateEditEngine:
             return None, "新标题为空，请再提供一次。"
         target = next((r for r in definition.regions if r.get("id") == region_id), None)
         if target is None:
-            return None, "没有找到要改标题的 section。"
+            return None, "没有找到要改标题的卡片。"
         before_title = _region_label(target)
         target["name"] = new_title
         if isinstance(target.get("component"), dict):
@@ -1829,7 +2305,7 @@ class TemplateEditEngine:
                 for r in definition.regions
                 if r.get("id") != region_id
             ],
-            impact=[f"已更新 section 标题：{before_title} → {new_title}。"],
+            impact=[f"已更新卡片标题：{before_title} → {new_title}。"],
         )
         return change_set, f"已把「{before_title}」改成「{new_title}」。请检查右侧草稿，满意后点「同意」保存。"
 
@@ -1844,7 +2320,7 @@ class TemplateEditEngine:
                 definition, plan, base_revision,
             )
         if not (op.sectionTitle and op.metricRef and op.sourceRef):
-            return None, "新增 section 还缺标题、指标或数据源，请补充。"
+            return None, "新增卡片还缺标题、指标或数据源，请补充。"
 
         metric = metrics[op.metricRef]
         new_region_id = f"region_{self._slugify(op.sectionTitle)}"
@@ -1982,7 +2458,7 @@ class TemplateEditEngine:
                     path=f"/regions/{new_region_id}",
                     before=None,
                     after=new_region,
-                    summary=f"新增「{op.sectionTitle}」section",
+                    summary=f"新增「{op.sectionTitle}」卡片",
                 )
             ],
             unchanged=[
@@ -1991,11 +2467,12 @@ class TemplateEditEngine:
                 if r.get("id") != new_region_id
             ],
             impact=[
-                f"新增 section「{op.sectionTitle}」，使用数据源 {op.sourceRef} 和指标 {op.metricRef}。",
+                f"新增卡片「{op.sectionTitle}」，数据来自 {_source_display_label(catalogs, op.sourceRef)}，"
+                f"指标是「{metric.get('label') or op.sectionTitle}」。",
                 "保存前需要重新校验并预览。",
             ],
         )
-        return change_set, f"已新增「{op.sectionTitle}」section。请检查右侧草稿，满意后点「同意」保存。"
+        return change_set, f"已新增卡片「{op.sectionTitle}」。请检查右侧草稿，满意后点「同意」保存。"
 
     # ------------------------------------------------------------------
     # 目录外指标（工单 #65）
@@ -2032,7 +2509,11 @@ class TemplateEditEngine:
             candidate, title, component_type, chart_kind, columns,
         )
         mode = source_mode_of_definition(definition.model_dump(mode="json"))
-        reason = out_of_catalog_region_reason(candidate, source_mode=mode.mode)
+        reason = (
+            f"模拟示例数据，仅用于核对版式。{candidate.assumption_note()}"
+            if mode.mode == "simulated"
+            else out_of_catalog_region_reason(candidate, source_mode=mode.mode)
+        )
         region: dict[str, Any] = {
             "id": region_id,
             "name": title,
@@ -2041,17 +2522,15 @@ class TemplateEditEngine:
             "component": component,
             "templateBinding": {
                 "sectionId": section_id,
-                # 目录外指标：真实能力还差一个登记 → 标成占位 + 能力待接通。
+                # 不伪造真实绑定；模拟示意可以正常出数。
                 "dataStatus": "placeholder",
                 "placeholderReason": reason,
                 "dataSourceLabel": DATA_SOURCE_LABEL,
                 # 目录外指标**没有**真实口径：这里不写 metricRef。
                 "metricRefs": [],
                 "sourceMode": mode.mode,
-                # 区域级占位文案按**来源模式**分叉：复用模板层那一份
-                # （report_template_service.pending_reason），不另起说法。
-                # 目录外指标的区域级数值同样是「模拟示例 / 用户提供的数据」。
-                "pendingReason": pending_reason(mode.mode),
+                # 编辑路径只描述当前展示，不承诺未来接入真实数据。
+                "pendingReason": reason,
             },
         }
         context = self._region_context(definition)
@@ -2074,6 +2553,7 @@ class TemplateEditEngine:
             ),
             candidate,
             reason,
+            simulated=mode.mode == "simulated",
         )
 
         regions = list(definition.regions)
@@ -2094,7 +2574,7 @@ class TemplateEditEngine:
                     path=f"/regions/{region_id}",
                     before=None,
                     after=region,
-                    summary=f"新增「{title}」section（目录外指标：{candidate.label}）",
+                    summary=f"新增「{title}」卡片（目录外指标：{candidate.label}）",
                 )
             ],
             unchanged=[
@@ -2103,17 +2583,325 @@ class TemplateEditEngine:
                 if item.get("id") != region_id
             ],
             impact=[
-                f"新增 section「{title}」，指标「{candidate.label}」不在真实指标目录里："
-                "这一块按模拟示例出数，并标「能力待接通」。",
+                f"新增卡片「{title}」，指标「{candidate.label}」按模拟示例出数。",
                 f"假设：{candidate.assumption_note()}",
                 "保存前需要重新校验并预览。",
             ],
         )
         return change_set, (
-            f"已新增「{title}」section。指标「{candidate.label}」不在真实指标目录里，"
-            f"这一块按模拟示例出数并标了「能力待接通」；{candidate.assumption_note()} "
+            f"已新增卡片「{title}」。指标「{candidate.label}」按模拟示例出数；"
+            f"{candidate.assumption_note()} "
             "请检查右侧草稿，满意后点「同意」保存。"
         )
+
+    # ------------------------------------------------------------------
+    # 追加指标（新增默认是追加）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _expand_metric_additions(
+        additions: list[EditMetricAddition],
+    ) -> list[EditMetricAddition]:
+        """把「一条里塞了好几个指标」拆成**一条一个指标**。
+
+        用户一句话说了几个指标（「再加总实时功率、运行中的服务器数和告警
+        总数」），上游有时把整串当成**一个**指标名。落到定义里就只剩一个
+        叫「总实时功率、运行中的服务器数和告警总数」的标签 —— 用户要的是
+        **三个**标签，三条都真的出现在右侧。
+
+        拆法是通用文本处理（清单分隔符），不认具体指标名。
+
+        已登记指标（带 ``metricRef``）不拆：它的显示名就是目录里的名字，
+        拆开反而认不出。
+        """
+        expanded: list[EditMetricAddition] = []
+        for addition in additions:
+            name = str(addition.label or addition.intent or "").strip()
+            parts = (
+                [name] if addition.metricRef
+                else TemplateEditEngine._split_metric_list(name)
+            )
+            if not parts:
+                parts = [name]
+            if len(parts) <= 1:
+                expanded.append(addition)
+                continue
+            for part in parts:
+                expanded.append(EditMetricAddition(
+                    intent=part,
+                    label=part,
+                    # 单位按**各自的名字**去推断更准 —— 原来那个单位是整串的。
+                    unit="",
+                    displayMode=addition.displayMode,
+                    metricRef=None,
+                    metricCandidate=None,
+                    note=addition.note,
+                ))
+        return expanded
+
+    def _apply_add_metric(
+        self, definition: ReportDefinitionDraft, plan: EditPlan, base_revision: int,
+        metrics: dict[str, dict],
+    ) -> tuple[ChangeSet | None, str]:
+        """往一个**已有区块**里追加一个/多个指标（**保留**原有指标）。
+
+        追加 ≠ 替换：这里只**加**，原有那一项一个字节都不动。
+
+        一次追加多个当**一次原子修改**：全部成功才落到草稿；任一步失败
+        整体不生效 —— 调用方丢弃草稿副本，原草稿保持不变。
+        """
+        additions = self._expand_metric_additions(plan.operation.addMetrics)
+        if not additions:
+            return None, "没有解析出要追加的指标。"
+        for addition in additions:
+            if not str(addition.label or addition.intent or "").strip():
+                # 认不出来的那一个 → 整批都不生效（原草稿保持不变）。
+                return None, "有指标没认出名字，请再说一次要追加哪几个指标。"
+        region_id = str(plan.target.regionId or "")
+        target = next(
+            (item for item in definition.regions if item.get("id") == region_id), None,
+        )
+        if target is None:
+            return None, "没有找到要追加指标的卡片。"
+
+        binding = target.get("templateBinding")
+        binding = dict(binding) if isinstance(binding, dict) else {}
+        section_id = str(binding.get("sectionId") or "") or region_id
+        component = target.get("component")
+        component = copy.deepcopy(component) if isinstance(component, dict) else {}
+
+        spec = binding.get("previewSpec")
+        spec = copy.deepcopy(spec) if isinstance(spec, dict) else {}
+        if not spec:
+            spec = adapt_preview_spec(target)
+        spec_metrics = [
+            item for item in (spec.get("metrics") or []) if isinstance(item, dict)
+        ]
+        existing_columns = [
+            dict(column) for column in (component.get("columns") or [])
+            if isinstance(column, dict)
+        ]
+
+        new_columns: list[dict[str, Any]] = []
+        new_metrics: list[dict[str, Any]] = []
+        for offset, addition in enumerate(additions):
+            candidate = candidate_from_dict(addition.metricCandidate)
+            label = str(addition.label or addition.intent or "").strip()
+            unit = str(addition.unit or (candidate.unit if candidate else "") or "")
+            if addition.metricRef:
+                kind = classify_metric_kind(
+                    intent=label, metric_ref=addition.metricRef,
+                )
+            elif candidate is not None:
+                kind = str(candidate.kind or "generic")
+            else:
+                kind = "generic"
+            # 同一板块里的第几个指标 → 同一个模拟身份：接着已有的往后排。
+            metric_index = len(spec_metrics) + offset
+            simulated_id = simulated_metric_id(section_id, metric_index)
+            display_mode = (
+                DISPLAY_MODE_PLACEHOLDER_ONLY
+                if str(addition.displayMode or "") == DISPLAY_MODE_PLACEHOLDER_ONLY
+                else DISPLAY_MODE_SIMULATED
+            )
+            new_columns.append({
+                "fieldRef": simulated_id,
+                "label": label,
+                "format": {"unitLabel": unit},
+                # 占位 / 非占位**记在定义里**：渲染层照它决定这一列要不要出数值。
+                "displayMode": display_mode,
+                "bindingKind": "simulated",
+            })
+            metric_entry = simulated_metric_binding(
+                section_id, metric_index, kind, unit,
+            )
+            metric_entry["label"] = label
+            # 展示模式**两处都记**：列上记一份，指标描述上也记一份 ——
+            # 渲染层两处都读（口径一致，不会一处占位一处出数）。
+            metric_entry["displayMode"] = display_mode
+            metric_entry["capabilityPending"] = False
+            metric_entry["pendingReason"] = (
+                "按用户要求只显示名称，不出数值。"
+                if display_mode == DISPLAY_MODE_PLACEHOLDER_ONLY
+                else "模拟示例数据，仅用于核对版式。"
+            )
+            new_metrics.append(metric_entry)
+
+        # 原有指标**保留**：列与指标描述都是「原有 + 新增」。
+        component["columns"] = existing_columns + new_columns
+        target["component"] = component
+        spec["columns"] = [
+            dict(column) for column in (component.get("columns") or [])
+            if isinstance(column, dict)
+        ]
+        spec["metrics"] = spec_metrics + new_metrics
+        binding["previewSpec"] = spec
+        target["templateBinding"] = binding
+
+        labels = "、".join(
+            str(item.label or item.intent) for item in additions
+        )
+        placeholder_labels = "、".join(
+            str(item.label or item.intent)
+            for item in additions
+            if str(item.displayMode or "") == DISPLAY_MODE_PLACEHOLDER_ONLY
+        )
+        change_set = ChangeSet(
+            baseDefinitionRevision=base_revision,
+            changed=[ChangeSetEntry(
+                regionId=region_id,
+                path=f"/regions/{region_id}/component/columns",
+                before={"columns": existing_columns},
+                after={"columns": component["columns"]},
+                summary=f"追加指标：{labels}",
+            )],
+            unchanged=[
+                ChangeSetUnchanged(regionId=str(item.get("id")), summary="未修改")
+                for item in definition.regions
+                if item.get("id") != region_id
+            ],
+            impact=[
+                f"「{_region_label(target)}」追加了 {len(additions)} 项指标：{labels}；"
+                "原有指标保留。",
+                *(
+                    [f"其中 {placeholder_labels} 按占位显示：只显示名称，不出数值。"]
+                    if placeholder_labels else []
+                ),
+                "保存前需要重新校验并预览。",
+            ],
+        )
+        reply = (
+            f"已在「{_region_label(target)}」这张卡片上追加 {len(additions)} 项指标："
+            f"{labels}。原有指标保留。"
+        )
+        if placeholder_labels:
+            reply += f"其中 {placeholder_labels} 按你说的先占位：只显示名称，不出数值。"
+        return change_set, reply
+
+    @staticmethod
+    def _downgrade_to_virtual_metric(plan: EditPlan, metric: dict[str, Any]) -> None:
+        """把「目录里有、但当前数据源没这个字段」的指标降级成**虚拟指标**。
+
+        模拟示例模式（``sourceMode == simulated``）下，真实字段准入**让位**：
+        不能因为「数据源没这个字段」就拒绝用户的增改请求。
+
+        降级后**不伪造 metricRef** —— 它按目录外口径处理：只有稳定的模拟
+        身份，按模拟示例出数，并标「能力待接通」。
+        """
+        label = str(metric.get("label") or "").strip()
+        if not label:
+            return
+        candidate = OutOfCatalogCandidate(
+            intent=label,
+            kind=str(metric.get("kind") or "generic"),
+            unit=str(metric.get("unit") or ""),
+            status=STATUS_OUT_OF_CATALOG,
+            note=(
+                "这一项按虚拟模拟示例展示，仅用于核对版式。"
+            ),
+        )
+        plan.operation.metricRef = None
+        plan.operation.metricVersion = None
+        plan.operation.metricIntent = label
+        plan.operation.metricCandidate = candidate.as_dict()
+
+    # ------------------------------------------------------------------
+    # 纠正（同一个待办里的补充说明）
+    # ------------------------------------------------------------------
+
+    def correct_plan(
+        self,
+        plan: EditPlan,
+        correction: str,
+        *,
+        definition: ReportDefinitionDraft,
+        scope: ToolScope | None = None,
+    ) -> EditPlan | None:
+        """把用户对**当前待办**的纠正落到这份计划上。
+
+        「其他」自由文本是在**同一张卡片里**写的 —— 它是对这个问题的
+        纠正，承接上下文，**不是**另一条无关消息。所以纠正落到的是
+        **同一份计划**上，不重开一轮普通对话。
+
+        返回 ``None`` = 这句纠正还没说清要改成什么样（上层在同一张卡片里
+        继续追问，不新开一轮）。
+        """
+        text = str(correction or "").strip()
+        if not text:
+            return None
+
+        # 1) 展示方式（先占位 / 直接出数值）—— 改的是**同一批**指标。
+        display_mode = self._display_mode_from_text(text)
+        if display_mode is not None and plan.operation.addMetrics:
+            corrected = plan.model_copy(deep=True)
+            for addition in corrected.operation.addMetrics:
+                addition.displayMode = display_mode
+            return corrected
+
+        # 2) 纠正里又点了新的指标名 → 并进**同一批**。
+        if plan.operation.addMetrics and any(
+            word in text for word in APPEND_WORDS
+        ):
+            extra = self._extract_appended_metric_names(text, None)
+            if extra:
+                corrected = plan.model_copy(deep=True)
+                catalogs, metrics = self._visible_items(scope)
+                for name in extra:
+                    metric_ref, candidate = self._resolve_metric_target(
+                        name, metrics, strip_add_prefix=False,
+                    )
+                    if metric_ref:
+                        catalog = metrics.get(metric_ref) or {}
+                        corrected.operation.addMetrics.append(EditMetricAddition(
+                            intent=name,
+                            label=str(catalog.get("label") or name),
+                            unit=str(catalog.get("unit") or ""),
+                            displayMode=DISPLAY_MODE_SIMULATED,
+                            metricRef=metric_ref,
+                        ))
+                        continue
+                    if candidate is None:
+                        continue
+                    corrected.operation.addMetrics.append(EditMetricAddition(
+                        intent=name,
+                        label=candidate.label,
+                        unit=candidate.unit,
+                        displayMode=(
+                            display_mode
+                            if display_mode is not None
+                            else DISPLAY_MODE_SIMULATED
+                        ),
+                        metricCandidate=candidate.as_dict(),
+                    ))
+                return corrected
+
+        # 3) 纠正说的是同一张卡片上的另一件事 → 按纠正重新解析一份计划。
+        #    **目标必须还是那张卡片**：换一张卡片的指令是**新任务**，不是对
+        #    当前待办的纠正（不能借「其他」这个口子改别的地方）。
+        reparsed = self.parse(
+            message=text,
+            definition=definition,
+            selected_region_id=plan.target.regionId or None,
+            scope=scope,
+        )
+        if reparsed.intent == EditIntent.UNKNOWN or reparsed.needsClarification:
+            return None
+        if plan.target.regionId and reparsed.target.regionId != plan.target.regionId:
+            return None
+        return reparsed
+
+    @staticmethod
+    def _display_mode_from_text(text: str) -> str | None:
+        """这句话说的是「先占位」还是「直接出数值」？
+
+        认不出来返回 ``None`` —— 不猜展示方式。
+        """
+        value = str(text or "")
+        if any(word in value for word in PLACEHOLDER_MODE_WORDS):
+            return DISPLAY_MODE_PLACEHOLDER_ONLY
+        if any(word in value for word in SIMULATED_MODE_WORDS):
+            return DISPLAY_MODE_SIMULATED
+        return None
 
     @staticmethod
     def _next_section_id(definition: ReportDefinitionDraft) -> str:
@@ -2227,7 +3015,7 @@ class TemplateEditEngine:
             return None, "没有解析出新的数据源。"
         target = next((r for r in definition.regions if r.get("id") == region_id), None)
         if target is None:
-            return None, "没有找到要改数据源的 section。"
+            return None, "没有找到要改数据源的卡片。"
         data = target.get("data") if isinstance(target.get("data"), dict) else {}
         inputs = data.get("inputs") if isinstance(data.get("inputs"), dict) else {}
         changed_dataset: str | None = None
@@ -2289,7 +3077,7 @@ class TemplateEditEngine:
                     input_name = str(name)
                     break
         if changed_dataset is None:
-            return None, "section 未绑定数据集，无法切换数据源。"
+            return None, "这张卡片未绑定数据集，无法切换数据源。"
         change_set = ChangeSet(
             baseDefinitionRevision=base_revision,
             changed=[
@@ -2302,7 +3090,11 @@ class TemplateEditEngine:
                         "sourceRef": new_source,
                         "sourceVersion": plan.operation.sourceVersion,
                     },
-                    summary=f"切换数据源：{before_source} → {new_source}",
+                    summary=(
+                        "切换数据源："
+                        f"{_source_display_label(catalogs, before_source)}"
+                        f" → {_source_display_label(catalogs, new_source)}"
+                    ),
                 )
             ],
             unchanged=[
@@ -2316,7 +3108,8 @@ class TemplateEditEngine:
             ],
         )
         reply = (
-            f"已把「{_region_label(target)}」的数据源换成 {new_source}。"
+            f"已把「{_region_label(target)}」的数据源换成 "
+            f"{_source_display_label(catalogs, new_source)}。"
             "保存前需要重新校验字段映射，请检查后再确认。"
         )
         return change_set, reply
@@ -2330,7 +3123,7 @@ class TemplateEditEngine:
         new_chart_kind = plan.operation.chartKind or ""
         target = next((r for r in definition.regions if r.get("id") == region_id), None)
         if target is None:
-            return None, "没有找到要改展示形式的 section。"
+            return None, "没有找到要改展示形式的卡片。"
         before_component = copy.deepcopy(target.get("component") or {})
         component = dict(before_component)
         component["type"] = new_component_type
@@ -2387,7 +3180,7 @@ class TemplateEditEngine:
             ],
             impact=["建议重新校验字段映射。"],
         )
-        reply = f"已把「{_region_label(target)}」改成 {new_component_type} 展示。"
+        reply = f"已把「{_region_label(target)}」改成{_component_display_label(new_component_type)}展示。"
         if new_chart_kind:
             reply += f"（图表类型：{new_chart_kind}）"
         return change_set, reply
@@ -2403,7 +3196,7 @@ class TemplateEditEngine:
             return None, "没有解析出新的粒度。", ""
         target = next((r for r in definition.regions if r.get("id") == region_id), None)
         if target is None:
-            return None, "没有找到要改粒度的 section。", ""
+            return None, "没有找到要改粒度的卡片。", ""
         before_label = _region_label(target)
         context = target.get("context") if isinstance(target.get("context"), dict) else {}
         before_grain = copy.deepcopy(context.get("grain"))
@@ -2432,7 +3225,7 @@ class TemplateEditEngine:
                 path=f"/regions/{region_id}/context/grain",
                 before=before_grain,
                 after=new_grain_obj,
-                summary=f"compilation 粒度：{old_unit or '原'} → {new_unit}",
+                summary=f"统计粒度：{old_unit or '原'} → {new_unit}",
             )
         ]
         impact = [f"按 {new_unit} 粒度重新编译，保存前需要重新校验并预览。"]
@@ -2468,12 +3261,12 @@ class TemplateEditEngine:
             impact=impact,
         )
         md = (
-            f"### 编译粒度变更\n\n"
-            f"已将「{before_label}」的 compilation 粒度改为 `{new_unit}`。"
+            f"### 统计粒度变更\n\n"
+            f"已将「{before_label}」的统计粒度改为{_grain_display_label(new_unit)}。"
             f"后续预览会按该粒度重新编译；"
             + ("注意分钟级一天约 1440 个点，可能影响渲染性能。" if new_unit == "MINUTE" else "")
         )
-        reply = f"已把「{before_label}」的 compilation 粒度改成 {new_unit}。"
+        reply = f"已把「{before_label}」的统计粒度改成{_grain_display_label(new_unit)}。"
         if target.get("name") != before_label:
             reply += f"趋势标题同步为「{target['name']}」。"
         return change_set, reply, md
@@ -2491,7 +3284,7 @@ class TemplateEditEngine:
             return None, error
         target = next((r for r in definition.regions if r.get("id") == region_id), None)
         if target is None:
-            return None, "没有找到要改时间范围的 section。"
+            return None, "没有找到要改时间范围的卡片。"
         context = target.get("context") if isinstance(target.get("context"), dict) else {}
         before_window = copy.deepcopy(context.get("timeWindow"))
         context["timeWindow"] = new_window
@@ -2528,10 +3321,10 @@ class TemplateEditEngine:
             return None, "没有解析出新的指标。"
         metric = metrics.get(new_metric_ref) if new_metric_ref else None
         if new_metric_ref and not metric:
-            return None, f"指标 {new_metric_ref} 未登记。"
+            return None, "这个指标当前不在可选范围内，请换一个指标。"
         target = next((r for r in definition.regions if r.get("id") == region_id), None)
         if target is None:
-            return None, "没有找到要改指标的 section。"
+            return None, "没有找到要改指标的卡片。"
         if not new_metric_ref:
             # 目录外指标（#65）：不再以「未登记」拒绝 —— 换成模拟指标，
             # 标「能力待接通」，口径待确认。
@@ -2580,7 +3373,7 @@ class TemplateEditEngine:
                     metric_updated = True
                     break
         if not metric_updated:
-            return None, "该 section 没有可替换的指标计算节点。"
+            return None, "该卡片没有可替换的指标计算节点。"
 
         # 更新 component.metric 展示信息
         component = target.get("component") if isinstance(target.get("component"), dict) else {}
@@ -2622,7 +3415,11 @@ class TemplateEditEngine:
                         "metricRef": new_metric_ref,
                         "metricVersion": plan.operation.metricVersion or metric["metricVersion"],
                     },
-                    summary=f"指标：{(before_metric or {}).get('metricRef') or '未知'} → {new_metric_ref}",
+                    summary=(
+                        "指标："
+                        f"{_metric_display_label(metrics, (before_metric or {}).get('metricRef'))}"
+                        f" → {_metric_display_label(metrics, new_metric_ref)}"
+                    ),
                 )
             ],
             unchanged=[
@@ -2654,7 +3451,11 @@ class TemplateEditEngine:
         binding = dict(binding) if isinstance(binding, dict) else {}
         section_id = str(binding.get("sectionId") or "") or self._next_section_id(definition)
         mode = source_mode_of_definition(definition.model_dump(mode="json"))
-        reason = out_of_catalog_region_reason(candidate, source_mode=mode.mode)
+        reason = (
+            f"模拟示例数据，仅用于核对版式。{candidate.assumption_note()}"
+            if mode.mode == "simulated"
+            else out_of_catalog_region_reason(candidate, source_mode=mode.mode)
+        )
 
         # 原来的真实指标引用清掉：目录外指标没有真实口径。
         before_metric: dict[str, Any] | None = None
@@ -2717,7 +3518,7 @@ class TemplateEditEngine:
             "metricRefs": [],
             "sourceMode": mode.mode,
             # 同上：区域级占位文案复用模板层那一份（按来源模式分叉）。
-            "pendingReason": pending_reason(mode.mode),
+            "pendingReason": reason,
         })
         target["templateBinding"] = binding
         # 示意语义描述复用 #59 的能力层：语义类别 / 单位 / 稳定模拟身份 /
@@ -2737,6 +3538,7 @@ class TemplateEditEngine:
             ),
             candidate,
             reason,
+            simulated=mode.mode == "simulated",
         )
 
         change_set = ChangeSet(
@@ -2764,15 +3566,14 @@ class TemplateEditEngine:
                 if item.get("id") != region_id
             ],
             impact=[
-                f"指标换成目录外指标「{candidate.label}」：这一块按模拟示例出数，"
-                "并标「能力待接通」。",
+                f"指标换成「{candidate.label}」：按模拟示例出数。",
                 f"假设：{candidate.assumption_note()}",
                 "指标口径变化，保存前需要重新校验与预览。",
             ],
         )
         return change_set, (
             f"已把「{_region_label(target)}」的指标换成「{candidate.label}」。"
-            "这个指标不在真实指标目录里，这一块按模拟示例出数并标了「能力待接通」；"
+            "这一块按模拟示例出数；"
             f"{candidate.assumption_note()}"
         )
 
@@ -2783,10 +3584,10 @@ class TemplateEditEngine:
         region_id = plan.target.regionId
         top_n = plan.operation.topN
         if not top_n:
-            return None, "没有解析出 TopN。"
+            return None, "没有解析出要展示多少条。"
         target = next((r for r in definition.regions if r.get("id") == region_id), None)
         if target is None:
-            return None, "没有找到要改 TopN 的 section。"
+            return None, "没有找到要改展示条数的卡片。"
         binding = target.get("binding") if isinstance(target.get("binding"), dict) else {}
         before_topn = binding.get("topN")
         binding["topN"] = top_n
@@ -2799,7 +3600,7 @@ class TemplateEditEngine:
                     path=f"/regions/{region_id}/binding/topN",
                     before=before_topn,
                     after=top_n,
-                    summary=f"TopN：{before_topn} → {top_n}",
+                    summary=f"展示条数：{before_topn} → {top_n}",
                 )
             ],
             unchanged=[
@@ -2809,7 +3610,7 @@ class TemplateEditEngine:
             ],
             impact=["输出条数变化，建议重新预览。"],
         )
-        return change_set, f"已把「{_region_label(target)}」的 TopN 改成 {top_n}。"
+        return change_set, f"已把「{_region_label(target)}」的展示条数改成 {top_n} 条。"
 
     @staticmethod
     def _apply_change_sort(
@@ -2846,7 +3647,7 @@ class TemplateEditEngine:
             ],
             impact=["排序方向变化，建议重新预览。"],
         )
-        return change_set, f"已把「{_region_label(target)}」的排序改成 {direction}。"
+        return change_set, f"已把「{_region_label(target)}」的排序改成{_sort_display_label(direction)}。"
 
     # ===== Markdown =====
 

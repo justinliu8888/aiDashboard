@@ -337,6 +337,9 @@ class ColumnResolution:
     - ``inferred``：模型没给（或给了坏的），系统补齐了。
     - ``clarification``：补不出来，且猜错会影响这张表用途 → 追问用户。
     - ``failure``：模型给的结构不合法，补齐也失败 → 明确失败允许重试。
+
+    ``options`` 是追问时给用户**直接能懂**的候选项（这张表可以展示什么）；
+    没有候选项时用户就用「其他」自己说。
     """
 
     kind: str
@@ -345,6 +348,7 @@ class ColumnResolution:
     question: str | None = None
     code: str | None = None
     message: str | None = None
+    options: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -355,6 +359,8 @@ class ExplicitTypeResolution:
     #: 命中依据：每块板块是被哪条规则定下来的。
     hits_by_index: dict[int, RuleHit] = field(default_factory=dict)
     question: str | None = None
+    #: 追问时给用户**直接能懂**的候选项（指哪一块板块）；空 = 用户自己说。
+    options: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -367,6 +373,9 @@ class PlanResolution:
     question: str | None = None
     failure_code: str | None = None
     failure_message: str | None = None
+    #: 追问时给用户**直接能懂**的候选项（这块要展示什么 / 指哪一块）。
+    #: 空 = 没有固定候选，用户用「其他」自己说。
+    options: tuple[str, ...] = ()
 
 
 # ---------- 文本工具 ----------
@@ -494,14 +503,19 @@ def _resolve_instruction_targets(
 
 def _ambiguous_type_question(
     clause: str, sections: Sequence[Mapping[str, Any]], targets: Sequence[int] | None
-) -> str:
-    """指令对不上板块时，问的那句具体问题。"""
+) -> tuple[str, tuple[str, ...]]:
+    """指令对不上板块时，问的那句具体问题 + 给用户选的候选项。
+
+    候选项就是**当前方案里的板块标题** —— 用户看得懂、也答得上来；
+    不给内部编号、不给规则 ID。
+    """
     if targets:
         titles = [str(sections[index].get("title") or "") for index in targets]
     else:
         titles = [str(section.get("title") or "") for section in sections]
     listed = "、".join(title for title in titles if title) or "（当前方案没有板块）"
-    return f"你说的「{clause.strip()}」是指哪一块板块？当前方案的板块有：{listed}。"
+    options = tuple(title for title in titles if title)
+    return f"你说的「{clause.strip()}」是指哪一块板块？当前方案的板块有：{listed}。", options
 
 
 def resolve_explicit_component_types(
@@ -531,9 +545,8 @@ def resolve_explicit_component_types(
         targets = _resolve_instruction_targets(clause, sections, pool)
         if targets is None:
             # 指令对不上板块：实质歧义 → 澄清，不偷偷改别的板块。
-            return ExplicitTypeResolution(
-                question=_ambiguous_type_question(clause, sections, None)
-            )
+            question, options = _ambiguous_type_question(clause, sections, None)
+            return ExplicitTypeResolution(question=question, options=options)
         if targets == "all":
             for index in range(len(sections)):
                 by_index[index] = component_type
@@ -543,9 +556,8 @@ def resolve_explicit_component_types(
             by_index[targets[0]] = component_type
             hits_by_index[targets[0]] = hit
             continue
-        return ExplicitTypeResolution(
-            question=_ambiguous_type_question(clause, sections, targets)
-        )
+        question, options = _ambiguous_type_question(clause, sections, targets)
+        return ExplicitTypeResolution(question=question, options=options)
     return ExplicitTypeResolution(by_index=by_index, hits_by_index=hits_by_index)
 
 
@@ -807,7 +819,35 @@ def resolve_table_columns(
             f"「{title}」这张表要展示哪些栏目？"
             "说清楚列名就行（例如「设备名称、时间、告警级别」）。"
         ),
+        # 候选项：这块板块**要展示的东西**（用户自己的说法）。
+        # 用户选一个就等于定了稿；不在列表里就用「其他」自己写。
+        options=_clarification_column_options(section),
     )
+
+
+def _clarification_column_options(section: Mapping[str, Any]) -> tuple[str, ...]:
+    """追问表格栏目时给用户的候选项。
+
+    候选项取**这块板块自己的指标意图**（用户原话）—— 那正是「这一列要
+    展示什么」的最贴近的答案。模型给的栏目说明也一并带上：那是它已经
+    理解到的展示内容。
+
+    不给内部编号、不给字段名：用户看不懂，也不该让他照抄。
+    """
+    options: list[str] = []
+    for intent in section.get("metricIntents") or []:
+        text = str(intent or "").strip()
+        if text and text not in options:
+            options.append(text)
+    raw_columns = section.get("columns")
+    if isinstance(raw_columns, (list, tuple)):
+        for item in raw_columns:
+            if not isinstance(item, Mapping):
+                continue
+            label = str(item.get("label") or "").strip()
+            if label and label not in options:
+                options.append(label)
+    return tuple(options)
 
 
 def _previous_explicit_type(previous: Mapping[str, Any]) -> ComponentType | None:
@@ -841,7 +881,7 @@ def resolve_plan(
         previous_sections=previous_sections,
     )
     if explicit.question:
-        return PlanResolution(question=explicit.question)
+        return PlanResolution(question=explicit.question, options=explicit.options)
 
     previous_by_index = match_previous_sections(sections, previous_sections)
 
@@ -897,7 +937,9 @@ def resolve_plan(
             continue
         resolution = resolve_table_columns(section, request_text=request_text)
         if resolution.kind == "clarification":
-            return PlanResolution(question=resolution.question)
+            return PlanResolution(
+                question=resolution.question, options=resolution.options
+            )
         if resolution.kind == "failure":
             return PlanResolution(
                 failure_code=resolution.code or "PLAN_COLUMNS_UNRESOLVED",
@@ -1195,9 +1237,13 @@ def apply_candidate(
         previous_sections=[section.model_dump() for section in previous_sections],
     )
     if resolution.question:
-        raise PlanClarificationRequired(
+        error = PlanClarificationRequired(
             resolution.question, question=resolution.question
         )
+        # 候选项（用户直接能懂的几个选项）随异常带上去：编排层据此渲染
+        # 追问卡片。异常对象上挂一个属性，不改既有异常的签名与契约。
+        error.options = tuple(resolution.options)
+        raise error
     if resolution.failure_code:
         raise PlanColumnsUnresolvedError(
             resolution.failure_message or "方案生成失败，请重试。",

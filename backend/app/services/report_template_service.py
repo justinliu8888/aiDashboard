@@ -400,6 +400,11 @@ def _match_metric(intents: list[str]) -> tuple[str | None, dict[str, Any] | None
     判定用的是**共享语义层**那一份谓词（``intent_names_registered_metric``），
     与编辑入口（``template_edit_engine``）**同一套** —— 两处各写一份必然漂移。
 
+    **一条意图没命中，不许把整块板块的匹配都断掉**：这一条没登记就
+    ``continue`` 接着看下一条 —— 一块板块可以有多条指标意图，后面那条
+    可能命中的正是已登记指标。少了那一条，这块板块就会**整块**掉进
+    「目录外」的兜底里，用户要的那块就白丢了。
+
     匹配不到口径不算错误 —— 那个区域会变成占位，并说明
     「当前能力里没有这个指标」。
     """
@@ -407,7 +412,9 @@ def _match_metric(intents: list[str]) -> tuple[str | None, dict[str, Any] | None
         for ref in _candidate_refs(intent):
             metric = get_metric(ref)
             if metric is None:
-                return None, None, f"指标「{intent}」没有登记，算不出数值。"
+                # 这条候选引用没登记 → **继续看下一条**，不因为它把整块
+                # 板块的匹配都断掉（后面那条意图可能命中的正是已登记指标）。
+                continue
             if not intent_names_registered_metric(intent, ref, {ref: metric}):
                 # 口径对不上 → 这一条意图是**目录外指标**，不静默映射到
                 # 已登记指标。继续看下一条意图有没有真命中的。
@@ -433,17 +440,43 @@ def _match_intent_by_pattern(text: str) -> str | None:
     return best[1] if best else None
 
 
-def _metric_is_backed(metric: Mapping[str, Any]) -> tuple[bool, str | None]:
-    """这个指标当前算不算得出数。
+def _metric_is_backed(
+    metric: Mapping[str, Any], *, source_mode: Any = None
+) -> tuple[bool, str | None]:
+    """这个指标当前**真实取数**算不算得出数。
 
     指标登记了不等于能出数：还要看它的底层字段在数据源目录里没有。
-    PUE 就是这种 —— 登记在册，但数据源没有 ``pue`` 字段，算不出来。
+    PUE 就是这种 —— 登记在册，但数据源没有 ``pue`` 字段，真实取数算不出来。
+
+    **这不是准入**：算不出来只标「口径待核实」，这一块照样生成、照样
+    在屏上出数（模拟示例 / 用户 JSON）。所以这里的话**不能说「算不出
+    数值」** —— 屏上正有数字，那句话会跟用户看到的东西打架；也不能说
+    字段名（那是内部口径）。
+
+    说法与**编辑入口**那一侧同源（``simulated_field_semantics`` 的目录外
+    文案后半句）：同一句诉求，两个阶段说的是同一件事。
     """
     field_ref = str(metric.get("fieldRef") or "")
     if field_ref and field_ref in _SOURCE_FIELDS:
         return True, None
     label = str(metric.get("label") or metric.get("metricRef") or "该指标")
-    return False, f"「{label}」口径待核实：当前数据源没有登记这个字段，算不出数值。"
+    return False, (
+        f"「{label}」口径待核实：真实数据接通时需要先确认这个指标的口径；"
+        f"{_simulated_block_note(source_mode)}。"
+    )
+
+
+def _simulated_block_note(mode: Any = None) -> str:
+    """这一块的数值**是哪来的**（按**来源模式**分两句）。
+
+    与 ``simulated_field_semantics.out_of_catalog_note`` 的后半句**同一套
+    说法**：真实目录的限制**不得**被说成「模拟渲染做不到」—— 这一块在
+    模拟示例下照样出数、照样能看版式（工单 #59）。
+    """
+    raw = mode.mode if isinstance(mode, SourceMode) else mode
+    if resolve_source_mode(raw).is_user_json:
+        return "当前这一块按你提供的 JSON 出数"
+    return "当前这一块按模拟示例出数（已标注为模拟），不影响先看版式"
 
 
 def classify_metric_kind(*, intent: str, metric_ref: str | None = None) -> str:
@@ -639,11 +672,15 @@ def _build_region(
             capability_pending=True,
         )
 
-    backed, reason = _metric_is_backed(metric)
+    backed, reason = _metric_is_backed(metric, source_mode=source_mode)
     if not backed:
-        # 指标登记在册但底层字段没有 —— 系统还算不出这个数（能力待接通）。
+        # 指标登记在册但真实取数算不出来（能力待接通）。
+        #
+        # **不拒绝生成**：这一块照样出数（模拟示例 / 用户 JSON），只是标
+        # 「口径待核实」。原因文案按来源模式说清数值是哪来的 —— 真实
+        # 取数的限制不得被说成「这一块没数」。
         return placeholder(
-            reason or "口径待核实：当前数据源没有登记这个字段，算不出数值。",
+            reason or f"口径待核实：真实数据接通时需要先确认这个指标的口径；{_simulated_block_note(source_mode)}。",
             [metric_ref],
             capability_pending=True,
         )

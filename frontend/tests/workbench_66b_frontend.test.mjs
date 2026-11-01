@@ -944,13 +944,13 @@ test("JSON 模式下，服务端那条仍写「模拟业务数据」的能力原
   assert.ok(!notes.join("").includes("模拟业务数据"), "JSON 模式下不许显示「模拟业务数据」");
   assert.ok(notes.join("").includes("PUE"), "还要说明是哪个指标没接通");
 
-  // 模拟模式照旧显示原话。
+  // 真实模拟模式使用顶部简洁说明，不重复旧能力原因。
   const simulatedRegion = {
     capabilityPending: true,
     payload: { metrics: [{ label: "PUE", capabilityPending: true, pendingReason: "本区域数值为模拟业务数据。" }] },
   };
   const simulated = source(simulatedRegion, simulatedRegion.payload, null, "simulated");
-  assert.ok(simulated.join("").includes("模拟业务数据"));
+  assert.equal(simulated.length, 0);
 });
 
 /** 把 readCapabilityNotes 从主脚本里抽出来跑（带来源模式参数）。 */

@@ -364,7 +364,9 @@ def test_target_becoming_known_continues_the_same_item(post_chat):
     first = _post(post_chat, definition, "改成柱状图")
 
     # 第一轮真的抛出了追问，额度记在「意图:目标为空」的键上。
-    assert "你想把哪个 section" in first["reply"]
+    # 面向用户的追问用业务语言（「卡片」），不摆内部词「section」。
+    assert "你想把哪张卡片" in first["reply"]
+    assert "section" not in first["reply"]
     assert first["uiActions"] != ["template_edit_clarification_limit"]
     state = session_service.load_clarification("conv_test")
     assert state.key == "CHANGE_VISUALIZATION:"
@@ -549,7 +551,9 @@ def test_a_different_intent_can_still_be_asked_once(post_chat):
     definition = build_definition_draft("A 机房能耗日报", "room_a")
 
     first = _post(post_chat, definition, "改成柱状图")
-    assert "你想把哪个 section" in first["reply"]
+    # 面向用户的追问用业务语言（「卡片」），不摆内部词「section」。
+    assert "你想把哪张卡片" in first["reply"]
+    assert "section" not in first["reply"]
 
     second = _post(post_chat, definition, "把粒度改成按月")
 

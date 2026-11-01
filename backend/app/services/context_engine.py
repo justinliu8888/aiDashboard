@@ -545,7 +545,9 @@ class ContextEngine:
                 api_key=self._settings.volc_api_key,
                 base_url=self._settings.volc_base_url,
                 timeout=self._settings.volc_timeout,
-                max_retries=0,
+                # **重试一次**（SDK 自带）：上游偶尔把长连接掐断，
+                # 不重试的话用户直接看到「请求失败：network error」。
+                max_retries=1,
             )
 
     async def build_template_edit_plan(

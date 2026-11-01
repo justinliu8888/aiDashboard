@@ -43,13 +43,19 @@ from app.schemas.agent import (
     ToolRequest,
     TURN_KIND_QUERY_ANSWER,
 )
-from app.schemas.edit_plan import EditIntent, EditPlan
+from app.schemas.edit_plan import DISPLAY_MODE_PLACEHOLDER_ONLY, EditIntent, EditPlan
 from app.schemas.fact import RECORDED_STAGE_DISCLOSURE, SessionFacts
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.report_policy import ReportPolicyDraft
 from app.storage.report_design_repository import DESIGN_PHASE_DRAFT_READY
 from app.schemas.session import MAX_CLARIFICATION_ROUNDS, PendingEditPlan
 from app.services import routing_rules
+from app.services.catalog_mock_service import get_catalog
+from app.services.internal_id_sanitizer import (
+    metric_display_label,
+    sanitize_internal_ids,
+    source_display_label,
+)
 from app.services.context_engine import (
     RouteDecision,
     RoutingAction,
@@ -95,9 +101,18 @@ CONFIRM_BUTTON_VALUE = "同意"
 MODIFY_BUTTON_VALUE = "修改"
 RESTART_BUTTON_VALUE = "重新开始"
 EDIT_ACCEPT = "接受修改"
-EDIT_ADJUST = "继续调整"
-EDIT_CANCEL = "取消"
+EDIT_ADJUST = "继续修改"
+EDIT_CANCEL = "撤回上一步"
+#: 待确认卡片上「先占位」的显式选项（这次改的是往卡片里加指标时才有）。
+EDIT_PLACEHOLDER = "先占位，只显示名称"
 EDIT_CHOICE_ID = "pending_edit_plan_confirm"
+
+#: 这些词是**别的流程的入口**，不是对当前待办的纠正：卡片待答时它们照旧
+#: 走既有那条路（不放行）。
+EDIT_COMMAND_VALUES = frozenset({
+    CONFIRM_BUTTON_VALUE, MODIFY_BUTTON_VALUE, RESTART_BUTTON_VALUE,
+    "继续修改", "发布", "导出 PDF",
+})
 
 # 可能触发模板编辑意图识别的粗关键词；仅用于判断“是否进入 TemplateEditEngine”，
 # 真正的意图拆解由 TemplateEditEngine.parse() 负责。
@@ -240,6 +255,118 @@ def _derive_clarification_key(
     return derived
 
 
+# --------------------------------------------------------------------------
+# 面向用户的建议文字（业务语言）
+# --------------------------------------------------------------------------
+
+#: 展示形式 → 用户听得懂的说法。
+_DISPLAY_FORM_LABELS: dict[str, str] = {
+    "METRIC_CARD": "指标卡",
+    "TABLE": "表格",
+    "DATA_QUALITY": "数据质量卡",
+    "ANALYSIS": "文字解读",
+    "TEXT": "文字说明",
+}
+
+#: 图形种类 → 用户听得懂的说法。
+_CHART_FORM_LABELS: dict[str, str] = {
+    "LINE": "折线图",
+    "BAR": "柱状图",
+    "PIE": "饼图",
+    "AREA": "面积图",
+}
+
+#: 编译粒度 → 用户听得懂的说法。
+_GRAIN_LABELS: dict[str, str] = {
+    "MINUTE": "分钟",
+    "HOUR": "小时",
+    "DAY": "天",
+}
+
+
+def _metric_display_label(metric_ref: str | None) -> str:
+    """指标的业务说法（**不点内部标识**）。
+
+    目录里登记的指标带一个用户看得懂的名字（「总耗电」）；查不到就返回
+    空串 —— 那就不显示这一项，**不把 ``metricRef`` 摆给用户看**。
+
+    实现放在 ``internal_id_sanitizer``：模型那条路径也要用同一套口径，
+    两边各写一份迟早对不上。
+    """
+    return metric_display_label(metric_ref)
+
+
+def _source_display_label(source_ref: str | None) -> str:
+    """数据源的业务说法（**不点内部标识**）。"""
+    return source_display_label(source_ref)
+
+
+def _sanitize_internal_ids(text: str) -> str:
+    """把用户可见文字里的**内部标识**换成业务说法。"""
+    return sanitize_internal_ids(text)
+
+
+def _display_form_label(region: dict[str, Any]) -> str:
+    """这张卡片现在是什么展示形式（业务语言）。"""
+    component = region.get("component") if isinstance(region.get("component"), dict) else {}
+    component_type = str(component.get("type") or "")
+    if component_type == "CHART":
+        return _CHART_FORM_LABELS.get(
+            str(component.get("chartKind") or ""), "图表",
+        )
+    return _DISPLAY_FORM_LABELS.get(component_type, "卡片")
+
+
+def _time_range_label(definition: ReportDefinitionDraft, region_id: str) -> str:
+    """这张卡片统计的是哪一段时间（业务语言）。
+
+    优先看**这张卡片自己**的时间窗；卡片没单独声明就用报表的。
+    """
+    window: dict[str, Any] = {}
+    for region in definition.regions or []:
+        if region.get("id") != region_id:
+            continue
+        context = region.get("context") if isinstance(region.get("context"), dict) else {}
+        candidate = context.get("timeWindow")
+        if isinstance(candidate, dict):
+            window = candidate
+        break
+    if not window:
+        defaults = definition.defaults if isinstance(definition.defaults, dict) else {}
+        candidate = defaults.get("timeWindow")
+        window = candidate if isinstance(candidate, dict) else {}
+    value = window.get("value") if isinstance(window.get("value"), dict) else window
+    if not isinstance(value, dict) or not value:
+        return "当前报表的时间范围"
+    kind = str(value.get("type") or "")
+    if kind == "CALENDAR":
+        unit = str(value.get("unit") or "DAY").upper()
+        offset = int(value.get("offset") or 0)
+        count = int(value.get("count") or 1)
+        if unit == "DAY":
+            if count == 1:
+                return {
+                    0: "今天", -1: "昨日", -2: "前天",
+                }.get(offset, f"最近 {abs(offset) + count} 天")
+            return f"最近 {count} 天"
+        if unit == "HOUR":
+            return "最近一小时" if count == 1 else f"最近 {count} 小时"
+        if unit == "MINUTE":
+            return "最近一分钟" if count == 1 else f"最近 {count} 分钟"
+        if unit == "MONTH":
+            return "本月" if count == 1 else f"最近 {count} 个月"
+        if unit == "WEEK":
+            return "最近一周" if count == 1 else f"最近 {count} 周"
+    if kind == "FIXED_INTERVAL":
+        start = str(value.get("start") or "")[:16]
+        end = str(value.get("end") or "")[:16]
+        if start and end:
+            return f"{start} 到 {end}"
+    if kind == "ROLLING":
+        return "最近一段时间"
+    return "当前报表的时间范围"
+
+
 def _build_agent():
     """按配置选择 Agent 实现。"""
     impl = get_settings().agent_impl
@@ -320,6 +447,12 @@ class AgentService:
             reply = (
                 "请先从下拉框选择一项再继续操作。"
                 "如果只是想问当前对话的情况（草稿、进度、能力），直接问就行。"
+            )
+        elif question.allowsOther:
+            # 这张卡片提供「其他」：没看懂就直接在卡片里写要怎么改。
+            reply = (
+                "这句我没太明白要怎么改这次修改。"
+                "可以在上面这张卡片里直接写要怎么改，或者从下拉框里选一项。"
             )
         else:
             reply = (
@@ -635,9 +768,15 @@ class AgentService:
                     type(pending_raw).__name__,
                 )
                 session_service.save_pending_choice(session_key, None)
-        if session_service.load_pending_plan(session_key):
+        pending_plan = session_service.load_pending_plan(session_key)
+        if pending_plan:
             # 待决计划比旧的其他选择锁更权威；确认不能被迟到的题目覆盖。
-            pending = (AgentState.USER_EDITING_TEMPLATE, self._pending_edit_question())
+            pending = (
+                AgentState.USER_EDITING_TEMPLATE,
+                self._pending_edit_question(
+                    placeholder=self._pending_plan_appends_metrics(pending_plan)
+                ),
+            )
 
         # 待确认入口（工单 #14）：
         #
@@ -651,6 +790,57 @@ class AgentService:
         pending_guard: tuple[AgentState, AgentQuestion] | None = None
         if pending:
             pending_state, question = pending
+            if question.id == EDIT_CHOICE_ID:
+                request.message = {"继续调整": EDIT_ADJUST, "取消": EDIT_CANCEL}.get(
+                    request.message, request.message
+                )
+            if question.id == "template_edit_confirm" and request.message == EDIT_ACCEPT:
+                return self._remember_choice(self._edit_notice(
+                    request, "当前没有待确认的修改计划，草稿没有重复修改；请选择下一步操作。",
+                    questions=[question], ui_actions=["template_editing"],
+                ))
+            if (
+                question.id == "template_edit_confirm"
+                and question.allowsOther
+                and request.state == pending_state
+                and request.message.strip()
+                and request.message not in EDIT_COMMAND_VALUES
+                and request.message not in {EDIT_ACCEPT, EDIT_CANCEL, "取消", "继续调整"}
+                and not routing_rules.is_readonly_question(request.message)
+            ):
+                # NEXT_ACTION 的「其他」进入编辑，不代表同意或保存草稿。
+                session_service.save_pending_choice(session_key, None)
+                pending = None
+        if pending:
+            pending_state, question = pending
+            allowed_values = {option.value for option in question.options} | (
+                {"重新开始"} if question.allowRestart else set()
+            )
+            # 「其他」：用户在**这张卡片里**写的自由文本 —— 它是这张卡片的
+            # 答案（对当前问题的纠正），承接上下文、**同一个待办**，不是
+            # 无关的新消息。卡片提供了「其他」才走这条路。
+            #
+            # 两条排除：
+            #   - **提问**照旧走只读查询（咨询不是决定）；
+            #   - **指令**（「重新开始」「同意」）是别的流程的入口，不放行。
+            if (
+                question.allowsOther
+                and request.message.strip()
+                and request.message not in allowed_values
+                and request.message not in EDIT_COMMAND_VALUES
+                and not routing_rules.is_readonly_question(request.message)
+                and question.id == EDIT_CHOICE_ID
+            ):
+                corrected_plan = self._resolve_pending_edit_correction(
+                    request, session_key, request.message,
+                )
+                if corrected_plan is not None:
+                    return self._handle_pending_edit_choice(
+                        request, session_key, corrected_plan=corrected_plan,
+                    )
+                # 纠正**解不开**（说不清要改成什么样）→ 照旧按「必须从菜单里
+                # 选」处理，但**留在同一张卡片里**继续追问。
+                pending_guard = (pending_state, question)
             if request.state != pending_state:
                 # 客户端状态与服务端的待确认状态不符（客户端过期 / 不同步）。
                 #
@@ -668,9 +858,6 @@ class AgentService:
                         request, pending_state, question
                     )
             else:
-                allowed_values = {option.value for option in question.options} | (
-                    {"重新开始"} if question.allowRestart else set()
-                )
                 if request.message not in allowed_values:
                     pending_guard = (pending_state, question)
                 else:
@@ -729,15 +916,10 @@ class AgentService:
         if pending_guard is None and request.message.strip() in {
             EDIT_ACCEPT, EDIT_ADJUST, EDIT_CANCEL,
         }:
-            return AgentResponse(
-                conversationId=request.conversationId,
-                state=AgentState.USER_EDITING_TEMPLATE,
-                reply="当前没有待确认的修改计划，请重新说明要修改什么。",
-                designSessionId=request.context.designSessionId,
-                domainObjects=AgentResponseDomainObjects(
-                    reportDefinitionDraft=request.snapshots.reportDefinition,
-                    reportPolicyDraft=request.snapshots.reportPolicy,
-                ),
+            # 没有待确认的计划：照实说清楚，并且把**当前**草稿带回去
+            # （不要把请求里那份旧快照当成现状）。
+            return self._edit_notice(
+                request, "当前没有待确认的修改计划，请重新说明要修改什么。"
             )
 
         if pending_guard is None and request.state == AgentState.READY:
@@ -1331,20 +1513,31 @@ class AgentService:
         }
 
     @staticmethod
-    def _pending_edit_question() -> AgentQuestion:
-        # 待确认修改计划出现时**恢复选择锁**（契约表 §5.2）：
-        # 这一阶段要连输入框一起锁住，用户先选「接受修改 / 继续调整 / 取消」。
+    def _pending_edit_question(*, placeholder: bool = False) -> AgentQuestion:
+        # 补充只更新提案，不能作为批准选项；必须另选「接受修改」。
+        options = [
+            QuestionOption(value=value, label=value)
+            for value in (EDIT_ACCEPT, EDIT_CANCEL, EDIT_ADJUST)
+        ]
         return AgentQuestion(
             id=EDIT_CHOICE_ID,
             prompt="确认这次修改：",
             expects="SINGLE_CHOICE",
             selectionOnly=True,
             lockScope=LOCK_SCOPE_INPUT_AND_MENU,
-            options=[
-                QuestionOption(value=value, label=value)
-                for value in (EDIT_ACCEPT, EDIT_ADJUST, EDIT_CANCEL)
-            ],
+            allowsOther=True,
+            otherLabel="其他",
+            otherPlaceholder="也可以直接在这里写要怎么改，比如「先占位，只显示名称」",
+            options=options,
         )
+
+    @staticmethod
+    def _pending_plan_appends_metrics(pending: PendingEditPlan) -> bool:
+        """这份待确认计划是不是「往卡片里加指标」。"""
+        raw = (pending.model_extra or {}).get("editPlan")
+        if not isinstance(raw, dict):
+            return False
+        return str(raw.get("intent") or "") == EditIntent.ADD_METRIC.value
 
     @staticmethod
     def _draft_revision(definition: ReportDefinitionDraft) -> int:
@@ -1620,7 +1813,9 @@ class AgentService:
                 summary=active.summary,
                 createdAt=active.createdAt,
             )
-            response.questions = [self._pending_edit_question()]
+            response.questions = [self._pending_edit_question(
+                placeholder=plan.intent == EditIntent.ADD_METRIC,
+            )]
             response.debug.pop("pendingEditPlan", None)
             return response
 
@@ -1746,21 +1941,64 @@ class AgentService:
             error=AgentError(code=code, message=message) if code else None,
         )
 
+    def _resolve_pending_edit_correction(
+        self, request: AgentRequest, session_key: str, correction: str,
+    ) -> EditPlan | None:
+        """把「其他」里写的纠正落到**当前待确认计划**上。
+
+        解不开（说不清要改成什么样 / 这句话根本不是对这张卡片的纠正）返回
+        ``None`` —— 那时照旧按「必须从菜单里选」处理，不放行。
+        """
+        pending = session_service.load_pending_plan(session_key)
+        if pending is None:
+            return None
+        raw = (pending.model_extra or {}).get("editPlan")
+        if not isinstance(raw, dict):
+            return None
+        record = session_service.repository.get_session(session_key)
+        stored = (record.snapshot or {}).get("definition") if record else None
+        if not isinstance(stored, dict):
+            return None
+        try:
+            definition = ReportDefinitionDraft.model_validate(stored)
+            plan = EditPlan.model_validate(raw)
+        except (TypeError, ValueError):
+            return None
+        scope = ToolScope(
+            project_id=request.context.projectId,
+            subject_ref=request.context.subjectRef,
+            subject_id=request.context.subjectId,
+        )
+        return template_edit_engine.correct_plan(
+            plan, correction, definition=definition, scope=scope,
+        )
+
     def _handle_pending_edit_choice(
-        self, request: AgentRequest, session_key: str
-    ) -> AgentResponse:
+        self, request: AgentRequest, session_key: str, *,
+        correction: str = "", corrected_plan: EditPlan | None = None,
+    ) -> AgentResponse | None:
+        """处理「待确认修改计划」这张卡片上的选择。
+
+        补充只更新待确认提案；只有「接受修改」执行并落草稿。
+
+        返回 ``None`` = 这句纠正解不开（说不清要改成什么样）：待确认计划
+        照旧留着，调用方在同一张卡片里继续追问。
+        """
         pending = session_service.load_pending_plan(session_key)
         if pending is None:
             return self._edit_notice(
                 request, "这份修改计划已失效，草稿没有变化；请重新提出修改。"
             )
+        if not correction and request.message == EDIT_PLACEHOLDER:
+            # 卡片上的「先占位」选项 = 一句纠正，走同一条纠正通路。
+            correction = EDIT_PLACEHOLDER
         if request.message in {EDIT_CANCEL, EDIT_ADJUST}:
             session_service.clear_pending_plan(session_key)
             if request.message == EDIT_CANCEL:
                 # 取消 = 这件事结束了，下一件事按额度键规则重新开。
                 session_service.reset_clarification(session_key)
                 return self._edit_notice(
-                    request, "已取消这次修改，草稿没有变化。"
+                    request, "已撤回这次待确认修改，草稿没有变化。"
                 )
             # 「继续调整」（规格第 58 条）：旧计划不再可接受，模板本身不变，
             # 回到**统一对话** —— 用户可以接着问、接着提反馈、接着改。
@@ -1809,8 +2047,14 @@ class AgentService:
             plan = EditPlan.model_validate((pending.model_extra or {})["editPlan"])
             if plan.target.regionId != pending.targetRegionId:
                 raise ValueError("修改目标与待确认计划不一致")
+            if corrected_plan is not None:
+                # 「其他」里的纠正：落到**同一份计划**上（同一个待办）。
+                plan = corrected_plan
         except (KeyError, TypeError, ValueError) as exc:
             session_service.clear_pending_plan(session_key)
+            # 计划已经失效 → 这张卡片**没有对应计划了**：选择锁一起清掉，
+            # 页面上别再挂一张答了也没用的卡。
+            session_service.save_pending_choice(session_key, None)
             return self._edit_notice(
                 request, f"{exc}，本次没有修改草稿。请重新核对目标。",
                 code="STALE_EDIT_PLAN",
@@ -1821,11 +2065,57 @@ class AgentService:
             subject_ref=request.context.subjectRef,
             subject_id=request.context.subjectId,
         )
+        if correction.strip() and corrected_plan is None:
+            # 旧客户端的占位选项也只算补充，不算批准。
+            corrected = template_edit_engine.correct_plan(
+                plan, correction, definition=definition, scope=scope,
+            )
+            if corrected is None:
+                # 纠正后仍然说不清要改成什么样 → **同一张卡片里**继续追问
+                # （不新开一轮普通对话）；待确认计划照旧留着，还能再答。
+                return None
+            plan = corrected
+        if correction.strip() or corrected_plan is not None:
+            summary = _sanitize_internal_ids(self._describe_rule_edit(plan, definition))
+            operations = (
+                [step.model_dump(mode="json") for step in plan.operations]
+                if plan.operations else [{
+                    "intent": plan.intent.value,
+                    "operation": plan.operation.model_dump(mode="json", exclude_none=True),
+                    "summary": summary,
+                }]
+            )
+            updated = pending.model_copy(deep=True, update={
+                "planId": f"plan_{uuid.uuid4().hex}",
+                "targetRegionId": plan.target.regionId,
+                "operations": operations,
+                "summary": summary,
+                "editPlan": plan.model_dump(mode="json"),
+            })
+            session_service.save_pending_plan(session_key, updated)
+            response = self._edit_notice(
+                request, f"已更新待确认的修改：{summary}\n接受后才会修改草稿。",
+                questions=[self._pending_edit_question()],
+                ui_actions=["pending_edit_plan"],
+            )
+            response.domainObjects.pendingEditPlan = PendingEditPlan(
+                planId=updated.planId, draftRevision=updated.draftRevision,
+                targetRegionId=updated.targetRegionId, operations=updated.operations,
+                summary=updated.summary, createdAt=updated.createdAt,
+            )
+            return self._remember_choice(response)
+        if request.message != EDIT_ACCEPT:
+            return self._edit_notice(request, "请先接受修改，草稿没有变化。")
         if session_service.take_pending_plan(session_key, pending.planId) is None:
+            # 计划已经被处理过了 → 这张卡片同样失效，选择锁一起清掉。
+            session_service.save_pending_choice(session_key, None)
             return self._edit_notice(
                 request, "这份修改计划已经被处理，草稿没有重复修改。",
                 code="EDIT_PLAN_ALREADY_HANDLED",
             )
+        # 计划已经落地 → 这张卡片**作废**：选择锁照旧清掉，页面上不再挂着
+        # 一张已经没有对应计划的卡片（「其他」纠正这条路也要清）。
+        session_service.save_pending_choice(session_key, None)
         try:
             result = template_edit_engine.apply(
                 plan=plan, definition=definition, scope=scope
@@ -1844,11 +2134,16 @@ class AgentService:
             )
         session_service.reset_clarification(session_key)
         if result.needsClarification:
-            return self._edit_notice(
-                request,
-                result.clarificationQuestion
-                or "修改校验未通过，草稿没有变化；请重新核对目标或数据能力。",
-                code="EDIT_VALIDATION_FAILED",
+            # 已接受的计划校验失败：保留原草稿，恢复并持久化 NEXT_ACTION，
+            # 不再挂已消费计划的确认卡或没有下一步出口的追问卡。
+            return self._remember_choice(
+                self._edit_notice(
+                    request,
+                    (result.clarificationQuestion or "修改校验未通过。")
+                    + "\n本次没有修改草稿，上一版仍保留。请选择下一步操作。",
+                    code="EDIT_VALIDATION_FAILED",
+                    questions=self._editing_confirm_questions(),
+                )
             )
         return self._remember_choice(
             self._build_template_edit_response(request, result, plan=plan_for_preview)
@@ -2590,7 +2885,7 @@ class AgentService:
             plan.needsClarification = not plan.target.regionId
             plan.clarificationQuestion = (
                 "" if not plan.needsClarification
-                else "你想把哪个 section 的时间范围改成这个具体时间段？"
+                else "你想把哪张卡片的时间范围改成这个具体时间段？"
             )
             if not plan.needsClarification:
                 plan.operation.timeWindow = resolved_time.timeWindow
@@ -2648,7 +2943,9 @@ class AgentService:
                 "summary": self._describe_rule_edit(plan, definition),
             }]
         )
-        summary = plan.summary or self._describe_rule_edit(plan, definition)
+        summary = _sanitize_internal_ids(
+            plan.summary or self._describe_rule_edit(plan, definition)
+        )
         # 用户说了「你自己决定」：候选照出，但假设写在明面上，
         # 而且仍然要他自己点「接受修改」—— **不代用户接受**（规格第 16 条）。
         delegated_note = (
@@ -2676,7 +2973,9 @@ class AgentService:
                 reportDefinitionDraft=definition,
                 reportPolicyDraft=request.snapshots.reportPolicy,
             ),
-            questions=[self._pending_edit_question()],
+            questions=[self._pending_edit_question(
+                placeholder=plan.intent == EditIntent.ADD_METRIC,
+            )],
             uiActions=["pending_edit_plan"],
             debug={
                 "editOutcome": "candidate",
@@ -2691,6 +2990,8 @@ class AgentService:
     def _describe_rule_edit(
         plan: EditPlan, definition: ReportDefinitionDraft
     ) -> str:
+        if plan.intent == EditIntent.ADD_METRIC:
+            return AgentService._describe_append_metrics(plan, definition)
         label = plan.target.matchedText or (definition.metadata or {}).get("name") or "当前报表"
         operation = plan.operation
         action = {
@@ -2710,20 +3011,77 @@ class AgentService:
             f"{name}：{value}"
             for name, value in (
                 ("新标题", operation.newTitle),
-                ("数据源", operation.sourceRef),
-                ("指标", operation.metricRef),
-                ("粒度", (operation.grain or {}).get("unit")),
+                # 数据源 / 指标 / 粒度 / 展示形式：一律说**业务语言**，
+                # 不点内部标识（sourceRef / metricRef / MINUTE / BAR）。
+                ("数据源", _source_display_label(operation.sourceRef)),
+                ("指标", _metric_display_label(operation.metricRef)),
+                (
+                    "粒度",
+                    _GRAIN_LABELS.get(
+                        str((operation.grain or {}).get("unit") or ""),
+                        "",
+                    ),
+                ),
                 ("时间窗", operation.timeWindowLabel),
                 ("排名数量", operation.topN),
-                ("展示形式", operation.chartKind or operation.componentType),
+                (
+                    "展示形式",
+                    _CHART_FORM_LABELS.get(
+                        str(operation.chartKind or ""),
+                        _DISPLAY_FORM_LABELS.get(
+                            str(operation.componentType or ""), "",
+                        ),
+                    ),
+                ),
             )
             if value is not None and value != ""
         ]
         suffix = "；".join(details)
         return (
             f"对「{label}」{action}" + (f"（{suffix}）" if suffix else "") + "。"
-            "当前预览仍为 Mock 数据，尚未真实编译。"
+            "报表示意使用全虚拟模拟数据；只有明确要求名称占位的指标不出数值。"
         )
+
+    @staticmethod
+    def _describe_append_metrics(
+        plan: EditPlan, definition: ReportDefinitionDraft
+    ) -> str:
+        """追加指标的**建议文字**：具体到用户能看懂。
+
+        说清楚四件事：出现在**哪张卡片**上、加**哪几个**、**什么展示形式**、
+        **统计哪段时间**。不出现「计划 / 参数 / 字段」这类内部词。
+        """
+        additions = list(plan.operation.addMetrics)
+        label = plan.target.matchedText or "当前卡片"
+        region = next(
+            (
+                item for item in (definition.regions or [])
+                if item.get("id") == plan.target.regionId
+            ),
+            None,
+        )
+        form = _display_form_label(region or {})
+        window = _time_range_label(definition, plan.target.regionId)
+        names = "、".join(
+            str(item.label or item.intent) for item in additions
+        )
+        placeholders = [
+            str(item.label or item.intent)
+            for item in additions
+            if str(item.displayMode or "") == DISPLAY_MODE_PLACEHOLDER_ONLY
+        ]
+        parts = [
+            f"在「{label}」这张{form}上追加 {len(additions)} 个指标：{names}",
+            f"展示形式：沿用这张卡片的{form}",
+            f"统计范围：{window}",
+        ]
+        if placeholders:
+            parts.append(
+                "其中 " + "、".join(placeholders) + " 按你说的先占位：只显示名称，不出数值"
+            )
+        else:
+            parts.append("数据按模拟示例展示")
+        return "；".join(parts) + "。原有指标保留。"
 
     @staticmethod
     def _edit_clarification_response(
@@ -2776,31 +3134,7 @@ class AgentService:
 
         # 需要追问：保留当前草稿，不写 ChangeSet
         if result.needsClarification:
-            questions = self._editing_prompt_questions()
-            if (
-                result.plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN
-                and result.plan.operation.supportedGrains
-            ):
-                grain_labels = {
-                    "MINUTE": "分钟",
-                    "HOUR": "小时",
-                    "DAY": "天",
-                }
-                questions = [
-                    AgentQuestion(
-                        id="compilation_grain",
-                        prompt="请选择当前数据源支持的粒度：",
-                        expects="SINGLE_CHOICE",
-                        options=[
-                            QuestionOption(
-                                value=f"按{grain_labels.get(grain, grain)}粒度",
-                                label=grain_labels.get(grain, grain),
-                            )
-                            for grain in result.plan.operation.supportedGrains
-                        ],
-                        selectionOnly=True,
-                    )
-                ]
+            questions = self._edit_clarification_questions(result)
             return AgentResponse(
                 conversationId=request.conversationId,
                 state=AgentState.USER_EDITING_TEMPLATE,
@@ -2851,11 +3185,13 @@ class AgentService:
                 debug=debug,
             )
 
-        # 正常应用成功：返回新草稿 + ChangeSet + 三按钮
+        # 正常应用成功：返回新草稿 + ChangeSet。
+        #
+        # 接受只批准本次修改，执行后回 NEXT_ACTION，不自动保存整份草稿。
         response = AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.USER_EDITING_TEMPLATE,
-            reply=result.reply or "已更新草稿，请确认。",
+            reply=result.reply or "已更新草稿。",
             designSessionId=request.context.designSessionId,
             domainObjects=AgentResponseDomainObjects(
                 reportPolicyDraft=request.snapshots.reportPolicy,
@@ -2863,7 +3199,7 @@ class AgentService:
                 changeSet=result.changeSet,
             ),
             questions=self._editing_confirm_questions(),
-            uiActions=["template_edit_applied", "confirm_template_edit"],
+            uiActions=["template_edit_applied"],
             debug=debug,
         )
         # 右侧那块画的是什么：与设计轮**同一个入口**生成示意载荷
@@ -2911,34 +3247,74 @@ class AgentService:
                 prompt="请选择或直接输入修改要求：",
                 expects="SINGLE_CHOICE",
                 lockScope=LOCK_SCOPE_NONE,
+                allowsOther=True,
+                otherLabel="其他",
+                otherPlaceholder="直接输入修改要求或补充说明",
                 options=[
-                    QuestionOption(value="删除这个 section", label="删除这个 section"),
+                    # 选项文案是**用户看得到**的：说业务词，不说内部术语
+                    # （原来的「删除这个 section」「改 compilation 粒度」把
+                    #  section / compilation 直接摆在了界面上）。
+                    # 取值本身也要能被引擎认出来：「删除」命中删除动词、
+                    # 「粒度」命中粒度话题词，所以换掉说法的语义不变。
+                    QuestionOption(value="删除这张卡片", label="删除这张卡片"),
                     QuestionOption(value="改标题", label="改标题"),
                     QuestionOption(value="改指标", label="改指标"),
                     QuestionOption(value="改数据源", label="改数据源"),
                     QuestionOption(value="改展示方式", label="改展示方式"),
                     QuestionOption(value="改时间范围", label="改时间范围"),
-                    QuestionOption(value="改 compilation 粒度", label="改 compilation 粒度"),
+                    QuestionOption(value="改统计粒度", label="改统计粒度"),
                 ],
             )
         ]
 
     @staticmethod
+    def _edit_clarification_questions(result: EditResult) -> list[AgentQuestion]:
+        """需要追问时给用户的那张卡（**新**的一张）。
+
+        粒度这一类有固定选项 → 给选项卡；其余一律给「统一对话」入口卡
+        （不锁输入，用户直接说要怎么改就行）。
+
+        纠正执行完还差一步时用同一张卡：原来那张（确认修改）针对的是
+        **已被处理**的计划，已经作废，不能让用户再答一次。
+        """
+        if (
+            result.plan.intent == EditIntent.CHANGE_COMPILATION_GRAIN
+            and result.plan.operation.supportedGrains
+        ):
+            return [
+                AgentQuestion(
+                    id="compilation_grain",
+                    prompt="请选择当前数据源支持的粒度：",
+                    expects="SINGLE_CHOICE",
+                    options=[
+                        QuestionOption(
+                            value=f"按{_GRAIN_LABELS.get(grain, grain)}粒度",
+                            label=_GRAIN_LABELS.get(grain, grain),
+                        )
+                        for grain in result.plan.operation.supportedGrains
+                    ],
+                    selectionOnly=True,
+                )
+            ]
+        return AgentService._editing_prompt_questions()
+
+    @staticmethod
     def _editing_confirm_questions() -> list[AgentQuestion]:
-        # 「确认编辑后的草稿」是确认态，不是「等待下一步操作选择」：
-        # 输入框保持可用，用户在确认前仍能问一句（契约表 §5.2 的 menu_only）。
+        # NEXT_ACTION 与待确认修改菜单不同：「其他」可直接提出下一项修改。
         return [
             AgentQuestion(
                 id="template_edit_confirm",
-                prompt="请确认当前编辑后的草稿：",
+                prompt="请选择下一步操作：",
                 expects="SINGLE_CHOICE",
-                lockScope=LOCK_SCOPE_MENU_ONLY,
                 options=[
                     QuestionOption(value=CONFIRM_BUTTON_VALUE, label="同意"),
                     QuestionOption(value=MODIFY_BUTTON_VALUE, label="修改"),
                     QuestionOption(value=RESTART_BUTTON_VALUE, label="重新开始"),
                 ],
                 selectionOnly=True,
+                allowsOther=True,
+                otherLabel="其他",
+                otherPlaceholder="直接输入修改要求",
             )
         ]
 
@@ -3125,7 +3501,15 @@ class AgentService:
         )
         if definition.metadata.get("templateBinding"):
             definition = definition.model_copy(deep=True)
-            definition.metadata.update({"definitionId": saved.definitionId, "revision": saved.revision})
+            # 草稿自己的版本号（``metadata.revision``）**不能**让给保存次数：
+            # 它是**编辑链**的版本（每改一次 +1），会话恢复、预览版本校对都
+            # 按它认「这是哪一版草稿」。保存次数另记一个字段（``savedRevision``），
+            # 两者互不占用 —— 否则保存一次就会把版本号拽回保存次数，下一次
+            # 编辑会被当成旧草稿拦掉。
+            definition.metadata.update({
+                "definitionId": saved.definitionId,
+                "savedRevision": saved.revision,
+            })
             saved.definitionDraft = definition.model_dump(mode="json")
         logger.info(
             "[agent.chat] step=save_done conversationId=%s definitionId=%s revision=%s",
@@ -3134,11 +3518,9 @@ class AgentService:
             saved.revision,
         )
 
-        reply = (
-            route.reply
-            or f"已保存草稿（{saved.definitionId}，revision={saved.revision}），"
-            "下一步进入后端校验。"
-        )
+        # 面向用户：**业务语言**。定义 id / 版本号这类内部标识不出口 ——
+        # 它们在下面的 ``toolRequests`` 里，前端要用得到。
+        reply = route.reply or "草稿已保存，接下来校验这份报表的指标口径。"
         response = AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.SAVE_DEFINITION_DRAFT,
@@ -3225,11 +3607,14 @@ class AgentService:
         definition_dict = (
             definition.model_dump(mode="json") if definition is not None else None
         )
+        saved = (
+            definition_save_service.get(request.context.reportDefinitionId)
+            if request.context.reportDefinitionId
+            else None
+        )
         # 若 snapshot 没带，从内存版 saved 取
-        if definition_dict is None and request.context.reportDefinitionId:
-            saved = definition_save_service.get(request.context.reportDefinitionId)
-            if saved is not None:
-                definition_dict = saved.definitionDraft
+        if definition_dict is None and saved is not None:
+            definition_dict = saved.definitionDraft
 
         result = validate_definition(definition_dict)
 
@@ -3247,7 +3632,14 @@ class AgentService:
                         target="JavaPreviewEngine",
                         arguments={
                             "definitionId": request.context.reportDefinitionId,
-                            "revision": request.context.baseDefinitionRevision,
+                            # 预览跑的是**已保存的那一版**：这是保存次数，
+                            # 不是草稿自己的版本号（两者是不同计数器，
+                            # 见 ``_save_placeholder``）。
+                            "revision": (
+                                saved.revision
+                                if saved is not None
+                                else request.context.baseDefinitionRevision
+                            ),
                         },
                     )
                 ],
@@ -3349,13 +3741,12 @@ class AgentService:
 
     @staticmethod
     def _ready_questions() -> list[AgentQuestion]:
-        # 旧流程的 READY 菜单：契约表 §5.2 没有把它列进「锁输入」的阶段，
-        # 保持既有行为（只锁菜单，输入框可用）。
+        # 旧流程的 READY 菜单：这是一张**待答**的卡片，用户得先选一个，
+        # 输入框与快捷入口一起锁住（契约表 §5.2）。
         return [AgentQuestion(
             id="ready_action",
             prompt="请选择下一步操作：",
             expects="SINGLE_CHOICE",
-            lockScope=LOCK_SCOPE_MENU_ONLY,
             options=[
                 QuestionOption(value="继续修改", label="继续修改"),
                 QuestionOption(value="发布", label="发布"),

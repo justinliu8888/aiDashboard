@@ -43,6 +43,10 @@ from app.services.report_draft_service import (
     DefinitionBuildError,
     compose_unsupported_style_disclosure,
 )
+from app.services.internal_id_sanitizer import (
+    sanitize_change_set_summaries,
+    sanitize_internal_ids,
+)
 from app.services.report_log_safety import (
     log_failure,
     log_info,
@@ -443,8 +447,17 @@ class AgentScopeReportAgent:
                 log_warning(logger, "查询态事实工具查证失败，不接受本轮答案")
                 return None, "事实工具查证失败"
             if request.state in {AgentState.USER_EDITING_TEMPLATE, AgentState.WAITING_USER_CONFIRM} and take_lookup_failure():
-                log_warning(logger, "编辑态事实工具查证失败，不接受本轮候选结论")
-                return None, "事实工具查证失败"
+                # 编辑态：事实工具查证失败**不废掉**本轮候选。
+                #
+                # 事实工具是帮模型**定位**目标卡片用的，不是「准不准加这个
+                # 指标」的准入闸门 —— 目录里没有的指标要走目录外通路，不是
+                # 拒绝的理由（需求：不查、不索引、不校验真实数据源或预定义
+                # 字段，来决定用户能不能加指标）。
+                #
+                # 目标认错了怎么办？用户面前还有那张**待确认卡片**：它写清楚
+                # 改哪张卡、怎么展示，用户点头才落草稿。查证失败时更该把
+                # 候选交给用户看，而不是让整轮变成「技术问题」把人堵死。
+                log_warning(logger, "编辑态事实工具查证失败，候选仍交用户确认")
 
             # 终结工具优先：模型调用了 submit_* 就以它的提交为准
             plan = self._plan_from_submission()
@@ -481,8 +494,7 @@ class AgentScopeReportAgent:
                 log_warning(logger, "查询态修复轮事实工具查证失败")
                 return None, "修复轮事实工具查证失败"
             if request.state in {AgentState.USER_EDITING_TEMPLATE, AgentState.WAITING_USER_CONFIRM} and take_lookup_failure():
-                log_warning(logger, "编辑态修复轮事实工具查证失败")
-                return None, "修复轮事实工具查证失败"
+                log_warning(logger, "编辑态修复轮事实工具查证失败，候选仍交用户确认")
             plan = self._plan_from_submission()
             if plan is not None:
                 return plan, ""
@@ -1104,6 +1116,12 @@ class AgentScopeReportAgent:
             }.get(action)
             if missing and not missing[1]:
                 return ask(f"修改「{(region or {}).get('name') or region_id}」还缺少 {missing[0]}，请明确具体值。")
+            if action == EditIntent.ADD_METRIC.value and not operation.addMetrics:
+                # 追加指标：至少要有一个要加的指标（名字、单位、怎么显示）。
+                return ask(
+                    f"要在「{(region or {}).get('name') or region_id}」上追加哪几个指标？"
+                    "把指标名字列出来就行。"
+                )
         if plan.confidence < 0.7:
             return ask(
                 plan.clarificationQuestion or "我还不能确定这次修改的具体内容，请确认目标和修改值。",
@@ -1120,6 +1138,11 @@ class AgentScopeReportAgent:
         summary = plan.summary or f"对「{name}」执行 {intent}：" + "；".join(
             self._describe_edit_step(step) for step in operation_steps
         )
+        # 模型写的摘要里可能带内部标识（``metric.machine_room.pue``、
+        # ``region_1``、``capabilityPending``）—— 用户看不懂也不该看。
+        # 规则路径（agent_service）走同一套清洗，两边口径一致。
+        summary = sanitize_internal_ids(summary)
+        operation_steps = sanitize_change_set_summaries(operation_steps)
         revision = int((definition.metadata or {}).get("revision") or 0)
         candidate = {
             "planId": f"plan_{uuid.uuid4().hex}",
@@ -1143,6 +1166,11 @@ class AgentScopeReportAgent:
                 prompt="确认这次修改：",
                 expects="SINGLE_CHOICE",
                 selectionOnly=True,
+                # 「其他」：用户在**这张卡片里**写的自由文本 = 对当前问题的
+                # 纠正（同一个待办），不是另一条无关消息。
+                allowsOther=True,
+                otherLabel="其他",
+                otherPlaceholder="也可以直接在这里写要怎么改",
                 options=[
                     QuestionOption(value=value, label=value)
                     for value in ("接受修改", "继续调整", "取消")
@@ -1166,6 +1194,7 @@ class AgentScopeReportAgent:
             "DELETE_SECTION": "删除卡片",
             "RENAME_SECTION": "修改卡片标题",
             "ADD_SECTION": "新增卡片",
+            "ADD_METRIC": "在卡片上追加指标",
             "CHANGE_DATA_SOURCE": "更换数据源",
             "CHANGE_COMPILATION_GRAIN": "修改编译粒度",
             "CHANGE_TIME_RANGE": "修改时间窗",
@@ -1175,6 +1204,14 @@ class AgentScopeReportAgent:
             "CHANGE_SORT": "修改排序",
         }
         details = [step.get("summary") or labels.get(action, "修改")]
+        if action == "ADD_METRIC":
+            names = "、".join(
+                str(item.get("label") or item.get("intent") or "")
+                for item in (operation.get("addMetrics") or [])
+                if isinstance(item, dict)
+            )
+            if names:
+                details = [f"追加指标：{names}"]
         for key, label in (
             ("newTitle", "标题"), ("sourceRef", "数据源"),
             ("metricRef", "指标"), ("timeWindowLabel", "时间窗"),

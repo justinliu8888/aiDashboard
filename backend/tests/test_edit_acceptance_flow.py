@@ -141,7 +141,7 @@ def test_candidate_requires_acceptance_before_draft_changes(post_chat, definitio
         snapshots=_snap(definition),
     ).json()
 
-    assert _accept_options(candidate) == ["接受修改", "继续调整", "取消"]
+    assert _accept_options(candidate) == ["接受修改", "撤回上一步", "继续修改"]
     assert candidate["domainObjects"]["reportDefinitionDraft"]["metadata"]["name"] == (
         "A 机房能耗日报"
     )
@@ -176,7 +176,9 @@ def test_duplicate_acceptance_does_not_apply_twice(post_chat, definition):
         state="USER_EDITING_TEMPLATE",
         snapshots=_snap(definition),
     ).json()
-    assert again["uiActions"] == ["selection_required"]
+    # 计划已经被取走：再点一次不会再改一次。
+    assert again["domainObjects"]["changeSet"] is None
+    assert again["domainObjects"]["reportDefinitionDraft"]["metadata"]["revision"] == 1
     assert session_service.repository.get_session("conv_test").snapshot["definition"]["metadata"]["revision"] == 1
 
 
