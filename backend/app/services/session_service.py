@@ -25,13 +25,14 @@ import logging
 import threading
 import uuid
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from pydantic import ValidationError
 
 from app.config import get_settings
 from app.schemas.agent import (
     ADVANCE_MESSAGE,
+    PLAN_VERSION_ID_KEY,
     TURN_KIND_QUERY_ANSWER,
     AgentRequest,
     AgentResponse,
@@ -65,9 +66,13 @@ EDIT_STATE_KEYS = (
     CLARIFICATION_QUESTION_KEY,
 )
 
-# 澄清轮次的两种结果。只有「asked」占用户澄清轮次。
+# 澄清轮次的三种结果。只有「asked」占用户澄清轮次。
 CLARIFICATION_ASKED = "asked"
 CLARIFICATION_TECHNICAL_FAILURE = "technical_failure"
+#: 这一轮**没有真的把追问抛出去**，但事项的键变了（例如这一轮把目标
+#: 解析出来了）—— 键跟着更新，**轮次照旧带着**，不因换键归零。
+#: 契约表 §7.4：「只有真的问出去了才算消耗」。
+CLARIFICATION_KEY_UPDATED = "key_updated"
 
 
 def _dump_snapshot(value: Any) -> str | None:
@@ -196,6 +201,68 @@ def resolve_placeholders(definition: dict[str, Any]) -> dict[str, Any]:
     return definition
 
 
+def _definition_identity(definition: Any) -> tuple[str, int]:
+    """草稿的**定义版本身份**：``(定义 id, 定义版本)``。
+
+    模板态的草稿带 ``metadata.templateBinding``（模板转换层落的），
+    身份取它登记的 ``definitionId`` / ``definitionVersion``（= 方案 id +
+    方案版本）；历史草稿没有它，就退回定义自身的 ``metadata.id`` /
+    ``metadata.revision``。
+
+    与 ``preview_service.resolve_preview_context`` 取身份**同一套口径**：
+    两边算出同一个身份，前端才不会把这份载荷当成过期版本。
+    """
+    if not isinstance(definition, Mapping):
+        return ("", 0)
+    metadata = definition.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    binding = metadata.get("templateBinding")
+    binding = binding if isinstance(binding, Mapping) else {}
+    definition_id = str(
+        binding.get("definitionId") or metadata.get("id") or ""
+    ).strip()
+    version = binding.get("definitionVersion")
+    if version is None:
+        version = metadata.get("revision")
+    try:
+        version = int(version)
+    except (TypeError, ValueError):
+        version = 0
+    return (definition_id, version)
+
+
+def _definition_is_older(previous: Any, incoming: Any) -> bool:
+    """这一轮带回来的草稿是不是**比库里那份旧**。
+
+    判据分三层，**先看定义版本，再看草稿版本号**：
+
+        1. **定义 id 不同** → 不是同一份定义（重新开始 / 换了一份方案），
+           这一轮带回来的就是新的，不算回滚；
+        2. **定义 id 相同、定义版本不同** → 方案改版后重新生成的那份，
+           版本高的更新 —— 这一轮带回来的赢；
+        3. **定义版本相同** → 同一份草稿的多次编辑，按草稿自己的版本号
+           比；迟到的旧回复（版本号更小）不回滚已应用的新草稿。
+
+    第 2 条是这套判据存在的理由：方案改一版、重新确认后生成的是**全新**
+    的草稿（草稿版本号从 0 重新起算），拿版本号去比会把这份新草稿当成
+    「旧稿」挡掉 —— 用户刷新页面看到的就是上一版方案的草稿，而不是刚
+    确认的那一份。
+    """
+    previous_id, previous_version = _definition_identity(previous)
+    incoming_id, incoming_version = _definition_identity(incoming)
+    if previous_id != incoming_id:
+        return False
+    if previous_version != incoming_version:
+        return incoming_version < previous_version
+    previous_revision = int(
+        ((previous or {}).get("metadata") or {}).get("revision") or 0
+    )
+    incoming_revision = int(
+        ((incoming or {}).get("metadata") or {}).get("revision") or 0
+    )
+    return previous_revision > incoming_revision
+
+
 class SessionService:
     """会话编排：id 生成、消息落库、快照维护。"""
 
@@ -232,6 +299,41 @@ class SessionService:
 
     # ---------- 落库 ----------
 
+    def _attach_plan_version_identity(
+        self, session_id: str, response: AgentResponse
+    ) -> None:
+        # 给这一轮响应补上「本次提交的是哪一版方案」的稳定 ID。
+        #
+        # 前端按它去重：重复响应、乱序响应与重连**不重复追加**同一份方案
+        # （工单 #66 AC4）。ID 落在 ``debug.planVersionId`` —— 既有字段，
+        # 不新增顶层字段、不改协议版本（见 ``PLAN_VERSION_ID_KEY``）。
+        #
+        # 派生口径与版本记录的写路径**完全一致**（``plan_version_id``），
+        # 所以响应里带的 ID 与会话恢复时版本序列里的 ``versionId`` 对得上：
+        # 前端拿两处的 ID 直接比就行，不用各自再推一遍。
+        #
+        # 这一步**不能抛**：它只是给响应补一个元信息，补不上就让这一轮
+        # 照常走完（落库、返回），不能因此把对话弄挂。
+        plan = getattr(response.domainObjects, "reportPlan", None)
+        if not isinstance(plan, dict):
+            return
+        try:
+            from app.services.plan_version_service import response_plan_version_id
+
+            version_id = response_plan_version_id(session_id, plan)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[session_service] 推方案版本身份失败 sessionId=%s", session_id
+            )
+            return
+        if not version_id:
+            return
+        debug = response.debug
+        if not isinstance(debug, dict):
+            debug = {}
+            response.debug = debug
+        debug[PLAN_VERSION_ID_KEY] = version_id
+
     def record_turn(
         self,
         *,
@@ -243,6 +345,9 @@ class SessionService:
     ) -> SessionRecord | None:
         """把一轮对话写入存储。返回落库后的会话记录。"""
         is_advance = user_text.strip() == ADVANCE_MESSAGE
+        # 先给这一轮补上方案版本身份：落库的消息体与返回给前端的响应
+        # 都带着它，前端据此去重（工单 #66 AC4）。
+        self._attach_plan_version_identity(session_id, response)
         try:
             # 0. 先确保会话行存在（消息表有指向会话行的外键）
             title = self._derive_title(session_id, user_text, is_advance)
@@ -279,9 +384,15 @@ class SessionService:
                 request=request,
                 message_count=count,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # 落库失败不能影响主链路
-            logger.exception("[session_service] 落库失败 sessionId=%s", session_id)
+            # 异常原文不进日志（#61）：留栈不留原文。
+            logger.exception(
+                "[session_service] 落库失败 sessionId=%s errorType=%s",
+                session_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
 
     def _state_to_store(self, session_id: str, response: AgentResponse) -> str:
@@ -343,9 +454,7 @@ class SessionService:
                 # 保留库里那份，不能因为一次交互就把草稿丢掉。
                 snapshot["definition"] = previous
             elif isinstance(previous, dict) and isinstance(incoming, dict):
-                previous_revision = int((previous.get("metadata") or {}).get("revision") or 0)
-                incoming_revision = int((incoming.get("metadata") or {}).get("revision") or 0)
-                if previous_revision > incoming_revision:
+                if _definition_is_older(previous, incoming):
                     # 迟到的只读/重复确认回复不能把已应用的新草稿回滚。
                     snapshot["definition"] = previous
             snapshot = self._carry_over_business_objects(snapshot, previous_snapshot)
@@ -471,6 +580,9 @@ class SessionService:
         assert isinstance(connection, sqlite3.Connection)
         now = datetime.now().isoformat(timespec="seconds")
         is_advance = user_text.strip() == ADVANCE_MESSAGE
+        # 同 ``record_turn``：先给这一轮补上方案版本身份，快照与消息体
+        # 都带着它（工单 #66 AC4）。
+        self._attach_plan_version_identity(session_id, response)
 
         title = self._derive_title(session_id, user_text, is_advance)
         state = self._state_to_store(session_id, response)
@@ -886,9 +998,13 @@ class SessionService:
         """
         try:
             self._repo.set_pending_choice(session_id, choice)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # 异常原文不进日志（#61）：留栈不留原文。
             logger.exception(
-                "[session_service] 写选择锁失败 sessionId=%s", session_id
+                "[session_service] 写选择锁失败 sessionId=%s errorType=%s",
+                session_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
             )
 
     def load_pending_choice(self, session_id: str) -> dict[str, Any] | None:
@@ -896,6 +1012,35 @@ class SessionService:
         return record.pendingChoice if record else None
 
     # ---------- 编辑态：待确认计划 ----------
+
+    @staticmethod
+    def _with_base_combination(plan: PendingEditPlan) -> PendingEditPlan:
+        # 把计划所基于的**生效组合快照**放到契约表 §4.2 声明的那个字段上。
+        #
+        # 编辑引擎产出计划时把组合快照写在 ``EditPlan.baseCombination`` 上
+        # （``template_edit_engine.parse``），它随计划一起进了
+        # ``PendingEditPlan.model_extra["editPlan"]``。这里把它**提上来**。
+        #
+        # 为什么值得提：契约表 §4.2 声明的落点就是
+        # ``PendingEditPlan.baseCombination``，之前它一直空着。而空组合按
+        # 契约表 §4.2 的「旧数据默认行为」读作「只按 ``draftRevision``
+        # 比」—— 读的人分不出「**没记**」与「记了但对得上」。
+        #
+        # 真正生效的校验仍然是接受时逐字段比那份快照（见
+        # ``template_edit_engine._stale_reason``）；这里只是让**存下来的**
+        # 那份计划**看得出**它基于哪一份组合。行为不变。
+        extra = plan.model_extra or {}
+        edit_plan = extra.get("editPlan")
+        combination = (
+            edit_plan.get("baseCombination")
+            if isinstance(edit_plan, dict)
+            else None
+        )
+        if not isinstance(combination, dict) or not combination:
+            return plan
+        if plan.baseCombination:
+            return plan
+        return plan.model_copy(update={"baseCombination": dict(combination)})
 
     def save_pending_plan(
         self, session_id: str, plan: PendingEditPlan
@@ -907,6 +1052,7 @@ class SessionService:
         """
         if not plan.planId.strip():
             raise ValueError("待确认计划必须有 planId")
+        plan = self._with_base_combination(plan)
         if not plan.createdAt:
             plan = plan.model_copy(
                 update={"createdAt": datetime.now().isoformat(timespec="seconds")}
@@ -941,6 +1087,7 @@ class SessionService:
         """
         if not plan.planId.strip():
             raise ValueError("待确认计划必须有 planId")
+        plan = self._with_base_combination(plan)
         if not plan.createdAt:
             plan = plan.model_copy(
                 update={"createdAt": datetime.now().isoformat(timespec="seconds")}
@@ -1040,6 +1187,8 @@ class SessionService:
 
         outcome=asked             真的把具体追问抛给了用户，轮次 +1
         outcome=technical_failure 工具或模型故障，不占用户澄清轮次，计数不动
+        outcome=key_updated       这一轮**没有真的追问**，但事项的键变了：
+                                  键跟着更新，轮次照旧带着（不因换键归零）
 
         换 key 表示换了一项待定修改（新需求），轮次从零重新计数。
         """
@@ -1050,6 +1199,26 @@ class SessionService:
             # 故障不算用户澄清：不动计数，也不改 key。
             current = self.load_clarification(session_id)
             return current or EditClarification(key=key, rounds=0)
+
+        if outcome == CLARIFICATION_KEY_UPDATED:
+            # 这一轮没有真的把追问抛出去 → 轮次不 +1；但这一轮可能把
+            # 目标解析出来了 → 键要跟着更新。轮次**照旧带着**，
+            # 不能因为键变了就归零（那会让同一件事重新获得一整轮额度）。
+            def mutate_key_only(snapshot: dict[str, Any]) -> dict[str, Any]:
+                snapshot[CLARIFICATION_KEY_KEY] = key
+                snapshot[CLARIFICATION_COUNT_KEY] = int(
+                    snapshot.get(CLARIFICATION_COUNT_KEY) or 0
+                )
+                if question:
+                    snapshot[CLARIFICATION_QUESTION_KEY] = question
+                return snapshot
+
+            snapshot = self._mutate_snapshot(session_id, mutate_key_only)
+            return EditClarification(
+                key=key,
+                rounds=int(snapshot.get(CLARIFICATION_COUNT_KEY) or 0),
+                lastQuestion=str(snapshot.get(CLARIFICATION_QUESTION_KEY) or ""),
+            )
 
         def mutate(snapshot: dict[str, Any]) -> dict[str, Any]:
             same_item = snapshot.get(CLARIFICATION_KEY_KEY) == key
@@ -1078,7 +1247,10 @@ class SessionService:
         )
 
     def can_ask_clarification(self, session_id: str, *, key: str) -> bool:
-        """还能不能再追问一次（同一项修改最多三轮）。"""
+        """还能不能再追问一次（同一项修改最多一轮，见 ``MAX_CLARIFICATION_ROUNDS``）。
+
+        换 key 表示换了一项待定修改 → 可以重新问一轮。
+        """
         state = self.load_clarification(session_id)
         if state is None or state.key != key:
             return True

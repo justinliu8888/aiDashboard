@@ -43,6 +43,18 @@ from app.services.report_draft_service import (
     DefinitionBuildError,
     compose_unsupported_style_disclosure,
 )
+from app.services.internal_id_sanitizer import (
+    sanitize_change_set_summaries,
+    sanitize_internal_ids,
+)
+from app.services.report_log_safety import (
+    log_failure,
+    log_info,
+    log_warning,
+    model_text_shape,
+    safe_identifier,
+    safe_reason,
+)
 from app.services import routing_rules
 from app.tools.context import (
     ToolContext,
@@ -143,6 +155,9 @@ class AgentScopeReportAgent:
         """构造 VolcengineChatModel。失败则返回 (None, err)。
 
         Agent 实例在每次 handle 时新建（AgentScope Agent 有对话内部状态，不适合跨请求复用）。
+
+        ``err`` 只回**原因类别**，不回异常原文：它会被写进日志，
+        而初始化异常里可能带着带凭据的 base_url。
         """
         if not self._settings.volc_api_key:
             return None, "VOLC_API_KEY 未配置"
@@ -166,8 +181,8 @@ class AgentScopeReportAgent:
             )
             return model, None
         except Exception as exc:  # noqa: BLE001
-            logger.exception("AgentScope 模型初始化失败：%s", exc)
-            return None, str(exc)
+            log_failure(logger, "AgentScope 模型初始化失败", exc)
+            return None, f"模型初始化失败（{safe_reason(exc)}）"
 
     async def _build_agent(self, request: AgentRequest):
         """为单次 handle 创建一个全新的 AgentScope Agent（含 Toolkit）。
@@ -236,29 +251,40 @@ class AgentScopeReportAgent:
     def handle(self, request: AgentRequest) -> AgentResponse:
         """同步入口：兼容老调用方（会新建 loop，可能遇到连接池失效问题）。"""
         if self._model is None:
-            logger.info("AgentScope 未就绪（%s），降级 FakeAgent", self._init_err)
+            log_info(
+                logger,
+                "AgentScope 未就绪（%s），降级 FakeAgent",
+                self._init_err,
+            )
             return self._degraded_response(request)
         try:
-            plan = asyncio.run(self._run_agent(request))
+            plan, reason = asyncio.run(self._run_agent(request))
         except Exception as exc:  # noqa: BLE001
-            logger.exception("AgentScope 运行异常，降级 FakeAgent：%s", exc)
+            log_failure(logger, "AgentScope 运行异常，降级 FakeAgent", exc)
             return self._degraded_response(request)
-        return self._dispatch(request, plan)
+        return self._dispatch(request, plan, reason)
 
     async def ahandle(self, request: AgentRequest) -> AgentResponse:
         """async 入口：复用 FastAPI 的事件循环，避免 httpx 连接池跨 loop 失效。"""
         if self._model is None:
-            logger.info("AgentScope 未就绪（%s），降级 FakeAgent", self._init_err)
+            log_info(
+                logger,
+                "AgentScope 未就绪（%s），降级 FakeAgent",
+                self._init_err,
+            )
             return self._degraded_response(request)
         try:
-            plan = await self._run_agent(request)
+            plan, reason = await self._run_agent(request)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("AgentScope 运行异常，降级 FakeAgent：%s", exc)
+            log_failure(logger, "AgentScope 运行异常，降级 FakeAgent", exc)
             return self._degraded_response(request)
-        return self._dispatch(request, plan)
+        return self._dispatch(request, plan, reason)
 
     def _dispatch(
-        self, request: AgentRequest, plan: dict[str, Any] | None
+        self,
+        request: AgentRequest,
+        plan: dict[str, Any] | None,
+        reason: str = "",
     ) -> AgentResponse:
         """把本轮结论组装成 AgentResponse。
 
@@ -266,7 +292,12 @@ class AgentScopeReportAgent:
         终结工具是结构化的、经过 Pydantic 校验的，比自由文本可靠。
         """
         if plan is None:
-            logger.info("AgentScope 输出不合法，降级 FakeAgent")
+            # 静默降级要留一条可查的原因（#61）：只写原因类别，不写模型原文。
+            log_info(
+                logger,
+                "AgentScope 输出不合法，降级 FakeAgent reason=%s",
+                reason or "未给出原因",
+            )
             if getattr(request, "queryMode", False):
                 return self._query_failure_response(request)
             return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
@@ -279,17 +310,17 @@ class AgentScopeReportAgent:
                 not isinstance(submission, dict)
                 or submission.get("tool") != "submit_query_answer"
             ):
-                logger.warning("查询态拒绝非查询答案终结工具")
+                log_warning(logger, "查询态拒绝非查询答案终结工具")
                 return self._query_failure_response(request)
         elif request.state == AgentState.USER_EDITING_TEMPLATE and (
             not isinstance(submission, dict)
             or submission.get("tool") not in {"submit_edit_answer", "submit_edit_plan"}
         ):
-            logger.warning("编辑态拒绝非编辑终结工具或旧式文本计划")
+            log_warning(logger, "编辑态拒绝非编辑终结工具或旧式文本计划")
             return self._unavailable_edit_response(request)
         elif isinstance(submission, dict) and submission.get("tool") == "submit_query_answer":
             # 普通业务轮不接受只读答案提交：这个出口只在查询模式注册。
-            logger.warning("非查询轮拒绝只读答案提交")
+            log_warning(logger, "非查询轮拒绝只读答案提交")
             return self._fallback.handle(request)
         if submission:
             response = self._dispatch_submission(request, submission)
@@ -307,7 +338,11 @@ class AgentScopeReportAgent:
         if mode == "CHITCHAT":
             return self._assemble_chitchat_response(request, plan)
 
-        logger.warning("AgentScope 返回未知 mode=%s，降级", mode)
+        log_warning(
+            logger,
+            "AgentScope 返回未知 mode（不在 GENERATE/FALLBACK/CHITCHAT 内），降级 mode=%s",
+            safe_identifier(mode),
+        )
         return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
 
     @staticmethod
@@ -371,12 +406,23 @@ class AgentScopeReportAgent:
         if tool == "submit_fix_plan":
             return self._assemble_fix_response(request, payload)
 
-        logger.warning("未知终结工具 %s，忽略提交", tool)
+        log_warning(
+            logger,
+            "未知终结工具（不在已知工具名内），忽略提交 tool=%s",
+            safe_identifier(tool),
+        )
         return None
 
     # ---------- Agent Loop（交给 AgentScope 的 ReAct 内核） ----------
 
-    async def _run_agent(self, request: AgentRequest) -> dict[str, Any] | None:
+    async def _run_agent(
+        self, request: AgentRequest
+    ) -> tuple[dict[str, Any] | None, str]:
+        """跑一轮 ReAct，返回 ``(plan, reason)``。
+
+        ``plan`` 为 None 时，``reason`` 说明**为什么**没拿到可用的结论 ——
+        降级到 FakeAgent 时要能在日志里查得到原因（#61）。
+        """
         from agentscope.message import Msg, TextBlock
 
         agent = await self._build_agent(request)
@@ -398,27 +444,41 @@ class AgentScopeReportAgent:
             # 第一次调用：由 AgentScope 跑完整 ReAct 循环（Reason → Tool → Observation → ...）
             reply_msg = await agent.reply(user_msg)
             if getattr(request, "queryMode", False) and take_lookup_failure():
-                logger.warning("查询态事实工具查证失败，不接受本轮答案")
-                return None
+                log_warning(logger, "查询态事实工具查证失败，不接受本轮答案")
+                return None, "事实工具查证失败"
             if request.state in {AgentState.USER_EDITING_TEMPLATE, AgentState.WAITING_USER_CONFIRM} and take_lookup_failure():
-                logger.warning("编辑态事实工具查证失败，不接受本轮候选结论")
-                return None
+                # 编辑态：事实工具查证失败**不废掉**本轮候选。
+                #
+                # 事实工具是帮模型**定位**目标卡片用的，不是「准不准加这个
+                # 指标」的准入闸门 —— 目录里没有的指标要走目录外通路，不是
+                # 拒绝的理由（需求：不查、不索引、不校验真实数据源或预定义
+                # 字段，来决定用户能不能加指标）。
+                #
+                # 目标认错了怎么办？用户面前还有那张**待确认卡片**：它写清楚
+                # 改哪张卡、怎么展示，用户点头才落草稿。查证失败时更该把
+                # 候选交给用户看，而不是让整轮变成「技术问题」把人堵死。
+                log_warning(logger, "编辑态事实工具查证失败，候选仍交用户确认")
 
             # 终结工具优先：模型调用了 submit_* 就以它的提交为准
             plan = self._plan_from_submission()
             if plan is not None:
-                return plan
+                return plan, ""
 
             plan = self._parse_plan(_extract_text(reply_msg))
             if plan is not None:
-                return plan
+                return plan, ""
 
             # 修复重试 1 次（Q5）
-            logger.warning(
-                "AgentScope 未提交终结工具 state=%s reply=%r",
-                request.state.value, _extract_text(reply_msg)[:400],
+            # 模型返回原文不进日志：只留长度与形状级摘要（#61）。
+            first_reply = _extract_text(reply_msg)
+            log_warning(
+                logger,
+                "AgentScope 未提交终结工具 state=%s replyLength=%d replyShape=%s",
+                request.state.value,
+                len(first_reply),
+                model_text_shape(first_reply),
             )
-            logger.info("AgentScope 首轮输出不合法，走修复重试")
+            log_info(logger, "AgentScope 首轮输出不合法，走修复重试")
             repair_msg = Msg(
                 name="user",
                 role="user",
@@ -431,19 +491,25 @@ class AgentScopeReportAgent:
             )
             reply_msg2 = await agent.reply(repair_msg)
             if getattr(request, "queryMode", False) and take_lookup_failure():
-                logger.warning("查询态修复轮事实工具查证失败")
-                return None
+                log_warning(logger, "查询态修复轮事实工具查证失败")
+                return None, "修复轮事实工具查证失败"
             if request.state in {AgentState.USER_EDITING_TEMPLATE, AgentState.WAITING_USER_CONFIRM} and take_lookup_failure():
-                logger.warning("编辑态修复轮事实工具查证失败")
-                return None
+                log_warning(logger, "编辑态修复轮事实工具查证失败，候选仍交用户确认")
             plan = self._plan_from_submission()
             if plan is not None:
-                return plan
-            logger.warning(
-                "AgentScope 修复轮未提交终结工具 state=%s reply=%r",
-                request.state.value, _extract_text(reply_msg2)[:400],
+                return plan, ""
+            repair_reply = _extract_text(reply_msg2)
+            log_warning(
+                logger,
+                "AgentScope 修复轮未提交终结工具 state=%s replyLength=%d replyShape=%s",
+                request.state.value,
+                len(repair_reply),
+                model_text_shape(repair_reply),
             )
-            return self._parse_plan(_extract_text(reply_msg2))
+            plan = self._parse_plan(repair_reply)
+            if plan is None:
+                return None, "两轮都没有可解析的终结提交"
+            return plan, ""
         finally:
             clear_tool_context()
             clear_submission()
@@ -645,10 +711,18 @@ class AgentScopeReportAgent:
         except DefinitionBuildError as exc:
             # 条件不被目录 / 指标 / 授权范围支持：明确阻断，
             # 不能退回默认草稿 —— 那会让用户拿到一份统计的是别的东西的报表。
-            logger.warning("草稿组装被阻断 code=%s message=%s", exc.code, exc.message)
+            # 阻断说明里带着**载荷字段值**（指标名 / 数据源名，可能含用户数据）
+            # → **不进日志**（#61 AC#1）；只留错误码与原因类型 ——
+            # 与 template_preview_flow 里同一个 `DefinitionBuildError` 的写法一致。
+            log_warning(
+                logger,
+                "草稿组装被阻断 code=%s errorType=%s",
+                exc.code,
+                type(exc).__name__,
+            )
             return self._blocked_generate_response(request, exc)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("草稿组装或校验失败：%s", exc)
+            log_failure(logger, "草稿组装或校验失败", exc)
             return self._fallback.handle(request)
 
         reply = plan.get("reply") or f"已生成 {policy.name} 草稿，请确认。"
@@ -1042,6 +1116,12 @@ class AgentScopeReportAgent:
             }.get(action)
             if missing and not missing[1]:
                 return ask(f"修改「{(region or {}).get('name') or region_id}」还缺少 {missing[0]}，请明确具体值。")
+            if action == EditIntent.ADD_METRIC.value and not operation.addMetrics:
+                # 追加指标：至少要有一个要加的指标（名字、单位、怎么显示）。
+                return ask(
+                    f"要在「{(region or {}).get('name') or region_id}」上追加哪几个指标？"
+                    "把指标名字列出来就行。"
+                )
         if plan.confidence < 0.7:
             return ask(
                 plan.clarificationQuestion or "我还不能确定这次修改的具体内容，请确认目标和修改值。",
@@ -1058,6 +1138,11 @@ class AgentScopeReportAgent:
         summary = plan.summary or f"对「{name}」执行 {intent}：" + "；".join(
             self._describe_edit_step(step) for step in operation_steps
         )
+        # 模型写的摘要里可能带内部标识（``metric.machine_room.pue``、
+        # ``region_1``、``capabilityPending``）—— 用户看不懂也不该看。
+        # 规则路径（agent_service）走同一套清洗，两边口径一致。
+        summary = sanitize_internal_ids(summary)
+        operation_steps = sanitize_change_set_summaries(operation_steps)
         revision = int((definition.metadata or {}).get("revision") or 0)
         candidate = {
             "planId": f"plan_{uuid.uuid4().hex}",
@@ -1081,6 +1166,11 @@ class AgentScopeReportAgent:
                 prompt="确认这次修改：",
                 expects="SINGLE_CHOICE",
                 selectionOnly=True,
+                # 「其他」：用户在**这张卡片里**写的自由文本 = 对当前问题的
+                # 纠正（同一个待办），不是另一条无关消息。
+                allowsOther=True,
+                otherLabel="其他",
+                otherPlaceholder="也可以直接在这里写要怎么改",
                 options=[
                     QuestionOption(value=value, label=value)
                     for value in ("接受修改", "继续调整", "取消")
@@ -1104,6 +1194,7 @@ class AgentScopeReportAgent:
             "DELETE_SECTION": "删除卡片",
             "RENAME_SECTION": "修改卡片标题",
             "ADD_SECTION": "新增卡片",
+            "ADD_METRIC": "在卡片上追加指标",
             "CHANGE_DATA_SOURCE": "更换数据源",
             "CHANGE_COMPILATION_GRAIN": "修改编译粒度",
             "CHANGE_TIME_RANGE": "修改时间窗",
@@ -1113,6 +1204,14 @@ class AgentScopeReportAgent:
             "CHANGE_SORT": "修改排序",
         }
         details = [step.get("summary") or labels.get(action, "修改")]
+        if action == "ADD_METRIC":
+            names = "、".join(
+                str(item.get("label") or item.get("intent") or "")
+                for item in (operation.get("addMetrics") or [])
+                if isinstance(item, dict)
+            )
+            if names:
+                details = [f"追加指标：{names}"]
         for key, label in (
             ("newTitle", "标题"), ("sourceRef", "数据源"),
             ("metricRef", "指标"), ("timeWindowLabel", "时间窗"),

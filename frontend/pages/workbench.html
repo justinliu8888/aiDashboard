@@ -121,11 +121,16 @@
 
 <!-- ===== 报表工具栏 ===== -->
 <div class="shrink-0 bg-white border-b border-slate-200 px-5 py-3">
-  <div class="flex items-center gap-4">
+  <!-- flex-wrap + 标题块最小宽度：
+       窗口一窄，整行原本会被按钮组（shrink-0）挤到只剩一条缝，
+       标题里的文字被压成竖排、工具栏能撑到三百多像素高，把下面的
+       对话区和右侧预览全挤没了。现在标题块保底 220px，放不下就让
+       按钮组整体换行，工具栏始终是两三行的高度。 -->
+  <div class="flex items-center gap-4 flex-wrap">
     <a class="w-8 h-8 shrink-0 rounded-lg border border-slate-200 hover:bg-slate-50 flex items-center justify-center text-slate-500" href="../" title="返回 playground">
       <iconify-icon class="text-base" icon="mdi:arrow-left"></iconify-icon>
     </a>
-    <div class="min-w-0">
+    <div class="min-w-[220px] flex-1">
       <div class="flex items-center gap-2 flex-wrap">
         <h1 class="text-base font-semibold text-slate-900">机房能耗日报</h1>
         <span id="draft-badge" class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-slate-100 text-slate-500 border-slate-200">
@@ -133,13 +138,12 @@
         </span>
         <span id="state-badge" class="inline-flex items-center gap-1 rounded-md text-xs font-medium px-2 py-1 border bg-slate-100 text-slate-600 border-slate-200 mono">IDLE</span>
       </div>
-      <div class="flex items-center gap-2.5 text-xs text-slate-500 mt-1.5">
-        <span>subject: <span class="mono">machine_room / room_a</span></span><span class="text-slate-300">|</span>
-        <span>revision: <span id="meta-rev" class="mono">—</span></span><span class="text-slate-300">|</span>
-        <span>designSessionId: <span id="meta-session" class="mono">—</span></span>
+      <div class="flex items-center gap-2.5 text-xs text-slate-500 mt-1.5 flex-wrap">
+        <span>报表范围：<span class="mono">machine_room / room_a</span></span><span class="text-slate-300">|</span>
+        <span>草稿：<span id="meta-rev" class="mono">尚未生成</span></span>
       </div>
     </div>
-    <div class="ml-auto flex items-center gap-2 shrink-0">
+    <div class="ml-auto flex items-center gap-2 flex-wrap shrink-0">
       <button id="btn-regenerate" class="inline-flex items-center gap-1.5 rounded-lg bg-white hover:bg-slate-50 text-slate-700 text-sm font-medium px-3 py-2 border border-slate-200 transition">
         <iconify-icon class="text-base text-slate-500" icon="mdi:refresh"></iconify-icon>重新生成
       </button>
@@ -178,8 +182,15 @@
     </div>
   </nav>
 
+  <!-- 对话区 + 预览区：窄屏上下排（整列可滚动），宽屏左右排 -->
+  <div class="flex-1 min-w-0 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden">
   <!-- 左：AI 对话区 -->
-  <section class="w-[36%] min-w-[340px] max-w-[560px] shrink-0 bg-white border-r border-slate-200 flex flex-col">
+  <!-- 左：对话区。
+       窄屏（< lg）时对话区与右侧预览区**上下排**，右侧不再被挤成一条
+       几十像素的缝（报表根本看不见）；宽屏仍然左右排。
+       窄屏时对话区给一个确定的高度：里面的消息列表自己滚，
+       整列再一起滚到下面的报表预览区。 -->
+  <section class="w-full lg:w-[36%] lg:min-w-[340px] lg:max-w-[560px] h-[400px] lg:h-auto shrink-0 min-h-0 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col">
     <div class="shrink-0 px-4 py-3 border-b border-slate-200 flex items-center gap-3">
       <div class="relative">
         <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
@@ -212,11 +223,36 @@
       <button id="btn-jump-bottom" class="hidden absolute bottom-3 right-4 z-10 flex items-center gap-1 rounded-full border border-slate-200 bg-white/95 shadow-md px-2.5 py-1.5 text-[11px] text-slate-600 hover:text-blue-700 hover:border-blue-300 transition">
         <iconify-icon class="text-sm" icon="mdi:chevron-double-down"></iconify-icon>回到底部
       </button>
+
+      <!-- 有新方案但用户在上方读历史：不强行滚动，给一个可点的提示（#66） -->
+      <button id="btn-latest-plan" class="hidden absolute bottom-12 right-4 z-10 flex items-center gap-1 rounded-full border border-blue-200 bg-white/95 shadow-md px-2.5 py-1.5 text-[11px] text-blue-700 hover:border-blue-300 transition">
+        <iconify-icon class="text-sm" icon="mdi:new-box"></iconify-icon>有最新方案
+      </button>
     </div>
 
-    <!-- 快捷入口 -->
+    <!-- 快捷入口 + JSON 粘贴入口（#66） -->
     <div class="shrink-0 border-t border-slate-200 bg-white px-4 pt-3">
-      <button data-quick="生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析" class="rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">生成能耗日报</button>
+      <div class="flex items-center gap-2 flex-wrap">
+        <button data-quick="生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析" class="rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">生成能耗日报</button>
+        <button id="btn-json-paste" class="rounded-full border border-slate-200 bg-white hover:border-blue-300 hover:text-blue-700 text-slate-600 text-[11px] px-2.5 py-1.5 transition">
+          <iconify-icon class="text-xs" icon="mdi:code-json"></iconify-icon>粘贴 JSON 数据
+        </button>
+        <span class="text-[11px] text-slate-400">把记录数组贴进来，并附一句你想做什么报表</span>
+      </div>
+    </div>
+
+    <!-- JSON 粘贴面板：记录数组 + 一句自然语言（#66） -->
+    <div id="json-paste-panel" class="hidden shrink-0 border-t border-slate-200 bg-slate-50 px-4 py-3">
+      <div class="text-[11px] text-slate-600 mb-1">记录数组（JSON）</div>
+      <textarea id="json-paste-data" rows="4" class="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-[11px] font-mono outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-100" placeholder='[{"设备名称":"A-1","耗电量":120.5}]'></textarea>
+      <div class="text-[11px] text-slate-600 mt-2 mb-1">想做什么报表（自然语言，可选）</div>
+      <textarea id="json-paste-note" rows="2" class="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-[11px] outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-100" placeholder="例如：按设备汇总耗电量并做趋势图"></textarea>
+      <div id="json-paste-hint" class="hidden mt-2 text-[11px] text-rose-700 leading-relaxed"></div>
+      <div class="flex items-center gap-2 mt-2 flex-wrap">
+        <button id="btn-json-paste-send" class="rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-[11px] font-medium px-3 py-1.5">发送</button>
+        <button id="btn-json-paste-cancel" class="rounded-lg border border-slate-200 bg-white text-slate-600 text-[11px] px-3 py-1.5">取消</button>
+        <span class="text-[10px] text-slate-400">数据来自你粘贴的 JSON，未经业务核验</span>
+      </div>
     </div>
 
     <!-- 输入 -->
@@ -230,7 +266,6 @@
           </button>
         </div>
         <div class="flex items-center justify-between mt-2">
-          <span class="text-[11px] text-slate-500">当前 state: <span id="footer-state" class="mono text-slate-700">ANALYZING</span></span>
           <span class="text-[10px] text-slate-400">Enter 发送 · Shift+Enter 换行</span>
         </div>
       </div>
@@ -238,7 +273,7 @@
   </section>
 
   <!-- 右：报表预览区 -->
-  <section class="flex-1 min-w-0 overflow-y-auto no-bar bg-slate-100">
+  <section class="flex-none lg:flex-1 min-h-0 min-w-0 overflow-y-auto no-bar bg-slate-100">
     <!-- 这里**只有报表本身**：文字方案已移到左侧对话区（#46 / 工单 06），
          右侧不再有方案容器，也没有任何对照折叠视图。 -->
     <div id="preview-root" class="p-5 space-y-5">
@@ -249,16 +284,17 @@
       </div>
     </div>
   </section>
+  </div>
 </div>
 
 <!-- toast -->
 <div id="toast" class="hidden fixed left-1/2 bottom-8 -translate-x-1/2 z-50 bg-slate-900 text-white text-sm px-4 py-2.5 rounded-lg shadow-lg"></div>
 
-<script src="./workbench_query.js?v=20261029-downline-grid-final2"></script>
+<script src="./workbench_query.js?v=20261031-conversational-template6"></script>
 <!-- 文字方案模块（#19）：先加载它，主工作台再调用 window.WorkbenchPlan -->
-<script src="./workbench_plan.js?v=20261029-downline-grid-final2"></script>
+<script src="./workbench_plan.js?v=20261101-markdown-plan2"></script>
 <!-- 主工作台：规则模块与方案模块先加载（它们是普通脚本，按文档顺序执行），
      主脚本用 defer：文档解析完执行、在 DOMContentLoaded 之前，不阻塞首帧。 -->
-<script src="./workbench.js?v=20261029-downline-grid-final2" defer></script>
+<script src="./workbench.js?v=20261101-failure-recovery1" defer></script>
 </body>
 </html>

@@ -131,6 +131,13 @@ KNOWN_TABLES: frozenset[str] = frozenset(
         "report_design_templates",
         "report_design_confirmations",
         "report_design_definitions",
+        # 方案版本记录（工单 #63）：存的是每一版方案的**纯结构**，不是业务数值。
+        "report_design_plan_versions",
+        # 用户 JSON 输入记录（工单 #64）：存的是**用户自己提供**的原始记录数组
+        # （契约表 §4.3）。这是用户数据，ADR 0004 §8 明确豁免「不落盘」约束；
+        # 它不是模拟业务数值表，但仍要在白名单里，否则「临时库里没有业务
+        # 数值表」这条断言会因为多了张表而失败。
+        "report_design_json_inputs",
     }
 )
 

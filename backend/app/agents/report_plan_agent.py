@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from app.schemas.report_plan import PlanValidationError
+from app.services import report_diagnostics_service as diagnostics
 from app.services.report_plan_service import (
     COLUMNS_NOTE_PREFIX,
     PlanResolution,
@@ -46,6 +47,34 @@ FAILURE_MODEL_CALL_FAILED = "MODEL_CALL_FAILED"
 FAILURE_MODEL_OUTPUT_INVALID = "MODEL_OUTPUT_INVALID"
 FAILURE_UNSAFE_CONTENT = "UNSAFE_CONTENT"
 
+#: 业务阶段：写进诊断元信息，标出这一轮模型调用在干什么。
+STAGE_PLAN_DESIGN = "plan_design"
+
+#: 解析分类：取值域固定四值（契约表 §6.3），三类失败**不许合并**。
+#:
+#: - ``PARSE_NOT_JSON``：返回格式损坏（不是 JSON 对象）
+#: - ``PARSE_STRUCTURE_INVALID``：是 JSON 但结构非法
+#: - ``TERMINAL_RESULT_MISSING``：未提交合法终结结果
+#: - ``PARSE_OK``：解析与校验都过了
+PARSE_NOT_JSON = diagnostics.PARSE_NOT_JSON
+PARSE_STRUCTURE_INVALID = diagnostics.PARSE_STRUCTURE_INVALID
+TERMINAL_RESULT_MISSING = diagnostics.TERMINAL_RESULT_MISSING
+PARSE_OK = diagnostics.PARSE_OK
+
+#: 提示词版本（**代码里的权威来源**）。
+#:
+#: 提示词文件里**不许**再塞版本标记：那个文件的字节就是发给模型的字节，
+#: 动一个字就等于改了模型输入（契约表 §6.5「不改提示词」）。
+#: 版本号放在这里；提示词里若写了 ``prompt-version: vX`` 标记，
+#: 以提示词里的为准（那是显式覆盖），没有标记就回落到这个常量。
+_PROMPT_VERSION = "v1"
+
+#: 提示词里的版本标记（可选）：``prompt-version: v1``。
+#: 提示词文件里现在**没有**这个标记，保留匹配逻辑是为了将来显式覆盖时仍能生效。
+_PROMPT_VERSION_PATTERN = re.compile(
+    r"prompt-version:\s*([A-Za-z0-9._\-]+)", re.IGNORECASE
+)
+
 #: 注入的外部模型调用：接收 messages 数组，返回模型文本。
 ModelCall = Callable[[list[dict[str, Any]]], Awaitable[str]]
 #: 可选的进度回调。同步、异步都支持；回调失败不影响本轮结论。
@@ -53,7 +82,40 @@ Emit = Callable[[dict[str, Any]], Any]
 
 
 class _InvalidOutput(Exception):
-    """模型输出不是本模块能识别的结构。"""
+    """模型输出不是本模块能识别的结构。
+
+    额外带上**失败分类**与 JSON 位置（诊断用）：
+    ``parse_status`` 说清是「不是 JSON」「结构非法」还是别的情况，
+    ``json_error`` 带着偏移与行列，指向原文里解析断掉的位置。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        parse_status: str = PARSE_STRUCTURE_INVALID,
+        parsed: Any = None,
+        json_error: json.JSONDecodeError | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.parse_status = parse_status
+        self.parsed = parsed
+        self.json_error = json_error
+
+    @property
+    def json_offset(self) -> int | None:
+        """JSON 解析断掉的字符偏移（相对**原文**）。"""
+        return self.json_error.pos if self.json_error is not None else None
+
+    @property
+    def json_line(self) -> int | None:
+        """JSON 解析断掉的行号（1 起，相对原文）。"""
+        return self.json_error.lineno if self.json_error is not None else None
+
+    @property
+    def json_column(self) -> int | None:
+        """JSON 解析断掉的列号（1 起，相对原文）。"""
+        return self.json_error.colno if self.json_error is not None else None
 
 
 class _UnsafeContent(Exception):
@@ -288,16 +350,49 @@ def _load_prompt() -> str:
     return _PROMPT_PATH.read_text(encoding="utf-8")
 
 
+def _session_json_context() -> str:
+    """当前会话里用户提交的 JSON 数据的**受限视图**（工单 #64）。
+
+    只有字段结构、缺失与类型统计和有上限的代表样本，整段标记为
+    **不可信输入**（数据里的文字不是指令）。
+
+    没有提交过 JSON → 空字符串，不给模型塞多余内容。
+
+    惰性导入：服务层依赖会话存储，直接 import 会绕成环。
+    """
+    try:
+        from app.services.session_context import current_session_key
+        from app.services.user_json_service import user_json_service
+    except Exception:  # noqa: BLE001
+        return ""
+    session_id = current_session_key()
+    if not session_id:
+        return ""
+    try:
+        record = user_json_service.latest_for_session(session_id)
+    except Exception:  # noqa: BLE001
+        _safe_warning("取 JSON 输入上下文失败，按无上下文处理")
+        return ""
+    if record is None:
+        return ""
+    return user_json_service.model_context(record)
+
+
 def build_messages(
     *,
     message: str,
     current_plan: dict[str, Any] | None,
     history: list[dict[str, Any]] | None,
+    json_context: str | None = None,
 ) -> list[dict[str, Any]]:
     """拼出发给模型的 messages。
 
-    顺序固定：系统提示 → 历史 → 当前方案 → 本轮需求。
+    顺序固定：系统提示 → 历史 → 当前方案 → JSON 数据上下文 → 本轮需求。
     历史只保留有文本的条目，角色限制在 user / assistant。
+
+    ``json_context`` 是用户提供的 JSON 数据的**受限视图**（工单 #64）：
+    只有字段结构、缺失与类型统计和有上限的代表样本，整段被标成
+    **不可信输入**。原文不进上下文，样本行数有上限。
     """
     messages: list[dict[str, Any]] = [{"role": "system", "content": _load_prompt()}]
 
@@ -321,61 +416,134 @@ def build_messages(
             }
         )
 
+    if json_context:
+        messages.append({"role": "user", "content": json_context})
+
     messages.append({"role": "user", "content": str(message or "")})
     return messages
+
+
+def _try_json(text: str) -> tuple[Any, json.JSONDecodeError | None]:
+    """解析一段文本；失败时把带位置的 ``JSONDecodeError`` 一起带回来。"""
+    try:
+        return json.loads(text), None
+    except json.JSONDecodeError as exc:
+        return None, exc
+    except ValueError:
+        return None, None
+
+
+def _shift_error(
+    exc: json.JSONDecodeError, doc: str, offset: int
+) -> json.JSONDecodeError:
+    """把解析错误的偏移换算回**原文**，行列也随之换算。"""
+    return json.JSONDecodeError(exc.msg, doc, exc.pos + offset)
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
     """从模型文本里取出 JSON 对象。
 
     依次尝试：整体解析 → 去掉 markdown 代码块 → 扫描第一个配平的 ``{}``。
-    """
-    raw = (text or "").strip()
-    if not raw:
-        raise _InvalidOutput("模型没有返回内容")
 
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        parsed = None
+    **降级顺序与原来完全一样**（本票只加诊断，不改解析行为）。
+    失败时抛出的 ``_InvalidOutput`` 额外带上：
+
+    - 失败分类：不是 JSON → ``PARSE_NOT_JSON``；是 JSON 但不是对象 →
+      ``PARSE_STRUCTURE_INVALID``；
+    - JSON 位置：偏移与行列，指向**原文**里解析断掉的地方。
+
+    解析用的是**去空白后的文本**（与改动前逐字一致），但记位置时会把
+    **前导空白的长度**加回去 —— 偏移与行列一律相对**原始返回文本**。
+    """
+    original = text or ""
+    raw = original.strip()
+    if not raw:
+        raise _InvalidOutput("模型没有返回内容", parse_status=PARSE_NOT_JSON)
+
+    # 前导空白的长度：记位置时加回去，位置才是相对**原文**的。
+    lead = len(original) - len(original.lstrip())
+
+    parsed, error = _try_json(raw)
     if isinstance(parsed, dict):
         return parsed
+    # 是 JSON 但不是对象：留着，失败时按「结构非法」归类。
+    json_value = parsed
 
-    fenced = _strip_code_fence(raw)
+    fenced, fenced_offset = _strip_code_fence(raw)
     if fenced != raw:
-        try:
-            parsed = json.loads(fenced)
-        except (json.JSONDecodeError, ValueError):
-            parsed = None
-        if isinstance(parsed, dict):
-            return parsed
+        fenced_parsed, fenced_error = _try_json(fenced)
+        if isinstance(fenced_parsed, dict):
+            return fenced_parsed
+        if fenced_parsed is not None:
+            json_value = fenced_parsed
+        elif fenced_error is not None:
+            error = _shift_error(fenced_error, raw, fenced_offset)
 
-    scanned = _scan_json_object(raw)
-    if scanned is not None:
+    scanned, scan_error = _scan_json_object(raw)
+    if isinstance(scanned, dict):
         return scanned
 
-    raise _InvalidOutput("模型输出不是 JSON 对象")
+    if json_value is not None:
+        raise _InvalidOutput(
+            "模型输出不是 JSON 对象",
+            parse_status=PARSE_STRUCTURE_INVALID,
+            parsed=json_value,
+        )
+
+    # 选一个**最有指向性**的位置：
+    # - 原文整体不是 JSON（错误停在最前面）而扫描找到了对象起点 → 用对象起点；
+    # - 否则用解析器放弃的那个位置（截断时正好指向末尾）。
+    if error is not None and scan_error is not None and error.pos < scan_error.pos:
+        error = scan_error
+    # 上面两个位置都是相对**去空白后的文本**的：换算回**原文**，
+    # 行列也跟着换算（行列由 JSONDecodeError 按 doc + pos 算）。
+    located = error or scan_error
+    if located is not None:
+        located = _shift_error(located, original, lead)
+    raise _InvalidOutput(
+        "模型输出不是 JSON 对象",
+        parse_status=PARSE_NOT_JSON,
+        json_error=located,
+    )
 
 
-def _strip_code_fence(text: str) -> str:
-    """去掉 ```json ... ``` 包裹，保留里面的内容。"""
+def _strip_code_fence(text: str) -> tuple[str, int]:
+    """去掉 ```json ... ``` 包裹，保留里面的内容。
+
+    返回 ``(去掉围栏后的文本, 该文本在原文里的起始偏移)``。
+    """
     stripped = text.strip()
     if not stripped.startswith("```"):
-        return text
+        return text, 0
     lines = stripped.splitlines()
     if len(lines) < 2:
-        return text
+        return text, 0
     lines = lines[1:]
     if lines and lines[-1].strip().startswith("```"):
         lines = lines[:-1]
-    return "\n".join(lines).strip()
+    fenced = "\n".join(lines).strip()
+    if not fenced:
+        return fenced, 0
+    # 起点偏移：围栏首行之后的第一处非空白。
+    base = text.find(stripped)
+    if base < 0:
+        base = 0
+    first_line_end = stripped.find("\n")
+    index = first_line_end + 1 if first_line_end >= 0 else 0
+    while index < len(stripped) and stripped[index].isspace():
+        index += 1
+    return fenced, base + index
 
 
-def _scan_json_object(text: str) -> dict[str, Any] | None:
-    """在自由文本里扫描第一个配平的 JSON 对象。"""
+def _scan_json_object(text: str) -> tuple[dict[str, Any] | None, json.JSONDecodeError | None]:
+    """在自由文本里扫描第一个配平的 JSON 对象。
+
+    返回 ``(对象, 解析错误)``；错误里的偏移已换算回**原文**。
+    找到 ``{`` 却一直没闭合时，错误指向**这个对象的起点**。
+    """
     start = text.find("{")
     if start < 0:
-        return None
+        return None, None
     depth = 0
     in_string = False
     escaped = False
@@ -398,10 +566,13 @@ def _scan_json_object(text: str) -> dict[str, Any] | None:
             if depth == 0:
                 try:
                     parsed = json.loads(text[start : index + 1])
-                except (json.JSONDecodeError, ValueError):
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None
+                except json.JSONDecodeError as exc:
+                    return None, _shift_error(exc, text, start)
+                except ValueError:
+                    return None, None
+                return (parsed if isinstance(parsed, dict) else None), None
+    # 扫到结尾也没闭合：对象从 start 开始就没写完。
+    return None, json.JSONDecodeError("JSON 对象没有闭合", text, start)
 
 
 #: 候选里不允许出现的顶层字段：提交 ID 和版本由服务端分配，模型不能自己给。
@@ -490,11 +661,12 @@ def _validate_requirements(raw: Any) -> dict[str, Any]:
     # 时间粒度：与时间范围单位不是一回事；用户没说就由服务端推定。
     grain_unit = requirements.get("grainUnit")
     if isinstance(grain_unit, str) and grain_unit.strip():
+        # 取值是模型给的，可能带着用户的话：**不进日志**。
         unit = grain_unit.strip().upper()
         if unit in GRAIN_UNITS:
             validated["grainUnit"] = unit
         else:
-            logger.info("模型给的 grainUnit 非法，已忽略：%s", grain_unit)
+            logger.info("模型给的 grainUnit 不在允许取值里，已忽略")
     return validated
 
 
@@ -503,6 +675,8 @@ def _validate_columns(raw: Any, label: str) -> list[dict[str, Any]]:
 
     结构完全不可用时（不是数组）不在这里判死：交给服务端的栏目解析，
     由它决定「补齐 → 追问 → 失败」哪条路。
+
+    日志只记**位置**（第几个板块）：板块标题是模型写的，可能带着用户的话。
     """
     if not isinstance(raw, list):
         logger.info("%s的 columns 不是数组，交给服务端解析", label)
@@ -539,6 +713,8 @@ def _validate_sections(raw: Any) -> list[dict[str, Any]]:
         # 报错要**点名是哪个板块**（#39）：只说「componentType 不在允许的取值里」
         # 的话，用户根本不知道要改哪一块。
         label = f"板块 {index + 1}「{section.get('title') or '未命名'}」"
+        # 日志用的标签只带位置：板块标题是模型写的，可能带着用户的话。
+        log_label = f"板块 {index + 1}"
         for key in _REQUIRED_SECTION_KEYS:
             if key not in section:
                 raise _InvalidOutput(f"{label}缺少 {key}")
@@ -563,10 +739,10 @@ def _validate_sections(raw: Any) -> list[dict[str, Any]]:
             if intent.strip() in DISPLAY_INTENTS:
                 validated["displayIntent"] = intent.strip()
             else:
-                logger.info("%s的 displayIntent 非法，已忽略：%s", label, intent)
+                logger.info("%s的 displayIntent 不在允许取值里，已忽略", log_label)
         # 表格板块的栏目声明：只有表格板块用得上。
         if component_type == _TABLE_COMPONENT_TYPE and section.get("columns") is not None:
-            validated["columns"] = _validate_columns(section["columns"], label)
+            validated["columns"] = _validate_columns(section["columns"], log_label)
         sections.append(validated)
     return sections
 
@@ -671,6 +847,39 @@ async def _fail(
     return _failure(code, message)
 
 
+def _safe_warning(message: str, *args: Any) -> None:
+    """写一条告警日志。
+
+    **日志器自己抛错也不许让业务请求失败**（契约表 §6.5）：
+    故障处理路径上已经在 ``except`` 里了，日志再抛错会把原始异常盖掉，
+    一路穿出到业务请求 —— 那一轮就直接失败了。
+    """
+    try:
+        logger.warning(message, *args)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _safe_failure(message: str, exc: BaseException) -> None:
+    """写一条失败日志：**只留原因类型与调用栈，不留异常原文**。
+
+    和 :func:`_safe_warning` 一样不许抛错；区别是这里把异常对象换成
+    它的类型 —— 上游异常原文可能带用户数据（#61）。
+
+    调用栈留着（能看出哪一行炸的），口径与路由层一致：
+    ``exc_info=(类型, None, 栈)``。
+    """
+    try:
+        logger.warning(
+            "%s errorType=%s",
+            message,
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _notify(emit: Emit | None, event: dict[str, Any]) -> None:
     """进度回调。回调自身出错不影响本轮结论。"""
     if emit is None:
@@ -680,7 +889,61 @@ async def _notify(emit: Emit | None, event: dict[str, Any]) -> None:
         if inspect.isawaitable(result):
             await result
     except Exception as exc:  # noqa: BLE001
-        logger.warning("方案设计进度回调失败：%s", exc)
+        # 异常原文不进日志：只留原因类型（#61）。
+        _safe_failure("方案设计进度回调失败", exc)
+
+
+def _record_parse_outcome(
+    state: diagnostics.ModelCallState,
+    *,
+    parse_status: str | None,
+    reason: str | None,
+    raw_output: str | None = None,
+    parsed: Any = None,
+    exc: _InvalidOutput | None = None,
+    write_diagnostic: bool = False,
+) -> None:
+    """记一次解析/校验的结论：日志 + （失败时）诊断记录。
+
+    两件事都**不让业务请求失败**：写日志、写诊断出错只会被吞掉。
+    """
+    diagnostics.log_model_parse(
+        state,
+        parse_status=parse_status,
+        reason=reason,
+        json_offset=exc.json_offset if exc is not None else None,
+        json_line=exc.json_line if exc is not None else None,
+        json_column=exc.json_column if exc is not None else None,
+    )
+    if not write_diagnostic:
+        return
+    diagnostics.write_diagnostic_record(
+        state=state,
+        reason=reason or FAILURE_MODEL_OUTPUT_INVALID,
+        parse_status=parse_status or PARSE_NOT_JSON,
+        raw_output=raw_output,
+        parsed=parsed,
+        json_offset=exc.json_offset if exc is not None else None,
+        json_line=exc.json_line if exc is not None else None,
+        json_column=exc.json_column if exc is not None else None,
+    )
+
+
+def _prompt_version(prompt_text: str) -> str:
+    """提示词版本：提示词里的标记优先，没有标记就回落到代码常量。
+
+    **不写 None** —— 版本号始终有值，日志里才能对齐到是哪一版提示词。
+    """
+    match = _PROMPT_VERSION_PATTERN.search(prompt_text or "")
+    return match.group(1) if match else _PROMPT_VERSION
+
+
+def _system_prompt_text(messages: list[dict[str, Any]]) -> str:
+    """取系统提示词文本（用来算摘要哈希与版本）。"""
+    for message in messages:
+        if str(message.get("role") or "") == "system":
+            return str(message.get("content") or "")
+    return ""
 
 
 async def generate_candidate(
@@ -690,6 +953,7 @@ async def generate_candidate(
     history: list[dict[str, Any]] | None,
     model_call: ModelCall,
     emit: Emit | None = None,
+    json_context: str | None = None,
 ) -> dict[str, Any]:
     """把一轮新建/修改需求变成方案候选、澄清问题或安全失败。
 
@@ -699,14 +963,30 @@ async def generate_candidate(
         history：有角色和文本的简短上下文。
         model_call：注入的模型调用，接收 messages，返回模型文本。
         emit：可选的进度回调。
+        json_context：用户提供的 JSON 数据的**受限视图**（字段结构、缺失与
+            类型统计、有上限的代表样本，标记为不可信输入）。不给时按当前
+            会话里已保存的输入记录解析（工单 #64）。
 
     返回：
         ``{"kind": "plan_candidate", "candidate": {...}}`` /
         ``{"kind": "clarification", "question": "..."}`` /
         ``{"kind": "failure", "code": "...", "message": "..."}``。
     """
+    if json_context is None:
+        json_context = _session_json_context()
     messages = build_messages(
-        message=message, current_plan=current_plan, history=history
+        message=message,
+        current_plan=current_plan,
+        history=history,
+        json_context=json_context,
+    )
+
+    # 阶段与提示词信息进请求级上下文：模型适配层据此给这一轮生成标识。
+    prompt_text = _system_prompt_text(messages)
+    diagnostics.set_call_context(
+        stage=STAGE_PLAN_DESIGN,
+        prompt_version=_prompt_version(prompt_text),
+        prompt_digest=diagnostics.prompt_digest(prompt_text),
     )
 
     await _notify(emit, {"event": "plan_design_started"})
@@ -715,13 +995,29 @@ async def generate_candidate(
         text = await model_call(messages)
     except Exception as exc:  # noqa: BLE001
         # 只记异常类型：上游报错文本可能带凭证，不进日志也不进返回值。
-        logger.warning("方案设计模型调用失败：%s", type(exc).__name__)
+        state = diagnostics.ensure_model_call_state()
+        state.error_type = type(exc).__name__
+        diagnostics.log_model_parse(state, reason=FAILURE_MODEL_CALL_FAILED)
+        # 留调用栈：口径与路由层一致（``exc_info=(类型, None, 栈)``）——
+        # 异常对象被换掉，异常消息不进日志，栈里只有代码位置，
+        # 排查的人能看出「炸在哪一行」。与 :func:`_safe_warning` 的区别就在这。
+        _safe_failure(
+            f"方案设计模型调用失败 requestId={state.request_id}", exc
+        )
         return await _fail(
             emit, FAILURE_MODEL_CALL_FAILED, "模型调用失败，请稍后重试"
         )
 
+    state = diagnostics.ensure_model_call_state()
+
     if not isinstance(text, str):
         logger.info("方案设计模型返回的不是文本：%s", type(text).__name__)
+        _record_parse_outcome(
+            state,
+            parse_status=PARSE_NOT_JSON,
+            reason=FAILURE_MODEL_OUTPUT_INVALID,
+            write_diagnostic=True,
+        )
         return await _fail(
             emit, FAILURE_MODEL_OUTPUT_INVALID, "模型输出无法解析，请重试"
         )
@@ -731,7 +1027,17 @@ async def generate_candidate(
     try:
         payload = _extract_json_object(text)
     except _InvalidOutput as exc:
-        logger.info("方案设计输出无法解析：%s", exc)
+        # 只记分类，不记模型原文：三种失败在日志里必须长得不一样。
+        logger.info("方案设计输出无法解析：%s", exc.parse_status)
+        _record_parse_outcome(
+            state,
+            parse_status=exc.parse_status,
+            reason=FAILURE_MODEL_OUTPUT_INVALID,
+            raw_output=text,
+            parsed=exc.parsed,
+            exc=exc,
+            write_diagnostic=True,
+        )
         return await _fail(
             emit, FAILURE_MODEL_OUTPUT_INVALID, "模型输出无法解析，请重试"
         )
@@ -742,7 +1048,16 @@ async def generate_candidate(
         _normalize_identifiers(payload)
         _scan_unsafe_content(payload)
     except _UnsafeContent as exc:
-        logger.info("方案设计输出含不安全内容：%s", exc)
+        # 解析与结构校验都过了，是**内容**不合规：分类记 OK，原因另记。
+        logger.info("方案设计输出含不安全内容：%s", type(exc).__name__)
+        _record_parse_outcome(
+            state,
+            parse_status=PARSE_OK,
+            reason=FAILURE_UNSAFE_CONTENT,
+            raw_output=text,
+            parsed=payload,
+            write_diagnostic=True,
+        )
         return await _fail(
             emit,
             FAILURE_UNSAFE_CONTENT,
@@ -753,13 +1068,30 @@ async def generate_candidate(
     if kind == KIND_PLAN_CANDIDATE:
         candidate = payload.get("candidate")
         if not isinstance(candidate, dict):
+            _record_parse_outcome(
+                state,
+                parse_status=PARSE_STRUCTURE_INVALID,
+                reason=FAILURE_MODEL_OUTPUT_INVALID,
+                raw_output=text,
+                parsed=payload,
+                write_diagnostic=True,
+            )
             return await _fail(
                 emit, FAILURE_MODEL_OUTPUT_INVALID, "模型输出缺少方案内容"
             )
         try:
             validated = _validate_candidate(candidate)
         except _InvalidOutput as exc:
-            logger.info("方案候选结构不合法：%s", exc)
+            # 原因里带的是模型给的字段与取值：**只回给用户**，不进日志。
+            logger.info("方案候选结构不合法：%s", exc.parse_status)
+            _record_parse_outcome(
+                state,
+                parse_status=PARSE_STRUCTURE_INVALID,
+                reason=FAILURE_MODEL_OUTPUT_INVALID,
+                raw_output=text,
+                parsed=payload,
+                write_diagnostic=True,
+            )
             return await _fail(
                 emit,
                 FAILURE_MODEL_OUTPUT_INVALID,
@@ -779,7 +1111,15 @@ async def generate_candidate(
                 list(validated.get("suggestions") or []),
             )
         except PlanValidationError as exc:
-            logger.info("候选里的板块都只是未接受的建议：%s", exc)
+            logger.info("候选里的板块都只是未接受的建议：%s", type(exc).__name__)
+            _record_parse_outcome(
+                state,
+                parse_status=PARSE_STRUCTURE_INVALID,
+                reason=FAILURE_MODEL_OUTPUT_INVALID,
+                raw_output=text,
+                parsed=payload,
+                write_diagnostic=True,
+            )
             return await _fail(
                 emit,
                 getattr(exc, "code", None) or FAILURE_MODEL_OUTPUT_INVALID,
@@ -794,10 +1134,26 @@ async def generate_candidate(
         if resolution.question:
             # 猜不出来、且猜错会影响这块的用途 → 走澄清追问通道，
             # 问题出现在左侧对话区。「没有真实数据」不是追问的理由。
-            logger.info("方案需要澄清：%s", resolution.question)
+            # 追问内容是模型写的，可能带着用户的话：**不进日志**。
+            logger.info("方案需要澄清")
+            _record_parse_outcome(
+                state,
+                parse_status=PARSE_OK,
+                reason=KIND_CLARIFICATION,
+                raw_output=text,
+                parsed=payload,
+            )
             return {"kind": KIND_CLARIFICATION, "question": resolution.question}
         if resolution.failure_code:
             # 修正仍失败：明确报失败并允许重试，不给空表。
+            # 这是**领域层**的结论（栏目定不下来），不是模型输出解析失败。
+            _record_parse_outcome(
+                state,
+                parse_status=PARSE_OK,
+                reason=resolution.failure_code,
+                raw_output=text,
+                parsed=payload,
+            )
             return await _fail(
                 emit,
                 resolution.failure_code,
@@ -805,16 +1161,47 @@ async def generate_candidate(
             )
 
         _apply_resolution(validated, resolution)
+        _record_parse_outcome(
+            state,
+            parse_status=PARSE_OK,
+            reason=None,
+            raw_output=text,
+            parsed=payload,
+        )
         return {"kind": KIND_PLAN_CANDIDATE, "candidate": validated}
 
     if kind == KIND_CLARIFICATION:
         question = str(payload.get("question") or "").strip()
         if not question:
+            _record_parse_outcome(
+                state,
+                parse_status=PARSE_STRUCTURE_INVALID,
+                reason=FAILURE_MODEL_OUTPUT_INVALID,
+                raw_output=text,
+                parsed=payload,
+                write_diagnostic=True,
+            )
             return await _fail(
                 emit, FAILURE_MODEL_OUTPUT_INVALID, "模型输出缺少澄清问题"
             )
+        _record_parse_outcome(
+            state,
+            parse_status=PARSE_OK,
+            reason=None,
+            raw_output=text,
+            parsed=payload,
+        )
         return {"kind": KIND_CLARIFICATION, "question": question}
 
+    # 解析出来了，但**没有提交合法终结结果**：不是「不是 JSON」，也不是「结构非法」。
+    _record_parse_outcome(
+        state,
+        parse_status=TERMINAL_RESULT_MISSING,
+        reason=FAILURE_MODEL_OUTPUT_INVALID,
+        raw_output=text,
+        parsed=payload,
+        write_diagnostic=True,
+    )
     return await _fail(
         emit, FAILURE_MODEL_OUTPUT_INVALID, "模型输出无法解析，请重试"
     )

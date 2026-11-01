@@ -20,6 +20,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from app.services.simulated_field_semantics import (
+    SEMANTIC_KIND_VALUES,
+    VALUE_TYPE_VALUES,
+)
+
 
 class ComponentType(str, Enum):
     """首波支持的六种占位组件类型（冻结契约枚举）。"""
@@ -287,6 +292,19 @@ def _require_key(value: str) -> str:
     if not _KEY_PATTERN.match(text):
         raise ValueError("不能包含空白字符")
     return text
+
+
+def _optional_enum(value: Any, allowed: tuple[str, ...]) -> str | None:
+    """可选枚举字段：域内取值照用，域外的**当没声明**。
+
+    模型偶尔会写错一个枚举值。让整份方案因此失败太重（这一列的语义本来
+    就允许「没声明」，契约表 §3.4 的 ⑤ 级），所以域外的取值直接丢掉，
+    不当成硬错误。
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text if text in allowed else None
 
 
 # ---------- 危险执行内容 ----------
@@ -581,6 +599,12 @@ class PlanColumnCandidate(_PlanModel):
     fieldRef: str | None = None
     #: 列的展示格式（精度、单位标注）。模型不给就没有单位标注。
     format: PlanColumnFormat | None = None
+    #: 列的**语义类别**（可选）。模型认得这一列是哪一类业务量时才写。
+    #: 取值域见契约表 §3.2；域外的值**当没声明**（不当硬错误）。
+    semanticKind: str | None = None
+    #: 列的**值形态**（可选）。模型认得这一列的值长什么样时才写。
+    #: 取值域见契约表 §3.2；域外的值**当没声明**（不当硬错误）。
+    valueType: str | None = None
 
     @field_validator("id", "fieldRef")
     @classmethod
@@ -594,6 +618,16 @@ class PlanColumnCandidate(_PlanModel):
     def _check_label(cls, value: str) -> str:
         return _require_text(value)
 
+    @field_validator("semanticKind", mode="before")
+    @classmethod
+    def _check_semantic_kind(cls, value: Any) -> Any:
+        return _optional_enum(value, SEMANTIC_KIND_VALUES)
+
+    @field_validator("valueType", mode="before")
+    @classmethod
+    def _check_value_type(cls, value: Any) -> Any:
+        return _optional_enum(value, VALUE_TYPE_VALUES)
+
 
 class PlanColumn(_PlanModel):
     """定稿栏目：稳定身份 + 显示名 + 行对象取值键。
@@ -604,12 +638,17 @@ class PlanColumn(_PlanModel):
       造数器按它造行，渲染层按它读单元格。
     - ``format``：列的展示格式（精度、单位标注）。可空 —— 没声明就没有
       单位标注，不写错的单位。
+    - ``semanticKind`` / ``valueType``：列的**语义描述**（可选）。模型认得
+      这一列是什么量时才写；服务端照它写进 ``previewSpec.columns[]``
+      （契约表 §3.1）。没写就由服务端按兜底链解析。
     """
 
     id: str
     label: str
     fieldRef: str
     format: PlanColumnFormat | None = None
+    semanticKind: str | None = None
+    valueType: str | None = None
 
     @field_validator("id", "fieldRef")
     @classmethod
@@ -620,6 +659,16 @@ class PlanColumn(_PlanModel):
     @classmethod
     def _check_label(cls, value: str) -> str:
         return _require_text(value)
+
+    @field_validator("semanticKind", mode="before")
+    @classmethod
+    def _check_semantic_kind(cls, value: Any) -> Any:
+        return _optional_enum(value, SEMANTIC_KIND_VALUES)
+
+    @field_validator("valueType", mode="before")
+    @classmethod
+    def _check_value_type(cls, value: Any) -> Any:
+        return _optional_enum(value, VALUE_TYPE_VALUES)
 
 
 class ReferenceTemplate(_PlanModel):
@@ -677,6 +726,12 @@ class PlanSection(_PlanModel):
 
     另外 ``columns`` 是表格板块的定稿栏目：每项都有稳定 ``id``、显示名
     ``label`` 与行对象取值键 ``fieldRef``。
+
+    **目录外指标**（工单 #65）：``metricIntents`` 写自由文本，**可以**是
+    真实指标目录里没有的指标（「电脑耗电率」「冰箱明细」）。方案侧照常
+    声明板块与栏目，服务端照常给栏目定身份与取值键；那一块走**通用模拟
+    能力**出数，并标「能力待接通 / 口径待确认」，**不静默映射**到已登记
+    指标、也**不伪造** ``metricRef``（契约表 §3.5）。
     """
 
     id: str
@@ -724,12 +779,48 @@ class PlanCandidate(_PlanModel):
         return [_require_text(item) for item in value]
 
 
+class PlanSelectionEvidence(_PlanModel):
+    """一条**命中依据**：这个板块是被哪条规则、按什么前提定稿的。
+
+    它跟方案一起持久化（工单 #60）。下次打开同一份方案时，靠它就能看出
+    当时的理由来自哪一版规则的哪一条，而不是重新猜一次 —— 规则版本变了
+    也不会无声改型。
+
+    - ``sectionId``：板块 ID。
+    - ``ruleId``：命中的规则稳定 ID。
+    - ``componentType``：定稿结果。
+    - ``detail``：命中依据（具体是哪个词、哪个前提成立的）。
+    """
+
+    sectionId: str
+    ruleId: str
+    componentType: ComponentType
+    detail: str
+
+    @field_validator("sectionId", "ruleId")
+    @classmethod
+    def _check_key(cls, value: str) -> str:
+        return _require_key(value)
+
+    @field_validator("detail")
+    @classmethod
+    def _check_detail(cls, value: str) -> str:
+        return _require_text(value)
+
+
 class ReportPlan(_PlanModel):
     """一份可提交的简短文字方案。
 
     序列化字段与冻结契约一一对应：``id``、``revision``、``topic``、
     ``requirements``、``sections``、``assumptions``、``suggestions``、
-    ``referenceTemplates``。
+    ``referenceTemplates``，另加工单 #60 的 ``ruleVersion`` 与
+    ``selectionEvidence``。
+
+    - ``ruleVersion``：定稿这份方案时用的**规则库版本**。规则库升版不会
+      追溯改写历史方案已经给出的理由 —— 历史方案记着自己那版。
+    - ``selectionEvidence``：每个板块的命中依据（规则 ID + 命中细节）。
+
+    两个新字段都可空：没有它们的是旧方案，仍然读得懂（老数据不迁移）。
     """
 
     id: str
@@ -740,10 +831,22 @@ class ReportPlan(_PlanModel):
     assumptions: list[str] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
     referenceTemplates: list[ReferenceTemplate] = Field(default_factory=list)
+    #: 定稿这份方案时用的规则库版本。None = 这份方案没有记录规则版本
+    #: （旧方案）。
+    ruleVersion: str | None = None
+    #: 命中依据：每个板块是被哪条规则、按什么前提定稿的。
+    selectionEvidence: list[PlanSelectionEvidence] = Field(default_factory=list)
 
     @field_validator("id", "topic")
     @classmethod
     def _check_text(cls, value: str) -> str:
+        return _require_text(value)
+
+    @field_validator("ruleVersion")
+    @classmethod
+    def _check_rule_version(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         return _require_text(value)
 
     @field_validator("assumptions", "suggestions")

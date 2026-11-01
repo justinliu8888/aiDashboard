@@ -123,13 +123,17 @@ def test_agentscope_generation_uses_locked_confirmation_contract(
     agent._fallback = FakeReportAgent()
 
     async def fake_plan(request):
-        return {
-            "mode": "GENERATE",
-            "reportName": "A 机房能耗日报",
-            "roomId": "room_a",
-            "includeTrend": True,
-            "reply": "已生成草稿，请确认。",
-        }
+        # #61：_run_agent 现在返回 (plan, reason) —— reason 是降级时可查的原因。
+        return (
+            {
+                "mode": "GENERATE",
+                "reportName": "A 机房能耗日报",
+                "roomId": "room_a",
+                "includeTrend": True,
+                "reply": "已生成草稿，请确认。",
+            },
+            "",
+        )
 
     async def continue_current(request, emit=None):
         return RouteDecision(

@@ -344,8 +344,12 @@ def test_conversion_failure_leaves_no_confirmed_but_draftless_state(client, monk
     payload = _confirm_plan(client, plan, "confirm_plan")
 
     assert payload["error"]["code"] == "TEMPLATE_BUILD_FAILED"
-    # 失败原因透传给用户，而不是一句「请重试」。
-    assert "no safe legacy execution binding" in payload["error"]["message"]
+    # #61 / 工单 #64 F3bis：**上游异常原文不进用户可见的消息** ——
+    # 异常文本可能带用户数据（用户 JSON 的字段值、用户名、路径）。
+    assert "no safe legacy execution binding" not in payload["error"]["message"]
+    # 但用户拿到的也不是一句「请重试」：说清出了什么事、用户能做什么。
+    assert "没能把方案转换成报表草稿" in payload["error"]["message"]
+    assert "方案保持原样" in payload["error"]["message"]
     stored = report_design_service.repository.load("sess_tpl_1")
     assert stored["templateDesign"] is None
     assert stored["definitionDraft"] is None
@@ -355,8 +359,14 @@ def test_conversion_failure_leaves_no_confirmed_but_draftless_state(client, monk
     assert "definition" not in detail["snapshot"]
 
 
-def test_legacy_template_confirmation_reports_the_real_reason(client, monkeypatch):
-    """历史兼容入口失败时，原因也要**原样**透传，不能被通用文案盖掉。"""
+def test_legacy_template_confirmation_does_not_leak_exception_text(client, monkeypatch):
+    """历史兼容入口失败时，**上游异常原文不进用户可见的消息**。
+
+    #61 的验收标准：异常原文不直接出现在用户可见的错误消息里 ——
+    上游异常文本可能带用户数据（用户 JSON 的字段值、用户名、路径）。
+    工单 #64 F3bis 收口这条遗留：用户拿到的是能行动的提示，
+    可定位的原因留在日志与操作记录里。
+    """
     from app.services import report_design_service as design_module
     from app.services.report_template_service import build_template_design
 
@@ -390,8 +400,11 @@ def test_legacy_template_confirmation_reports_the_real_reason(client, monkeypatc
     payload = _confirm_template(client, template)
 
     assert payload["error"]["code"] == "TEMPLATE_CONFIRM_FAILED"
-    # 原因原样送达：板块名没有被概括掉。
-    assert "板块 2「PUE 趋势」的组件类型非法：'radar'" in payload["error"]["message"]
+    # 异常原文**不送达**用户。
+    assert "板块 2「PUE 趋势」的组件类型非法：'radar'" not in payload["error"]["message"]
+    # 但也不是一句「请重试」：说清出了什么事、当前状态与用户能做什么。
+    assert "模板未能安全转换为草稿" in payload["error"]["message"]
+    assert "当前模板保持原样" in payload["error"]["message"]
 
 
 def test_invalid_component_type_in_plan_fails_with_the_real_reason(client, monkeypatch):

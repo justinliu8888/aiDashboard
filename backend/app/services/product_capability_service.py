@@ -133,6 +133,16 @@ def describe_capability(
 #: 又是两件事 —— 少说一件就会被读成虚假承诺。
 _DATA_SOURCE_NOTE = "预览链路的数值来自模拟业务数据，尚未接通真实 EAS / Java 生产取数。"
 
+#: **真实目录 / 真实取数的限制 ≠ 模拟渲染做不到**（工单 #59）。
+#:
+#: 真实指标目录里没有登记这个指标，接真实数据时确实要补登记 —— 但那是
+#: **真实取数**的限制：模拟模式下这一块照样出数、照样能看版式。把前者说成
+#: 后者，用户就会以为这块根本做不出来。
+_REAL_LIMIT_NOT_RENDER_LIMIT = (
+    "这是真实取数的限制，不是模拟渲染的限制："
+    "模拟模式下这一块仍按模拟示例出数（已标注为模拟）。"
+)
+
 
 def _summary_for(result: dict[str, Any]) -> str:
     """把能力核对结果压成一句面向用户的话。
@@ -151,7 +161,7 @@ def _summary_for(result: dict[str, Any]) -> str:
     if outcome == OUTCOME_NOT_REGISTERED:
         return (
             "当前授权范围的数据目录里没有登记这个对象，"
-            "我不能核对它的能力边界。" + _DATA_SOURCE_NOTE
+            "我不能核对它的能力边界。" + _DATA_SOURCE_NOTE + _REAL_LIMIT_NOT_RENDER_LIMIT
         )
     if outcome == OUTCOME_NOT_AUTHORIZED:
         return (
@@ -786,6 +796,7 @@ def _not_registered_metric(
         "mustState": [
             f"指标 {metric_ref} 没有在指标目录里登记",
             "不要把「查不到」说成「数据不存在」",
+            _REAL_LIMIT_NOT_RENDER_LIMIT,
         ],
     }
 
@@ -925,7 +936,10 @@ def _edit_reason(supported: bool, reason: str | None) -> str | None:
 def _preview_reason(supported: bool, reason: str | None) -> str | None:
     if supported:
         return "预览链路可以渲染该结果，数值来自模拟业务数据。"
-    return reason
+    # 预览链路**出不了数**时要说清：这是真实取数的限制，不是渲染的限制。
+    if not reason:
+        return _REAL_LIMIT_NOT_RENDER_LIMIT
+    return f"{reason}{_REAL_LIMIT_NOT_RENDER_LIMIT}"
 
 
 def _must_state(
@@ -939,6 +953,7 @@ def _must_state(
             "该对象在目录里已登记",
             "但当前产品链路不支持它，不能承诺生成成功",
             reason or "",
+            _REAL_LIMIT_NOT_RENDER_LIMIT,
         ]
     if outcome == OUTCOME_OK and catalog_facts:
         return [

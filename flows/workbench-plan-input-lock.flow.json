@@ -1,0 +1,24 @@
+{
+  "outDir": "/tmp/haewu-plan-input-lock",
+  "waitMs": 800,
+  "flows": [{
+    "name": "pending-plan-keeps-chat-locked",
+    "url": "http://127.0.0.1:8960/playground/pages/workbench.html",
+    "steps": [
+      {"waitFor": "[data-session-id='sess_c17867b7fba4']", "timeout": 5000},
+      {"click": "[data-session-id='sess_c17867b7fba4']"},
+      {"waitFor": "#plan-root .plan-action-select", "timeout": 5000},
+      {"eval": "document.getElementById('chat-input').disabled && document.getElementById('btn-send').disabled && !document.querySelector('#plan-root .plan-action-select').disabled"},
+      {"eval": "(() => { const s = document.querySelector('#plan-root .plan-action-select'); s.value='modify'; s.dispatchEvent(new Event('change',{bubbles:true})); return document.getElementById('chat-input').disabled && !document.querySelector('#plan-root .plan-other-input').disabled; })()"},
+      {"type": "#plan-root .plan-other-input", "text": "增加设备温度指标"},
+      {"scroll": "#plan-root .plan-other-submit"},
+      {"screenshot": "real-pending-plan-chat-locked"},
+      {"click": "[data-session-id='sess_cb212e5a30a2']"},
+      {"eval": "Boolean(lockedChoice) && document.getElementById('chat-input').disabled && document.getElementById('btn-send').disabled"},
+      {"click": "#btn-new-session"},
+      {"eval": "(() => { const plan = {id:'input_lock_probe',revision:1,topic:'运行报表方案',requirements:{metrics:['运行指标']},sections:[{id:'section_1',title:'核心指标',componentType:'metric_card',metricIntents:['运行指标']}]}; syncPlanFromResponse({designPhase:'PLAN_WAITING_CONFIRM',domainObjects:{reportPlan:plan}}); return true; })()"},
+      {"eval": "document.querySelector('#plan-root .plan-action-select') && document.getElementById('chat-input').disabled && document.getElementById('btn-send').disabled"},
+      {"eval": "(() => { syncPlanFromResponse({designPhase:'DRAFT_READY'}); return !document.getElementById('chat-input').disabled && !document.getElementById('btn-send').disabled; })()"}
+    ]
+  }]
+}

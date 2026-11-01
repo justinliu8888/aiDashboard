@@ -1,0 +1,426 @@
+"""工单 66C / GitHub #66：目录外指标的「澄清口径」收得了尾。
+
+集成验收 C2 查出的真缺陷（🔴 阻塞）：**真实模型路径**
+（``AGENT_IMPL=agentscope``）下，目录外新增指标的「澄清口径」菜单
+**收不了尾** —— 模型自造的 slug 选项（``pc_energy_abs``）既过不了菜单
+闸门（闸门只认 ``value``），也命中不了规则层的
+``_match_clarification_choice``（按候选 **显示名** 子串匹配），
+用户无论选 ``value`` 还是 ``label`` 都解不开。
+
+修法：**口径选项必须来自规则层**。规则层判出该指标确实 ambiguous 时，
+菜单的 ``option.value`` 取规则候选的 ``label``（耗电量 / 占比 / 功率）；
+别的澄清路径（粒度 / 范围 / 参考对象等）照旧用模型给的选项。
+
+测试分三层：
+
+1. **规则层**：``ambiguous_caliber_candidates`` 给什么、给不给；
+2. **装配层**：模型给的 slug 选项被换成规则候选（真实 ``POST /api/agent/chat``
+   编排，替身业务 Agent 只复刻「模型自造 slug 选项」这一个现场）；
+3. **脚本路径**：``FakeReportAgent`` 那条路径**逐字未变**。
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import pytest
+
+from app.schemas.agent import (
+    AgentQuestion,
+    AgentResponse,
+    AgentState,
+    QuestionOption,
+)
+from app.services.agent_service import agent_service
+from app.services.out_of_catalog_candidate import ambiguous_caliber_candidates
+from app.services.report_draft_service import build_definition_draft
+
+
+#: 模型自造的选项（工单 #66 的缺陷现场）：slug 化的 value + 自造的 label。
+_SLUG_OPTIONS = [
+    QuestionOption(value="pc_energy_abs", label="电脑绝对能耗量"),
+    QuestionOption(value="pc_energy_ratio", label="电脑能耗占比"),
+]
+
+#: 规则层候选（``simulated_field_semantics.clarification_candidates``）。
+_RULE_LABELS = ["耗电量", "占比", "功率"]
+
+#: 规则层候选的**显示名**（``value`` 是简称，``label`` 是带单位与解释的完整话）。
+#:
+#: 这两条**分开断言**：``value`` 对、``label`` 错的「半吊子」状态（选项看着是规则层
+#: 的、点下去却按别的口径走）单靠断言 ``value`` **抓不到** —— 独立复核 F3 实测过。
+_RULE_OPTION_LABELS = [
+    "耗电量（kWh） —— 一段时间内消耗的电能",
+    "占比（%） —— 占总量的比例",
+    "功率（kW） —— 瞬时功率",
+]
+
+#: 模型自造选项的显示名（**不该**出现在被接管的菜单里）。
+_MODEL_OPTION_LABELS = ["电脑绝对能耗量", "电脑能耗占比"]
+
+#: 规则层那句口径问句（与脚本路径显示的那句**逐字一致**）。
+_RULE_CALIBER_QUESTION = (
+    "「电脑耗电率」这个说法有多种口径，你要哪一种：耗电量（kWh）、占比（%）、功率（kW）？"
+)
+
+
+class _SlugOptionAgent:
+    """替身业务 Agent：只复刻「模型自造 slug 选项」这一个现场。
+
+    **不是** ``FakeReportAgent`` 的实例 —— 真实模型路径正是这样走的：
+    规则快路对 ambiguous 计划返回 ``None``，澄清菜单由模型给出。
+
+    工单 #66 独立复核（F-7）补的第二现场：**模型这一轮问的是粒度**，
+    但 ``question.id`` 仍是 ``template_edit_clarification``（模型的**所有**
+    澄清都用同一个 id）→ 靠 ``editing_intent`` 区分。
+    """
+
+    def __init__(
+        self,
+        question_id: str = "template_edit_clarification",
+        *,
+        editing_intent: str = "ADD_SECTION",
+        ask_grain: bool = False,
+    ) -> None:
+        self.question_id = question_id
+        self.editing_intent = editing_intent
+        self.ask_grain = ask_grain
+        self.calls: list[str] = []
+
+    def handle(self, request) -> AgentResponse:
+        self.calls.append(request.message)
+        if self.ask_grain:
+            question = "请选择这张卡片的时间粒度："
+        elif self.question_id == "template_edit_clarification":
+            question = "请确认你想新增的「电脑耗电率」具体指什么？"
+        else:
+            question = "请选择当前数据源支持的粒度："
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=question,
+            questions=[
+                AgentQuestion(
+                    id=self.question_id,
+                    prompt=question,
+                    expects="SINGLE_CHOICE",
+                    options=[option.model_copy() for option in _SLUG_OPTIONS],
+                    selectionOnly=True,
+                )
+            ],
+            uiActions=["ask_template_edit_detail"],
+            debug={
+                "editOutcome": "clarification",
+                "editingIntent": self.editing_intent,
+                "editingTargetRegionId": None,
+            },
+        )
+
+
+@pytest.fixture()
+def definition():
+    return build_definition_draft("A 机房能耗日报", "room_a")
+
+
+def _post(post_chat, definition, message: str, state: str = "USER_EDITING_TEMPLATE"):
+    return post_chat(
+        message,
+        state=state,
+        snapshots={"reportDefinition": definition.model_dump(mode="json")},
+    ).json()
+
+
+def _questions(body: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(body.get("questions") or [])
+
+
+def _options(body: dict[str, Any]) -> list[dict[str, Any]]:
+    for question in _questions(body):
+        if question.get("options"):
+            return list(question["options"])
+    return []
+
+
+# ==========================================================================
+# 1. 规则层：口径选项来自规则候选，不是模型现编
+# ==========================================================================
+
+
+def test_rule_layer_gives_the_caliber_options_for_an_ambiguous_intent():
+    """含义不清 → 给规则候选；含义清楚 → 什么都不给（调用方一律不动）。"""
+    options = ambiguous_caliber_candidates("电脑耗电率")
+
+    assert [item["value"] for item in options] == _RULE_LABELS
+    # value 取候选的 **label** —— 与 _match_clarification_choice 命中的是
+    # 同一份候选，用户选完就能解出候选。
+    assert "耗电量" in options[0]["label"]
+    assert "kWh" in options[0]["label"]
+    # 含义清楚（目录外但口径不歧义）→ 不给口径选项。
+    assert ambiguous_caliber_candidates("冰箱明细") == []
+    assert ambiguous_caliber_candidates("电脑耗电功率") == []
+    assert ambiguous_caliber_candidates("") == []
+
+
+# ==========================================================================
+# 2. 装配层：模型自造的 slug 选项被换成规则候选
+# ==========================================================================
+
+
+def test_model_slug_options_are_replaced_by_the_rule_caliber_options(
+    monkeypatch, post_chat, definition
+):
+    """真实模型路径的现场：模型给 slug → 菜单必须是规则候选。"""
+    monkeypatch.setattr(agent_service, "_agent", _SlugOptionAgent())
+
+    body = _post(post_chat, definition, "新增一个电脑耗电率指标")
+
+    question = next(
+        q for q in _questions(body) if q["id"] == "template_edit_clarification"
+    )
+    assert question["expects"] == "SINGLE_CHOICE"
+    assert question["selectionOnly"] is True
+    values = [option["value"] for option in question["options"]]
+    assert values == _RULE_LABELS
+    # 显示名也要是规则层那一份（只断言 value 抓不到「value 对、label 错」）。
+    assert [option["label"] for option in question["options"]] == _RULE_OPTION_LABELS
+    # 模型自造的 slug 一个都不许留在菜单里。
+    assert "pc_energy_abs" not in values
+    assert "pc_energy_ratio" not in values
+    assert all("pc_energy" not in str(option) for option in question["options"])
+    assert (body.get("debug") or {}).get("caliberMenuSource") == "rule_candidates"
+
+
+def test_choosing_a_rule_caliber_option_closes_the_clarification(
+    monkeypatch, post_chat, definition
+):
+    """选一个规则口径 → 直接出待接受的候选，**不再追问**。"""
+    monkeypatch.setattr(agent_service, "_agent", _SlugOptionAgent())
+
+    first = _post(post_chat, definition, "新增一个电脑耗电率指标")
+    value = _options(first)[0]["value"]
+    # 菜单项的显示名也是规则层那一份（不是「value 对、label 错」的半吊子状态）。
+    assert [option["label"] for option in _options(first)] == _RULE_OPTION_LABELS
+    assert value == "耗电量"
+
+    body = _post(post_chat, definition, value)
+
+    pending = (body.get("domainObjects") or {}).get("pendingEditPlan")
+    assert pending is not None
+    candidate = pending["operations"][0]["operation"]["metricCandidate"]
+    # 用户拍板的那个口径**真的解开了**：候选不再是「含义不清」。
+    assert candidate["status"] == "out_of_catalog"
+    assert candidate["unit"] == "kWh"
+    # 不再追问口径。
+    assert [q["id"] for q in _questions(body)] == ["pending_edit_plan_confirm"]
+
+
+def test_other_clarification_paths_keep_the_model_options(
+    monkeypatch, post_chat, definition
+):
+    """别的澄清路径**照旧用模型给的选项**：一条都不许动。
+
+    两条守卫各验一次：
+
+    1. 规则层没判定 ambiguous（这里问法本身就不是口径问题）→ 不替换；
+    2. 规则层判定了 ambiguous，但**问题不是口径澄清**（模型问的是粒度）
+       → 也不替换。
+    """
+    agent = _SlugOptionAgent()
+    monkeypatch.setattr(agent_service, "_agent", agent)
+
+    body = _post(post_chat, definition, "帮我调一下")
+
+    values = [option["value"] for option in _options(body)]
+    assert values == ["pc_energy_abs", "pc_energy_ratio"]
+    # 显示名也是模型自己的（不许被换成规则层那三条）。
+    assert [option["label"] for option in _options(body)] == _MODEL_OPTION_LABELS
+    assert (body.get("debug") or {}).get("caliberMenuSource") is None
+
+    # 口径确实 ambiguous，但模型这轮问的是粒度 → 选项仍然是模型的。
+    agent = _SlugOptionAgent(question_id="compilation_grain")
+    monkeypatch.setattr(agent_service, "_agent", agent)
+
+    body = _post(post_chat, definition, "新增一个电脑耗电率指标")
+
+    values = [option["value"] for option in _options(body)]
+    assert values == ["pc_energy_abs", "pc_energy_ratio"]
+    assert [option["label"] for option in _options(body)] == _MODEL_OPTION_LABELS
+    assert (body.get("debug") or {}).get("caliberMenuSource") is None
+
+
+# ==========================================================================
+# 3. 脚本路径（FakeReportAgent）：**逐字未变**
+# ==========================================================================
+
+
+def test_script_path_clarification_is_unchanged(post_chat, definition):
+    """脚本路径那条不受本次修复影响：菜单、口径问句、自由文本都照旧。"""
+    body = _post(post_chat, definition, "新增一个电脑耗电率指标")
+
+    assert body["reply"] == (
+        "「电脑耗电率」这个说法有多种口径，你要哪一种：耗电量（kWh）、占比（%）、功率（kW）？"
+    )
+    question = _questions(body)[0]
+    assert question["id"] == "template_edit_action"
+    assert question["expects"] == "SINGLE_CHOICE"
+    assert question["selectionOnly"] is False
+    assert question["lockScope"] == "none"
+    assert [option["value"] for option in question["options"]] == [
+        "删除这张卡片", "改标题", "改指标", "改数据源",
+        "改展示方式", "改时间范围", "改统计粒度",
+    ]
+    # 选项是**用户看得见**的：里面不许有内部术语（section / compilation）。
+    # 说法换成了业务词，但取值仍能被引擎认出来（「删除」命中删除动词、
+    # 「粒度」命中粒度话题词），语义没变。
+    labels = " ".join(
+        f"{option.get('value', '')} {option.get('label', '')}" for option in question["options"]
+    )
+    for leaked in ("section", "compilation"):
+        assert leaked not in labels, f"选项里漏出了内部术语：{leaked}"
+    assert (body.get("domainObjects") or {}).get("pendingEditPlan") is None
+
+    # 脚本路径的澄清是自由文本（不锁菜单）：「耗电量」直接走通。
+    body = _post(post_chat, definition, "耗电量")
+
+    pending = (body.get("domainObjects") or {}).get("pendingEditPlan")
+    assert pending is not None
+    candidate = pending["operations"][0]["operation"]["metricCandidate"]
+    assert candidate["status"] == "out_of_catalog"
+
+
+def test_caliber_menu_log_keeps_no_user_words(monkeypatch, post_chat, definition, caplog):
+    """菜单替换那条日志不许带**用户原话**（#61 AC#1）。
+
+    指标意图是从用户原话里摘出来的（「电脑耗电率」）→ 只留长度；
+    选项值是**规则层封闭词表**（耗电量 / 占比 / 功率），不是用户原话 → 留着有排查价值。
+    """
+    caplog.set_level(logging.INFO, logger="app")
+    monkeypatch.setattr(agent_service, "_agent", _SlugOptionAgent())
+
+    _post(post_chat, definition, "新增一个电脑耗电率指标")
+
+    text = caplog.text
+    assert "step=caliber_menu_replaced" in text
+    assert "intentLength=" in text
+    assert "电脑耗电率" not in text
+    assert "耗电量" in text
+
+
+# ==========================================================================
+# 4. 工单 #66 独立复核 F-7：接管条件收紧 + 问句与选项同源
+# ==========================================================================
+#
+# F-7 的现场（复核实测，用户在界面上真实看到的样子）：
+#
+#     问句：请选择这张卡片的时间粒度：
+#     选项：['耗电量', '占比', '功率']      ← 被口径选项接管了
+#
+# 用户点第一项「耗电量」→ 回答被当成**口径答案**解开（用户要的**粒度丢了**）。
+#
+# 根因：模型的**所有**澄清都用同一个 ``question.id``，
+# 只看 id 区分不出口径与粒度 / 时间窗 / 参考对象 → 接管条件必须再问一句
+# 「模型这一轮问的是不是口径」，并让**问句与选项同源成对替换**。
+
+
+def test_caliber_menu_replaces_the_question_together_with_the_options(
+    monkeypatch, post_chat, definition
+):
+    """模型问口径时：**问句与选项一起**换成规则层那一句 —— 同源成对。"""
+    monkeypatch.setattr(agent_service, "_agent", _SlugOptionAgent())
+
+    body = _post(post_chat, definition, "新增一个电脑耗电率指标")
+
+    question = next(
+        q for q in _questions(body) if q["id"] == "template_edit_clarification"
+    )
+    values = [option["value"] for option in question["options"]]
+    assert values == _RULE_LABELS
+    # 显示名与选项**同源**（口径问句里列的那三个，正是这三个 label 的前半段）。
+    assert [option["label"] for option in question["options"]] == _RULE_OPTION_LABELS
+    for option in question["options"]:
+        assert option["label"].startswith(f"{option['value']}（")
+    # 问句与选项**同源**：两者都是规则层那句口径问句。
+    assert question["prompt"] == _RULE_CALIBER_QUESTION
+    assert body["reply"] == _RULE_CALIBER_QUESTION
+    assert question["prompt"] == body["reply"]
+    assert (body.get("debug") or {}).get("caliberMenuSource") == "rule_candidates"
+
+
+def test_caliber_menu_replaces_the_question_for_change_metric_too(
+    monkeypatch, post_chat, definition
+):
+    """``CHANGE_METRIC`` 同样算口径相关（不只是 ``ADD_SECTION``）。"""
+    monkeypatch.setattr(
+        agent_service, "_agent", _SlugOptionAgent(editing_intent="CHANGE_METRIC")
+    )
+
+    body = _post(post_chat, definition, "新增一个电脑耗电率指标")
+
+    question = next(
+        q for q in _questions(body) if q["id"] == "template_edit_clarification"
+    )
+    assert [option["value"] for option in question["options"]] == _RULE_LABELS
+    assert [option["label"] for option in question["options"]] == _RULE_OPTION_LABELS
+    assert question["prompt"] == _RULE_CALIBER_QUESTION
+    assert body["reply"] == _RULE_CALIBER_QUESTION
+
+
+def test_grain_question_keeps_the_model_options_entirely(
+    monkeypatch, post_chat, definition
+):
+    """**核心护栏**：模型这轮问的是粒度 → 一个字段都不许动。
+
+    复核实测的越界现场：模型的 ``question.id`` 与口径澄清**同为**
+    ``template_edit_clarification`` → 只看 id 会把粒度菜单接管成口径菜单。
+    """
+    agent = _SlugOptionAgent(
+        editing_intent="CHANGE_COMPILATION_GRAIN", ask_grain=True
+    )
+    monkeypatch.setattr(agent_service, "_agent", agent)
+
+    body = _post(post_chat, definition, "新增一个电脑耗电率指标，按天粒度")
+
+    question = next(
+        q for q in _questions(body) if q["id"] == "template_edit_clarification"
+    )
+    # 选项是模型自己的（slug 原样），一个都不许被换成口径候选。
+    values = [option["value"] for option in question["options"]]
+    assert values == ["pc_energy_abs", "pc_energy_ratio"]
+    # 标签也是模型自己写的那个 —— 不许被换成「耗电量（kWh） —— …」。
+    assert [option["label"] for option in question["options"]] == [
+        "电脑绝对能耗量", "电脑能耗占比",
+    ]
+    # 问句与回复也保持模型的。
+    assert question["prompt"] == "请选择这张卡片的时间粒度："
+    assert body["reply"] == "请选择这张卡片的时间粒度："
+    # 没有接管 → 不许有接管标记。
+    assert (body.get("debug") or {}).get("caliberMenuSource") is None
+
+
+def test_grain_answer_is_not_taken_as_a_caliber_answer(
+    monkeypatch, post_chat, definition
+):
+    """用户回答粒度 → **不得**被当成口径答案解开（粒度不许丢）。"""
+    agent = _SlugOptionAgent(
+        editing_intent="CHANGE_COMPILATION_GRAIN", ask_grain=True
+    )
+    monkeypatch.setattr(agent_service, "_agent", agent)
+
+    first = _post(post_chat, definition, "新增一个电脑耗电率指标，按天粒度")
+    value = _options(first)[0]["value"]
+
+    body = _post(post_chat, definition, value)
+
+    pending = (body.get("domainObjects") or {}).get("pendingEditPlan")
+    candidate = None
+    if pending:
+        for operation in pending.get("operations") or []:
+            found = (operation.get("operation") or {}).get("metricCandidate")
+            if found:
+                candidate = found
+                break
+    # 用户点的是**粒度**菜单里的第一项 —— 它**不得**被当成口径答案。
+    status = str((candidate or {}).get("status") or "")
+    assert status != "out_of_catalog", (
+        "用户回答粒度却被当成口径答案解开了（粒度丢失）"
+    )

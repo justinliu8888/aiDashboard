@@ -1,0 +1,124 @@
+{
+  "outDir": "../.selfcheck/flow-66b-前端工作台",
+  "serveCmd": "python3 support/agent_b_mock_server.py 8166",
+  "port": 8166,
+  "waitMs": 1500,
+  "timeout": 60000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "66B-01 方案卡按版本在底部追加：旧卡留在原地并标为历史、确认入口失效、重复响应不重复追加",
+      "url": "http://127.0.0.1:8166/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "(() => { try { localStorage.clear(); } catch (e) {} window.location.reload(); return true; })()"
+        },
+        { "wait": 2500 },
+
+        { "eval": "typeof window.syncPlanFromResponse === 'function'" },
+        { "eval": "!!document.getElementById('chat-scroll')" },
+        { "eval": "document.querySelectorAll('#chat-scroll [data-plan-bubble]').length === 0" },
+        { "eval": "document.getElementById('btn-latest-plan').classList.contains('hidden') === true" },
+
+        {
+          "eval": "(() => { const plan = { id: 'rplan_flow1', revision: 1, topic: 'A 机房能耗日报', requirements: { subject: 'A 机房', timeRange: '昨天', metrics: ['总耗电'], exclusions: [] }, sections: [{ id: 'sec_total', title: '总电费概览', componentType: 'metric_card', displayIntent: 'total', selectionReason: '看总量，指标卡最直观', metricIntents: ['总耗电'], columns: [{ id: 'c1', label: '设备名称', fieldRef: 'section_1.col_1' }] }], assumptions: ['口径待核实'], suggestions: [], referenceTemplates: [] }; window.syncPlanFromResponse({ state: 'WAITING_USER_CONFIRM', reply: '我拟了这份方案，确认后我出报表。', designPhase: 'PLAN_WAITING_CONFIRM', domainObjects: { reportPlan: plan }, debug: { planVersionId: 'planver_flow_a', planId: plan.id, planRevision: 1 } }); return true; })()"
+        },
+        { "wait": 600 },
+
+        { "eval": "document.querySelectorAll('#chat-scroll [data-plan-bubble]').length === 1" },
+        { "eval": "document.getElementById('chat-scroll').innerText.includes('最新方案')" },
+        { "eval": "document.getElementById('chat-scroll').innerText.includes('总电费概览')" },
+        { "eval": "document.querySelectorAll('#chat-scroll .plan-confirm').length === 1" },
+        { "eval": "document.querySelector('#chat-scroll .plan-confirm').getAttribute('data-plan-can-confirm') === 'true'" },
+        { "eval": "(() => { const c = document.getElementById('chat-scroll'); return c.scrollHeight - c.scrollTop - c.clientHeight <= 48; })()" },
+        { "screenshot": "66b-01-第一版方案卡" },
+
+        {
+          "eval": "(() => { const plan = { id: 'rplan_flow1', revision: 2, topic: 'A 机房能耗日报（含 PUE）', requirements: { subject: 'A 机房', timeRange: '昨天', metrics: ['总耗电'], exclusions: [] }, sections: [{ id: 'sec_total', title: '总电费概览', componentType: 'metric_card', displayIntent: 'total', selectionReason: '看总量，指标卡最直观', metricIntents: ['总耗电'], columns: [{ id: 'c1', label: '设备名称', fieldRef: 'section_1.col_1' }] }, { id: 'sec_pue', title: 'PUE 总览', componentType: 'table', displayIntent: 'records', selectionReason: '看具体记录与属性，用表格', metricIntents: ['PUE'], columns: [{ id: 'c2', label: '采集时间', fieldRef: 'section_2.col_1' }] }], assumptions: ['口径待核实'], suggestions: [], referenceTemplates: [] }; window.syncPlanFromResponse({ state: 'WAITING_USER_CONFIRM', reply: '已按你的要求加上 PUE 板块。', designPhase: 'PLAN_WAITING_CONFIRM', domainObjects: { reportPlan: plan }, debug: { planVersionId: 'planver_flow_b', planId: plan.id, planRevision: 2 } }); return true; })()"
+        },
+        { "wait": 600 },
+
+        { "eval": "document.querySelectorAll('#chat-scroll [data-plan-bubble]').length === 2" },
+        { "eval": "document.getElementById('chat-scroll').innerText.includes('历史版本')" },
+        { "eval": "document.getElementById('chat-scroll').innerText.includes('最新方案')" },
+        { "eval": "document.getElementById('chat-scroll').innerText.includes('PUE 总览')" },
+        { "eval": "document.getElementById('chat-scroll').innerText.includes('已按你的要求加上 PUE 板块。')" },
+        { "eval": "document.querySelectorAll('#chat-scroll .plan-confirm').length === 2" },
+        { "eval": "Array.from(document.querySelectorAll('#chat-scroll .plan-confirm')).filter(b => b.getAttribute('data-plan-can-confirm') === 'true').length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('#chat-scroll .plan-confirm')).filter(b => b.disabled).length === 1" },
+        { "eval": "document.getElementById('btn-latest-plan').classList.contains('hidden') === true" },
+        { "screenshot": "66b-02-第二版追加在底部、旧卡标为历史" },
+
+        {
+          "eval": "(() => { const plan = { id: 'rplan_flow1', revision: 2, topic: 'A 机房能耗日报（含 PUE）', requirements: { subject: 'A 机房', timeRange: '昨天', metrics: ['总耗电'], exclusions: [] }, sections: [{ id: 'sec_total', title: '总电费概览', componentType: 'metric_card', displayIntent: 'total', selectionReason: '看总量，指标卡最直观', metricIntents: ['总耗电'], columns: [{ id: 'c1', label: '设备名称', fieldRef: 'section_1.col_1' }] }, { id: 'sec_pue', title: 'PUE 总览', componentType: 'table', displayIntent: 'records', selectionReason: '看具体记录与属性，用表格', metricIntents: ['PUE'], columns: [{ id: 'c2', label: '采集时间', fieldRef: 'section_2.col_1' }] }], assumptions: ['口径待核实'], suggestions: [], referenceTemplates: [] }; window.syncPlanFromResponse({ state: 'WAITING_USER_CONFIRM', reply: '已按你的要求加上 PUE 板块。', designPhase: 'PLAN_WAITING_CONFIRM', domainObjects: { reportPlan: plan }, debug: { planVersionId: 'planver_flow_b', planId: plan.id, planRevision: 2 } }); return true; })()"
+        },
+        { "wait": 500 },
+        { "eval": "document.querySelectorAll('#chat-scroll [data-plan-bubble]').length === 2" },
+
+        { "eval": "(() => { const c = document.getElementById('chat-scroll'); c.scrollTop = 0; return true; })()" },
+        { "wait": 500 },
+        { "eval": "chatStickToBottom === false" },
+
+        {
+          "eval": "(() => { const plan = { id: 'rplan_flow1', revision: 3, topic: 'A 机房能耗日报（含 PUE 与同比）', requirements: { subject: 'A 机房', timeRange: '昨天', metrics: ['总耗电'], exclusions: [] }, sections: [{ id: 'sec_total', title: '总电费概览', componentType: 'metric_card', displayIntent: 'total', selectionReason: '看总量，指标卡最直观', metricIntents: ['总耗电'], columns: [{ id: 'c1', label: '设备名称', fieldRef: 'section_1.col_1' }] }, { id: 'sec_pue', title: 'PUE 总览', componentType: 'table', displayIntent: 'records', selectionReason: '看具体记录与属性，用表格', metricIntents: ['PUE'], columns: [{ id: 'c2', label: '采集时间', fieldRef: 'section_2.col_1' }] }, { id: 'sec_yoy', title: '同比变化', componentType: 'chart', displayIntent: 'trend', selectionReason: '看变化趋势，用曲线', metricIntents: ['总耗电'], columns: [{ id: 'c3', label: '日期', fieldRef: 'section_3.col_1' }] }], assumptions: ['口径待核实'], suggestions: [], referenceTemplates: [] }; window.syncPlanFromResponse({ state: 'WAITING_USER_CONFIRM', reply: '另外加上了同比板块。', designPhase: 'PLAN_WAITING_CONFIRM', domainObjects: { reportPlan: plan }, debug: { planVersionId: 'planver_flow_c', planId: plan.id, planRevision: 3 } }); return true; })()"
+        },
+        { "wait": 600 },
+
+        { "eval": "document.querySelectorAll('#chat-scroll [data-plan-bubble]').length === 3" },
+        { "eval": "document.getElementById('chat-scroll').innerText.includes('同比变化')" },
+        { "eval": "Array.from(document.querySelectorAll('#chat-scroll .plan-confirm')).filter(b => b.getAttribute('data-plan-can-confirm') === 'true').length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('#chat-scroll .plan-confirm')).filter(b => b.disabled).length === 2" },
+        { "eval": "document.getElementById('btn-latest-plan').classList.contains('hidden') === false" },
+        { "eval": "document.getElementById('btn-latest-plan').innerText.includes('有最新方案')" },
+        { "screenshot": "66b-03-有最新方案提示" },
+
+        {
+          "eval": "(() => { const plan = { id: 'rplan_flow1', revision: 3, topic: 'A 机房能耗日报（含 PUE 与同比）', requirements: { subject: 'A 机房', timeRange: '昨天', metrics: ['总耗电'], exclusions: [] }, sections: [{ id: 'sec_total', title: '总电费概览', componentType: 'metric_card', displayIntent: 'total', selectionReason: '看总量，指标卡最直观', metricIntents: ['总耗电'], columns: [{ id: 'c1', label: '设备名称', fieldRef: 'section_1.col_1' }] }, { id: 'sec_pue', title: 'PUE 总览', componentType: 'table', displayIntent: 'records', selectionReason: '看具体记录与属性，用表格', metricIntents: ['PUE'], columns: [{ id: 'c2', label: '采集时间', fieldRef: 'section_2.col_1' }] }, { id: 'sec_yoy', title: '同比变化', componentType: 'chart', displayIntent: 'trend', selectionReason: '看变化趋势，用曲线', metricIntents: ['总耗电'], columns: [{ id: 'c3', label: '日期', fieldRef: 'section_3.col_1' }] }], assumptions: ['口径待核实'], suggestions: [], referenceTemplates: [] }; window.syncPlanFromResponse({ state: 'WAITING_USER_CONFIRM', reply: '另外加上了同比板块。', designPhase: 'PLAN_WAITING_CONFIRM', domainObjects: { reportPlan: plan }, debug: { planVersionId: 'planver_flow_c', planId: plan.id, planRevision: 3 } }); return true; })()"
+        },
+        { "wait": 500 },
+        { "eval": "document.querySelectorAll('#chat-scroll [data-plan-bubble]').length === 3" },
+
+        { "click": "#btn-latest-plan" },
+        { "wait": 400 },
+        { "eval": "document.getElementById('btn-latest-plan').classList.contains('hidden') === true" },
+        { "eval": "(() => { const c = document.getElementById('chat-scroll'); return c.scrollHeight - c.scrollTop - c.clientHeight <= 48; })()" }
+      ]
+    },
+    {
+      "name": "66B-02 JSON 粘贴入口：面板可开可关，粘错时当场给出可修正的提示",
+      "url": "http://127.0.0.1:8166/frontend/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#btn-json-paste" },
+        { "eval": "document.getElementById('btn-json-paste').innerText.includes('粘贴 JSON 数据')" },
+        { "eval": "document.getElementById('json-paste-panel').classList.contains('hidden') === true" },
+        { "eval": "document.body.innerText.includes('未经业务核验') === false" },
+
+        { "click": "#btn-json-paste" },
+        { "wait": 300 },
+        { "eval": "document.getElementById('json-paste-panel').classList.contains('hidden') === false" },
+        { "eval": "!!document.getElementById('json-paste-data')" },
+        { "eval": "!!document.getElementById('json-paste-note')" },
+        { "eval": "document.body.innerText.includes('未经业务核验')" },
+        { "eval": "document.body.innerText.includes('已连接真实业务库') === false" },
+        { "screenshot": "66b-04-JSON粘贴面板打开" },
+
+        { "type": "#json-paste-data", "text": "[{\"设备名称\": \"A-1\"," },
+        { "type": "#json-paste-note", "text": "按设备汇总耗电量" },
+        { "click": "#btn-json-paste-send" },
+        { "wait": 400 },
+        { "eval": "document.getElementById('json-paste-hint').classList.contains('hidden') === false" },
+        { "eval": "document.getElementById('json-paste-hint').innerText.includes('语法')" },
+        { "eval": "document.getElementById('json-paste-hint').innerText.includes('检查')" },
+        { "screenshot": "66b-05-JSON粘错时的可修正提示" },
+
+        { "click": "#btn-json-paste-cancel" },
+        { "wait": 300 },
+        { "eval": "document.getElementById('json-paste-panel').classList.contains('hidden') === true" },
+        { "eval": "document.body.innerText.includes('未经业务核验') === false" },
+        { "eval": "document.body.innerText.includes('已连接真实业务库') === false" }
+      ]
+    }
+  ]
+}

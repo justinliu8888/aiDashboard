@@ -29,7 +29,7 @@ ContextEngine 依赖模型输出，但模型输出不稳（枚举不匹配、JSO
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Iterable
 
 from app.data.machine_room_energy import DEVICE_TYPE_ALIASES
 from app.services.catalog_mock_service import match_source_by_alias
@@ -785,19 +785,7 @@ def detect_unknown_metric(
     if detect_metric_refs(text):
         return None
 
-    candidates: list[str] = []
-    for match in _RE_QUOTED.finditer(text):
-        token = match.group(1).strip()
-        if not token or token in _QUOTED_STOPWORDS:
-            continue
-        if any(hint in token for hint in _METRIC_WORD_HINTS):
-            candidates.append(token)
-    for match in _RE_METRIC_SUFFIX.finditer(text):
-        token = match.group(0)
-        if any(hint in token for hint in _RE_DERIVED_HINTS):
-            continue
-        if any(hint in token for hint in _METRIC_WORD_HINTS):
-            candidates.append(token)
+    candidates = _metric_candidates(text)
     if not candidates:
         return None
 
@@ -875,10 +863,31 @@ _QUESTION_MARKERS: tuple[str, ...] = (
 )
 
 #: 疑问必须指向的报表业务对象。没有它就是闲聊，不属于本产品的问答范围。
+#:
+#: 「图」是**单字**业务对象：「这个图是什么意思」问的就是报表里那张图，
+#: 少了它这句话就指不到业务对象，掉进普通流程、被当成改稿指令。
 _QUESTION_SUBJECTS: tuple[str, ...] = (
     "报表", "草稿", "预览", "图表", "卡片", "指标", "数据源", "粒度",
     "分钟", "成本", "pue", "能耗", "耗电", "进度", "做到哪", "哪一步",
     "刚才", "之前", "上次", "这份", "那份", "当前", "现在", "支持",
+    "图",
+)
+
+#: 上面那张表是**子串匹配**，单字「图」会误伤这些**与报表无关**的词
+#: （「图书」「地图」里的「图」不是报表对象）。
+#:
+#: 命中它们时先把词从句子里去掉，再按同一张表匹配 —— 这样
+#: 「图书库存那张图是什么意思」里的「图」仍然算业务对象，
+#: 「这本图书是什么意思」里的「图」不算。
+#:
+#: 这是一张**封闭词表**（与本项目其它词表一致），需随产品词表同步：
+#: 收录的是「**含**『图』但与报表无关」的整词，不是所有带图的词 ——
+#: 「图表」「本图」「这张图」「图书库存那张图」里的「图」都是报表对象，
+#: 不许收进来。
+_NON_REPORT_GRAPH_WORDS: tuple[str, ...] = (
+    "图书", "地图", "图标", "图片", "蓝图", "企图",
+    "图腾", "图案", "版图", "意图",
+    "图纸", "图章", "图钉", "构图",
 )
 
 #: 明确的改动动词：出现这些就是在下指令，不是在提问。
@@ -926,6 +935,54 @@ def has_operation_command(message: str) -> bool:
     return any(word in text for word in _OPERATION_VERBS)
 
 
+def command_verbs_in(message: str) -> tuple[str, ...]:
+    """这句里带了哪些**命令动词**（:data:`_OPERATION_VERBS`）。
+
+    给「这一轮没有执行」那层实话用：命中几个就提几个，调用方按出现顺序排列。
+
+    长词优先、互不重叠：「重新生成」里含「生成」，只算「重新生成」一个 ——
+    否则同一处命令会被报成两个。
+    """
+    text = (message or "").strip()
+    if not text:
+        return ()
+    hits: list[tuple[int, int, str]] = []
+    for verb in _OPERATION_VERBS:
+        start = text.find(verb)
+        while start != -1:
+            hits.append((start, start + len(verb), verb))
+            start = text.find(verb, start + 1)
+    # 同一处起点取最长的词；再按出现位置从前往后挑不重叠的。
+    hits.sort(key=lambda item: (item[0], -item[1]))
+    picked: list[tuple[int, int, str]] = []
+    for start, end, verb in hits:
+        if any(not (end <= taken_start or start >= taken_end)
+               for taken_start, taken_end, _ in picked):
+            continue
+        picked.append((start, end, verb))
+    ordered: list[str] = []
+    for _, _, verb in sorted(picked, key=lambda item: item[0]):
+        if verb not in ordered:
+            ordered.append(verb)
+    return tuple(ordered)
+
+
+def mentions_report_object(message: str) -> bool:
+    """这句话有没有指向**报表业务对象**。
+
+    判定口径只有这一份（:data:`_QUESTION_SUBJECTS` 的子串匹配）——
+    只读提问与问题反馈两处都用它，不各写一遍。
+
+    「图」是单字业务对象，子串匹配会误伤「图书」「地图」这类与报表无关的
+    词：先把这几个无关词（:data:`_NON_REPORT_GRAPH_WORDS`，**封闭词表**，
+    需随产品词表同步）从句子里去掉，再按同一张表匹配。
+    """
+    text = (message or "").strip().lower()
+    for word in _NON_REPORT_GRAPH_WORDS:
+        text = text.replace(word, "")
+    return any(subject in text for subject in _QUESTION_SUBJECTS)
+
+
 def is_readonly_question(message: str) -> bool:
     """这句是不是「只读提问」。
 
@@ -944,7 +1001,248 @@ def is_readonly_question(message: str) -> bool:
     # 业务对象表里 PUE 是小写，但用户在句首写大写 PUE 很常见。
     # 认不出一句提问，后果是「提问」被当成「修改」——
     # 设计流程里那会平白多出一版方案，所以这里按大小写不敏感匹配。
-    return any(subject in text.lower() for subject in _QUESTION_SUBJECTS)
+    return mentions_report_object(text)
+
+
+# --------------------------------------------------------------------------
+# 确定性快路的「只读提问」判定词表
+# --------------------------------------------------------------------------
+#
+# 这两张表**只**服务于确定性快路（``agent_service._try_answer_readonly_query``），
+# 与上面意图门那一套**故意不同**，各判各的、不合并：
+#
+#   - **意图门**问的是「这条消息是**命令**还是**咨询**」：有命令动词就是命令；
+#     必须是疑问句**且**指向报表业务对象（:func:`mentions_report_object`）
+#     才算咨询。
+#   - **确定性快路**问的是「这条消息是不是**在问这块卡片的能力**」
+#     （可展示方式 / 可用粒度）：它**不要求**指向报表业务对象 ——
+#     「这个可以展示吗」就该答。它排除的只是「**要改这块卡**」的那几个动词；
+#     「导出 / 保存 / 发布 / 重新开始」这些**不是对卡片的改动**，
+#     所以**不在**快路的排除表里。
+#
+# 放在本模块是为了让它们与意图门那套**同处一地**：漂移风险从「跨文件复制
+# 粘贴」降成「同文件内两个具名集合」。
+#
+# 词表**内容一个字都不许改**（改了就是改既有业务输出）—— 只搬家、只改引用。
+
+# 只读能力查询的疑问词。命中之后才尝试用确定性证据直接回答，
+# 避免把「把趋势图改成折线图」这类修改请求误判成查询。
+READONLY_QUESTION_WORDS = (
+    "哪些", "什么", "怎么", "能不能", "可不可以", "能否", "是否",
+    "有没有", "支持", "吗", "？", "?",
+)
+
+# 明确的改动动词：出现这些词就是在下指令，不是在提问。
+# 「这个能按分钟看吗」是提问，「改成按分钟粒度」是指令；
+# 即使指令后面带问号（「改成按分钟粒度，可以吗」），也仍然是指令。
+EDIT_COMMAND_WORDS = (
+    "改成", "改为", "换成", "换为", "调成", "设为", "设定为",
+)
+
+
+# --------------------------------------------------------------------------
+# 问题反馈与目录外新增（#58）
+# --------------------------------------------------------------------------
+#
+# 这两类都不在既有的九类意图里，但必须落在**同一个**意图体系上扩展，
+# 不能另起一套平行判定。它们各自解决一个具体误判：
+#
+#   - 问题反馈：「好丑啊，一个点……」没有疑问标记，:func:`is_readonly_question`
+#     的四条判据（疑问标记 + 业务对象 + 无改动动词 + 非生成请求）不成立，
+#     于是直接掉进编辑快路，被当成「明确修改」。
+#   - 目录外新增：用户要加一个目录里没有的指标，走通用模拟策略，
+#     不能静默映射到「总耗电」这类已有指标。
+
+#: 对当前这份产出不满的表达。
+#:
+#: 只收**评价当前结果**的说法。用户如果同时给了改动动词
+#: （「好丑，改成柱状图」），那是明确修改，不走这里。
+_ISSUE_FEEDBACK_MARKERS: tuple[str, ...] = (
+    "好丑", "太丑", "难看", "不好看",
+    "不满意", "失望", "离谱", "莫名其妙", "奇怪",
+    "不合理", "看不懂", "不明白",
+    "一个点", "只有一个点", "就一个点", "一个数据点",
+    "点太少", "太少点", "就一个", "只有一个",
+    "没出来", "没显示", "不显示", "空白",
+    "重叠", "不清晰", "不直观", "看不出趋势", "看不出变化",
+)
+
+#: 「就 2 个点」这类数量异常的说法。
+#:
+#: 「点级」「点位」不是数据点（那是粒度），排除掉。
+_RE_ISSUE_POINT_COUNT = re.compile(
+    r"(?:\d+|[一二三四五六七八九十两])\s*个?\s*(?:数据)?点(?!级|位)"
+)
+
+#: 「对当前结果不满」的**评价性形容词**（痛点词）。
+#:
+#: 固定词表（``_ISSUE_FEEDBACK_MARKERS``）只登记了「好丑」「看不懂」这类**直接**
+#: 说辞；「颜色太扎眼了」「趋势太单调了」这种带**程度副词**的抱怨不在词表里，
+#: 会被判成 ``UNKNOWN`` → 掉进编辑快路（工单 #58 独立验收的 P3 缺口）。
+#:
+#: 这里补的是**结构性特征**：程度副词 + 评价性形容词、否定式体验说法。
+#: 句子不必逐条登记 —— 配上「没有改动动词、没有疑问标记」就能判出来。
+#:
+#: 只收**负面**评价词。「好看」「漂亮」「不错」这类正面评价不在这里：
+#: 它们不是「问题反馈」，也不是修改指令，交给别的层判。
+_ISSUE_FEEDBACK_ADJECTIVES: tuple[str, ...] = (
+    # 观感
+    "扎眼", "刺眼", "晃眼", "单调", "难看", "不好看", "模糊", "潦草",
+    "拥挤", "简陋", "粗糙", "做作", "磨叽", "花哨",
+    # 可读性
+    "费劲", "费眼", "费力", "难懂", "难用", "费解", "迷惑", "冗长",
+    "冗余", "累赘", "空洞", "没用", "无意义", "不清晰", "不直观",
+    # 体验
+    "不友好", "不专业", "反直觉", "头疼", "尴尬", "糟心", "不适应",
+    "不舒服", "不方便", "别扭",
+    # 数值观感
+    "太大", "太小", "太多", "太少", "偏高", "偏低", "过长", "过短",
+    # 单字评价词：只在「程度副词 + 单字」或「单字 + 了」这两种形状里用
+    "丑", "挤", "糊", "差", "糟", "烂", "乱", "密", "闷", "晕", "烦", "累",
+)
+
+#: 抱怨句里最常见的**程度副词**（「太 X 了」「很 X」「有点 X」）。
+_ISSUE_DEGREE_WORDS: tuple[str, ...] = (
+    "有点", "有些", "过于", "非常", "特别", "格外", "相当", "十分",
+    "极其", "略微", "完全", "太", "很", "极", "挺", "真", "巨", "超",
+)
+
+#: 否定式体验说法：说不清哪里不好，但明确表示「用不下去 / 看不明白」。
+_ISSUE_NEGATIVE_USE: tuple[str, ...] = (
+    "看不下去", "看不下", "没法看", "没法用", "不能看", "用不了",
+    "不好用", "搞不懂", "看不明白", "受不了", "忍不了",
+)
+
+
+def _alternation(words: tuple[str, ...]) -> str:
+    """把一组词拼成正则分支（长的排前面，避免「太大」被「太」抢先匹配）。"""
+    return "|".join(re.escape(word) for word in sorted(words, key=len, reverse=True))
+
+
+_ISSUE_ADJ_PATTERN = _alternation(_ISSUE_FEEDBACK_ADJECTIVES)
+_ISSUE_DEGREE_PATTERN = _alternation(_ISSUE_DEGREE_WORDS)
+
+#: 「程度副词 + 评价性形容词」：「太扎眼了」「很费劲」「有点糊」。
+_RE_ISSUE_DEGREE_ADJ = re.compile(
+    rf"(?:{_ISSUE_DEGREE_PATTERN})\s*(?:地)?\s*(?:{_ISSUE_ADJ_PATTERN})"
+)
+
+#: 「评价性形容词 + 了」：「单调了」「难用了」。
+_RE_ISSUE_ADJ_DONE = re.compile(rf"(?:{_ISSUE_ADJ_PATTERN})了")
+
+#: 「加一个 / 新增」这类新增请求的说法。
+_ADD_REQUEST_WORDS: tuple[str, ...] = (
+    "加一个", "加个", "再加一个", "再加个", "新增", "增加", "添加",
+    "补充一个", "补充一个", "加张", "加个板块", "加个卡片",
+)
+
+
+def _has_structural_complaint(text: str) -> bool:
+    """句子的**形状**像不像「对当前结果不满」。
+
+    固定词表认不出的抱怨句（「颜色太扎眼了」「一眼看过去很费劲」）
+    用形状来认（工单 #58 独立验收的 P3 缺口）：
+
+    1. 「程度副词 + 评价性形容词」——「太扎眼了」「很费劲」「有点糊」；
+    2. 「评价性形容词 + 了」——「单调了」「难用了」；
+    3. 否定式体验说法——「看不下去」「没法看」。
+
+    带**疑问标记**的句子不在这里当抱怨吞掉：它更可能是提问，
+    交给 :func:`is_readonly_question` 那一层判。
+    """
+    if any(marker in text for marker in _QUESTION_MARKERS):
+        return False
+    if any(word in text for word in _ISSUE_NEGATIVE_USE):
+        return True
+    if _RE_ISSUE_DEGREE_ADJ.search(text):
+        return True
+    return bool(_RE_ISSUE_ADJ_DONE.search(text))
+
+
+def _has_issue_marker(text: str) -> bool:
+    """句子里有没有「对当前结果不满」的信号。"""
+    if any(marker in text for marker in _ISSUE_FEEDBACK_MARKERS):
+        return True
+    if _RE_ISSUE_POINT_COUNT.search(text):
+        return True
+    return _has_structural_complaint(text)
+
+
+def detect_issue_feedback(message: str, *, subject_required: bool = True) -> bool:
+    """这句话是不是「对当前这份报表的问题反馈」。
+
+    与 :func:`is_readonly_question` 的关键区别：**不要求疑问标记**。
+    「昨日能耗趋势好丑啊，一个点……」一个问号都没有，但它既不是
+    提问也不是指令 —— 它是在说当前这份结果哪里不对劲。
+
+    判据：
+
+        1. 不是生成请求；
+        2. 没有明确改动动词（带改动动词的仍然是明确修改）；
+        3. 有「不满 / 数量异常」的表达 —— 固定词表，或者
+           :func:`_has_structural_complaint` 认出来的**结构特征**
+           （程度副词 + 评价性形容词等）；
+        4. 指向报表业务对象 —— ``subject_required=False`` 时跳过，
+           因为编辑态里「对象」就是当前这张草稿（规格第 51 条）。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if is_clear_generation_request(text):
+        return False
+    if has_operation_command(text):
+        return False
+    if not _has_issue_marker(text):
+        return False
+    if not subject_required:
+        return True
+    return mentions_report_object(text)
+
+
+def _metric_candidates(text: str) -> list[str]:
+    """从句子里抽出「像指标名」的候选词。"""
+    candidates: list[str] = []
+    for match in _RE_QUOTED.finditer(text):
+        token = match.group(1).strip()
+        if not token or token in _QUOTED_STOPWORDS:
+            continue
+        if any(hint in token for hint in _METRIC_WORD_HINTS):
+            candidates.append(token)
+    for match in _RE_METRIC_SUFFIX.finditer(text):
+        token = match.group(0)
+        if any(hint in token for hint in _RE_DERIVED_HINTS):
+            continue
+        if any(hint in token for hint in _METRIC_WORD_HINTS):
+            candidates.append(token)
+    return candidates
+
+
+def detect_out_of_catalog_add(
+    message: str, *, known_metrics: Iterable[str] | None = None
+) -> bool:
+    """这句话是不是「要新增一个目录里没有的指标」。
+
+    目录外新增按通用模拟策略走（规格第 6 条）：要么先澄清，要么
+    标成显式假设后给候选，**不能**静默映射到已有指标。
+
+    ``known_metrics`` 传当前授权范围内已登记的指标名（label 或 alias）。
+    没有它就判不了 —— 返回 False，交给既有流程按普通新增处理。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if not any(word in text for word in _ADD_REQUEST_WORDS):
+        return False
+    if not _RE_REPORT_REQUEST.search(text):
+        return False
+    candidates = _metric_candidates(text)
+    if not candidates:
+        return False
+    known = {str(item).strip().lower() for item in (known_metrics or [])}
+    if not known:
+        return False
+    name = max(candidates, key=len)
+    return name.lower() not in known
 
 
 #: 问的是「当前对话已记录的阶段 / 进度」的说法。
@@ -1104,3 +1402,235 @@ def resolve_include_trend(slots: dict[str, Any]) -> bool:
     if "trend" in excluded:
         return False
     return True
+
+
+# --------------------------------------------------------------------------
+# 用户 JSON 输入（工单 #64）
+# --------------------------------------------------------------------------
+
+
+#: 数组位置标记行。用户在消息里写明记录数组在报文里的位置
+#: （规格第 31 条），服务端按它取数组，不自己挑。
+#:
+#: **冒号可省**：契约表 §4.3 登记了两种写法 —— ``数组位置: data.records``
+#: 与 ``@arrayPath data.records``。后者**没有冒号**，所以这里的冒号是
+#: 可选的：两种写法都要认（写了冒号也认，不写也认）。
+_ARRAY_PATH_MARKER = re.compile(
+    r"^\s*(?:@arrayPath|arrayPath|数组位置)\s*(?:[:：]\s*)?(?P<path>(?![:：])[^\s]+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_array_path(message: str) -> str | None:
+    """从消息里取「数组位置」标记。
+
+    约定：单独一行写成 ``数组位置: data.records`` 或 ``@arrayPath data.records``
+    （契约表 §4.3 登记的两种写法，**冒号可省**）。
+    没有这一行 → ``None``（服务端按「顶层数组」或「唯一数组」处理）。
+    """
+    match = _ARRAY_PATH_MARKER.search(message or "")
+    if not match:
+        return None
+    path = match.group("path").strip()
+    return path or None
+
+
+def _scan_json_span(text: str, start: int) -> tuple[str, bool]:
+    """从 ``start`` 开始扫一段 JSON，返回 ``(片段, 是否闭合)``。
+
+    括号计数**跳过字符串字面量**：JSON 里的 ``]``、``{`` 可能在字符串里。
+    """
+    pairs = {"[": "]", "{": "}"}
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+            continue
+        if char in ("]", "}"):
+            if not stack or stack[-1] != char:
+                return text[start : index + 1], True
+            stack.pop()
+            if not stack:
+                return text[start : index + 1], True
+    return text[start:], False
+
+
+def _looks_like_json(fragment: str) -> bool:
+    """这段文字像不像一份 JSON 数据。
+
+    判据保守：必须以 ``[`` / ``{`` 开头，**并且**含引号 ——
+    ``[重要]``、``[1, 2]`` 这种不是记录数据，不该被当成 JSON 输入。
+    宁可漏判（当成普通消息），不可误判（把一句中文报成语法错）。
+    """
+    text = fragment.strip()
+    if not text or text[0] not in "[{":
+        return False
+    return '"' in text
+
+
+def detect_json_payload(message: str) -> str | None:
+    """从一条聊天消息里找出用户贴的 JSON 数据段。
+
+    返回**原文片段**（调用方负责校验与存储）；没有 JSON 段时返回 ``None``。
+
+    宁可漏判不可误判：普通中文消息里带方括号的，不当成 JSON 输入。
+
+    这条判据**只认含引号的片段** —— 判据与取舍理由见
+    :func:`_looks_like_json`。没引号但明显是数据的那类（``[]``、
+    ``[1,2,3]``）由 :func:`detect_data_array_payload` 单独认，
+    两条路径互不干扰。
+    """
+    text = message or ""
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        fragment, _closed = _scan_json_span(text, index)
+        if _looks_like_json(fragment):
+            return fragment
+    return None
+
+
+# --------------------------------------------------------------------------
+# 没引号、但明显是数据的方括号数组（工单 #66E）
+# --------------------------------------------------------------------------
+
+#: 「用户想给 JSON」的**登记在案**的信号：契约表 §4.3 的数组位置标记。
+#:
+#: 契约里登记的 JSON 输入写法就这两种（``数组位置: data.records`` /
+#: ``@arrayPath data.records``），消息里有它就说明用户想给 JSON。
+#:
+#: 只认**独立成行**的标记（与 :func:`extract_array_path` 同一口径）：
+#: 标记后面**还写了别的字**就不认 —— 那是聊天，不是标记。
+#: 「只写标记、不写路径」也算（说明用户想给数据，只是没说清位置）。
+_BARE_ARRAY_PATH_MARKER = re.compile(
+    r"^[ \t]*(?:@arrayPath|arrayPath)[ \t]*[:：]?[ \t]*$"
+    r"|^[ \t]*数组位置[ \t]*[:：]?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: 一串数字（可带小数与指数），或什么都没有 —— 方括号里**只可能是数据**的内容。
+_NUMBER_TOKEN = r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
+_NUMERIC_ARRAY_BODY = re.compile(
+    rf"^\s*(?:{_NUMBER_TOKEN}\s*(?:,\s*{_NUMBER_TOKEN}\s*)*)?$"
+)
+
+#: 片段之后允许跟的**句末**内容：空白与中英文句读。
+#: 粘数据的习惯是「说明 + 数据」，数据后面通常只有标点。
+_TRAILING_PUNCTUATION = re.compile(r"^[\s。，、；：！？,.;:!?]*$")
+
+
+def _bracket_spans(text: str) -> list[tuple[int, int, str]]:
+    """消息里所有**完整**的 ``[...]`` 片段（起止位置与原文）。
+
+    扫到一段就跳过整段，所以嵌套的方括号不会被单独当成一段。
+    """
+    spans: list[tuple[int, int, str]] = []
+    index = 0
+    while index < len(text):
+        if text[index] != "[":
+            index += 1
+            continue
+        fragment, closed = _scan_json_span(text, index)
+        if not closed:
+            break
+        spans.append((index, index + len(fragment), fragment))
+        index += len(fragment)
+    return spans
+
+
+def detect_data_array_payload(message: str) -> str | None:
+    """认出「没有引号、但明显是数据」的方括号数组（工单 #66E）。
+
+    为什么要有它：:func:`detect_json_payload` 要求片段**含引号**，于是
+    ``[]``、``[1,2,3]`` 这类输入**根本不会被当成 JSON 输入轮** ——
+    用户粘了数据，服务端却当普通需求处理，给了一份**模拟示例**方案，
+    界面一句提示都没有（规格第 30 条要避免的正是这件事）。
+
+    判据保守（宁可漏判不可误判 —— 与 :func:`_looks_like_json` 同一条原则）：
+
+    1. 片段是**完整的** ``[...]``，内容**只可能是数字**（或空的）——
+       ``[重要]``、``[a,b]`` 这种不是数据，不认；
+    2. 消息里**只有这一处**这样的片段 —— 有两处就分不清用户指的是哪一段，
+       **不猜**（与契约表 §4.3「服务端不替用户挑数组」同一条道理）；
+    3. 这一段在**消息末尾**（后面只剩空白或句读）—— 粘数据的习惯是
+       「说明 + 数据」，数据放在最后（前端 JSON 粘贴入口也是这个顺序）。
+
+    返回原文片段（调用方负责校验与存储）。
+    """
+    text = message or ""
+    candidates: list[tuple[int, int, str]] = []
+    for start, end, fragment in _bracket_spans(text):
+        if not (fragment.startswith("[") and fragment.endswith("]")):
+            continue
+        if not _NUMERIC_ARRAY_BODY.match(fragment[1:-1]):
+            continue
+        candidates.append((start, end, fragment))
+    if len(candidates) != 1:
+        return None
+    _start, end, fragment = candidates[0]
+    if not _TRAILING_PUNCTUATION.match(text[end:]):
+        return None
+    return fragment
+
+
+#: 「路径」长得像路径：ASCII 词或点分路径（``data.records`` / ``records``）。
+_PATH_TOKEN = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*")
+
+
+def has_json_input_intent(message: str) -> bool:
+    """消息里有没有「用户想给 JSON」的**登记在案**的信号。
+
+    契约表 §4.3 登记的数组位置标记只出现在 JSON 输入里 —— 消息里有它，
+    就说明用户想给 JSON。
+
+    认的是**独立成行**的标记（``数组位置: data.records`` /
+    ``@arrayPath data.records``，或者只写标记不写路径），与
+    :func:`extract_array_path` 同一口径：标记后面还写了别的字就不认
+    （那是聊天，不是标记）。
+
+    路径还得**长得像路径**（``data.records`` / ``records``）：
+    「数组位置怎么填」这种问句里也带标记字样，但后面跟的是中文，
+    不是路径 —— 那是在聊天，不是在给数据。
+    """
+    text = message or ""
+    path = extract_array_path(text)
+    if path is not None and _PATH_TOKEN.fullmatch(path):
+        return True
+    return bool(_BARE_ARRAY_PATH_MARKER.search(text))
+
+
+def strip_detected_json(message: str, payload: str) -> str:
+    """把消息里**已经认出来的那一段** JSON 去掉，只留人话部分。
+
+    与 :func:`strip_json_payload` 同一套口径，但「认哪一段」由调用方决定 ——
+    聊天入口认出来的可能是含引号的片段，也可能是不含引号的数组形状
+    （工单 #66E）。
+    """
+    if not payload:
+        return (message or "").strip()
+    text = (message or "").replace(payload, " ")
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def strip_json_payload(message: str) -> str:
+    """把消息里的 JSON 段去掉，只留人话部分。
+
+    用于**聊天消息只保存安全摘要与引用**（规格第 21 条）：
+    落库的用户消息里不留完整数组。
+    """
+    fragment = detect_json_payload(message)
+    return strip_detected_json(message, fragment or "")

@@ -47,6 +47,10 @@ FROZEN_PLAN_SAMPLE = {
     "assumptions": ["PUE 统计口径待核实，数据待连接"],
     "suggestions": [],
     "referenceTemplates": [],
+    # 工单 #60 扩了方案契约：规则版本与命中依据随方案一起持久化。
+    # 这份样例是**旧方案**的样子 —— 没有规则版本，也没有命中依据。
+    "ruleVersion": None,
+    "selectionEvidence": [],
 }
 
 

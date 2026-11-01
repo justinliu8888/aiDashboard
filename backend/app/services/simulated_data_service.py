@@ -45,6 +45,17 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.data.machine_room_energy import METRIC_DEVICE_ENERGY, METRIC_TOTAL_ENERGY
+from app.schemas.edit_plan import (
+    DISPLAY_MODE_PLACEHOLDER_ONLY,
+    DISPLAY_MODE_SIMULATED,
+)
+from app.services.data_source_mode import (
+    SOURCE_MODE_KEY,
+    SOURCE_MODE_USER_JSON,
+    SourceMode,
+    source_mode_of_definition,
+    source_mode_of_region,
+)
 from app.services.edit_time_resolver import DEFAULT_TIMEZONE
 from app.services.mock_data_service import (
     ROOM_A_DEVICES,
@@ -53,6 +64,28 @@ from app.services.mock_data_service import (
     hash_float,
     resolve_room_name,
     room_id_of_definition,
+)
+from app.services.simulated_field_semantics import (
+    BINDING_KIND_SIMULATED,
+    SEMANTIC_KIND_ALARMS,
+    SEMANTIC_KIND_CABINET_STATUS,
+    SEMANTIC_KIND_COST,
+    SEMANTIC_KIND_ENERGY,
+    SEMANTIC_KIND_GENERIC,
+    SEMANTIC_KIND_POWER,
+    SEMANTIC_KIND_PUE,
+    VALUE_TYPE_COUNT,
+    VALUE_TYPE_COST,
+    VALUE_TYPE_CURRENT,
+    VALUE_TYPE_DURATION,
+    VALUE_TYPE_ENERGY,
+    VALUE_TYPE_PERCENT,
+    VALUE_TYPE_POWER,
+    VALUE_TYPE_TEMPERATURE,
+    VALUE_TYPE_VOLTAGE,
+    description_of,
+    describe_simulated_metric,
+    metric_family_seed_key,
 )
 
 
@@ -68,13 +101,16 @@ SIMULATED_ELECTRICITY_PRICE_PER_KWH = 0.7
 ALARM_ROW_COUNT = 5
 
 #: 区域量身份（``previewSpec.kind`` / ``metrics[].kind``）。
-KIND_ENERGY = "energy"
-KIND_COST = "cost"
-KIND_PUE = "pue"
-KIND_POWER = "power"
-KIND_ALARMS = "alarms"
-KIND_CABINET_STATUS = "cabinet_status"
-KIND_GENERIC = "generic"
+#:
+#: 语义类别集中在 ``simulated_field_semantics``（模拟字段描述契约），
+#: 这里只是**转出**同一组常量，方便本模块与外部按旧名字引用。
+KIND_ENERGY = SEMANTIC_KIND_ENERGY
+KIND_COST = SEMANTIC_KIND_COST
+KIND_PUE = SEMANTIC_KIND_PUE
+KIND_POWER = SEMANTIC_KIND_POWER
+KIND_ALARMS = SEMANTIC_KIND_ALARMS
+KIND_CABINET_STATUS = SEMANTIC_KIND_CABINET_STATUS
+KIND_GENERIC = SEMANTIC_KIND_GENERIC
 
 KNOWN_KINDS = (
     KIND_ENERGY,
@@ -92,6 +128,17 @@ SUPPORTED_GRAINS = ("MINUTE", "HOUR", "DAY")
 #: 标题区域不产出数据载荷（规格：覆盖所有**非标题**区域）。
 TITLE_ROLES = ("REPORT_TITLE",)
 
+#: 语义未声明的列，造数器给的是**占位**。占位文案必须让人一眼看出这是
+#: 占位、不是业务数（契约表 §3.4 的 ⑤ 级：语义未声明 → 明确标注）。
+PLACEHOLDER_VALUE_SUFFIX = "（口径待确认）"
+
+# ---------------------------------------------------------------- 展示模式
+#
+# 列上带 ``displayMode``：这一列**怎么展示**。
+#
+# 取值域只有两个，**唯一出处**是 ``app.schemas.edit_plan``（编辑层写、
+# 这里读）：``simulated`` = 照常出模拟数值（缺省）；``placeholder_only`` =
+# 只显示名称、**不显示数值**（用户明确要求「先占位 / 先加标签」时才用）。
 #: 告警级别取值池（示例值，非真实告警）。
 _ALARM_LEVELS = ("严重", "重要", "一般", "提示", "警告")
 
@@ -746,9 +793,26 @@ def _resolve_kind(region: dict[str, Any], spec: dict[str, Any]) -> str:
 
 
 def _resolve_metrics(
-    region: dict[str, Any], spec: dict[str, Any], kind: str
+    region: dict[str, Any],
+    spec: dict[str, Any],
+    kind: str,
+    *,
+    columns: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """区域的指标清单（多指标消费 ``metrics[]``，不是只看主量）。"""
+    """区域的指标清单（多指标消费 ``metrics[]``，不是只看主量）。
+
+    描述侧的三个字段（``bindingKind`` / ``simulatedId`` /
+    ``deterministicScope``）**原样带过来** —— 载荷层照着它们说清「这一项
+    是目录内指标还是目录外模拟」。
+
+    **合并**（与列同一套口径）：
+
+    - ``previewSpec.metrics[]`` 是**底**；
+    - 列里声明了、清单里**还没有**的**目录外指标**追加进来 ——
+      目录外指标也要出现在 ``metrics[]`` 里，不能只活在列上；
+    - 占位模式（``displayMode = "placeholder_only"``）的指标标上
+      ``placeholderOnly``：只显示名称，**不显示数值**。
+    """
     raw_metrics = spec.get("metrics") or []
     metrics: list[dict[str, Any]] = []
     for item in raw_metrics:
@@ -757,29 +821,69 @@ def _resolve_metrics(
         metric_kind = str(item.get("kind") or "").strip().lower()
         if metric_kind not in KNOWN_KINDS:
             metric_kind = kind
-        metrics.append(
+        resolved = {
+            "metricKey": str(item.get("metricKey") or metric_kind),
+            "label": str(item.get("label") or region.get("name") or "指标"),
+            "kind": metric_kind,
+            "unit": str((item.get("unit") if "unit" in item else spec.get("unit")) or ""),
+            "capabilityPending": bool(item.get("capabilityPending")),
+            "pendingReason": item.get("pendingReason"),
+        }
+        for key in ("bindingKind", "simulatedId", "deterministicScope", "displayMode"):
+            if key in item:
+                resolved[key] = item[key]
+        metrics.append(resolved)
+    if not metrics:
+        metric = (region.get("component") or {}).get("metric") or {}
+        metrics = [
             {
-                "metricKey": str(item.get("metricKey") or metric_kind),
-                "label": str(item.get("label") or region.get("name") or "指标"),
-                "kind": metric_kind,
-                "unit": str(item.get("unit") or spec.get("unit") or ""),
-                "capabilityPending": bool(item.get("capabilityPending")),
-                "pendingReason": item.get("pendingReason"),
+                "metricKey": kind,
+                "label": str(metric.get("label") or region.get("name") or "指标"),
+                "kind": kind,
+                "unit": str(
+                    spec.get("unit") or (metric.get("format") or {}).get("unitLabel") or ""
+                ),
+                "capabilityPending": bool(spec.get("capabilityPending")),
+                "pendingReason": spec.get("pendingReason"),
+            }
+        ]
+    region_columns = columns if columns is not None else _columns_of(region, spec)
+    metrics.extend(_column_metrics(region_columns, metrics))
+    for item in metrics:
+        item["placeholderOnly"] = _is_placeholder_metric(item, region_columns)
+    return metrics
+
+
+def _column_metrics(
+    columns: list[dict[str, Any]], metrics: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """列里声明的、**指标清单里还没有**的目录外指标 → 追加进清单。
+
+    只收**目录外**的列（``bindingKind = "simulated"``）：维度列（设备名称、
+    时间……）不是指标，进了清单会凭空多出一项。
+    """
+    extra: list[dict[str, Any]] = []
+    for column in columns:
+        if str(column.get("bindingKind") or "") != BINDING_KIND_SIMULATED:
+            continue
+        field_ref = str(column.get("fieldRef") or "").strip()
+        label = str(column.get("label") or "").strip()
+        if not field_ref and not label:
+            continue
+        if any(_metric_matches_column(item, column) for item in metrics):
+            continue
+        extra.append(
+            {
+                "metricKey": field_ref or label,
+                "label": label or field_ref,
+                "kind": str(column.get("semanticKind") or KIND_GENERIC),
+                "unit": _column_unit(column),
+                "capabilityPending": bool(column.get("capabilityPending")),
+                "pendingReason": None,
+                "bindingKind": BINDING_KIND_SIMULATED,
             }
         )
-    if metrics:
-        return metrics
-    metric = (region.get("component") or {}).get("metric") or {}
-    return [
-        {
-            "metricKey": kind,
-            "label": str(metric.get("label") or region.get("name") or "指标"),
-            "kind": kind,
-            "unit": str(spec.get("unit") or (metric.get("format") or {}).get("unitLabel") or ""),
-            "capabilityPending": bool(spec.get("capabilityPending")),
-            "pendingReason": spec.get("pendingReason"),
-        }
-    ]
+    return extra
 
 
 def _unit_for(kind: str, spec: dict[str, Any], fallback: str = "") -> str:
@@ -844,24 +948,16 @@ def _metric_family(kind: str, metric_key: str, unit: str) -> str:
     同比（``yoyPercent``）按量族给，不是按区域给 —— 同一个量的同比只能有
     一个，否则同一份报表内部自相矛盾。
 
-    判据：
+    判据集中在 ``simulated_field_semantics.metric_family_seed_key``（**全仓库
+    只有这一处来源**）。
 
-    1. ``energy``（耗电）与 ``cost``（电费 = 耗电 × 单价）是**同一个基础量**
-       → 同一族（``energy``）：总耗电卡与总电费卡的同比必须相同；
-    2. ``pue`` / ``power`` / ``alarms`` / ``cabinet_status`` 各自一族
-       （PUE、实时功率、告警是各自的量，同比也各自不同）；
-    3. ``generic``（量身份认不出来）先看**单位**：``kWh`` 是能耗、``元`` 是能耗
-       折算出来的电费 → 都归能耗族；其余按 ``metricKey`` 分族（同一个指标键
-       是同一个量，不同指标键不是同一个量）。
+    **与描述里的 ``deterministicScope`` 的关系（如实记录，别当成约束）**：
+    描述里的 ``deterministicScope`` **记录**该字段的预期作用域；当前造数器
+    **按区域 / 量族自行推导**种子，**不由本字段决定** —— 也就是说，本函数
+    返回的量族**不读**描述里的 ``seedKey``。两侧目前对得上，是靠「写入侧
+    与本函数用同一套判据」保证的，不是靠字段本身约束的。
     """
-    if kind in (KIND_ENERGY, KIND_COST):
-        return "energy"
-    if kind == KIND_GENERIC:
-        text = str(unit or "").strip().lower()
-        if text in ("kwh", "元", "cny", "rmb"):
-            return "energy"
-        return f"generic:{metric_key}"
-    return kind
+    return metric_family_seed_key(kind, metric_key, unit)
 
 
 def _yoy_for(ctx: _Context, family: str) -> float:
@@ -873,50 +969,23 @@ def _yoy_for(ctx: _Context, family: str) -> float:
     return round(hash_float(f"yoy/{ctx.seed_scope}/{family}", -8.0, 20.0), 1)
 
 
-# ---------------------------------------------------------------- 列分类
+# ---------------------------------------------------------------- 列语义
 
 
-def _column_value_kind(label: str, field_ref: str) -> str:
-    """按**列名**判断这一列该出什么样的值。
+def _column_value_types(columns: list[dict[str, Any]]) -> list[str]:
+    """每一列的**值形态** —— 按**描述**读，不按列名或标题猜。
 
-    顺序敏感：先判告警级别/状态/时间，再判设备，最后才落到数值与兜底。
+    描述落在 ``previewSpec.columns[]``（转换层写、这里读）。历史定义里没有
+    描述时，按**字段身份 / 声明单位**解析一份（``description_of``）——
+    仍然不看显示名里有没有「耗电」「率」这种字样。
+
+    ADR 0004 §5.4：表格列必须来自方案声明，系统**不得按标题猜**。
     """
-    text = f"{label or ''} {field_ref or ''}".lower()
-    if any(k in text for k in ("级别", "等级", "严重", "severity", "level")):
-        return "level"
-    if any(k in text for k in ("状态", "status", "运行情况")):
-        return "status"
-    if any(k in text for k in ("时间", "时刻", "日期", "timestamp", "datetime", "time", "date")):
-        return "time"
-    if any(k in text for k in ("设备编号", "设备id", "机柜编号", "资产编号", "deviceid", "assetid")):
-        return "device_id"
-    if any(k in text for k in ("设备类型", "类型", "devicetype")):
-        return "device_type"
-    if any(k in text for k in ("设备名称", "设备名", "机柜名称", "机柜", "名称", "devicename", "device")):
-        return "device_name"
-    if any(k in text for k in ("pue", "能效")):
-        return "pue"
-    if any(k in text for k in ("功率", "power")):
-        return "power"
-    if any(k in text for k in ("电费", "费用", "成本", "金额", "cost", "fee")):
-        return "cost"
-    if any(k in text for k in ("能耗", "耗电", "用电", "电量", "kwh", "energy")):
-        return "energy"
-    if any(k in text for k in ("占比", "比例", "比率", "率", "percent", "ratio", "share")):
-        return "percent"
-    if any(k in text for k in ("数量", "次数", "台数", "条数", "count", "num")):
-        return "count"
-    if any(k in text for k in ("耗时", "时长", "duration")):
-        return "duration"
-    if any(k in text for k in ("温度", "temperature", "℃")):
-        return "temperature"
-    if any(k in text for k in ("电压", "voltage")):
-        return "voltage"
-    if any(k in text for k in ("电流", "current")):
-        return "current"
-    if any(k in text for k in ("描述", "说明", "详情", "备注", "desc", "note", "message")):
-        return "description"
-    return "text"
+    value_types: list[str] = []
+    for column in columns:
+        description = description_of(column)
+        value_types.append(description.valueType)
+    return value_types
 
 
 # ---------------------------------------------------------------- 值生成
@@ -945,8 +1014,92 @@ def _generic_value(kind: str, seed: str) -> Any:
     if kind == "pue":
         return round(hash_float(seed, 1.2, 1.8 - 1e-6), 2)
     if kind == "text":
-        return f"示例值 {int(hash_float(seed, 1, 99))}"
+        # 语义没解析出来的列给的是**占位**，不是业务数。占位文案必须说清
+        # 自己是占位（契约表 §3.4 的 ⑤ 级：语义未声明 → 明确标注），
+        # 用户不能把「示例值 11」当成真的业务数值。
+        return f"示例值 {int(hash_float(seed, 1, 99))}{PLACEHOLDER_VALUE_SUFFIX}"
     return round(hash_float(seed, 10.0, 500.0), 1)
+
+
+#: 金额单位各自的**取值区间**（示意值）。每个单位用自己的量级 ——
+#: 「万元」不是「元」除以一万的那种写法，是**另一个量纲**。
+_MONEY_RANGES: dict[str, tuple[float, float]] = {
+    "元": (500.0, 3600.0),
+    "千元": (5.0, 36.0),
+    "万元": (0.5, 3.6),
+    "亿元": (0.05, 0.36),
+}
+
+#: 计数单位（目录外指标按单位识别出「这是个计数」时用它）。
+_COUNT_UNITS: frozenset[str] = frozenset(
+    {"个", "台", "条", "次", "件", "套", "只", "人", "人次", "户"}
+)
+
+
+def _money_range(unit: str) -> tuple[float, float] | None:
+    """金额单位 → 它的取值区间；不是金额单位就是 ``None``。"""
+    text = str(unit or "").strip()
+    if text in _MONEY_RANGES:
+        return _MONEY_RANGES[text]
+    if text.lower() in ("cny", "rmb"):
+        return _MONEY_RANGES["元"]
+    return None
+
+
+def _simulated_value(value_type: str, unit: str, seed: str) -> float:
+    """目录外列的**通用示意数值**。
+
+    认得出量纲就按量纲给一个量级合理的数（% → 0~100、kWh → 百位、
+    计数 → 整数、金额 → 按单位量级），认不出就给一个通用数值 + 空单位。
+
+    **不编造业务含义**：这是「这一列长什么样」的示意，不是业务结论。
+
+    列上记的 ``valueType`` 是**口径判定**的结果（目录外列认不出口径 →
+    ``text``）；**值本身**按单位给一个示意数值 —— 认不出口径不等于没有值
+    （值形态取值域里没有「通用数值」这一项，所以按单位定形状）。
+    """
+    text = str(unit or "").strip()
+    if value_type == VALUE_TYPE_PERCENT:
+        return round(hash_float(f"simulated/{seed}", 8.0, 92.0), 1)
+    if value_type == VALUE_TYPE_COUNT:
+        return float(int(hash_float(f"simulated/{seed}", 1, 20)))
+    if value_type == VALUE_TYPE_ENERGY:
+        return round(hash_float(f"simulated/{seed}", 800.0, 5200.0), 1)
+    if value_type == VALUE_TYPE_POWER:
+        return round(hash_float(f"simulated/{seed}", 20.0, 400.0), 1)
+    if value_type == VALUE_TYPE_COST:
+        low, high = _money_range(text) or _MONEY_RANGES["元"]
+        return round(hash_float(f"simulated/{seed}", low, high), 2)
+    if value_type == VALUE_TYPE_TEMPERATURE:
+        return round(hash_float(f"simulated/{seed}", 18.0, 29.0), 1)
+    if value_type == VALUE_TYPE_VOLTAGE:
+        return round(hash_float(f"simulated/{seed}", 218.0, 242.0), 1)
+    if value_type == VALUE_TYPE_CURRENT:
+        return round(hash_float(f"simulated/{seed}", 3.0, 42.0), 1)
+    if value_type == VALUE_TYPE_DURATION:
+        return round(hash_float(f"simulated/{seed}", 1.0, 120.0), 1)
+    # 单位本身就说明了量纲（值形态没认出来时按单位再判一次）。
+    if text in _COUNT_UNITS:
+        return float(int(hash_float(f"simulated/{seed}", 1, 20)))
+    if text in ("%", "％"):
+        return round(hash_float(f"simulated/{seed}", 8.0, 92.0), 1)
+    if text.lower() in ("kwh", "mwh", "wh"):
+        return round(hash_float(f"simulated/{seed}", 800.0, 5200.0), 1)
+    if text.lower() in ("kw", "mw", "w"):
+        return round(hash_float(f"simulated/{seed}", 20.0, 400.0), 1)
+    money = _money_range(text)
+    if money is not None:
+        return round(hash_float(f"simulated/{seed}", money[0], money[1]), 2)
+    if text in ("℃", "°C", "°c"):
+        return round(hash_float(f"simulated/{seed}", 18.0, 29.0), 1)
+    if text in ("V", "v"):
+        return round(hash_float(f"simulated/{seed}", 218.0, 242.0), 1)
+    if text in ("A", "a"):
+        return round(hash_float(f"simulated/{seed}", 3.0, 42.0), 1)
+    if text in ("分钟", "min", "小时", "h"):
+        return round(hash_float(f"simulated/{seed}", 1.0, 120.0), 1)
+    # 认不出量纲 → **通用数值 + 空单位**（不是「不支持」）。
+    return round(hash_float(f"simulated/{seed}", 10.0, 500.0), 1)
 
 
 def _metric_value(
@@ -973,12 +1126,24 @@ def _metric_value(
     if kind == KIND_CABINET_STATUS:
         return float(len(base.devices))
     # generic：一个量级合理的示例值（明确标注为模拟）。
+    # 目录外指标按**单位**给量级 —— 认得出量纲就按量纲给，认不出给通用数值。
     if unit in ("kWh", "kwh"):
         return round(hash_float(f"generic/{seed}", 800.0, 5200.0), 1)
-    if unit in ("元", "CNY", "RMB"):
-        return round(hash_float(f"generic/{seed}", 500.0, 3600.0), 2)
+    money = _money_range(unit)
+    if money is not None:
+        return round(hash_float(f"generic/{seed}", money[0], money[1]), 2)
     if unit in ("%", "％"):
         return round(hash_float(f"generic/{seed}", 10.0, 90.0), 1)
+    if unit in _COUNT_UNITS:
+        return float(int(hash_float(f"generic/{seed}", 1, 20)))
+    if unit in ("℃", "°C", "°c"):
+        return round(hash_float(f"generic/{seed}", 18.0, 29.0), 1)
+    if unit in ("V", "v"):
+        return round(hash_float(f"generic/{seed}", 218.0, 242.0), 1)
+    if unit in ("A", "a"):
+        return round(hash_float(f"generic/{seed}", 3.0, 42.0), 1)
+    if unit in ("分钟", "min", "小时", "h"):
+        return round(hash_float(f"generic/{seed}", 1.0, 120.0), 1)
     return round(hash_float(f"generic/{seed}", 5.0, 95.0), 1)
 
 
@@ -1007,12 +1172,14 @@ def _metric_card_payload(
     primary_unit = ""
     primary_precision = 1
     # 主量：区域 kind 声明的那个指标；没有就取清单里的第一个。
-    ordered = [item for item in metrics if item["kind"] == kind] + [
-        item for item in metrics if item["kind"] != kind
-    ]
+    primary = next((item for item in metrics if item["kind"] == kind), None)
+    # Keep the confirmed order of the remaining metrics, rather than grouping by kind.
+    ordered = ([primary] + [item for item in metrics if item is not primary]) if primary else metrics
     # 同比按**主量的量族**给：总耗电与总电费同族 → 同一个同比；
     # PUE / 实时功率 / 告警各自一族 → 各自的同比。
     primary_metric = ordered[0] if ordered else None
+    # 占位模式：主量只显示名称 → 卡片**不出大数字、不出趋势**。
+    primary_is_placeholder = bool(primary_metric and primary_metric.get("placeholderOnly"))
     yoy = _yoy_for(
         ctx,
         _metric_family(
@@ -1022,6 +1189,29 @@ def _metric_card_payload(
         ),
     )
     for item in ordered:
+        precision = declared_precision
+        if precision is None:
+            precision = 2 if item["kind"] in (KIND_COST, KIND_PUE) else 1
+        if item["kind"] == KIND_COST:
+            # 电费按 2 位小数：总耗电（1 位）× 单价（1 位）= 2 位，两个卡片严格相等。
+            precision = max(int(precision), 2)
+        if item.get("placeholderOnly"):
+            # 只显示名称：这一项**不带数值**（前端渲染成「—」）。
+            metric_payload = {
+                "metricKey": item["metricKey"],
+                "label": item["label"],
+                "kind": item["kind"],
+                "unit": item.get("unit") or "",
+                "precision": int(precision),
+                "placeholderOnly": True,
+                "capabilityPending": bool(item["capabilityPending"]),
+                "pendingReason": item.get("pendingReason"),
+            }
+            for key in ("bindingKind", "simulatedId"):
+                if item.get(key) is not None:
+                    metric_payload[key] = item[key]
+            metric_payloads.append(metric_payload)
+            continue
         value = _metric_value(
             item["kind"],
             base=base,
@@ -1030,68 +1220,234 @@ def _metric_card_payload(
             seed=f"{seed_scope}|{item['metricKey']}",
             unit=item.get("unit") or "",
         )
-        precision = declared_precision
-        if precision is None:
-            precision = 2 if item["kind"] in (KIND_COST, KIND_PUE) else 1
-        if item["kind"] == KIND_COST:
-            # 电费按 2 位小数：总耗电（1 位）× 单价（1 位）= 2 位，两个卡片严格相等。
-            precision = max(int(precision), 2)
         value = round(float(value), int(precision))
-        metric_payloads.append(
-            {
-                "metricKey": item["metricKey"],
-                "label": item["label"],
-                "kind": item["kind"],
-                "unit": item.get("unit") or "",
-                "value": value,
-                "precision": int(precision),
-                "capabilityPending": bool(item["capabilityPending"]),
-                "pendingReason": item.get("pendingReason"),
-            }
-        )
-        if primary_value is None:
+        metric_payload = {
+            "metricKey": item["metricKey"],
+            "label": item["label"],
+            "kind": item["kind"],
+            "unit": item.get("unit") or "",
+            "value": value,
+            "precision": int(precision),
+            "capabilityPending": bool(item["capabilityPending"]),
+            "pendingReason": item.get("pendingReason"),
+        }
+        # 目录内 / 目录外随载荷带出去：前端与下游据此知道这一项的来源。
+        for key in ("bindingKind", "simulatedId"):
+            if item.get(key) is not None:
+                metric_payload[key] = item[key]
+        metric_payloads.append(metric_payload)
+        if primary_value is None and not primary_is_placeholder:
             primary_value = value
             primary_unit = item.get("unit") or ""
             primary_precision = int(precision)
 
-    if primary_value is None:
+    if primary_value is None and not primary_is_placeholder:
         primary_value = 0.0
 
     unit = primary_unit or _unit_for(kind, spec, str(fmt.get("unitLabel") or ""))
     return {
         "label": str(metric.get("label") or region.get("name") or "指标"),
-        "value": primary_value,
+        "value": None if primary_is_placeholder else primary_value,
         "unit": unit,
         "precision": primary_precision,
-        "yoyPercent": yoy,
-        "comparisonAvailable": True,
+        # 占位模式：不出趋势值（前端据 ``yoyPercent`` 为空就不画趋势）。
+        "yoyPercent": None if primary_is_placeholder else yoy,
+        "comparisonAvailable": not primary_is_placeholder,
         "windowLabel": base.window_label,
         "dataSource": "simulated",
         "metrics": metric_payloads,
     }
 
 
-def _columns_of(region: dict[str, Any], spec: dict[str, Any]) -> list[dict[str, Any]]:
-    """区域声明的列：优先 ``previewSpec.columns``（03 号票定稿），否则用组件列。"""
-    raw = spec.get("columns")
-    if not isinstance(raw, list) or not raw:
-        raw = (region.get("component") or {}).get("columns") or []
-    columns: list[dict[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        field_ref = str(item.get("fieldRef") or "")
+def _display_mode_of(column: dict[str, Any]) -> str:
+    """列的**展示模式**（缺省 = 照常出数）。"""
+    mode = str(column.get("displayMode") or "").strip().lower()
+    return mode or DISPLAY_MODE_SIMULATED
+
+
+def _is_placeholder_only(column: dict[str, Any]) -> bool:
+    """这一列是不是**只显示名称**（占位模式）。"""
+    return _display_mode_of(column) == DISPLAY_MODE_PLACEHOLDER_ONLY
+
+
+def _merged_columns(region: dict[str, Any], spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """区域的列：``previewSpec.columns`` 与 ``component.columns`` **合并**。
+
+    合并规则（两边都有时以谁为准是**定死的**）：
+
+    - 以 ``previewSpec.columns`` 为**底** —— 它带着**语义描述**
+      （``semanticKind`` / ``valueType`` / ``deterministicScope``）；
+    - ``component.columns`` 里 ``fieldRef`` **还没被覆盖**的列**追加**在后面
+      —— 目录外新增的列只写在组件列上时也不会丢（新增是追加，不是替换）；
+    - 同一个 ``fieldRef`` 两边都有：**身份信息**（``label`` / ``format`` /
+      ``displayMode`` / ``bindingKind``）以 ``component.columns`` 为准，
+      **语义描述**沿用 ``previewSpec`` 的。
+
+    旧行为是「有 previewSpec.columns 就整份丢掉组件列」—— 目录外新增的列
+    会连同它的展示值一起消失。
+    """
+    preview_raw = [
+        item for item in (spec.get("columns") or []) if isinstance(item, dict)
+    ]
+    component_raw = [
+        item
+        for item in ((region.get("component") or {}).get("columns") or [])
+        if isinstance(item, dict)
+    ]
+    merged: list[dict[str, Any]] = []
+    position_by_ref: dict[str, int] = {}
+    for item in preview_raw:
+        field_ref = str(item.get("fieldRef") or "").strip()
         if not field_ref:
             continue
-        columns.append(
-            {
-                "id": item.get("id"),
-                "label": item.get("label"),
-                "fieldRef": field_ref,
-                "format": item.get("format"),
-            }
-        )
+        merged.append(dict(item))
+        position_by_ref.setdefault(field_ref, len(merged) - 1)
+    for item in component_raw:
+        field_ref = str(item.get("fieldRef") or "").strip()
+        if not field_ref:
+            continue
+        position = position_by_ref.get(field_ref)
+        if position is None:
+            merged.append(dict(item))
+            position_by_ref[field_ref] = len(merged) - 1
+            continue
+        # 同一个 fieldRef：身份信息以组件列为准，语义描述沿用 previewSpec。
+        target = merged[position]
+        for key in ("id", "label", "displayMode", "bindingKind"):
+            value = item.get(key)
+            if value is None:
+                continue
+            if key == "label" and not str(value).strip():
+                continue
+            target[key] = value
+        # 展示格式**逐键合并**：组件列的单位 / 精度说了算，
+        # previewSpec 里其余的键（``kind`` / ``precision``）不丢。
+        component_format = item.get("format")
+        if isinstance(component_format, dict) and component_format:
+            base_format = target.get("format")
+            target["format"] = (
+                {**base_format, **component_format}
+                if isinstance(base_format, dict)
+                else dict(component_format)
+            )
+    return merged
+
+
+def _columns_of(region: dict[str, Any], spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """区域声明的列（``previewSpec.columns`` 与 ``component.columns`` 合并后）。
+
+    列的**语义描述**（``semanticKind`` / ``valueType`` / ``deterministicScope``）
+    跟着列一起读；历史定义没有描述时按声明事实补一份（见
+    :func:`_column_value_types`）。
+    """
+    columns: list[dict[str, Any]] = []
+    for item in _merged_columns(region, spec):
+        field_ref = str(item.get("fieldRef") or "").strip()
+        if not field_ref:
+            continue
+        column = {
+            "id": item.get("id"),
+            "label": item.get("label"),
+            "fieldRef": field_ref,
+            "format": item.get("format"),
+        }
+        mode = _display_mode_of(item)
+        if mode != DISPLAY_MODE_SIMULATED:
+            column["displayMode"] = mode
+        binding_kind = str(item.get("bindingKind") or "").strip()
+        if binding_kind:
+            column["bindingKind"] = binding_kind
+        # 已经记着描述就原样带（转换层写的），没记的补一份。
+        description = description_of(item)
+        column.update(description.as_dict())
+        columns.append(column)
     return columns
+
+
+def _column_unit(column: dict[str, Any]) -> str:
+    """列的**有效单位**：声明的单位优先，没有就按显示名**推断量纲**。
+
+    推断走的是通用形态（单位符号 / 计数单位 / 比率后缀），不是按业务词猜。
+    """
+    declared = str(column.get("unit") or "").strip()
+    if not declared:
+        fmt = column.get("format")
+        if isinstance(fmt, dict):
+            declared = str(fmt.get("unitLabel") or "").strip()
+    return describe_simulated_metric(
+        str(column.get("label") or ""), unit=declared
+    ).unit
+
+
+def _metric_matches_column(metric: dict[str, Any], column: dict[str, Any]) -> bool:
+    """这个指标是不是这一列说的那一个。
+
+    判据是**键**（取值键 / 模拟身份 / 显示名），不是「像不像」——
+    目录外的列与目录外的指标靠同一个键对上。
+    """
+    field_ref = str(column.get("fieldRef") or "").strip()
+    label = str(column.get("label") or "").strip()
+    if not field_ref and not label:
+        return False
+    for key in ("metricKey", "simulatedId", "label"):
+        value = str(metric.get(key) or "").strip()
+        if not value:
+            continue
+        if field_ref and value == field_ref:
+            return True
+        if label and value == label:
+            return True
+    return False
+
+
+def _simulated_column_flags(
+    columns: list[dict[str, Any]], metrics: list[dict[str, Any]]
+) -> list[bool]:
+    """每一列是不是**目录外**（模拟）的列。
+
+    目录外的列要**出数值**：用户要的是「这个新指标长什么样」，
+    给一段占位文字不算展示值。判据是**显式标记**：
+
+    1. 列自己标了 ``bindingKind = "simulated"``；
+    2. 这一列对得上一个**目录外指标**（模拟绑定的那一项）。
+
+    目录内的列认不出来时仍然是占位文字（契约表 §3.4 的 ⑤ 级不变）。
+    """
+    simulated_keys: set[str] = set()
+    for item in metrics:
+        if str(item.get("bindingKind") or "") != BINDING_KIND_SIMULATED:
+            continue
+        for key in ("metricKey", "simulatedId", "label"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                simulated_keys.add(value)
+    flags: list[bool] = []
+    for column in columns:
+        if str(column.get("bindingKind") or "") == BINDING_KIND_SIMULATED:
+            flags.append(True)
+            continue
+        field_ref = str(column.get("fieldRef") or "").strip()
+        label = str(column.get("label") or "").strip()
+        flags.append(
+            bool((field_ref and field_ref in simulated_keys)
+                 or (label and label in simulated_keys))
+        )
+    return flags
+
+
+def _is_placeholder_metric(
+    metric: dict[str, Any], columns: list[dict[str, Any]]
+) -> bool:
+    """这个指标是不是**只显示名称**（占位模式）。
+
+    指标自己标了 ``displayMode``，或者它对得上一个占位列 —— 两种都算。
+    """
+    if str(metric.get("displayMode") or "").strip().lower() == DISPLAY_MODE_PLACEHOLDER_ONLY:
+        return True
+    return any(
+        _is_placeholder_only(column) and _metric_matches_column(metric, column)
+        for column in columns
+    )
 
 
 def _row_value(
@@ -1101,8 +1457,13 @@ def _row_value(
     device: dict[str, Any] | None,
     bucket: _Bucket | None,
     hours: float,
+    simulated: bool = False,
+    unit: str = "",
 ) -> Any:
     """一列在一个具体行里的值。"""
+    if simulated:
+        # 目录外的列：**通用示意数值**（口径待确认也要有数）。
+        return _simulated_value(value_kind, unit, seed)
     if value_kind == "device_id":
         return (device or {}).get("deviceId", "")
     if value_kind == "device_name":
@@ -1155,17 +1516,28 @@ def _table_payload(
     buckets: list[_Bucket],
     ctx: _Context,
     seed_scope: str,
+    columns: list[dict[str, Any]] | None = None,
+    metrics: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """表格载荷：按**列名**生成行，列的 fieldRef 一定能读到单元格。"""
-    columns = _columns_of(region, spec)
-    if not columns:
+    """表格载荷：按**列名**生成行，列的 fieldRef 一定能读到单元格。
+
+    - **目录外的列照样出数值**（通用示意值），不跳列、不留空；
+    - **占位模式**的列只显示名称：这一格**不写值**（前端渲染成空格子），
+      列名照常出现在表头。
+    """
+    region_columns = columns if columns is not None else _columns_of(region, spec)
+    if not region_columns:
         raise SimulatedDataError(
             "MISSING_COLUMNS",
             f"区域 {region.get('id')!r} 是表格，但没有声明任何列，无法生成行。",
         )
-    kinds = [
-        _column_value_kind(str(c.get("label") or ""), str(c.get("fieldRef") or ""))
-        for c in columns
+    columns = region_columns
+    kinds = _column_value_types(columns)
+    simulated_flags = _simulated_column_flags(columns, metrics or [])
+    # 每一列的取值计划：值形态、是不是目录外、有效单位。
+    plans = [
+        (column, value_kind, simulated, _column_unit(column))
+        for column, value_kind, simulated in zip(columns, kinds, simulated_flags)
     ]
     has_device = any(k in kinds for k in ("device_name", "device_id", "device_type"))
     has_time = "time" in kinds
@@ -1181,12 +1553,15 @@ def _table_payload(
                 % len(base.devices)
             ] if base.devices else None
             row: dict[str, Any] = {}
-            for column, value_kind in zip(columns, kinds):
+            for column, value_kind, simulated, unit in plans:
+                if _is_placeholder_only(column):
+                    # 占位模式：只显示名称，不出数值。
+                    continue
                 seed = f"alarm/{seed_scope}/{index}/{column['fieldRef']}"
                 if value_kind in ("device_name", "device_id", "device_type") and device:
                     row[column["fieldRef"]] = _row_value(
                         value_kind, seed=seed, device=device, bucket=None,
-                        hours=window_hours,
+                        hours=window_hours, simulated=simulated, unit=unit,
                     )
                 elif value_kind == "time":
                     moment = _moment_in_window(
@@ -1196,57 +1571,67 @@ def _table_payload(
                 else:
                     row[column["fieldRef"]] = _row_value(
                         value_kind, seed=seed, device=device, bucket=None,
-                        hours=window_hours,
+                        hours=window_hours, simulated=simulated, unit=unit,
                     )
             rows.append(row)
     elif kind == KIND_CABINET_STATUS:
         for device in base.devices:
             row = {}
-            for column, value_kind in zip(columns, kinds):
+            for column, value_kind, simulated, unit in plans:
+                if _is_placeholder_only(column):
+                    continue
                 seed = f"cabinet/{seed_scope}/{device['deviceId']}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
                     value_kind, seed=seed, device=device, bucket=None,
-                    hours=window_hours,
+                    hours=window_hours, simulated=simulated, unit=unit,
                 )
             rows.append(row)
     elif has_device:
         for device in base.devices:
             row = {}
-            for column, value_kind in zip(columns, kinds):
+            for column, value_kind, simulated, unit in plans:
+                if _is_placeholder_only(column):
+                    continue
                 seed = f"device/{seed_scope}/{device['deviceId']}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
                     value_kind, seed=seed, device=device, bucket=None,
-                    hours=window_hours,
+                    hours=window_hours, simulated=simulated, unit=unit,
                 )
             rows.append(row)
     elif has_time and has_energy:
         for bucket in buckets:
             row = {}
-            for column, value_kind in zip(columns, kinds):
+            for column, value_kind, simulated, unit in plans:
+                if _is_placeholder_only(column):
+                    continue
                 seed = f"trend/{seed_scope}/{bucket.start.isoformat()}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
                     value_kind, seed=seed, device=None, bucket=bucket,
-                    hours=window_hours,
+                    hours=window_hours, simulated=simulated, unit=unit,
                 )
             rows.append(row)
     elif has_time:
         for bucket in buckets:
             row = {}
-            for column, value_kind in zip(columns, kinds):
+            for column, value_kind, simulated, unit in plans:
+                if _is_placeholder_only(column):
+                    continue
                 seed = f"series/{seed_scope}/{bucket.start.isoformat()}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
                     value_kind, seed=seed, device=None, bucket=bucket,
-                    hours=window_hours,
+                    hours=window_hours, simulated=simulated, unit=unit,
                 )
             rows.append(row)
     else:
         for device in base.devices:
             row = {}
-            for column, value_kind in zip(columns, kinds):
+            for column, value_kind, simulated, unit in plans:
+                if _is_placeholder_only(column):
+                    continue
                 seed = f"generic/{seed_scope}/{device['deviceId']}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
                     value_kind, seed=seed, device=device, bucket=None,
-                    hours=window_hours,
+                    hours=window_hours, simulated=simulated, unit=unit,
                 )
             rows.append(row)
 
@@ -1381,8 +1766,21 @@ def _chart_payload(
         names = [d["deviceName"] for d in base.devices]
         return names, values, _y_field_for(metric_kind), names
 
-    primary = metrics[0] if metrics else {"kind": kind, "metricKey": kind, "label": region.get("name")}
-    x_labels, y_values, y_field, x_values = _series_for(primary["kind"])
+    # 占位模式的指标**不产生数据点**（整列不进 series）。
+    visible = [item for item in metrics if not item.get("placeholderOnly")]
+    primary = (
+        visible[0]
+        if visible
+        else {"kind": kind, "metricKey": kind, "label": region.get("name")}
+    )
+    if visible:
+        x_labels, y_values, y_field, x_values = _series_for(primary["kind"])
+    else:
+        # 全是占位：仍然给一份**合法**的载荷（没有点，不报错）。
+        x_labels = _axis_labels(buckets, grain, multi_day)
+        y_values = []
+        y_field = _y_field_for(kind)
+        x_values = []
     if declared_y and y_field == "value":
         # 量身份认不出来时，认定义里声明的纵轴字段。
         y_field = declared_y
@@ -1396,7 +1794,7 @@ def _chart_payload(
     ]
 
     # 单位：规格要求数值型组件自带单位，前端从载荷读，不硬编码。
-    units = _chart_units(spec, kind, metrics)
+    units = _chart_units(spec, kind, visible or metrics)
     unit = units[0] if units else ""
     if not unit:
         # 量身份认不出来时，按纵轴字段反推（energyKwh→kWh …）。
@@ -1413,9 +1811,9 @@ def _chart_payload(
         "points": points,
         "dataSource": "simulated",
     }
-    if len(metrics) > 1:
+    if len(visible) > 1:
         series = []
-        for index, item in enumerate(metrics):
+        for index, item in enumerate(visible):
             labels, values, field, x_values = _series_for(item["kind"])
             series_unit = units[index] if index < len(units) else ""
             if not series_unit:
@@ -1507,6 +1905,58 @@ def _text_payload(
 # ---------------------------------------------------------------- 公开入口
 
 
+def _source_mode_of_region(region: dict[str, Any], definition_mode: SourceMode) -> SourceMode:
+    """这一个区域的来源模式：区域级记录优先，没记录就用定义级。
+
+    区域级与定义级**不一致**是校验层的失败项（契约表 §1.4）—— 造数这一层
+    不改写谁的值，只按服务端记录的那一份来标。
+    """
+    region_mode = source_mode_of_region(region)
+    return region_mode if region_mode.recorded else definition_mode
+
+
+def _generate_user_json_payloads(
+    definition: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """用户 JSON 模式的载荷：用**完整已校验数据**渲染。
+
+    数据从**已保存的原始输入**里取（生效组合绑定的那一版），
+    不用模型看到的样本，也不重新随机选图（规格第 22 / 43 / 48 条）。
+
+    没有绑定输入、或绑定的输入找不到了 → **明确失败**，
+    不拿模拟数字冒充用户的真实数据（规格第 49 条）。
+    """
+    from app.services.effective_combination import combination_of_definition
+    from app.services.json_payload_service import build_user_json_payloads
+    from app.services.user_json_service import user_json_service
+
+    combination = combination_of_definition(definition)
+    input_id = combination.get("inputId")
+    input_version = combination.get("inputVersion")
+    if not input_id or input_version is None:
+        raise SimulatedDataError(
+            "JSON_INPUT_MISSING",
+            "这份报表声明使用用户 JSON 数据，但没有绑定输入记录。",
+        )
+    record = user_json_service.get(str(input_id), int(input_version))
+    if record is None:
+        raise SimulatedDataError(
+            "JSON_INPUT_MISSING",
+            "绑定的用户 JSON 输入记录不存在，无法渲染。",
+        )
+    rows = user_json_service.rows_of(record)
+    # 全局数据问题（`metadata.jsonInputIssues.dataIssues`）**不进区域载荷** ——
+    # 它由报表面板顶部渲染一次；塞进每块板的 notes 就是同一句话说 N 遍。
+    payloads = build_user_json_payloads(
+        definition=definition,
+        rows=rows,
+        combination=combination,
+    )
+    for payload in payloads.values():
+        payload[SOURCE_MODE_KEY] = SOURCE_MODE_USER_JSON
+    return payloads
+
+
 def generate_simulated_data(
     definition: dict[str, Any], preview_context: dict[str, Any]
 ) -> dict[str, dict[str, Any]]:
@@ -1532,6 +1982,12 @@ def generate_simulated_data(
             "INVALID_DEFINITION", "报表定义缺少 regions 列表。"
         )
 
+    definition_mode = source_mode_of_definition(definition)
+    if definition_mode.is_user_json:
+        # 用户 JSON 模式：数字来自用户粘贴并经服务端校验的数据，
+        # 不是造数器编出来的示例值（ADR 0004 §8）。
+        return _generate_user_json_payloads(definition)
+
     ctx = _build_context(definition, preview_context)
     base = _build_base(definition, ctx)
     room_name = resolve_room_name(room_id_of_definition(definition))
@@ -1556,7 +2012,9 @@ def generate_simulated_data(
         ctype = str(component.get("type") or "")
         spec = _preview_spec(region)
         kind = _resolve_kind(region, spec)
-        metrics = _resolve_metrics(region, spec, kind)
+        # 列先算一遍：指标清单（目录外指标）与表格 / 图表都用同一份列。
+        columns = _columns_of(region, spec)
+        metrics = _resolve_metrics(region, spec, kind, columns=columns)
         # 区域级种子材料：报表级种子 + 区域标识。
         seed_scope = ctx.region_seed_scope(region_id)
         region_grain = _region_grain(region) or ctx.grain
@@ -1575,7 +2033,7 @@ def generate_simulated_data(
         elif ctype == "TABLE":
             payload = _table_payload(
                 region, spec, kind, base=base, buckets=region_buckets, ctx=ctx,
-                seed_scope=seed_scope,
+                seed_scope=seed_scope, columns=columns, metrics=metrics,
             )
         elif ctype == "CHART":
             payload = _chart_payload(
@@ -1594,5 +2052,10 @@ def generate_simulated_data(
                 "UNSUPPORTED_COMPONENT",
                 f"区域 {region_id!r} 的组件类型 {ctype!r} 无法生成模拟数据。",
             )
+        # 来源模式随载荷带出去（契约表 §1.1：``regions[].payload.sourceMode``）。
+        #
+        # 区域级记录优先，没记录就用定义级 —— 一份报表不混两种来源的数字，
+        # 真混了由校验层拦（``validation_service`` 的来源模式一致性规则）。
+        payload[SOURCE_MODE_KEY] = _source_mode_of_region(region, definition_mode).mode
         result[region_id] = payload
     return result

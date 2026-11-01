@@ -16,9 +16,30 @@
 """
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol, TypedDict, runtime_checkable
+
+
+#: 方案版本记录的 ID 前缀。与方案 id（``rplan_``）、修改计划 id（``plan_``）
+#: 刻意分开：光看标识就知道是哪一层的东西。
+PLAN_VERSION_ID_PREFIX = "planver_"
+
+
+def plan_version_id(session_id: str, plan_id: str, plan_revision: int) -> str:
+    """版本记录的**稳定 ID**：同一版方案永远是同一个 ID。
+
+    从「会话 + 方案 + 版本」派生，不靠随机数：老会话按实际存储恢复出来的
+    那一版，ID 跟当初存过的那一版对得上；重复提交同一版也得到同一个 ID，
+    因此**不会重复追加**。
+
+    格式：``planver_<12 位十六进制>``。
+    """
+    digest = hashlib.sha256(
+        f"{session_id}|{plan_id}|{plan_revision}".encode("utf-8")
+    ).hexdigest()
+    return f"{PLAN_VERSION_ID_PREFIX}{digest[:12]}"
 
 
 # ---------- 设计阶段 ----------
@@ -150,6 +171,41 @@ class PhaseResetResult(TypedDict, total=False):
     changed: bool
 
 
+class PlanVersionRecord(TypedDict, total=False):
+    """一条**方案版本记录**（工单 #63）。
+
+    以前方案是「整份覆盖」写进 ``report_design_sessions.plan_json`` 的：
+    旧版正文只残留在历史消息的响应载荷里，既查不到也还原不回来。
+    这条记录把**每一版**单独存一份：
+
+    - ``versionId``：版本的稳定 ID（同一版永远是同一个）。
+    - ``planId`` / ``planRevision``：这一版是哪个方案的哪个版本。
+    - ``reportPlan``：这一版的**正文**（纯方案结构，不含模拟载荷）。
+    - ``operationId``：这一版是**哪次操作**提交上来的（操作标识）。
+    - ``sequence``：同一会话里的真实保存顺序（从 1 起递增）。
+    - ``createdAt``：这一版落库的时间。
+
+    存储层只填前面这些；下面三个标记由服务层读时算出来：
+
+    - ``recovered``：这一版是从会话当前方案里**恢复**出来的（老会话没有
+      版本历史时才有，**不伪造**过去的版本）。
+    - ``isCurrent``：这一版是不是会话当前方案。
+    - ``confirmed``：这一版是不是已经被确认过（既有确认边界，#63 不改）。
+    """
+
+    versionId: str
+    sessionId: str
+    planId: str
+    planRevision: int
+    operationId: str | None
+    sequence: int
+    reportPlan: dict[str, Any] | None
+    createdAt: str
+    recovered: bool
+    isCurrent: bool
+    confirmed: bool
+
+
 # write_turn：协调者注入的同事务消息 / 会话写入回调。
 # 回调拿到的是本模块正在使用的那条连接，自己不 commit。
 WriteTurn = Callable[[sqlite3.Connection], Any]
@@ -213,6 +269,24 @@ class ReportDesignRepository(Protocol):
         上一成功方案保留。结果区分 committed / conflict。
         """
 
+    def list_plan_versions(self, session_id: str) -> list[PlanVersionRecord]:
+        """按**真实保存顺序**返回会话里已存的方案版本记录。
+
+        只返回真正存下来的版本记录（工单 #63）。老会话没有版本历史时
+        返回空列表 —— 由服务层按实际存储恢复可用方案，**不伪造**过去的版本。
+
+        顺序按同一会话里的保存序号（``sequence``）排，不按时间戳排：
+        时间戳只到秒，两版可能同秒。
+        """
+
+    def find_plan_operation(
+        self, session_id: str, plan_id: str, plan_revision: int
+    ) -> str | None:
+        """查某一版方案是**哪次操作**提交上来的（操作标识）。
+
+        查不到就返回 None（老数据没有操作记录时不猜）。
+        """
+
     def commit_clarification(
         self,
         operation_id: str,
@@ -230,7 +304,8 @@ class ReportDesignRepository(Protocol):
             - 不把操作记成 FAILED —— 那是技术失败的语义，
               会让界面显示成「出错了」，而追问是正常的一轮；
             - 操作记成 SUCCEEDED 且不关联任何方案版本，
-              这样同一条消息重发时能被认出「已经问过了」。
+              这样同一条消息重发时能被认出「已经问过了」；
+            - **不产生方案版本记录**（工单 #63）：澄清不是一次提交。
 
         同样与 write_turn 回调同事务提交。
         """

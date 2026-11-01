@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 from .change_set import ChangeSet
 from .report_definition import ReportDefinitionDraft
@@ -28,6 +28,70 @@ ADVANCE_MESSAGE = "__advance__"
 # 不能只看 state 就再推一次。
 TURN_KIND_ACTION = "action"
 TURN_KIND_QUERY_ANSWER = "query_answer"
+
+
+# --------------------------------------------------------------------------
+# 输入锁范围（契约表 §5「有效菜单与输入锁」）
+# --------------------------------------------------------------------------
+#
+#   none            不锁
+#   menu_only       只锁下拉框与快捷入口；输入框与发送按钮保持可用
+#   input_and_menu  输入框 + 发送按钮 + Enter + 快捷入口 + 下拉框全锁
+#
+# 权威落点是 ``sessions.pending_choice.question.lockScope`` —— 既有列里的
+# **新增键**，不另开表、不另开列（契约表 §5.1、§5.3）。
+LOCK_SCOPE_NONE = "none"
+LOCK_SCOPE_MENU_ONLY = "menu_only"
+LOCK_SCOPE_INPUT_AND_MENU = "input_and_menu"
+LOCK_SCOPES = (LOCK_SCOPE_NONE, LOCK_SCOPE_MENU_ONLY, LOCK_SCOPE_INPUT_AND_MENU)
+
+# 「模板已生成、等待下一步操作选择」这一阶段的菜单身份（契约表 §5.2）。
+LOCKED_INPUT_MENU_QUESTION_ID = "template_edit_confirm"
+LOCKED_INPUT_MENU_PROMPT = "请选择下一步操作："
+# 「待确认修改计划」这一阶段的菜单身份（契约表 §5.2）。
+PENDING_EDIT_MENU_QUESTION_ID = "pending_edit_plan_confirm"
+
+# --------------------------------------------------------------------------
+# 方案版本身份（契约表 §4.1.2，工单 #66）
+# --------------------------------------------------------------------------
+#
+# 「本次响应带的是哪一版方案」的稳定 ID 落在 ``AgentResponse.debug`` 的
+# 这个键上。
+#
+# 为什么落在 ``debug`` 而不是 ``domainObjects.reportPlan``：
+#
+#   - ``debug`` 是**既有字段**，往里加一个键不新增顶层字段、不改
+#     ``AGENT_PROTOCOL_VERSION``（工单 #66 的硬边界）；
+#   - ``domainObjects.reportPlan`` 是**方案正文**，而方案结构是**字段封闭**
+#     的（``ReportPlan`` 用 ``extra="forbid"``）—— 往正文里塞一个不是方案
+#     字段的键，等于悄悄改了方案契约；
+#   - ``debug`` 里本来就并排放着 ``planId`` / ``planRevision``
+#     （设计流程的方案就绪响应），版本 ID 放在它们旁边是同一口径。
+#
+# 这个 ID 与版本序列里的 ``versionId`` **同源同值**（都从「会话 + 方案 +
+# 版本」派生），所以前端拿响应里的 ID 与恢复出来的版本序列直接比就行。
+PLAN_VERSION_ID_KEY = "planVersionId"
+
+
+def derive_lock_scope(question_id: str, prompt: str, options: Any = None) -> str:
+    """按契约表 §5.2 的阶段判据推出输入锁范围。
+
+    判据只看**服务端当前这一份有效菜单**的身份，不看历史消息：
+
+    - **有待答选项**（``options`` 非空）→ 锁输入（``input_and_menu``）：
+      用户得先从这张卡片里选一个，输入框、发送按钮、Enter 与快捷入口
+      一起锁住；
+    - **没有选项**（纯文本题 / 说明题）→ 只锁菜单，不锁输入。
+
+    判据的落点是**服务端当前这一份有效菜单**，不是历史消息 ——
+    菜单被答掉之后就不再锁。
+
+    显式指定优先：调用方写了 ``lockScope`` 就不推导（见
+    ``AgentQuestion._derive_lock_scope``）。
+    """
+    if options:
+        return LOCK_SCOPE_INPUT_AND_MENU
+    return LOCK_SCOPE_MENU_ONLY
 
 
 class AgentState(str, Enum):
@@ -233,6 +297,66 @@ class AgentQuestion(BaseModel):
     relatesTo: str | None = None
     selectionOnly: bool = False
     allowRestart: bool = False
+    # 输入锁范围（契约表 §5.1）。缺省按 "menu_only" 处理。
+    lockScope: str = LOCK_SCOPE_MENU_ONLY
+
+    # ---------- 「其他」自由文本（卡片内纠错入口） ----------
+    #
+    # ``allowsOther=True`` 时，这张卡片除了选项列表，还提供**一个**「其他」
+    # 项与一个**卡片内**的文本输入框。用户在里面写的内容按**这张卡片的
+    # 答案（纠正）**处理 —— 承接上文的同一个待办，不是另一条无关消息。
+    #
+    # 「其他」**不是**选项列表里的一个普通 value：选了「其他」却没填内容
+    # 等于没回答。前端按 ``allowsOther`` 渲染「其他」这一项与输入框。
+    allowsOther: bool = False
+    #: 「其他」这一项的显示文案。
+    otherLabel: str = "其他"
+    #: 卡片内输入框的提示文案（可空）。
+    otherPlaceholder: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_lock_scope(cls, data: Any) -> Any:
+        """没给 lockScope 时，按契约表 §5.2 的阶段判据推导。
+
+        为什么放在模型里推导：同一份菜单对象**既要进响应、又要进
+        ``sessions.pending_choice``**（契约表 §5.3「同一个菜单对象既有响应
+        又有落库副本，不允许两处各拼一份」）。推导放在模型里，两份副本
+        天然一致 —— 生产者（设计服务、编辑服务）不必各写一遍。
+
+        调用方**显式**给了 lockScope 时不推导：
+
+        - 存量的老记录没有这个键 → 按 "menu_only" 处理（契约表 §5.3
+          「旧数据的默认行为」），由读回菜单的那一处显式补上；
+        - 「已选继续调整 / 修改」这类明确不锁的场景 → 写 "none"。
+
+        判据本身：**有待答选项就锁输入**，没有选项就只锁菜单。
+        """
+        if isinstance(data, dict) and "lockScope" not in data:
+            derived = derive_lock_scope(
+                str(data.get("id") or ""),
+                str(data.get("prompt") or ""),
+                data.get("options"),
+            )
+            if derived != LOCK_SCOPE_MENU_ONLY:
+                return {**data, "lockScope": derived}
+        return data
+
+    @field_validator("lockScope", mode="before")
+    @classmethod
+    def _normalize_lock_scope(cls, value: Any) -> str:
+        """非法取值归一成 ``"menu_only"``（契约表 §5.3 的旧数据默认行为）。
+
+        契约表 §5.1 把取值域定死为三个，但服务端**不保证**生产者的写入一定合法
+        （手改的库、旧数据、外部写入都可能带进第四个值）。读回时统一归一，
+        免得前后端对同一份坏数据给出**不同的锁**——前端的 ``lockScopeOf``
+        对认不出的值本来就兜底成 ``menu_only``，这里与它保持同一口径。
+
+        归一后**不锁输入**，是三个合法取值里最弱的一档；真正的安全边界在
+        后端对确认与权限的校验（契约表 §8 不变量 6：锁只是引导）。
+        """
+        text = str(value or "").strip()
+        return text if text in LOCK_SCOPES else LOCK_SCOPE_MENU_ONLY
 
 
 class AgentBlock(BaseModel):
@@ -308,6 +432,20 @@ class AgentResponse(BaseModel):
     def isQueryAnswer(self) -> bool:
         """本轮是不是只读查询回答（不推进业务）。"""
         return self.turnKind == TURN_KIND_QUERY_ANSWER
+
+    @property
+    def planVersionId(self) -> str | None:
+        """本轮响应带出的方案版本稳定 ID（工单 #66）。
+
+        没有带方案的那一轮返回 None。前端按它去重：重复响应、乱序
+        响应与重连不重复追加同一份方案。
+
+        它是读出来的便捷视图，不是协议字段 —— 真正的落点是
+        debug.planVersionId（见 PLAN_VERSION_ID_KEY）。
+        """
+        value = (self.debug or {}).get(PLAN_VERSION_ID_KEY)
+        text = str(value).strip() if value else ""
+        return text or None
 
     @property
     def turnPersisted(self) -> bool:

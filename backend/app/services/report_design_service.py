@@ -37,7 +37,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from app.agents.report_plan_agent import (
     KIND_CLARIFICATION,
@@ -48,6 +48,7 @@ from app.agents.report_plan_agent import (
 from app.schemas.agent import (
     DESIGN_ACTION_CONFIRM_PLAN,
     DESIGN_ACTION_CONFIRM_TEMPLATE,
+    LOCK_SCOPE_MENU_ONLY,
     AgentError,
     AgentQuestion,
     AgentRequest,
@@ -81,6 +82,18 @@ from app.services.preview_service import (
 )
 from app.services.simulated_data_service import SimulatedDataError
 from app.services.template_definition_service import build_template_definition
+from app.services.data_source_mode import (
+    SOURCE_MODE_KEY,
+    SOURCE_MODE_USER_JSON,
+    SourceMode,
+    resolve_source_mode,
+    source_mode_of_definition,
+)
+from app.services.report_log_safety import (
+    log_failure,
+    log_warning,
+    safe_reason,
+)
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.services.session_context import current_session_key
 from app.services.session_service import session_service
@@ -115,6 +128,32 @@ UI_ACTION_PLAN_CONFIRM_PENDING = "plan_confirm_pending"
 UI_ACTION_PLAN_RETRY = "plan_retry"
 #: 模板已就绪。刻意与旧的确认报表动作分开。
 UI_ACTION_TEMPLATE_READY = "template_ready"
+
+# --------------------------------------------------------------------------
+# 文字阶段的追问卡片
+# --------------------------------------------------------------------------
+#
+# 「有把握就生成，没把握就追问」：追问**不只是一句话**，还要给用户能直接
+# 点的选项，外加一个「其他」—— 用户随时可以自己说，不被这几个选项框住。
+#
+# 选项的内容由**领域层**给（``report_plan_service`` 解析出来的那几个具体
+# 候选：指哪一块板块 / 这张表展示什么），这里只负责把它变成一张卡片。
+#
+# 「其他」那三个字段（``allowsOther`` / ``otherLabel`` /
+# ``otherPlaceholder``）的**形状已冻结**，由编辑编排那条线在
+# ``AgentQuestion`` 上加；这里按冻结形状传，传了就是那三个值。
+# --------------------------------------------------------------------------
+
+#: 文字阶段追问卡片的 id。
+CLARIFICATION_QUESTION_ID = "plan_clarification"
+
+#: 「其他」那一项的显示名。
+CLARIFICATION_OTHER_LABEL = "其他"
+
+#: 「其他」那一项的输入提示：说清楚**要什么**，不是内部字段。
+CLARIFICATION_OTHER_PLACEHOLDER = (
+    "写下你要的展示内容（例如：按设备、按天、最近 7 天）"
+)
 
 
 # --------------------------------------------------------------------------
@@ -233,11 +272,19 @@ _VERSION_PATTERN = re.compile(r"第\d+版")
 
 
 def _reason_text(exc: Exception) -> str:
-    """异常的可读原因，**原样**透传给用户。
+    """异常的可读原因，**原样**透传。
 
     不做二次概括、不截断：下游（方案契约层、模板层）已经把「哪个板块
     出了什么事」写进异常消息里了，这里再概括一次等于把可定位的信息
     丢掉。截断尤其危险 —— 板块名往往在消息末尾。
+
+    **只用在领域校验这条路上**（``_plan_contract_error``）：那里抛的是
+    我们自己写的契约错误，消息由我们拼、板块标识是结构化的。
+
+    **上游异常不再用它**（工单 #64 F3bis）：上游异常原文可能带用户数据
+    （用户 JSON 里的字段值、用户名、路径），用户可见的回复里不许出现
+    原文 —— 那一类路径改用 :func:`_safe_failure_reason`（只给能行动的
+    提示）与 :func:`safe_reason`（只给类型名，进日志与操作记录）。
     """
     message = str(exc).strip()
     return message or exc.__class__.__name__
@@ -258,10 +305,173 @@ def _definition_dict(
     return None
 
 
-def _plan_contract_error(sections: Any) -> str | None:
+def _clarification_question(
+    question: str, *, options: Sequence[str] = ()
+) -> AgentQuestion:
+    """文字阶段的**追问卡片**。
+
+    - **选项是用户直接能懂的**：指哪一块板块 / 这张表展示什么 —— 由领域层
+      解析出来，不是内部编号、不是规则 ID、不是一份泛化计划；
+    - **带「其他」**：用户随时可以自己说，不被这几个选项框住
+      （``allowsOther`` / ``otherLabel`` / ``otherPlaceholder`` 的形状已冻结，
+      由编辑编排那条线在 ``AgentQuestion`` 上加）；
+    - **不锁输入**（``lockScope = menu_only``）：追问本来就允许自由作答 ——
+      那句问话常常还写着「说清楚列名就行」，锁住输入框就自相矛盾了。
+      锁只是引导，真正的边界在后端对确认与权限的校验。
+    """
+    values: list[str] = []
+    for item in options or ():
+        text = str(item or "").strip()
+        if text and text not in values:
+            values.append(text)
+    return AgentQuestion(
+        id=CLARIFICATION_QUESTION_ID,
+        prompt=question,
+        expects="SINGLE_CHOICE",
+        options=[{"value": value, "label": value} for value in values],
+        selectionOnly=False,
+        lockScope=LOCK_SCOPE_MENU_ONLY,
+        allowsOther=True,
+        otherLabel=CLARIFICATION_OTHER_LABEL,
+        otherPlaceholder=CLARIFICATION_OTHER_PLACEHOLDER,
+    )
+
+
+# --------------------------------------------------------------------------
+# 来源模式口径（工单 #64 F3）
+#
+# 右侧那块画的是什么，取决于**服务端记录的来源模式**（契约表 §4.3）：
+#
+# - 模拟示例（simulated）：系统按固定种子造的示例业务数据（ADR 0004）。
+#   只说明当前模拟展示，不承诺未来接入真实数据。
+# - 用户 JSON（user_json）：用户自己提供的数据，**未经业务核验**。
+#   这里**不说**「模拟业务数据」—— 那是事实性错误（画的是用户自己的
+#   数据，不是造出来的）；也**不说**「接入真实数据后会自动替换」/
+#   「已接上真实数据」—— 那同样是不存在的事实。
+# --------------------------------------------------------------------------
+
+#: 右侧渲染口径只描述当前草稿的模拟示意。
+_RENDER_NOTE_SIMULATED = (
+    "右侧这份报表用系统生成的**模拟业务数据**渲染，是用来核对版式的"
+    "全虚拟示意；只有明确要求名称占位的指标只显示名称、不出数值。"
+)
+
+#: 右侧渲染口径 —— 用户 JSON。用户自己的数据，**未经业务核验**。
+_RENDER_NOTE_USER_JSON = (
+    "右侧这份报表用你提交的 JSON 渲染：用户提供的数据，未经业务核验。"
+)
+
+#: 「出了数」的措辞 —— 模拟示例（既有文案，逐字不改）。
+_NUMBERS_NOTE_SIMULATED = "已绑定指标并出了示意数值"
+
+#: 「出了数」的措辞 —— 用户 JSON（数值来自用户自己的数据，不是示意）。
+_NUMBERS_NOTE_USER_JSON = "已绑定指标并出了数值"
+
+#: 渲染没成功的措辞 —— 模拟示例（既有文案，逐字不改）。
+_RENDER_FAILED_SIMULATED = "示意数据没有生成出来"
+
+#: 渲染没成功的措辞 —— 用户 JSON（用户自己的数据没渲染出来）。
+_RENDER_FAILED_USER_JSON = "数据没有渲染出来"
+
+
+def _session_has_user_json() -> bool:
+    """当前会话有没有提交过用户 JSON 输入。
+
+    判据与定义层（``template_definition_service``）**一致**：会话里最新
+    一版输入记录存在就算有。**只看有没有这条记录，不读原文**。
+
+    读不到（存储没就绪 / 会话没绑定）→ 按「没有」处理：宁可说模拟，
+    也不把用户的数据说成别的来源。
+    """
+    try:
+        from app.services.user_json_service import user_json_service
+    except Exception:  # noqa: BLE001
+        return False
+    session_id = current_session_key()
+    if not session_id:
+        return False
+    try:
+        return user_json_service.latest_for_session(session_id) is not None
+    except Exception:  # noqa: BLE001
+        log_warning(logger, "[report_design] 读会话 JSON 输入记录失败")
+        return False
+
+
+def _reply_source_mode(
+    *,
+    definition: Any = None,
+    plan: Mapping[str, Any] | None = None,
+) -> SourceMode:
+    """回复口径用的来源模式。
+
+    判定顺序与定义层（``template_definition_service``）**一致**：
+
+    1. 定义里服务端**记录**的来源模式（``metadata.sourceMode``）；
+    2. 方案里记录的 ``sourceMode``；
+    3. 当前会话提交过的用户 JSON（会话里有输入记录 → 用户 JSON 模式）；
+    4. 默认口径（模拟示例）。
+
+    **不猜**：认不出来的记录值一律走默认口径 —— 宁可说模拟，也不把
+    用户的数据说成别的来源。
+    """
+    if definition is not None:
+        mode = source_mode_of_definition(_definition_dict(definition))
+        if mode.recorded:
+            return mode
+    if plan:
+        declared = resolve_source_mode(plan.get(SOURCE_MODE_KEY))
+        if declared.recorded:
+            return declared
+    if _session_has_user_json():
+        return resolve_source_mode(SOURCE_MODE_USER_JSON)
+    return resolve_source_mode(None)
+
+
+def _render_note(mode: SourceMode) -> str:
+    """右侧那块是用什么数据渲染的（按来源模式分别说）。"""
+    return _RENDER_NOTE_USER_JSON if mode.is_user_json else _RENDER_NOTE_SIMULATED
+
+
+def _numbers_note(mode: SourceMode) -> str:
+    """「出了数」的说法（按来源模式分别说）。"""
+    return _NUMBERS_NOTE_USER_JSON if mode.is_user_json else _NUMBERS_NOTE_SIMULATED
+
+
+def _render_failed_note(mode: SourceMode) -> str:
+    """渲染没成功的说法（按来源模式分别说）。"""
+    return _RENDER_FAILED_USER_JSON if mode.is_user_json else _RENDER_FAILED_SIMULATED
+
+
+def _safe_failure_reason(exc: BaseException) -> str:
+    """失败原因里**可以**给用户看的部分（没有就空串）。
+
+    只认**我们自己写的、带结构化板块标识**的领域契约错误：板块序号与
+    标题是模型方案的结构（方案卡片上用户本来就能看到），说清楚「是哪
+    一块出了问题」用户才能动手改。
+
+    **异常原文一律不给**（工单 #64 F3bis）：上游异常文本可能带用户数据
+    （用户 JSON 里的字段值、用户名、路径）。原因类型留在日志里
+    （:func:`safe_reason` / :func:`log_failure`）。
+    """
+    if not isinstance(exc, PlanContractError):
+        return ""
+    index = getattr(exc, "section_index", None)
+    title = getattr(exc, "section_title", None)
+    label = "".join(
+        part
+        for part in (
+            f"板块 {index + 1}" if isinstance(index, int) else "",
+            f"「{title}」" if title else "",
+        )
+        if part
+    )
+    return f"{label}不符合方案契约" if label else ""
+
+
+def _plan_contract_error(sections: Any) -> PlanContractError | None:
     """检查方案板块的契约（组件类型 + 取数板块的指标意图）。
 
-    返回可读原因（点名板块）；合法时返回 ``None``。
+    返回**异常对象**（合法时返回 ``None``）。
 
     这是**确认前的最后一道关**，也是「方案落库前」的兜底：模型适配层与
     领域层已经各有一道校验，这里再挡一次，是为了拦住绕过那两层的路径
@@ -269,6 +479,11 @@ def _plan_contract_error(sections: Any) -> str | None:
 
     判据直接调用方案契约层的 ``validate_section_contract`` —— 编排层
     **不保留第二份实现**，否则两份判据会漂移。
+
+    返回对象而不是字符串，是为了让调用方能拿到**结构化**的板块标识
+    （序号 + id）：契约错误的消息里带着**模型写的板块标题**，可能夹带
+    用户原话 —— 日志只记序号与 id（#61 AC#1），给用户看的那句仍是
+    原样透传（:func:`_reason_text`）。
     """
     if not isinstance(sections, list):
         return None
@@ -276,7 +491,7 @@ def _plan_contract_error(sections: Any) -> str | None:
         try:
             validate_section_contract(section, index=index)
         except PlanContractError as exc:
-            return _reason_text(exc)
+            return exc
     return None
 
 
@@ -486,8 +701,12 @@ class ReportDesignService:
         """读会话的设计状态；没进过设计流程返回 None。"""
         try:
             return self.repository.load(self.session_key(request))
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读设计状态失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读设计状态失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
 
     def is_new_build(self, request: AgentRequest) -> bool:
@@ -513,8 +732,12 @@ class ReportDesignService:
         session_key = self.session_key(request)
         try:
             existing = session_service.repository.get_session(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读会话失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读会话失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return False
         if existing is None:
             return True
@@ -751,15 +974,18 @@ class ReportDesignService:
             draft = build_template_definition(template, plan, request.context.subjectId)
             title = template.get("title") or plan.get("topic") or "报表"
             plan_revision = template.get("planRevision") or plan.get("revision")
+            # 右侧那块画的是什么，按**服务端记录的来源模式**说（工单 #64 F3）：
+            # 用户 JSON 模式画的是用户自己的数据，不是模拟业务数据。
+            mode = _reply_source_mode(definition=draft, plan=plan)
             response = AgentResponse(
                 conversationId=request.conversationId, state=AgentState.WAITING_USER_CONFIRM,
                 designSessionId=request.context.designSessionId,
                 designPhase=DESIGN_PHASE_DRAFT_READY,
                 reply=(
                     f"已按第 {plan_revision} 版方案「{title}」生成报表草稿。"
-                    "右侧这份报表用系统生成的**模拟业务数据**渲染，是用来核对版式的"
-                    "示意，接入真实数据后会自动替换。"
-                    "请确认草稿后继续校验、试运行；尚未接通的指标会标注「能力待接通」。"
+                    f"{_render_note(mode)}"
+                    "请确认草稿后继续校验、试运行。"
+                    + ("尚未接通的指标会标注「能力待接通」。" if mode.is_user_json else "")
                 ),
                 domainObjects=AgentResponseDomainObjects(
                     reportDefinitionDraft=draft, reportPolicyDraft=build_policy_draft(template["title"]),
@@ -768,6 +994,7 @@ class ReportDesignService:
                 questions=[AgentQuestion(
                     id="template_edit_confirm", prompt="请选择下一步操作：", expects="SINGLE_CHOICE",
                     selectionOnly=True, options=[{"value": v, "label": v} for v in ("同意", "修改", "重新开始")],
+                    allowsOther=True, otherLabel="其他", otherPlaceholder="直接输入修改要求",
                 )],
                 uiActions=["confirm_framework", "draft_ready"],
             )
@@ -801,15 +1028,21 @@ class ReportDesignService:
             return self._failure_response(request, self.load_state(request), code="TEMPLATE_REVISION_CONFLICT",
                                           message="模板已变化，本次没有覆盖它，请刷新后重试。")
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[report_design] 模板确认失败")
+            # 日志只记**原因类型**与调用栈，不记异常原文（#61）：上游异常
+            # 文本可能带用户数据（用户 JSON 里的字段值、用户名、路径）。
+            log_failure(logger, "[report_design] 模板确认失败", exc)
             if operation_id:
-                self._fail_operation(operation_id, "TEMPLATE_CONFIRM_FAILED", _reason_text(exc))
-            # 失败原因**原样**透传：下游已经写清了「哪个板块出了什么事」，
-            # 这里再概括成一句通用文案就把可定位的信息丢掉了。
+                self._fail_operation(
+                    operation_id, "TEMPLATE_CONFIRM_FAILED", safe_reason(exc)
+                )
+            # 用户可见的回复**不带异常原文**（#61）：给的是能行动的提示。
+            # 可定位的原因留在日志（原因类型 + 调用栈）与操作记录里。
+            reason = _safe_failure_reason(exc)
             return self._failure_response(request, state, code="TEMPLATE_CONFIRM_FAILED",
                                           message=(
-                                              f"模板未能安全转换为草稿：{_reason_text(exc)}"
-                                              "当前模板保持原样，请修改方案或重试。"
+                                              "模板未能安全转换为草稿，"
+                                              + (f"{reason}，" if reason else "")
+                                              + "当前模板保持原样，请修改方案或重试。"
                                           ))
 
     def restart_design(
@@ -864,8 +1097,12 @@ class ReportDesignService:
             self.repository.reset_design_phase(
                 self.session_key(request), write_restart
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 阶段复位失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 阶段复位失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return self._failure_response(
                 request,
                 state,
@@ -939,8 +1176,9 @@ class ReportDesignService:
             - **逐区域标注能力**：按方案声明的组件类型逐板块标注量身份、
               单位与列；当前能力算不出来的板块标成「能力待接通」并写明
               原因（能力待接通 / 口径待核实 / 统计对象不在授权范围内）——
-              草稿阶段一律用**模拟业务
-              数据**渲染，不留空壳、也不编造口径；
+              草稿阶段不留空壳、也不编造口径：模拟示例模式用**模拟业务
+              数据**渲染（ADR 0004），用户 JSON 模式用**用户提交的那份
+              数据**渲染（未经业务核验）；
             - **转换成报表草稿**：模板转成可确认的报表草稿；
             - **一次事务落库**：模板、草稿、确认关系、阶段
               （``DRAFT_READY``）、下一步菜单与本轮消息同生共死。
@@ -1036,8 +1274,12 @@ class ReportDesignService:
             claim = self.repository.claim_operation(
                 session_key, message_id, current_revision
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 认领确认操作失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 认领确认操作失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return self._failure_response(
                 request,
                 state,
@@ -1075,34 +1317,56 @@ class ReportDesignService:
         # ---- 方案契约检查（事务外，生成草稿前的最后一道关） ----
         contract_error = _plan_contract_error(current_plan.get("sections"))
         if contract_error:
-            logger.info("[report_design] 方案组件类型非法：%s", contract_error)
+            # 契约错误的消息里带着**模型写的板块标题**，可能夹带用户原话
+            # —— 整句不进日志（#61 AC#1）。日志只留板块序号与 id 这两个标识。
+            logger.info(
+                "[report_design] 方案组件类型非法 errorType=%s sectionIndex=%s sectionId=%s",
+                type(contract_error).__name__,
+                contract_error.section_index,
+                contract_error.section_id,
+            )
+            # 给用户看的那句与落库的原因**逐字未变**（仍是原样透传）。
+            contract_reason = _reason_text(contract_error)
             self._fail_operation(
-                operation_id, "PLAN_COMPONENT_TYPE_INVALID", contract_error
+                operation_id, "PLAN_COMPONENT_TYPE_INVALID", contract_reason
             )
             return self._failure_response(
                 request,
                 state,
                 code="PLAN_COMPONENT_TYPE_INVALID",
-                message=f"{contract_error}方案保持原样，请修改后重试。",
+                message=f"{contract_reason}方案保持原样，请修改后重试。",
                 retryable=True,
             )
 
         # ---- 生成模板（事务外） ----
         try:
+            # 来源模式按**服务端记录**判定（模拟示例 / 用户 JSON）：会话里提交过
+            # JSON 就是用户 JSON 模式。不传就落默认口径（模拟示例），区域的
+            # ``pendingReason`` 会说成「模拟业务数据」—— 在用户 JSON 模式下
+            # 那是**说反话**（那块数值是用户自己的数据）。
+            #
+            # 判据与本模块的回复口径（``_reply_source_mode``）**同一套**，
+            # 也与转换层（``build_template_definition`` 自己解析会话 JSON
+            # 输入）一致 → 回复、区域文案、定义记录三处口径不会漂。
+            source_mode = _reply_source_mode(plan=current_plan).mode
             template = build_template_design(
                 current_plan,
                 subject_id=request.context.subjectId,
+                source_mode=source_mode,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[report_design] 生成模板失败")
-            self._fail_operation(operation_id, "TEMPLATE_BUILD_FAILED", str(exc))
+            log_failure(logger, "[report_design] 生成模板失败", exc)
+            self._fail_operation(operation_id, "TEMPLATE_BUILD_FAILED", safe_reason(exc))
+            # 用户可见的回复**不带异常原文**（#61）：给能行动的提示。
+            reason = _safe_failure_reason(exc)
             return self._failure_response(
                 request,
                 state,
                 code="TEMPLATE_BUILD_FAILED",
                 message=(
-                    f"这次没能生成模板：{_reason_text(exc)}"
-                    "方案保持原样，请修改后重试。"
+                    "这次没能生成模板，"
+                    + (f"{reason}，" if reason else "")
+                    + "方案保持原样，请修改后重试。"
                 ),
                 retryable=True,
             )
@@ -1119,15 +1383,17 @@ class ReportDesignService:
                 template_data, current_plan, request.context.subjectId
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[report_design] 模板转草稿失败")
-            self._fail_operation(operation_id, "TEMPLATE_BUILD_FAILED", str(exc))
+            log_failure(logger, "[report_design] 模板转草稿失败", exc)
+            self._fail_operation(operation_id, "TEMPLATE_BUILD_FAILED", safe_reason(exc))
+            reason = _safe_failure_reason(exc)
             return self._failure_response(
                 request,
                 state,
                 code="TEMPLATE_BUILD_FAILED",
                 message=(
-                    f"这次没能把方案转换成报表草稿：{_reason_text(exc)}"
-                    "方案保持原样，请修改后重试。"
+                    "这次没能把方案转换成报表草稿，"
+                    + (f"{reason}，" if reason else "")
+                    + "方案保持原样，请修改后重试。"
                 ),
                 retryable=True,
             )
@@ -1163,29 +1429,33 @@ class ReportDesignService:
                 write_confirmation,
             )
         except (DesignPlanInvalidError, DesignOperationStateError) as exc:
-            logger.warning("[report_design] 提交草稿被拒：%s", exc)
-            self._fail_operation(operation_id, "TEMPLATE_COMMIT_REJECTED", str(exc))
+            log_failure(logger, "[report_design] 提交草稿被拒", exc)
+            self._fail_operation(
+                operation_id, "TEMPLATE_COMMIT_REJECTED", safe_reason(exc)
+            )
             return self._failure_response(
                 request,
                 state,
                 code="TEMPLATE_COMMIT_REJECTED",
                 message=(
-                    f"这次草稿没能保存下来：{_reason_text(exc)}"
+                    "这次草稿没能保存下来，"
                     "方案保持原样，请重试。"
                 ),
                 retryable=True,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[report_design] 提交草稿失败")
+            log_failure(logger, "[report_design] 提交草稿失败", exc)
             # 提交异常回滚后，操作会停在 PROCESSING：必须显式失败收尾，
             # 否则这条消息会一直显示「处理中」，用户也拿不到重试入口。
-            self._fail_operation(operation_id, "TEMPLATE_COMMIT_FAILED", str(exc))
+            self._fail_operation(
+                operation_id, "TEMPLATE_COMMIT_FAILED", safe_reason(exc)
+            )
             return self._failure_response(
                 request,
                 state,
                 code="TEMPLATE_COMMIT_FAILED",
                 message=(
-                    f"这次草稿没能保存下来：{_reason_text(exc)}"
+                    "这次草稿没能保存下来，"
                     "方案保持原样，请重试。"
                 ),
                 retryable=True,
@@ -1226,15 +1496,23 @@ class ReportDesignService:
             confirmation = self.repository.find_confirmation(
                 session_key, plan_id, int(plan_revision)
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 查确认关系失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 查确认关系失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         if not confirmation:
             return None
         try:
             return self.repository.load_template(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读已提交模板失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读已提交模板失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
 
     def _current_session_state(self, session_key: str) -> AgentState | None:
@@ -1246,8 +1524,12 @@ class ReportDesignService:
         """
         try:
             record = session_service.repository.get_session(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读会话失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读会话失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         if record is None:
             return None
@@ -1264,8 +1546,12 @@ class ReportDesignService:
         """
         try:
             record = session_service.repository.get_session(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读会话失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读会话失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         snapshot = (record.snapshot if record else None) or {}
         raw = snapshot.get("definition")
@@ -1274,16 +1560,24 @@ class ReportDesignService:
             # 草稿：宁可回初版，也不要把「没有草稿」当成结果。
             try:
                 stored = self.repository.load(session_key) or {}
-            except Exception:  # noqa: BLE001
-                logger.exception("[report_design] 读设计存储失败")
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "[report_design] 读设计存储失败 errorType=%s",
+                    type(exc).__name__,
+                    exc_info=(type(exc), None, exc.__traceback__),
+                )
                 return None
             raw = stored.get("definitionDraft")
         if not isinstance(raw, dict):
             return None
         try:
             return ReportDefinitionDraft(**raw)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读当前草稿失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读当前草稿失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
 
     async def _handle_design_turn(
@@ -1316,8 +1610,12 @@ class ReportDesignService:
             claim = self.repository.claim_operation(
                 session_key, message_id, expected_revision
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 认领操作失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 认领操作失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return self._failure_response(
                 request,
                 state,
@@ -1405,6 +1703,7 @@ class ReportDesignService:
                 operation_id=operation_id,
                 expected_revision=expected_revision,
                 question=question,
+                options=getattr(exc, "options", ()) or (),
                 state=state,
             )
         except PlanColumnsUnresolvedError as exc:
@@ -1486,7 +1785,12 @@ class ReportDesignService:
                 write_turn,
             )
         except (DesignPlanInvalidError, DesignOperationStateError) as exc:
-            logger.warning("[report_design] 提交方案被拒：%s", exc)
+            # 异常原文不进日志（#61）：只留原因类型与调用栈。
+            logger.warning(
+                "[report_design] 提交方案被拒 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             self._fail_operation(operation_id, "PLAN_COMMIT_REJECTED", str(exc))
             return self._failure_response(
                 request,
@@ -1495,8 +1799,12 @@ class ReportDesignService:
                 message="这次方案没能保存下来，方案保持原样，请重试。",
                 retryable=True,
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 提交方案失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 提交方案失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             # 提交异常回滚后，操作可能停在 PROCESSING：必须显式失败收尾，
             # 否则这条消息会一直显示「处理中」，用户也拿不到可理解的重试入口。
             self._fail_operation(operation_id, "PLAN_COMMIT_FAILED", "提交方案失败")
@@ -1534,12 +1842,16 @@ class ReportDesignService:
         operation_id: str,
         expected_revision: int | None,
         question: str,
+        options: Sequence[str] = (),
         state: dict[str, Any] | None,
     ) -> AgentResponse:
         """提交一次必要追问。
 
         追问不是技术失败：阶段不动，上一成功方案保留，
         这一轮的消息与操作状态同事务落库。
+
+        追问**带一张卡片**：具体选项 + 「其他」。只回一句纯文本的话，
+        用户得自己猜该怎么答；给了选项，他点一下就能继续。
         """
         if not question:
             self._fail_operation(operation_id, "PLAN_CLARIFICATION_EMPTY", "澄清内容为空")
@@ -1562,6 +1874,7 @@ class ReportDesignService:
             domainObjects=AgentResponseDomainObjects(
                 reportPlan=current_plan if isinstance(current_plan, dict) else None
             ),
+            questions=[_clarification_question(question, options=options)],
             uiActions=[UI_ACTION_PLAN_CLARIFICATION],
             debug={"designPhase": phase, "planClarification": True},
         )
@@ -1574,8 +1887,12 @@ class ReportDesignService:
                 question,
                 write_turn,
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 提交澄清失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 提交澄清失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             self._fail_operation(operation_id, "PLAN_CLARIFICATION_FAILED", "提交澄清失败")
             return self._failure_response(
                 request,
@@ -1626,8 +1943,13 @@ class ReportDesignService:
             self.repository.fail_operation(
                 operation_id, {"code": code, "message": message}
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 失败收尾没能落库 operation=%s", operation_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 失败收尾没能落库 operation=%s errorType=%s",
+                operation_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
 
     def _failure_response(
         self,
@@ -1804,7 +2126,10 @@ class ReportDesignService:
         if bound:
             # 同 _draft_response：ADR 0004 起草稿阶段就用模拟业务数据渲染，
             # 既不说「已接上数据」，也不说「数值待试运行产生」。
-            reply += f"{len(bound)} 个区域已绑定指标并出了示意数值"
+            #
+            # 措辞按**服务端记录的来源模式**分别说（工单 #64 F3）：用户
+            # JSON 模式下的数值来自用户自己的数据，不是「示意数值」。
+            reply += f"{len(bound)} 个区域{_numbers_note(_reply_source_mode(plan=plan))}"
             if placeholder_note:
                 reply += f"，{placeholder_note}"
             reply += "。"
@@ -1868,8 +2193,9 @@ class ReportDesignService:
         回复文案带**实际已确认的标题与方案版本号**，不写死示例文本。
 
         这一轮同时挂上**报表示意载荷**（``reportPreviewPayload``）：
-        草稿阶段就用模拟业务数据渲染，用户确认方案后右侧当场有数字，
-        不用再点一次什么才出数。
+        草稿阶段右侧就有数，用户确认方案后当场看得到，
+        不用再点一次什么才出数。载荷里的数字来自**服务端记录的来源模式**
+        （模拟示例 → 模拟业务数据；用户 JSON → 用户提交的那份数据）。
         """
         template = template or {}
         regions = template.get("regions") or []
@@ -1880,23 +2206,32 @@ class ReportDesignService:
         placeholder_note = _placeholder_fragment(capability_regions, scope_regions)
         title = template.get("title") or (plan or {}).get("topic") or "报表"
         plan_revision = template.get("planRevision") or (plan or {}).get("revision")
+        # 来源模式：定义里服务端记录的那一份；没有就按会话里的 JSON 输入
+        # 记录与方案记录兜底（工单 #64 F3）。
+        mode = _reply_source_mode(definition=draft, plan=plan)
+        if not mode.is_user_json:
+            # 全虚拟示意不受真实能力接通状态影响，回复不展示该类说明。
+            placeholder_note = ""
 
         reply = (
             f"已按第 {plan_revision} 版方案「{title}」生成报表草稿。"
-            "右侧这份报表用系统生成的**模拟业务数据**渲染，是用来核对版式的"
-            "示意，接入真实数据后会自动替换。"
+            f"{_render_note(mode)}"
         )
         if bound:
             # ADR 0004：草稿阶段就用模拟业务数据渲染，**不再**说
             # 「数值待试运行产生」—— 那是旧口径。反过来也不能说「已接上
             # 真实数据」—— 那同样是不存在的事实。
-            reply += f"{len(bound)} 个区域已绑定指标并出了示意数值"
+            #
+            # 用户 JSON 模式下的数值来自用户自己的数据（未经业务核验），
+            # 那是**真实的那份数据**，不是「示意数值」。
+            reply += f"{len(bound)} 个区域{_numbers_note(mode)}"
             if placeholder_note:
                 reply += f"，{placeholder_note}"
             reply += "。"
         elif placeholder_note:
             reply += f"{placeholder_note}。"
-        reply += pending_notes_reply(template)
+        if mode.is_user_json:
+            reply += pending_notes_reply(template)
         if duplicate:
             reply += "（这一版方案之前已经确认过，直接沿用已生成的草稿，没有重复生成。）"
 
@@ -1906,8 +2241,12 @@ class ReportDesignService:
         elif isinstance(draft, dict):
             try:
                 draft_obj = ReportDefinitionDraft(**draft)
-            except Exception:  # noqa: BLE001
-                logger.exception("[report_design] 草稿结构无法还原")
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "[report_design] 草稿结构无法还原 errorType=%s",
+                    type(exc).__name__,
+                    exc_info=(type(exc), None, exc.__traceback__),
+                )
                 draft_obj = None
         else:
             draft_obj = None
@@ -1930,6 +2269,7 @@ class ReportDesignService:
             questions=[AgentQuestion(
                 id="template_edit_confirm", prompt="请选择下一步操作：", expects="SINGLE_CHOICE",
                 selectionOnly=True, options=[{"value": v, "label": v} for v in ("同意", "修改", "重新开始")],
+                allowsOther=True, otherLabel="其他", otherPlaceholder="直接输入修改要求",
             )],
             uiActions=["confirm_framework", "draft_ready"],
             debug={
@@ -1965,8 +2305,12 @@ class ReportDesignService:
         """
         try:
             record = session_service.repository.get_session(self.session_key(request))
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读示意上下文失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读示意上下文失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         snapshot = (record.snapshot if record else None) or {}
         context = snapshot.get("previewContext")
@@ -1987,8 +2331,9 @@ class ReportDesignService:
 
         造数失败（定义非法 / 时间窗推不出来 / 粒度解析不了 / 表格没有列）
         时**明确失败**：不退回空表、不给半份载荷，响应里带明确的错误码与
-        原因。草稿本身已经落库，所以这一轮如实说「示意数据没生成出来」，
-        而不是把整轮说成失败。
+        原因。草稿本身已经落库，所以这一轮如实说「数据没生成出来」
+        （模拟示例模式说「示意数据没有生成出来」，用户 JSON 模式说
+        「数据没有渲染出来」），而不是把整轮说成失败。
         """
         definition_dict = _definition_dict(definition)
         if definition_dict is None:
@@ -2012,19 +2357,24 @@ class ReportDesignService:
                 .get("templateBinding", {})
                 .get("definitionId"),
             )
+            # 失败口径按**来源模式**分别说（工单 #64 F3）：用户 JSON 模式
+            # 下没渲染出来的是用户自己的数据，不是「示意数据」。
+            mode = source_mode_of_definition(definition_dict)
+            numbers_note = _numbers_note(mode)
+            failed_note = _render_failed_note(mode)
             response.reportPreviewPayload = None
             response.error = AgentError(
                 code=code,
-                message=f"示意数据没有生成出来：{exc}",
+                message=f"{failed_note}：{exc}",
             )
-            # 失败时不能还留着「出了示意数值」—— 同一段正文里先说出了数、
+            # 失败时不能还留着「出了数」—— 同一段正文里先说出了数、
             # 后说没生成出来，是自相矛盾。把那句改成失败口径，原因单独说明。
             response.reply = response.reply.replace(
-                "已绑定指标并出了示意数值",
-                "已绑定指标，但示意数据没有生成出来",
+                numbers_note,
+                f"已绑定指标，但{failed_note}",
             )
-            if "示意数据没有生成出来" not in response.reply:
-                response.reply += "示意数据没有生成出来"
+            if failed_note not in response.reply:
+                response.reply += failed_note
             response.reply += f"（原因：{exc}）"
         return response
 
@@ -2034,6 +2384,10 @@ class ReportDesignService:
 
         正文由前端方案模块渲染；这里给一句可读的摘要，
         读屏与「只看文本」的场景也不丢信息。
+
+        「确认后会用什么数据渲染」这句话按**服务端记录的来源模式**说
+        （工单 #64 F3）：用户 JSON 模式画的是用户自己提交的那份数据，
+        不是「系统生成的模拟业务数据」。
         """
         if not plan:
             return "已准备好文字方案，请查看左侧对话区里的方案卡片。"
@@ -2046,10 +2400,16 @@ class ReportDesignService:
         head = f"已根据你的要求整理出文字方案（第 {revision} 版）：{topic}。"
         if titles:
             head += f"包含板块：{titles}。"
-        head += (
-            "请在左侧对话区查看完整方案；确认后我会用系统生成的模拟业务数据"
-            "把这份报表渲染出来。"
-        )
+        if _reply_source_mode(plan=plan).is_user_json:
+            head += (
+                "请在左侧对话区查看完整方案；确认后我会用你提交的 JSON "
+                "把这份报表渲染出来（用户提供的数据，未经业务核验）。"
+            )
+        else:
+            head += (
+                "请在左侧对话区查看完整方案；确认后我会用系统生成的模拟业务数据"
+                "把这份报表渲染出来。"
+            )
         return head
 
     # ---------- 辅助 ----------
@@ -2064,8 +2424,12 @@ class ReportDesignService:
         session_key = current_session_key() or request.conversationId
         try:
             records = session_service.repository.list_messages(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读历史消息失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读历史消息失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return []
         history: list[dict[str, Any]] = []
         for record in records[-6:]:
@@ -2087,8 +2451,12 @@ class ReportDesignService:
         """
         try:
             records = session_service.repository.list_messages(session_key)
-        except Exception:  # noqa: BLE001
-            logger.exception("[report_design] 读原始请求失败")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[report_design] 读原始请求失败 errorType=%s",
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return None
         for record in records:
             if record.role != "user":

@@ -138,7 +138,7 @@ def _region_label(region: dict[str, Any]) -> str:
         or component.get("title")
         or metric.get("label")
         or region.get("id")
-        or "未命名 section"
+        or "未命名卡片"
     )
 
 

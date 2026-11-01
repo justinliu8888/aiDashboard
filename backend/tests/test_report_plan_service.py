@@ -329,6 +329,9 @@ def test_result_serializes_with_the_frozen_top_level_field_set():
         "assumptions",
         "suggestions",
         "referenceTemplates",
+        # 工单 #60：规则版本与命中依据随方案一起持久化。
+        "ruleVersion",
+        "selectionEvidence",
     }
     assert set(plan.model_dump(mode="json")["requirements"]) == {
         "metrics",

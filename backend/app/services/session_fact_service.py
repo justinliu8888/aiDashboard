@@ -122,11 +122,22 @@ class SessionFactService:
         try:
             record = session_service.repository.get_session(session_id)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[session_fact] 读取会话记录失败 sessionId=%s", session_id)
+            # 异常原文不进日志（#61）：留栈不留原文。
+            logger.exception(
+                "[session_fact] 读取会话记录失败 sessionId=%s errorType=%s",
+                session_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
             return SessionFacts(
                 status=FactStatus.UNAVAILABLE,
                 sessionExists=False,
-                reason=f"读取当前对话的服务端记录失败，暂时无法确认：{exc}",
+                # 异常原文不进用户可见的消息（#61 AC#3）：上游异常的文本
+                # 可能带路径 / 凭据，只留原因类型，其余进日志。
+                reason=(
+                    "读取当前对话的服务端记录失败，暂时无法确认"
+                    f"（{type(exc).__name__}）"
+                ),
             )
 
         if record is None:
@@ -163,9 +174,13 @@ class SessionFactService:
             try:
                 definition = ReportDefinitionDraft.model_validate(raw_definition)
             except ValidationError as exc:
+                # 校验错误的消息里带着**出错的字段值**（可能是用户原话与模型
+                # 原文）—— 不进日志（#61）。只留原因类型与调用栈。
                 logger.warning(
-                    "[session_fact] 服务端草稿无法解析 sessionId=%s err=%s",
-                    session_id, exc,
+                    "[session_fact] 服务端草稿无法解析 sessionId=%s errorType=%s",
+                    session_id,
+                    type(exc).__name__,
+                    exc_info=(type(exc), None, exc.__traceback__),
                 )
                 return SessionFacts(
                     status=FactStatus.UNAVAILABLE,

@@ -53,9 +53,19 @@ from app.data.machine_room_energy import (
     METRIC_PUE,
     METRIC_TOTAL_ENERGY,
 )
+from app.services.data_source_mode import (
+    SourceMode,
+    resolve_source_mode,
+)
 from app.services.metric_mock_service import get_metric, match_metric_by_alias
 from app.services.mock_data_service import resolve_room_name
 from app.services.scope_service import authorized_subject_ids, is_subject_authorized
+from app.services.simulated_field_semantics import (
+    KIND_GENERIC,
+    intent_names_registered_metric,
+    out_of_catalog_reason,
+    resolve_metric_semantics,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -69,6 +79,17 @@ DEFAULT_SOURCE_REF = "catalog.machine_room.energy"
 #: 数据来源标识与展示文案。界面必须把文案显示出来。
 DATA_SOURCE = "mock_energy"
 DATA_SOURCE_LABEL = "模拟数据（能耗 Mock 源，非生产事实表）"
+
+#: 区域 ``pendingReason`` 文案 —— 模拟示例（ADR 0004）。**既有文案，逐字不改**。
+PENDING_REASON_SIMULATED = "本区域数值为模拟业务数据，接入真实数据后自动替换。"
+
+#: 区域 ``pendingReason`` 文案 —— 用户 JSON（工单 #66 F）。
+#:
+#: 用户 JSON 模式下这块区域的数值是**用户自己提供的那份数据**，不是造出来的
+#: 模拟数据 —— 说「模拟业务数据」是**事实性错误**；说「接入真实数据后自动
+#: 替换」同样是**不存在的事实**（用户的数据不是系统接通的业务库）。
+#: 口径与界面一致：**用户提供的数据，未经业务核验**。
+PENDING_REASON_USER_JSON = "本区域数值来自用户提供的数据，未经业务核验。"
 
 #: 指标口径可核对的底层字段。指标登记了但字段不在数据源里，
 #: 就说明当前能力算不出这个数 —— 只能占位，不能编。
@@ -117,11 +138,34 @@ SCOPE_PLACEHOLDER_REASON = (
 #: 整句文案会变。
 _SCOPE_KEYWORDS = ("授权", "权限", "越权")
 
+#: 目录外指标的占位原因前缀。
+#:
+#: 这句只说**真实能力**还差什么（目录里没有登记这个指标），**不说**
+#: 「模拟渲染做不到」—— 模拟模式下这一块照样出数、照样能看版式
+#: （工单 #59 的验收：真实目录的限制不得被说成渲染限制）。
+OUT_OF_CATALOG_REASON_PREFIX = "能力待接通："
+
 
 def _reason_is_scope(reason: Any) -> bool:
     """占位原因是不是**范围授权**问题。"""
     text = str(reason or "")
     return any(keyword in text for keyword in _SCOPE_KEYWORDS)
+
+
+def pending_reason(mode: Any = None) -> str:
+    """区域 ``pendingReason`` 的文案（按**来源模式**分别说）。
+
+    - 模拟示例（``simulated``）：既有文案，**逐字不改**（ADR 0004）。
+    - 用户 JSON（``user_json``）：用户自己提供的数据，**未经业务核验**；
+      不说「模拟业务数据」（不是事实），也不宣称已接入真实业务系统
+      （同样不是事实）。
+
+    ``mode`` 可以是 ``SourceMode``，也可以是它的字符串取值。
+    """
+    raw = mode.mode if isinstance(mode, SourceMode) else mode
+    if resolve_source_mode(raw).is_user_json:
+        return PENDING_REASON_USER_JSON
+    return PENDING_REASON_SIMULATED
 
 
 def region_data_status(region: Mapping[str, Any]) -> str:
@@ -265,8 +309,13 @@ def _resolve_window(time_range: Any) -> _Window:
 
     try:
         resolved = resolve_time_window(time_range)
-    except Exception:  # noqa: BLE001
-        logger.exception("[report_template] 时间窗解析失败")
+    except Exception as exc:  # noqa: BLE001
+        # 异常原文不进日志（#61）：留栈不留原文。
+        logger.exception(
+            "[report_template] 时间窗解析失败 errorType=%s",
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
+        )
         resolved = None
     if not isinstance(resolved, dict):
         return _default_window()
@@ -308,6 +357,27 @@ def _resolve_room(subject_text: Any, subject_id: Any = None) -> tuple[str | None
     return None, f"当前账号没有「{text}」的授权范围。"
 
 
+def _candidate_refs(intent: str) -> list[str]:
+    """这个指标意图**可能**命中的已登记指标引用（按优先级）。
+
+    两层匹配（和 ``_match_metric`` 一样）：
+
+        1. 指标目录自己的别名（``match_metric_by_alias``）；
+        2. 目录别名之外的**常见措辞**（``_INTENT_PATTERNS``）。
+
+    两层都给出来，是因为**两层都只是子串命中** —— 命中的引用还得过
+    「口径对不对得上」那关（``_match_metric`` 里的判定）。
+    """
+    refs: list[str] = []
+    alias_ref = match_metric_by_alias(intent)
+    if alias_ref:
+        refs.append(alias_ref)
+    pattern_ref = _match_intent_by_pattern(intent)
+    if pattern_ref and pattern_ref not in refs:
+        refs.append(pattern_ref)
+    return refs
+
+
 def _match_metric(intents: list[str]) -> tuple[str | None, dict[str, Any] | None, str | None]:
     """按区域里的指标意图匹配指标口径。
 
@@ -321,19 +391,35 @@ def _match_metric(intents: list[str]) -> tuple[str | None, dict[str, Any] | None
     「设备耗电」）。用户说的是同一件事，不能因为用词不同就把一个
     **算得出数的**指标判成「没有对应指标」。
 
+    **别名命中 ≠ 识别成功**（规格第 6 条 / 契约表 §3.5）：两层的匹配都是
+    **子串** ——「设备耗电**率**」包含别名「设备耗电」，但方案要的是**比率**，
+    不是 kWh 的耗电量。口径对不上就**不静默映射**到已登记指标：这一条意图
+    按**目录外**处理（``metricRefs`` 为空、``bindingKind = "simulated"``），
+    由既有那条「匹配不到口径」的出口接住。
+
+    判定用的是**共享语义层**那一份谓词（``intent_names_registered_metric``），
+    与编辑入口（``template_edit_engine``）**同一套** —— 两处各写一份必然漂移。
+
+    **一条意图没命中，不许把整块板块的匹配都断掉**：这一条没登记就
+    ``continue`` 接着看下一条 —— 一块板块可以有多条指标意图，后面那条
+    可能命中的正是已登记指标。少了那一条，这块板块就会**整块**掉进
+    「目录外」的兜底里，用户要的那块就白丢了。
+
     匹配不到口径不算错误 —— 那个区域会变成占位，并说明
     「当前能力里没有这个指标」。
     """
     for intent in intents:
-        ref = match_metric_by_alias(intent)
-        if not ref:
-            ref = _match_intent_by_pattern(intent)
-        if not ref:
-            continue
-        metric = get_metric(ref)
-        if metric is None:
-            return None, None, f"指标「{intent}」没有登记，算不出数值。"
-        return ref, metric, None
+        for ref in _candidate_refs(intent):
+            metric = get_metric(ref)
+            if metric is None:
+                # 这条候选引用没登记 → **继续看下一条**，不因为它把整块
+                # 板块的匹配都断掉（后面那条意图可能命中的正是已登记指标）。
+                continue
+            if not intent_names_registered_metric(intent, ref, {ref: metric}):
+                # 口径对不上 → 这一条意图是**目录外指标**，不静默映射到
+                # 已登记指标。继续看下一条意图有没有真命中的。
+                continue
+            return ref, metric, None
     return None, None, None
 
 
@@ -354,47 +440,67 @@ def _match_intent_by_pattern(text: str) -> str | None:
     return best[1] if best else None
 
 
-def _metric_is_backed(metric: Mapping[str, Any]) -> tuple[bool, str | None]:
-    """这个指标当前算不算得出数。
+def _metric_is_backed(
+    metric: Mapping[str, Any], *, source_mode: Any = None
+) -> tuple[bool, str | None]:
+    """这个指标当前**真实取数**算不算得出数。
 
     指标登记了不等于能出数：还要看它的底层字段在数据源目录里没有。
-    PUE 就是这种 —— 登记在册，但数据源没有 ``pue`` 字段，算不出来。
+    PUE 就是这种 —— 登记在册，但数据源没有 ``pue`` 字段，真实取数算不出来。
+
+    **这不是准入**：算不出来只标「口径待核实」，这一块照样生成、照样
+    在屏上出数（模拟示例 / 用户 JSON）。所以这里的话**不能说「算不出
+    数值」** —— 屏上正有数字，那句话会跟用户看到的东西打架；也不能说
+    字段名（那是内部口径）。
+
+    说法与**编辑入口**那一侧同源（``simulated_field_semantics`` 的目录外
+    文案后半句）：同一句诉求，两个阶段说的是同一件事。
     """
     field_ref = str(metric.get("fieldRef") or "")
     if field_ref and field_ref in _SOURCE_FIELDS:
         return True, None
     label = str(metric.get("label") or metric.get("metricRef") or "该指标")
-    return False, f"「{label}」口径待核实：当前数据源没有登记这个字段，算不出数值。"
+    return False, (
+        f"「{label}」口径待核实：真实数据接通时需要先确认这个指标的口径；"
+        f"{_simulated_block_note(source_mode)}。"
+    )
+
+
+def _simulated_block_note(mode: Any = None) -> str:
+    """这一块的数值**是哪来的**（按**来源模式**分两句）。
+
+    与 ``simulated_field_semantics.out_of_catalog_note`` 的后半句**同一套
+    说法**：真实目录的限制**不得**被说成「模拟渲染做不到」—— 这一块在
+    模拟示例下照样出数、照样能看版式（工单 #59）。
+    """
+    raw = mode.mode if isinstance(mode, SourceMode) else mode
+    if resolve_source_mode(raw).is_user_json:
+        return "当前这一块按你提供的 JSON 出数"
+    return "当前这一块按模拟示例出数（已标注为模拟），不影响先看版式"
 
 
 def classify_metric_kind(*, intent: str, metric_ref: str | None = None) -> str:
     """把方案的指标意图归一化成**语义量身份**。
 
-    身份来自**指标口径**；口径对不上时再按方案的指标意图归一化 ——
-    「实时功率」「告警列表」「机柜状态」这些系统还没接通的量，身份是
-    **认得出来的**，区域因此能标「能力待接通」，而不是只说「没接到数据」。
+    - **已登记指标** → 目录登记的量身份（``METRIC_KIND_BY_REF``），不猜；
+    - **目录外指标** → 通用模拟策略（``generic``）或**形状型**身份
+      （告警列表 / 机柜状态 / 实时功率 / PUE）。
+
+    目录外指标**不给**能耗量族（``energy`` / ``cost``）：那两个量族是
+    「总耗电」「总电费」这类**已登记指标**的量族，共用同一份基础样本 ——
+    给了就等于把陌生指标静默映射成「总耗电」（规格决定 6：目录外指标默认
+    走通用模拟策略）。
 
     认不出来时给 ``generic``：陌生指标照样有明确标注的示例，
     **不按区域标题猜真实口径**。
     """
-    if metric_ref and metric_ref in METRIC_KIND_BY_REF:
-        return METRIC_KIND_BY_REF[metric_ref]
-    text = (intent or "").strip().lower()
-    if not text:
-        return "generic"
-    if "功率" in text:
-        return "power"
-    if "告警" in text or "报警" in text:
-        return "alarms"
-    if ("机柜" in text or "机架" in text or "柜位" in text) and "状态" in text:
-        return "cabinet_status"
-    if "电费" in text or "成本" in text:
-        return "cost"
-    if "pue" in text or "电能使用效率" in text:
-        return "pue"
-    if "能耗" in text or "耗电" in text or "用电" in text or "电量" in text:
-        return "energy"
-    return "generic"
+    if metric_ref:
+        if metric_ref in METRIC_KIND_BY_REF:
+            return METRIC_KIND_BY_REF[metric_ref]
+        # 目录里没有这条引用 → 通用模拟策略。**不按单位猜**：
+        # 按单位猜就是把陌生指标静默映射成「总耗电」。
+        return KIND_GENERIC
+    return resolve_metric_semantics(intent=intent).kind
 
 
 def _column_key(section_id: str, column_id: str, index: int) -> str:
@@ -471,6 +577,7 @@ def _build_region(
     room_id: str | None,
     room_reason: str | None,
     window: _Window,
+    source_mode: SourceMode,
 ) -> TemplateRegion:
     """把方案里的一个板块变成一个模板区域。
 
@@ -479,6 +586,11 @@ def _build_region(
 
     定义层面不产生任何业务数值 —— 数值由草稿阶段的模拟业务数据渲染产生
     （ADR 0004）。这一层给的是**绑定描述符**与**定稿栏目**。
+
+    ``source_mode`` 是**服务端记录的来源模式**（模拟示例 / 用户 JSON）：
+    它只影响**说明文案**（真实目录的限制在两种模式下怎么表述，
+    以及区域 ``pendingReason`` 说的是「模拟业务数据」还是「用户提供的数据」），
+    不放宽授权判定，也不改变「指标绑没绑上」这件事。
     """
     section = dict(section or {})
     section_id = str(section.get("id") or f"section_{index + 1}")
@@ -542,20 +654,33 @@ def _build_region(
             data=_text_payload(section, resolve_room_name(room_id) if room_id else ""),
         )
 
-    metric_ref, metric, intent_reason = _match_metric(intents)
+    metric_ref, metric, _ = _match_metric(intents)
     if metric_ref is None or metric is None:
-        # 目录里没有这个指标 —— 身份认得出来就标「能力待接通」，
-        # 认不出来给 generic（照实标，不编口径）。
+        # 目录里没有这个指标 —— **模拟模式下这一块照样出数**（通用模拟策略）。
+        #
+        # 区域仍然是「能力待接通」（真实能力确实还差一个登记），但说明里
+        # **不把真实目录的限制说成「模拟渲染做不到」**：模拟示例照常出数，
+        # 用户先看到的是版式。
+        #
+        # 上游那句「算不出数值」也不能直接用 —— 它说的是**真实数据**算不出，
+        # 而这一块在模拟模式下是有数的。两件事分开说。
+        reason = out_of_catalog_reason(
+            source_mode.mode, intent=intents[0] if intents else ""
+        )
         return placeholder(
-            intent_reason or "能力待接通：当前已接通的能力里没有对应指标。",
+            reason,
             capability_pending=True,
         )
 
-    backed, reason = _metric_is_backed(metric)
+    backed, reason = _metric_is_backed(metric, source_mode=source_mode)
     if not backed:
-        # 指标登记在册但底层字段没有 —— 系统还算不出这个数（能力待接通）。
+        # 指标登记在册但真实取数算不出来（能力待接通）。
+        #
+        # **不拒绝生成**：这一块照样出数（模拟示例 / 用户 JSON），只是标
+        # 「口径待核实」。原因文案按来源模式说清数值是哪来的 —— 真实
+        # 取数的限制不得被说成「这一块没数」。
         return placeholder(
-            reason or "口径待核实：当前数据源没有登记这个字段，算不出数值。",
+            reason or f"口径待核实：真实数据接通时需要先确认这个指标的口径；{_simulated_block_note(source_mode)}。",
             [metric_ref],
             capability_pending=True,
         )
@@ -605,9 +730,12 @@ def _build_region(
                 "offset": window.offset,
             },
             "windowLabel": window.label,
-            # 这个区域的数值**是模拟的**（ADR 0004）：草稿阶段不接真实数，
-            # 屏上那一屏由模拟业务数据渲染，接入真实数据后自动替换。
-            "pendingReason": "本区域数值为模拟业务数据，接入真实数据后自动替换。",
+            # 这个区域的数值来源**按来源模式分别说**（ADR 0004 / 工单 #66 F）：
+            # - 模拟示例：草稿阶段不接真实数，屏上那一屏由模拟业务数据渲染，
+            #   接入真实数据后自动替换（既有文案，**逐字不改**）；
+            # - 用户 JSON：数值来自**用户自己提供的那份数据**，未经业务核验
+            #   —— 说「模拟业务数据」是说反话。
+            "pendingReason": pending_reason(source_mode),
         },
         # 取数来源与数据性质披露保留：数值就来自这个模拟源
         dataSource=DATA_SOURCE,
@@ -619,6 +747,7 @@ def build_template_design(
     plan: Mapping[str, Any],
     *,
     subject_id: Any = None,
+    source_mode: Any = None,
 ) -> TemplateDesign:
     """从已确认的文字方案生成模板设计。
 
@@ -632,6 +761,10 @@ def build_template_design(
 
     这一步**不取真实数、不算数值**：区域带的是指标绑定与时间窗与**定稿栏目**，
     数值由草稿阶段的模拟业务数据渲染产生（ADR 0004）。
+
+    ``source_mode`` 是**服务端记录的来源模式**（模拟示例 / 用户 JSON）。
+    不传就用默认口径（模拟示例）；它由调用方（数据输入那条链路）决定，
+    **不靠标题、板块名或提示词猜**。
     """
     plan = dict(plan or {})
     requirements = dict(plan.get("requirements") or {})
@@ -643,6 +776,7 @@ def build_template_design(
 
     room_id, room_reason = _resolve_room(requirements.get("subject"), subject_id)
     window = _resolve_window(requirements.get("timeRange"))
+    mode = resolve_source_mode(source_mode or plan.get("sourceMode"))
 
     regions: list[TemplateRegion] = []
     for index, section in enumerate(sections):
@@ -653,6 +787,7 @@ def build_template_design(
                 room_id=room_id,
                 room_reason=room_reason,
                 window=window,
+                source_mode=mode,
             )
         )
 

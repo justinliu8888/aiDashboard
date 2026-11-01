@@ -24,8 +24,14 @@ logging.basicConfig(
 )
 try:
     configure_app_file_logging()
-except OSError:
-    logging.getLogger(__name__).exception("无法写入后端文件日志，继续使用控制台日志")
+except OSError as exc:
+    # 异常原文不进日志（#61）：留栈不留原文 —— 异常对象换成 None，
+    # 消息正文仍是不含敏感信息的事实陈述。写文件失败不影响启动，
+    # 继续用控制台日志。
+    logging.getLogger(__name__).exception(
+        "无法写入后端文件日志，继续使用控制台日志",
+        exc_info=(type(exc), None, exc.__traceback__),
+    )
 
 app = FastAPI(title="智能报表 AI 后端", version="1.0.0")
 settings = get_settings()
@@ -66,10 +72,29 @@ def playground_root() -> RedirectResponse:
     return RedirectResponse(url=_WORKBENCH_URL)
 
 
+class _NoCacheStaticFiles(StaticFiles):
+    """开发期静态资源：**不缓存**。
+
+    工作台的前端脚本改得很勤。浏览器对没有 ``Cache-Control`` 的静态资源
+    会按启发式规则缓存（甚至连 HTML 都缓存），于是「改了没生效」「调试
+    代码跑的是旧版」这类问题极难查 —— 明明服务端已经是新文件，页面还在
+    跑旧脚本。
+
+    这里统一回 ``no-store``：改完刷新就是新的。生产部署另有 CDN / 缓存
+    策略，不受这里影响。
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
+
 if _FRONTEND_DIR.exists():
     app.mount(
         "/playground",
-        StaticFiles(directory=str(_FRONTEND_DIR), html=True),
+        _NoCacheStaticFiles(directory=str(_FRONTEND_DIR), html=True),
         name="playground",
     )
 

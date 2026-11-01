@@ -193,7 +193,7 @@ def _probe(
     探针做的是**前端真实做的事**：
     ``readReportPreviewPayload`` → ``isStaleReportPayload`` →
     ``applyReportPreviewPayload``；``next_payload`` 模拟**下一轮**响应的载荷
-    （可以是 null —— 同意轮就不带载荷）。
+    （可以是 null —— 那一轮没带载荷时前端就原样保留手上那份）。
     """
     request = {
         "definition": definition,
@@ -407,41 +407,56 @@ def test_three_stages_carry_identical_numbers(seam_chain):
     """三段示意数值**逐字段**相等。
 
     1. 确认方案那轮响应里的 ``reportPreviewPayload``；
-    2. 点「同意」之后前端手上那份（同意轮**不带**载荷 → 前端保留第 1 段）；
+    2. 点「同意」那轮响应里的 ``reportPreviewPayload``；
     3. 重新读取会话时按定义 + 冻结上下文重新生成的那一份。
 
     规格要求三处**完全相同**（后端确定性种子保证）。
+
+    .. note::
+       **第 2 段的口径变了**（工单 #66 C2 F-3 判据 2，2026-10-31 统筹裁决）：
+       点「同意」那一轮草稿刚落库，**也要**带示意载荷 —— 界面上的「同意」
+       走的就是 ``_save_placeholder``（``SAVE_DEFINITION_DRAFT``）那一轮，
+       没有它右侧要等整页刷新才出现新板块。
+
+       所以第 2 段从「不带载荷」变成「带载荷」，而且它必须与第 1、3 段
+       **逐字段相等** —— 同一份冻结上下文 → 同一个种子 → 数字不跳。
+       这比原来那条断言**更强**：原来只钉住「同意轮不带载荷」，
+       现在钉住「同意轮带的载荷与另外两段一模一样」。
     """
     stage1 = seam_chain["stageConfirm"]
+    stage2 = seam_chain["stageApprove"]
     stage3 = seam_chain["stageRestore"]
     assert stage1 is not None and stage3 is not None
+    assert stage2 is not None, "点「同意」那一轮必须带示意载荷（#66 F-3 判据 2）"
 
-    # 第 1 段 vs 第 3 段：逐字段相等。
+    # 第 1 段 vs 第 2 段 vs 第 3 段：逐字段相等。
     flat1 = _numeric_fields(stage1)
+    flat2 = _numeric_fields(stage2)
     flat3 = _numeric_fields(stage3)
-    assert set(flat1) == set(flat3)
+    assert set(flat1) == set(flat2) == set(flat3)
     differing = {
-        key: (flat1[key], flat3[key])
+        key: (flat1[key], flat2[key], flat3[key])
         for key in flat1
-        if flat1[key] != flat3[key]
+        if not (flat1[key] == flat2[key] == flat3[key])
     }
-    assert not differing, f"第 1 段与第 3 段的数值不一致：{differing}"
+    assert not differing, f"三段的数值不一致：{differing}"
     # 上下文也一模一样（同一个冻结上下文 → 同一个种子）。
+    assert stage1["previewContext"] == stage2["previewContext"]
     assert stage1["previewContext"] == stage3["previewContext"]
 
-    # 第 2 段：点「同意」那轮**不带**载荷 —— 前端保留第 1 段那份。
-    # 这是产品行为（模拟载荷只活在内存里），前端必须原样保留。
-    assert seam_chain["stageApprove"] is None, "同意轮竟然带了载荷，口径变了"
-
+    # 前端视角：第 1 段收下 → 第 2 段（同意轮）也收下、且不被判过期 →
+    # 手上那份数字仍然是同一份。
     verdict = _probe(
         seam_chain["draftDefinition"],
         stage1,
-        next_payload=None,
-        definition_after=seam_chain["draftDefinition"],
+        next_payload=stage2,
+        definition_after=seam_chain["savedDefinition"],
         has_next=True,
     )
-    assert verdict["nextAccepted"] is False, "没有载荷的一轮不该收下任何东西"
-    assert verdict["retainedSame"] is True, "同意轮之后前端手上那份载荷被动了"
+    assert verdict["nextAccepted"] is True, "同意轮带的载荷前端没收下"
+    assert verdict["nextStale"] is False, "同意轮带的载荷被判成过期版本了"
+    assert verdict["nextRegionCount"] == verdict["regionCount"]
+    assert verdict["nextValues"] == verdict["values"], "同意轮之后手上的数字变了"
 
 
 def test_three_stages_are_identical_through_the_frontend_functions(seam_chain):

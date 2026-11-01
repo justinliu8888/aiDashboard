@@ -250,7 +250,9 @@ def test_day_grain_api_returns_updated_title(post_chat, definition):
     ).json()
 
     assert accepted["state"] == "USER_EDITING_TEMPLATE"
-    assert accepted["uiActions"] == ["template_edit_applied", "confirm_template_edit"]
+    assert accepted["uiActions"] == ["template_edit_applied"]
+    # 批准之后**不再**挂第二张确认卡（同一轮就执行完了）。
+    assert accepted["questions"] == []
     assert next(
         item for item in accepted["domainObjects"]["reportDefinitionDraft"]["regions"]
         if item["id"] == "region_hourly_trend"
@@ -295,13 +297,20 @@ def test_suggest_visualization_returns_filtered_options(definition):
     assert result.changeSet is None
 
 
-def test_change_metric_rejects_missing_source_field(definition):
+def test_change_metric_falls_back_to_a_virtual_metric_without_the_field(definition):
+    """模拟示例模式：当前数据源没这个字段时，**不再**拒绝用户的改法。
+
+    这一项降级成**虚拟指标**：不伪造 metricRef，按模拟示例出数。
+    （真实数据模式 ``user_json`` 下这项校验仍然保留。）
+    """
     result = apply(definition, "把设备耗电排名的指标换成能耗成本")
 
-    assert result.needsClarification is True
-    assert result.changeSet is None
-    assert result.draftAfterEdit.metadata["revision"] == 0
-    assert "energyCost" in result.clarificationQuestion
+    assert result.needsClarification is False
+    assert result.changeSet is not None
+    assert result.draftAfterEdit.metadata["revision"] == 1
+    # 目录外口径：不伪造 metricRef，只带稳定的模拟身份。
+    assert result.plan.operation.metricRef is None
+    assert result.plan.operation.metricIntent == "能耗成本"
 
 
 @pytest.mark.parametrize(("intent", "operation"), [
@@ -444,7 +453,9 @@ def test_agent_api_applies_edit_and_returns_current_draft(post_chat, definition)
     assert applied["state"] == "USER_EDITING_TEMPLATE"
     assert applied["domainObjects"]["changeSet"] is not None
     assert applied["domainObjects"]["reportDefinitionDraft"]["metadata"]["revision"] == 1
-    assert "confirm_template_edit" in applied["uiActions"]
+    # 批准之后不再挂二次确认卡。
+    assert applied["questions"] == []
+    assert "confirm_template_edit" not in applied["uiActions"]
 
 
 def test_agent_api_keeps_editing_context_when_action_is_missing(
@@ -645,7 +656,9 @@ def test_composite_plan_summary_is_carried_on_result_plan(definition):
     result = template_edit_engine.apply(plan=plan, definition=definition, scope=SCOPE)
 
     assert result.plan.summary
-    assert "eas_energy_detail" in result.plan.summary
+    # 摘要里写的是**业务名**（EAS 能耗明细），不是内部标识（eas_energy_detail）。
+    assert "EAS 能耗明细" in result.plan.summary
+    assert "eas_energy_detail" not in result.plan.summary
     assert result.plan.model_dump(mode="json")["operations"]
 
 
@@ -701,8 +714,11 @@ def test_plan_source_and_grain_change_summary_states_source_grain_and_limits(def
         scope=SCOPE,
     )
 
-    assert "eas_energy_detail" in plan.summary
-    assert "MINUTE" in plan.summary
+    # 摘要里写的是**业务名**（EAS 能耗明细 / 分钟），不是内部标识。
+    assert "EAS 能耗明细" in plan.summary
+    assert "eas_energy_detail" not in plan.summary
+    assert "分钟" in plan.summary
+    assert "MINUTE" not in plan.summary
     assert "小时趋势" in plan.summary
     # 不能声称真实编译已经完成
     assert "Mock" in plan.summary
