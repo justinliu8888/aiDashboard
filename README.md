@@ -92,12 +92,19 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 ```dotenv
 AGENT_IMPL=agentscope
-VOLC_API_KEY=your-api-key-here
-VOLC_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
-VOLC_MODEL=doubao-seed-2-1-lite-260915
-VOLC_TEMPERATURE=0.2
-VOLC_TIMEOUT=30
+LLM_PROVIDER=minimax
+MINIMAX_API_KEY=your-api-key-here
+MINIMAX_BASE_URL=https://api.minimax.cn/v1
+MINIMAX_MODEL=MiniMax-M3
+LLM_TEMPERATURE=0.2
+LLM_TIMEOUT=30
 ```
+
+`LLM_PROVIDER` 决定用哪家模型，当前默认 `minimax`。显式切回火山方舟：改成
+`LLM_PROVIDER=volcengine`，其余读 `VOLC_*`（`VOLC_API_KEY` / `VOLC_BASE_URL` /
+`VOLC_MODEL`）。**不会自动回退** —— provider 没配好就明确失败，不悄悄换一家继续跑。
+
+`base_url` 一律填 **API 根地址**（不带 `/chat/completions`），OpenAI SDK 自己拼路径。
 
 `.env` 已被 Git 忽略。不要提交真实 API Key、Token 或其他密钥。
 
@@ -169,15 +176,21 @@ ai功能/
 | 变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `AGENT_IMPL` | `fake` | Agent 实现，可选 `fake` 或 `agentscope`。 |
-| `VOLC_API_KEY` | 空 | 火山方舟 API Key。 |
-| `VOLC_BASE_URL` | 方舟 OpenAI 兼容地址 | 模型接口地址。 |
-| `VOLC_MODEL` | 见 `config.py` | 业务 Agent 模型或 endpoint ID。 |
-| `VOLC_TEMPERATURE` | `0.2` | 模型温度。 |
-| `VOLC_TIMEOUT` | `30` | 模型调用超时，单位为秒。 |
-| `VOLC_CONTEXT_CONCIERGE_MODEL` | 跟随 `VOLC_MODEL` | ContextEngine 接待模型。 |
-| `VOLC_CONTEXT_ROUTER_MODEL` | 跟随 `VOLC_MODEL` | ContextEngine 深度路由模型。 |
-| `VOLC_CONTEXT_CONCIERGE_TIMEOUT` | `30` | 接待模型超时，单位为秒。 |
-| `VOLC_CONTEXT_ROUTER_TIMEOUT` | `30` | 路由模型超时，单位为秒。 |
+| `LLM_PROVIDER` | `minimax` | 用哪家模型，可选 `minimax` 或 `volcengine`（显式切回方舟）。 |
+| `MINIMAX_API_KEY` | 空 | MiniMax API Key。 |
+| `MINIMAX_BASE_URL` | `https://api.minimax.cn/v1` | MiniMax API 根地址（不带 `/chat/completions`）。 |
+| `MINIMAX_MODEL` | `MiniMax-M3` | MiniMax 模型名。 |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | 空 | 通用覆盖，优先级高于上面两个 provider，任意 provider 都吃。 |
+| `LLM_TEMPERATURE` | `0.2` | 模型温度。 |
+| `LLM_TIMEOUT` | `30` | 模型调用超时，单位为秒。 |
+| `LLM_DESIGN_TIMEOUT` | `120` | 方案设计（完整 JSON）调用超时，单位为秒。 |
+| `LLM_CONTEXT_CONCIERGE_MODEL` | 跟随当前模型 | ContextEngine 接待模型。 |
+| `LLM_CONTEXT_ROUTER_MODEL` | 跟随当前模型 | ContextEngine 深度路由模型。 |
+| `LLM_CONTEXT_CONCIERGE_TIMEOUT` | `30` | 接待模型超时，单位为秒。 |
+| `LLM_CONTEXT_ROUTER_TIMEOUT` | `30` | 路由模型超时，单位为秒。 |
+| `VOLC_API_KEY` | 空 | 火山方舟 API Key，仅 `LLM_PROVIDER=volcengine` 时生效。 |
+| `VOLC_BASE_URL` | 方舟 OpenAI 兼容地址 | 同上。 |
+| `VOLC_MODEL` | `doubao-seed-2-1-lite-260915` | 同上。 |
 | `LLM_REPAIR_RETRIES` | `1` | 结构校验失败后的修复重试次数。 |
 | `REACT_MAX_ITERS` | `6` | 生成流程的 ReAct 最大步数。 |
 | `REACT_MAX_ITERS_EDIT` | `4` | 编辑流程的 ReAct 最大步数。 |

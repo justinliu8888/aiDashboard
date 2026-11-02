@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.agents.fake_report_agent import FakeReportAgent
+from app.config import get_settings
 from app.main import app
 from app.services.agent_service import agent_service
 from app.services.context_engine import context_engine
@@ -14,7 +15,14 @@ from app.storage.sqlite_store import SqliteSessionRepository
 
 @pytest.fixture(autouse=True)
 def disable_context_model(monkeypatch, tmp_path):
-    """测试只验证本地状态机和规则，不访问外部模型。"""
+    """测试只验证本地状态机和规则，不访问外部模型。
+
+    ``agent_impl`` 显式置为 ``fake``：本套件本来就是 fake 模式
+    （业务 Agent 已被替换成 FakeReportAgent，路由层也没有模型客户端）。
+    真实模型模式在「模型没接上」时是**明确失败**而不是静默降级，
+    这里必须落在 fake 那一侧，否则用例会撞上「缺配置即失败」的分支。
+    """
+    monkeypatch.setattr(get_settings(), "agent_impl", "fake")
     monkeypatch.setattr(context_engine, "_client", None)
     monkeypatch.setattr(agent_service, "_agent", FakeReportAgent())
     # 每个测试用独立的 SQLite 文件，避免用例之间串数据

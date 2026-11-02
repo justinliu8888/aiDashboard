@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -12,34 +13,93 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(_BACKEND_DIR / ".env")
 
 
+#: 支持的 LLM provider。
+PROVIDER_MINIMAX = "minimax"
+PROVIDER_VOLCENGINE = "volcengine"
+
+#: provider 取值别名。未知取值直接报错，不静默挑一个。
+_PROVIDER_ALIASES = {
+    "minimax": PROVIDER_MINIMAX,
+    "volcengine": PROVIDER_VOLCENGINE,
+    "volc": PROVIDER_VOLCENGINE,
+    "ark": PROVIDER_VOLCENGINE,
+    "doubao": PROVIDER_VOLCENGINE,
+}
+
+
+def _env(*names: str, default: str = "") -> str:
+    """按顺序读第一个非空的环境变量。
+
+    新的 provider 中立变量优先，旧的 ``VOLC_*`` 作为兼容回退：
+    旧 ``.env`` 不改也能跑，显式切回方舟时也不用重配。
+    """
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
+
+
+def _env_int(*names: str, default: int) -> int:
+    return int(_env(*names, default=str(default)))
+
+
+def _env_float(*names: str, default: float) -> float:
+    return float(_env(*names, default=str(default)))
+
+
 class Settings:
     """运行时配置。"""
 
     # Agent 实现选择：fake / agentscope
     agent_impl: str = os.getenv("AGENT_IMPL", "fake").lower()
 
-    # 火山方舟
-    volc_api_key: str = os.getenv("VOLC_API_KEY", "")
-    volc_base_url: str = os.getenv(
-        "VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"
-    )
-    volc_model: str = os.getenv("VOLC_MODEL", "doubao-seed-1-6-250615")
-    volc_temperature: float = float(os.getenv("VOLC_TEMPERATURE", "0.2"))
-    volc_timeout: int = int(os.getenv("VOLC_TIMEOUT", "30"))
+    # ===== LLM provider 统一配置 =====
+    #
+    # 当前运行配置：``minimax`` + ``MiniMax-M3``，思考显式关闭。
+    # 显式切回火山方舟：``LLM_PROVIDER=volcengine``，其余走 ``VOLC_*``。
+    # **不自动回退**：provider 没配好就明确失败，不悄悄换一家继续跑。
+    llm_provider: str = os.getenv("LLM_PROVIDER", PROVIDER_MINIMAX).strip().lower()
 
-    # ContextEngine 两段式模型：轻量接待员 + 重路由器
-    volc_context_concierge_model: str = os.getenv(
-        "VOLC_CONTEXT_CONCIERGE_MODEL", os.getenv("VOLC_MODEL", "doubao-seed-1-6-250615")
-    )
-    volc_context_router_model: str = os.getenv(
-        "VOLC_CONTEXT_ROUTER_MODEL", os.getenv("VOLC_MODEL", "doubao-seed-1-6-250615")
-    )
-    volc_context_concierge_timeout: int = int(os.getenv("VOLC_CONTEXT_CONCIERGE_TIMEOUT", "30"))
-    volc_context_router_timeout: int = int(os.getenv("VOLC_CONTEXT_ROUTER_TIMEOUT", "30"))
+    # 通用覆盖：任何 provider 都吃，优先级最高。
+    llm_api_key: str = _env("LLM_API_KEY")
+    llm_base_url: str = _env("LLM_BASE_URL")
+    llm_model: str = _env("LLM_MODEL")
 
-    # 方案设计（#19）的专用时限。完整方案 JSON 比短问答慢得多
-    # （实测真实模型约 45 秒），复用 volc_timeout（30 秒）会稳定超时。
-    volc_design_timeout: int = int(os.getenv("VOLC_DESIGN_TIMEOUT", "120"))
+    # MiniMax（OpenAI 兼容协议）
+    minimax_api_key: str = _env("MINIMAX_API_KEY")
+    minimax_base_url: str = _env("MINIMAX_BASE_URL", default="https://api.minimax.cn/v1")
+    minimax_model: str = _env("MINIMAX_MODEL", default="MiniMax-M3")
+
+    # 火山方舟（保留显式切回路径；仅在 LLM_PROVIDER=volcengine 时生效）
+    volc_api_key: str = _env("VOLC_API_KEY")
+    volc_base_url: str = _env(
+        "VOLC_BASE_URL", default="https://ark.cn-beijing.volces.com/api/v3"
+    )
+    volc_model: str = _env("VOLC_MODEL", default="doubao-seed-2-1-lite-260915")
+
+    # 阶段模型覆盖：留空 = 跟随当前 provider 的默认模型。
+    llm_context_concierge_model: str = _env("LLM_CONTEXT_CONCIERGE_MODEL")
+    llm_context_router_model: str = _env("LLM_CONTEXT_ROUTER_MODEL")
+    llm_design_model: str = _env("LLM_DESIGN_MODEL")
+    # 旧名：只作为方舟路径下的阶段覆盖。
+    volc_context_concierge_model: str = _env("VOLC_CONTEXT_CONCIERGE_MODEL")
+    volc_context_router_model: str = _env("VOLC_CONTEXT_ROUTER_MODEL")
+
+    # 通用参数（旧 ``VOLC_*`` 名继续认）
+    llm_temperature: float = _env_float("LLM_TEMPERATURE", "VOLC_TEMPERATURE", default=0.2)
+    llm_timeout: int = _env_int("LLM_TIMEOUT", "VOLC_TIMEOUT", default=30)
+    # 方案设计（#19）的专用时限。完整方案 JSON 比短问答慢得多，
+    # 复用通用超时（30 秒）会稳定超时。
+    llm_design_timeout: int = _env_int(
+        "LLM_DESIGN_TIMEOUT", "VOLC_DESIGN_TIMEOUT", default=120
+    )
+    llm_context_concierge_timeout: int = _env_int(
+        "LLM_CONTEXT_CONCIERGE_TIMEOUT", "VOLC_CONTEXT_CONCIERGE_TIMEOUT", default=30
+    )
+    llm_context_router_timeout: int = _env_int(
+        "LLM_CONTEXT_ROUTER_TIMEOUT", "VOLC_CONTEXT_ROUTER_TIMEOUT", default=30
+    )
 
     # 可靠性
     llm_repair_retries: int = int(os.getenv("LLM_REPAIR_RETRIES", "1"))
@@ -99,6 +159,110 @@ class Settings:
     require_access_token: bool = os.getenv("AI_REQUIRE_ACCESS_TOKEN", "0").lower() in (
         "1", "true", "yes"
     )
+
+    # ---------- 解析后的有效配置 ----------
+    #
+    # 这一层是「当前到底在用哪家、哪个模型、怎么调」的唯一答案。
+    # 调用方只读这里的解析结果，不自己拼 provider。
+
+    @property
+    def provider_name(self) -> str:
+        """当前 provider 名称。未知取值直接报错，不静默挑一家。"""
+        resolved = _PROVIDER_ALIASES.get(self.llm_provider)
+        if resolved is None:
+            raise ValueError(
+                f"未知 LLM_PROVIDER={self.llm_provider!r}，"
+                f"支持：{PROVIDER_MINIMAX} / {PROVIDER_VOLCENGINE}"
+            )
+        return resolved
+
+    @property
+    def provider_is_volcengine(self) -> bool:
+        return self.provider_name == PROVIDER_VOLCENGINE
+
+    @property
+    def active_api_key(self) -> str:
+        if self.llm_api_key:
+            return self.llm_api_key
+        return self.volc_api_key if self.provider_is_volcengine else self.minimax_api_key
+
+    @property
+    def active_base_url(self) -> str:
+        """模型接口的 **API 根地址**（不含 /chat/completions）。
+
+        OpenAI SDK 会自己拼路径；把完整 URL 当 base_url 传会拼出
+        ``.../chat/completions/chat/completions``。
+        """
+        if self.llm_base_url:
+            return self.llm_base_url
+        return self.volc_base_url if self.provider_is_volcengine else self.minimax_base_url
+
+    @property
+    def active_model(self) -> str:
+        if self.llm_model:
+            return self.llm_model
+        return self.volc_model if self.provider_is_volcengine else self.minimax_model
+
+    @property
+    def context_concierge_model(self) -> str:
+        if self.llm_context_concierge_model:
+            return self.llm_context_concierge_model
+        if self.provider_is_volcengine and self.volc_context_concierge_model:
+            return self.volc_context_concierge_model
+        return self.active_model
+
+    @property
+    def context_router_model(self) -> str:
+        if self.llm_context_router_model:
+            return self.llm_context_router_model
+        if self.provider_is_volcengine and self.volc_context_router_model:
+            return self.volc_context_router_model
+        return self.active_model
+
+    @property
+    def design_model(self) -> str:
+        return self.llm_design_model or self.active_model
+
+    @property
+    def request_extra_body(self) -> dict[str, Any]:
+        """请求体附加字段。
+
+        MiniMax 默认会把思考过程内联进 content，直接 ``json.loads`` 会炸；
+        显式 ``thinking.type=disabled`` 才是干净的纯 JSON。
+        方舟不认这个字段，所以按 provider 区分。
+        """
+        if self.provider_is_volcengine:
+            return {}
+        return {"thinking": {"type": "disabled"}}
+
+    @property
+    def real_model_mode(self) -> bool:
+        """真实模型模式（不是 fake 规则实现）。"""
+        return self.agent_impl == "agentscope"
+
+    # ---------- 旧名兼容 ----------
+    #
+    # 外部脚本与旧代码仍可能读这些名字，值与新的中立名一致。
+
+    @property
+    def volc_temperature(self) -> float:
+        return self.llm_temperature
+
+    @property
+    def volc_timeout(self) -> int:
+        return self.llm_timeout
+
+    @property
+    def volc_design_timeout(self) -> int:
+        return self.llm_design_timeout
+
+    @property
+    def volc_context_concierge_timeout(self) -> int:
+        return self.llm_context_concierge_timeout
+
+    @property
+    def volc_context_router_timeout(self) -> int:
+        return self.llm_context_router_timeout
 
 
 @lru_cache

@@ -540,11 +540,12 @@ class ContextEngine:
     def __init__(self) -> None:
         self._settings = get_settings()
         self._client: AsyncOpenAI | None = None
-        if self._settings.volc_api_key:
+        if self._settings.active_api_key:
             self._client = AsyncOpenAI(
-                api_key=self._settings.volc_api_key,
-                base_url=self._settings.volc_base_url,
-                timeout=self._settings.volc_timeout,
+                api_key=self._settings.active_api_key,
+                # base_url 是 **API 根地址**，OpenAI SDK 自己拼 /chat/completions。
+                base_url=self._settings.active_base_url,
+                timeout=self._settings.llm_timeout,
                 # **重试一次**（SDK 自带）：上游偶尔把长连接掐断，
                 # 不重试的话用户直接看到「请求失败：network error」。
                 max_retries=1,
@@ -576,7 +577,7 @@ class ContextEngine:
 
         await _emit(emit, "stage", {
             "stage": "template_edit_semantic_start",
-            "model": self._settings.volc_context_router_model,
+            "model": self._settings.context_router_model,
             "ruleIntent": rule_plan.intent.value,
         })
         try:
@@ -589,14 +590,14 @@ class ContextEngine:
                 "validIntents": [intent.value for intent in EditIntent],
             }
             raw = await self._chat_json_stream(
-                model=self._settings.volc_context_router_model,
+                model=self._settings.context_router_model,
                 temperature=0,
                 messages=[
                     {"role": "system", "content": _TEMPLATE_EDIT_SEMANTIC_PROMPT},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
                 response_format={"type": "json_object"},
-                timeout=self._settings.volc_context_router_timeout,
+                timeout=self._settings.llm_context_router_timeout,
                 emit=emit,
                 chunk_stage="template_edit_semantic_chunk",
             )
@@ -708,8 +709,8 @@ class ContextEngine:
             request.conversationId,
             request.state.value,
             len(request.message or ""),
-            self._settings.volc_context_concierge_timeout,
-            self._settings.volc_context_router_timeout,
+            self._settings.llm_context_concierge_timeout,
+            self._settings.llm_context_router_timeout,
         )
 
         # 规则层先判阻断：越权范围、未登记指标。
@@ -749,15 +750,34 @@ class ContextEngine:
         )
 
         if self._client is None:
+            reason = f"未配置 {self._settings.provider_name} 的 API Key"
+            # 真实模型模式：模型没接上就**明确失败**，不静默退回规则路由。
+            # 退回规则路由会产出一条看着正常的路由结论，用户看不出模型根本没跑，
+            # 只会以为「系统今天就是慢」。缺配置必须变成看得见的失败。
+            if self._settings.real_model_mode:
+                log_timeline_step("model_not_configured")
+                await _emit(
+                    emit,
+                    "stage",
+                    {"stage": "model_not_configured", "reason": reason},
+                )
+                log_warning(
+                    logger,
+                    "[context_engine] step=model_not_configured conversationId=%s reason=%s",
+                    request.conversationId,
+                    reason,
+                )
+                raise RuntimeError(f"模型未配置：{reason}")
+            # fake 模式（显式测试用）：本来就没有模型，规则路由照旧。
             log_timeline_step("fallback_no_client")
             await _emit(emit, "stage", {"stage": "fallback_no_client"})
             log_warning(
                 logger,
                 "[context_engine] step=fallback_no_client conversationId=%s reason=%s",
                 request.conversationId,
-                "VOLC_API_KEY 未配置",
+                reason,
             )
-            decision = self._fallback_route(request, "VOLC_API_KEY 未配置")
+            decision = self._fallback_route(request, reason)
             decision.engineStage = "fallback_no_client"
             decision.isTemplateEdit = _detect_template_edit(request.message, request.state)
             self._resolve_inputs(decision, request, explicit, defaults)
@@ -854,13 +874,13 @@ class ContextEngine:
                 "stage",
                 {
                     "stage": "deep_route_start",
-                    "model": self._settings.volc_context_router_model,
+                    "model": self._settings.context_router_model,
                     "debugParams": {
                         "模型调用": {
-                            "model": self._settings.volc_context_router_model,
+                            "model": self._settings.context_router_model,
                             "temperature": 0,
                             "responseFormat": "json_object",
-                            "timeoutSeconds": self._settings.volc_context_router_timeout,
+                            "timeoutSeconds": self._settings.llm_context_router_timeout,
                         },
                         "路由输入": {
                             "state": request.state.value,
@@ -880,17 +900,17 @@ class ContextEngine:
                 logger,
                 "[context_engine] step=deep_route_start conversationId=%s model=%s",
                 request.conversationId,
-                self._settings.volc_context_router_model,
+                self._settings.context_router_model,
             )
             raw = await self._chat_json_stream(
-                model=self._settings.volc_context_router_model,
+                model=self._settings.context_router_model,
                 temperature=0,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": self._compose_input(request, explicit, defaults)},
                 ],
                 response_format={"type": "json_object"},
-                timeout=self._settings.volc_context_router_timeout,
+                timeout=self._settings.llm_context_router_timeout,
                 emit=emit,
                 chunk_stage="deep_route_chunk",
             )
@@ -1108,25 +1128,25 @@ class ContextEngine:
             "stage",
             {
                 "stage": "concierge_start",
-                "model": self._settings.volc_context_concierge_model,
+                "model": self._settings.context_concierge_model,
             },
         )
         log_info(
             logger,
             "[context_engine] step=concierge_start conversationId=%s model=%s",
             request.conversationId,
-            self._settings.volc_context_concierge_model,
+            self._settings.context_concierge_model,
         )
         try:
             raw = await self._chat_json_stream(
-                model=self._settings.volc_context_concierge_model,
+                model=self._settings.context_concierge_model,
                 temperature=0.2,
                 messages=[
                     {"role": "system", "content": _CONCIERGE_PROMPT},
                     {"role": "user", "content": self._compose_concierge_input(request)},
                 ],
                 response_format={"type": "json_object"},
-                timeout=self._settings.volc_context_concierge_timeout,
+                timeout=self._settings.llm_context_concierge_timeout,
                 emit=emit,
                 chunk_stage="concierge_chunk",
             )
@@ -1197,6 +1217,9 @@ class ContextEngine:
             response_format=response_format,
             stream=True,
             timeout=timeout,
+            # MiniMax 默认把思考内联进 content，会污染 JSON 解析；
+            # 显式关思考，拿到的是纯 JSON 正文。
+            extra_body=self._settings.request_extra_body,
         )
 
         chunks: list[str] = []

@@ -368,23 +368,37 @@ def _time_range_label(definition: ReportDefinitionDraft, region_id: str) -> str:
 
 
 def _build_agent():
-    """按配置选择 Agent 实现。"""
+    """按配置选择 Agent 实现。
+
+    ``agentscope`` 是**真实模型模式**：构造失败就让它失败，不降级 FakeAgent。
+    降级下去用户拿到的是规则拼出来的回复，看着像正常结果，
+    实际上模型根本没跑 —— 配置漏了却看不出来（契约表 §6.5 的诚实失败要求）。
+
+    ``fake`` 是显式测试模式：用 FakeReportAgent，不碰模型。
+    """
     impl = get_settings().agent_impl
     if impl == "agentscope":
+        settings = get_settings()
+        logger.info(
+            "使用 AgentScopeReportAgent（provider=%s model=%s）",
+            settings.provider_name,
+            settings.active_model,
+        )
         try:
             from app.agents.agentscope_report_agent import AgentScopeReportAgent
 
-            logger.info("使用 AgentScopeReportAgent（火山方舟）")
             return AgentScopeReportAgent()
         except Exception as e:  # noqa: BLE001
             # 异常原文不进日志（#61）：异常对象换成 None —— 调用栈还在，
             # 异常消息没了。只留原因类型。
             logger.exception(
-                "AgentScopeReportAgent 初始化失败，降级 FakeAgent errorType=%s",
+                "AgentScopeReportAgent 初始化失败，真实模型模式不降级 FakeAgent "
+                "errorType=%s",
                 type(e).__name__,
                 exc_info=(type(e), None, e.__traceback__),
             )
-            return FakeReportAgent()
+            # 原样抛出去：真实模型模式宁可启动失败，也不要装作正常。
+            raise
     logger.info("使用 FakeReportAgent")
     return FakeReportAgent()
 
@@ -1372,7 +1386,7 @@ class AgentService:
                         "impl": self._agent.__class__.__name__,
                         "execution": "async" if handle is not None else "sync",
                         "configuredModel": (
-                            get_settings().volc_model if self._agent.__class__.__name__ == "AgentScopeReportAgent"
+                            get_settings().active_model if self._agent.__class__.__name__ == "AgentScopeReportAgent"
                             else "local_rules"
                         ),
                     },

@@ -2,7 +2,8 @@
 
 架构：
     - 单 Agent + Tools（工具统一在 app/tools/ 下）
-    - LLM：火山方舟 Doubao-Seed-2.1-lite，通过 AgentScope 原生 VolcengineChatModel 接入
+    - LLM：通过 AgentScope 的 OpenAI 兼容模型接入（当前 provider = MiniMax，
+  MiniMax-M3，思考显式关闭）；provider 由 ``app.config`` 统一配置。
     - ReAct 循环：Reason → Tool → Observation → ... → 终结工具提交结论
     - 可靠性：LLM 输出不合法 → 修复重试 1 次 → 仍失败则由上层降级 FakeAgent
 
@@ -139,7 +140,7 @@ def _neutralize_applied_style_claims(reply: str) -> str:
 
 
 class AgentScopeReportAgent:
-    """AgentScope ReAct Agent + 火山方舟 Doubao，覆盖样例 1。"""
+    """AgentScope ReAct Agent + 真实模型（provider 由配置决定），覆盖样例 1。"""
 
     def __init__(self) -> None:
         self._settings = get_settings()
@@ -152,32 +153,38 @@ class AgentScopeReportAgent:
     # ---------- 初始化 ----------
 
     def _init_model(self):
-        """构造 VolcengineChatModel。失败则返回 (None, err)。
+        """构造 AgentScope 的 OpenAI 兼容模型（当前 provider = MiniMax）。
 
         Agent 实例在每次 handle 时新建（AgentScope Agent 有对话内部状态，不适合跨请求复用）。
 
         ``err`` 只回**原因类别**，不回异常原文：它会被写进日志，
         而初始化异常里可能带着带凭据的 base_url。
         """
-        if not self._settings.volc_api_key:
-            return None, "VOLC_API_KEY 未配置"
+        settings = self._settings
+        if not settings.active_api_key:
+            return None, f"{settings.provider_name} API Key 未配置"
         try:
-            from agentscope.credential import VolcengineCredential
-            from agentscope.formatter import VolcengineChatFormatter
-            from agentscope.model import VolcengineChatModel
+            from agentscope.credential import OpenAICredential
+            from agentscope.formatter import OpenAIChatFormatter
+            from agentscope.model import OpenAIChatModel
 
-            credential = VolcengineCredential(
-                api_key=self._settings.volc_api_key,
-                base_url=self._settings.volc_base_url,
+            credential = OpenAICredential(
+                api_key=settings.active_api_key,
+                # base_url 是 **API 根地址**，SDK 自己拼 /chat/completions。
+                base_url=settings.active_base_url,
             )
-            model = VolcengineChatModel(
+            model = OpenAIChatModel(
                 credential=credential,
-                model=self._settings.volc_model,
-                parameters=VolcengineChatModel.Parameters(
-                    temperature=self._settings.volc_temperature,
+                model=settings.active_model,
+                parameters=OpenAIChatModel.Parameters(
+                    temperature=settings.llm_temperature,
                 ),
                 stream=False,
-                formatter=VolcengineChatFormatter(),
+                formatter=OpenAIChatFormatter(),
+                # **每次请求都带上**（AgentScope 2.0 的 extra_body 逐请求下发）：
+                # MiniMax 默认把思考内联进 content，会污染 JSON 解析；
+                # 显式关思考，拿到的是纯 JSON 正文。
+                extra_body=settings.request_extra_body,
             )
             return model, None
         except Exception as exc:  # noqa: BLE001
@@ -251,12 +258,15 @@ class AgentScopeReportAgent:
     def handle(self, request: AgentRequest) -> AgentResponse:
         """同步入口：兼容老调用方（会新建 loop，可能遇到连接池失效问题）。"""
         if self._model is None:
-            log_info(
+            # 模型没接上：**明确失败**，不降级 FakeAgent。
+            # 降级下去用户拿到的是一条规则拼出来的回复，看着像正常结果，
+            # 实际上模型根本没跑 —— 配置漏了却看不出来。
+            log_warning(
                 logger,
-                "AgentScope 未就绪（%s），降级 FakeAgent",
+                "AgentScope 未就绪（%s），本轮明确失败",
                 self._init_err,
             )
-            return self._degraded_response(request)
+            return self._model_unavailable_response(request)
         try:
             plan, reason = asyncio.run(self._run_agent(request))
         except Exception as exc:  # noqa: BLE001
@@ -267,18 +277,36 @@ class AgentScopeReportAgent:
     async def ahandle(self, request: AgentRequest) -> AgentResponse:
         """async 入口：复用 FastAPI 的事件循环，避免 httpx 连接池跨 loop 失效。"""
         if self._model is None:
-            log_info(
+            # 同 handle：模型没接上是**明确失败**，不是降级。
+            log_warning(
                 logger,
-                "AgentScope 未就绪（%s），降级 FakeAgent",
+                "AgentScope 未就绪（%s），本轮明确失败",
                 self._init_err,
             )
-            return self._degraded_response(request)
+            return self._model_unavailable_response(request)
         try:
             plan, reason = await self._run_agent(request)
         except Exception as exc:  # noqa: BLE001
             log_failure(logger, "AgentScope 运行异常，降级 FakeAgent", exc)
             return self._degraded_response(request)
         return self._dispatch(request, plan, reason)
+
+    @staticmethod
+    def _model_unavailable_response(request: AgentRequest) -> AgentResponse:
+        """模型不可用：如实说失败，不拿规则拼一条像模像样的回复。
+
+        与 ``_query_failure_response`` / ``_unavailable_edit_response`` 同口径：
+        带可辨识的失败码，前端能把它渲染成失败而不是正常答复。
+        """
+        message = "模型服务当前不可用，本轮没有生成结果。请稍后重试。"
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=request.state,
+            reply=message,
+            designSessionId=request.context.designSessionId,
+            error=AgentError(code="MODEL_UNAVAILABLE", message=message),
+            debug={"modelOutcome": "model_unavailable"},
+        )
 
     def _dispatch(
         self,
