@@ -345,3 +345,94 @@ def test_ordinal_indexes(text, expected_index):
 
     assert result.status == REF_RESOLVED
     assert result.visibleIndex == expected_index
+
+
+# ---------- 历史指代（「刚才那张」） ----------
+
+
+def test_recency_reference_resolves_to_the_last_applied_card():
+    """「刚才那张」= 上一次**已应用**修改的那张卡片。"""
+    result = resolve_visible_reference(
+        "把刚才那张卡片的标题改为测试卡片",
+        _regions(),
+        history_region_id="region_hourly_trend",
+    )
+
+    assert result.status == REF_RESOLVED
+    assert result.regionId == "region_hourly_trend"
+    assert result.label == "小时趋势"
+    assert result.reason == "history_region"
+
+
+def test_recency_reference_reads_history_only_when_asked():
+    """历史不是活动目标：没有活动目标时，普通指代词照样要问。"""
+    result = resolve_visible_reference(
+        "把这个删掉",
+        _regions(),
+        history_region_id="region_hourly_trend",
+    )
+
+    assert result.status == REF_NEEDS_CLARIFICATION
+    assert result.regionId == ""
+    assert result.options
+
+
+def test_recency_without_history_asks_with_candidates():
+    """没有历史时不猜：照旧列出可见卡片让用户选。"""
+    result = resolve_visible_reference("把刚才那张改成柱状图", _regions())
+
+    assert result.status == REF_NEEDS_CLARIFICATION
+    assert result.reason == "recency_without_history"
+    assert result.options
+    assert "小时趋势" in result.question
+
+
+def test_explicit_ordinal_wins_over_history():
+    """用户点名了对象就以名字 / 序数为准，历史靠后。"""
+    result = resolve_visible_reference(
+        "把第二张改成柱状图",
+        _regions(),
+        history_region_id="region_hourly_trend",
+    )
+
+    assert result.status == REF_RESOLVED
+    assert result.regionId == "region_device_ranking"
+
+
+def test_exact_name_wins_over_history():
+    """明确说出的卡片名比「刚才那张」更具体。"""
+    result = resolve_visible_reference(
+        "把设备耗电排名改成柱状图",
+        _regions(),
+        history_region_id="region_hourly_trend",
+    )
+
+    assert result.status == REF_RESOLVED
+    assert result.regionId == "region_device_ranking"
+
+
+def test_history_is_ignored_when_the_card_is_no_longer_visible():
+    """历史指向的卡片已经不在页面上了：追问，不指着一张看不见的卡片。"""
+    visible = ["region_total_energy", "region_device_ranking"]
+    result = resolve_visible_reference(
+        "把刚才那张改成柱状图",
+        _regions(),
+        visible_region_ids=visible,
+        history_region_id="region_hourly_trend",
+    )
+
+    assert result.status == REF_NEEDS_CLARIFICATION
+    assert result.regionId == ""
+
+
+def test_active_selection_still_wins_for_ordinary_demonstrative():
+    """有活动目标时，「这个」照旧指活动目标（历史不参与）。"""
+    result = resolve_visible_reference(
+        "把这个删掉",
+        _regions(),
+        selected_region_id="region_data_quality",
+        history_region_id="region_hourly_trend",
+    )
+
+    assert result.status == REF_RESOLVED
+    assert result.regionId == "region_data_quality"

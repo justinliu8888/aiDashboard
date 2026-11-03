@@ -58,6 +58,17 @@ _DEMONSTRATIVE_PATTERN = re.compile(
 # 指代词后面常跟的“卡片/图/表”限定，用于判断它指的是正文卡片
 _CARD_HINT_PATTERN = re.compile(r"卡片|图表|图|表|区域|区块|面板|模块")
 
+# 近期指代：「刚才那张」「刚刚那块」「刚才改过的那张」
+#
+# 只有**明确说了「刚才 / 刚刚 / 方才」**才算历史指代：普通「这个 / 那张」
+# 是泛指指代，没有活动目标时必须追问，不能因为「上次改过某张」就悄悄
+# 挑那一张 —— 历史是过去发生的事，不是当前选中的对象。
+_RECENCY_PATTERN = re.compile(
+    r"(?:刚才|刚刚|方才|刚)\s*"
+    r"(?:(?:改|调|处理|操作|动)过的?\s*)?"
+    r"(?:那|这)?\s*(?:个|张|块|条|幅|项|组)"
+)
+
 
 # ---------- 输出结构 ----------
 
@@ -245,6 +256,7 @@ def resolve_visible_reference(
     *,
     visible_region_ids: list[str] | None = None,
     selected_region_id: str | None = None,
+    history_region_id: str | None = None,
 ) -> ReferenceResolution:
     """解析「第三个」「最后一张」「这个」这类对可见对象的指代。
 
@@ -259,7 +271,10 @@ def resolve_visible_reference(
     * `text`：用户原话；
     * `regions`：当前草稿的 regions；
     * `visible_region_ids`：前端回传的正文卡片 ID 顺序（可选）；
-    * `selected_region_id`：当前选中的 region（用于解析「这个」）。
+    * `selected_region_id`：当前选中的 region（用于解析「这个」）；
+    * `history_region_id`：最近一次**已应用**的卡片级修改所在卡片
+      （可选）。这是**历史**，不是活动目标：**只有**明确的历史指代
+      （「刚才那张」）才会读它；普通指代词不会因为有历史就自己挑一张。
     """
     raw = (text or "").strip()
     if not raw:
@@ -349,6 +364,44 @@ def resolve_visible_reference(
             visibleCount=len(cards),
             options=options,
             reason="exact_label",
+            staleRegionIds=stale,
+            orderSource=order_source,
+        )
+
+    # 明确的历史指代：「刚才那张」= 上一次**已应用**的那次修改所在卡片。
+    #
+    # 位置：序数、精确名称之后，普通指代词之前 —— 用户点名了对象
+    # （「第二张」「设备耗电排名」）就以名字 / 序数为准，只有泛泛地说
+    # 「刚才那张」才去读历史。
+    #
+    # 历史是**过去发生的事**：读它不会把哪张卡片变成「当前选中」，
+    # 调用方也不该拿它当活动目标回传。没有可用历史（没改过 / 那张卡片
+    # 已经不在页面上了）时照旧追问，不猜。
+    recency = _RECENCY_PATTERN.search(raw)
+    if recency is not None:
+        if history_region_id:
+            for card in cards:
+                if card.regionId == str(history_region_id):
+                    return ReferenceResolution(
+                        status=STATUS_RESOLVED,
+                        regionId=card.regionId,
+                        label=card.label,
+                        matchedText=recency.group(0),
+                        visibleIndex=card.index,
+                        visibleCount=len(cards),
+                        options=options,
+                        reason="history_region",
+                        staleRegionIds=stale,
+                        orderSource=order_source,
+                    )
+        return ReferenceResolution(
+            status=STATUS_NEEDS_CLARIFICATION,
+            visibleCount=len(cards),
+            options=options,
+            question="您指的是哪一个卡片？当前可见的有：" + "、".join(
+                f"第 {card.index} 个 {card.label}" for card in cards
+            ) + "。",
+            reason="recency_without_history",
             staleRegionIds=stale,
             orderSource=order_source,
         )

@@ -4,7 +4,7 @@
     cd backend
     python3 scripts/smoke_llm.py
 
-依赖：backend/.env 里配好 VOLC_API_KEY 和 VOLC_MODEL。
+依赖：backend/.env 里配好 provider 的 API Key 与模型（当前默认 minimax）。
 """
 from __future__ import annotations
 
@@ -47,9 +47,11 @@ CASES = [
 def main() -> int:
     settings = get_settings()
     print(f"==> AGENT_IMPL = {settings.agent_impl}")
-    print(f"==> VOLC_MODEL = {settings.volc_model}")
-    print(f"==> VOLC_BASE_URL = {settings.volc_base_url}")
-    print(f"==> api_key = {'<set>' if settings.volc_api_key else '<empty>'}\n")
+    print(f"==> LLM_PROVIDER = {settings.provider_name}")
+    print(f"==> model = {settings.active_model}")
+    print(f"==> base_url = {settings.active_base_url}")
+    print(f"==> api_key = {'<set>' if settings.active_api_key else '<empty>'}")
+    print(f"==> extra_body = {settings.request_extra_body}\n")
 
     agent = AgentScopeReportAgent()
 

@@ -1,0 +1,204 @@
+/* ============================================================================
+ * workbench_presentation.css —— 报表展示排版模块（P3）的专属样式。
+ *
+ * 用途：给 <script src="./workbench_presentation.js"> 配套的结构样式。
+ * 接入方式（由 P0 在 workbench.html 里加一行）：
+ *   <link rel="stylesheet" href="./workbench_presentation.css?v=20261102">
+ *
+ * 约束：
+ *   - 纯 CSS，无构建步骤依赖（不引 preprocessor、不引 tailwind 配置）；
+ *   - 类名一律加 wp- 前缀，**不覆盖**宿主已有的 .region-highlight 等类；
+ *   - 动态排版（列数、间距、列宽）由 workbench_presentation.js 以
+ *     **inline style** 逐属性写入，本文件只负责结构与状态样式，
+ *     两边不打架：inline style 优先级更高；
+ *   - 唯一例外是「窄屏减列」兜底（见下方窄屏一节）：它只在 JS 拿不到
+ *     容器宽度时生效，用 !important 压过 inline style。
+ * ==========================================================================*/
+
+/* ---------------------------------------------------------------- 根容器 */
+
+.wp-root {
+  box-sizing: border-box;
+  width: 100%;
+  /* 页面最大宽度由 JS 以 inline style 写入（max-width + margin:0 auto） */
+}
+
+/* 根 / 组里的直接子项：允许收缩，避免长表格把栅格撑破 */
+.wp-root > .wp-leaf,
+.wp-root > .wp-group,
+.wp-group > .wp-leaf,
+.wp-group > .wp-group {
+  min-width: 0;
+}
+
+/* ---------------------------------------------------------------- 容器分组 */
+
+.wp-group {
+  box-sizing: border-box;
+  min-width: 0;
+  /* display / grid-template-columns / gap 由 JS 以 inline style 写入 */
+}
+
+/* 组标题：默认不渲染（options.renderGroupTitle === true 时才出现） */
+.wp-group-title {
+  box-sizing: border-box;
+  grid-column: 1 / -1; /* GRID 模式下占满整行，不占一格 */
+  flex: 0 0 100%; /* FLOW 模式下独占一行 */
+  min-width: 0;
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155;
+  line-height: 1.5;
+}
+
+/* ---------------------------------------------------------------- 叶子外壳 */
+
+/*
+ * 叶子外壳只包住 renderLeaf 的产物，不改卡片内部结构。
+ * 卡片自身的样式（tailwind 类）仍然生效。
+ */
+.wp-leaf {
+  box-sizing: border-box;
+  min-width: 0;
+}
+
+/* Explicit presentation wins over legacy typography utilities, but not badges/tools. */
+.wp-card[data-wp-font-size] .region-name,
+.wp-card[data-wp-font-size] .region-body > div:not(.region-payload-notes),
+.wp-card[data-wp-font-size] [data-region-metric] > div,
+.wp-card[data-wp-font-size] .region-body th,
+.wp-card[data-wp-font-size] .region-body td {
+  font-size: var(--wp-font-size);
+}
+
+.wp-card[data-wp-text-align] .region-name,
+.wp-card[data-wp-text-align] .region-body,
+.wp-card[data-wp-text-align] .region-body th,
+.wp-card[data-wp-text-align] .region-body td {
+  text-align: var(--wp-text-align);
+}
+
+.wp-card[data-wp-border-radius],
+.wp-card[data-wp-border-radius] [data-region-metric] {
+  border-radius: var(--wp-border-radius);
+}
+
+/* Wrap by available card width, not viewport width; retain host editing/lock visibility. */
+.wp-leaf > .wp-card {
+  padding-inline: min(1.25rem, 8%);
+}
+
+.wp-card > .flex:first-child {
+  flex-wrap: wrap;
+}
+
+.wp-card > .flex:first-child > .flex-1 {
+  flex-basis: 10rem;
+  max-width: 100%;
+}
+
+.wp-card > .flex:first-child > .shrink-0,
+.wp-card .region-tools {
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.wp-card .region-tools > button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.wp-card .region-name,
+.wp-card .region-body {
+  overflow-wrap: anywhere;
+}
+
+/* At most two metric columns; shrink to one without size containment affecting FLOW heights. */
+.wp-card .region-body > .grid:has(> [data-region-metric]) {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, max(10rem, calc(50% - 0.25rem))), 1fr));
+}
+
+/* 隐藏内容：半透明显示（不删 DOM、不空出位置） */
+.wp-leaf-hidden,
+.wp-group-hidden {
+  opacity: 0.45;
+}
+
+/* 隐藏内容加一点虚线提示，和普通卡片一眼能分开 */
+.wp-leaf-hidden > *,
+.wp-group-hidden > * {
+  filter: grayscale(0.35);
+}
+
+/* ---------------------------------------------------------------- 绝对定位层 */
+
+/*
+ * 绝对定位的叶子由 JS 加 position:absolute，所属容器由 JS 加
+ * position:relative + min-height（内容不裁、不重叠）。这里只兜底。
+ */
+.wp-group,
+.wp-root {
+  isolation: isolate;
+}
+
+/* ---------------------------------------------------------------- 窄屏减列 */
+
+/*
+ * 容器宽度太窄时，多列组收成窄屏列数（默认 1 列）。
+ *
+ * 断点口径：容器宽度 480px。定义里若写了**显式窄屏配置**
+ * （definition.page.breakpoints），JS 会按配置算列数，这条兜底自动让位
+ * （只在 data-narrow-source="default" 时生效）。
+ *
+ * 优先级：JS 算出的生效列数写在内联样式里（优先级最高），
+ * CSS 这条只在 JS **拿不到容器宽度**（没有 data-narrow-measured）时兜底。
+ * 两条规则都只改排版，**不写报表定义**。
+ */
+@media (max-width: 480px) {
+  .wp-root[data-narrow-source="default"]:not([data-narrow-measured="1"])
+    .wp-group[data-arrangement-mode="GRID"] {
+    grid-template-columns: repeat(1, minmax(0, 1fr)) !important;
+  }
+}
+
+/* ---------------------------------------------------------------- 错误态 */
+
+/*
+ * 区域有错误时（region.errors 非空）由 JS 打标记：
+ *   - 区域元素：data-region-error="1" + data-region-error-code="<code>"，
+ *     并加 wp-has-error 类；
+ *   - 红色边框由 JS 以 inline style 写入（要盖过主题 / 局部的边框）；
+ *   - 提示条：data-presentation-error="1" 的 .wp-error 容器。
+ *
+ * 区域**照常渲染、照常可交互**：这里只补底色与提示条的排版。
+ */
+.wp-has-error {
+  background-color: rgba(220, 38, 38, 0.04);
+}
+
+.wp-error {
+  box-sizing: border-box;
+  grid-column: 1 / -1; /* GRID 模式下独占一行，不占一格 */
+  flex: 0 0 100%; /* FLOW 模式下独占一行 */
+  min-width: 0;
+  margin: 4px 0 0;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(220, 38, 38, 0.08);
+  color: #b91c1c;
+  font-size: 12px;
+  line-height: 1.5;
+  /* 不挡住卡片本体的点击与交互 */
+  pointer-events: none;
+}
+
+.wp-error-item {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.wp-error-item + .wp-error-item {
+  margin-top: 2px;
+}

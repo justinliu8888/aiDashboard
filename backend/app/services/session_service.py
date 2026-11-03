@@ -66,6 +66,20 @@ EDIT_STATE_KEYS = (
     CLARIFICATION_QUESTION_KEY,
 )
 
+#: 会话快照里的「最近一次**已应用**的卡片级修改所在卡片」。
+#:
+#: 这是**历史**，不是活动目标：它只给「刚才那张」这类明确的历史指代当
+#: 锚点，永远不会被当成 ``context.selectedRegionId`` 回传，也不会高亮
+#: 任何卡片。老会话没有这个键 = 没有历史，不报错。
+LAST_APPLIED_REGION_KEY = "lastAppliedRegionId"
+
+#: 会话快照里的**草稿对象身份**（契约 0002 §6）。
+#:
+#: ``draftId`` 是数据库对象身份，独立于 sessionId / conversationId / messageId；
+#: 同一草稿跨会话共享身份与锁。会话快照里存它，是为了让「这条会话对应
+#: 哪个草稿对象」在刷新、重启之后仍然查得到。
+DRAFT_ID_KEY = "draftId"
+
 # 澄清轮次的三种结果。只有「asked」占用户澄清轮次。
 CLARIFICATION_ASKED = "asked"
 CLARIFICATION_TECHNICAL_FAILURE = "technical_failure"
@@ -73,6 +87,14 @@ CLARIFICATION_TECHNICAL_FAILURE = "technical_failure"
 #: 解析出来了）—— 键跟着更新，**轮次照旧带着**，不因换键归零。
 #: 契约表 §7.4：「只有真的问出去了才算消耗」。
 CLARIFICATION_KEY_UPDATED = "key_updated"
+
+
+class PendingPlanConsumedError(RuntimeError):
+    """待确认计划在提交事务里**取不到了**（已被别人消费掉）。
+
+    这一轮是基于一份已经失效的候选做的修改 —— 必须整笔回滚，
+    不能拿它去改草稿（否则同一份修改会落两遍）。
+    """
 
 
 def _dump_snapshot(value: Any) -> str | None:
@@ -270,7 +292,23 @@ class SessionService:
         self._repo = repository
         # snapshot 整块存一个 JSON 字段，跨轮状态也整块存。同一会话的两次写
         # （落库 vs 更新待确认计划）必须串行，否则后写的会把先写的覆盖掉。
-        self._lock = threading.RLock()
+        #
+        # 锁**与仓库共用一把**：这里原来自己造了一把，于是
+        #   落库路径 仓库锁(事务) → 会话锁
+        #   快照路径 会话锁 → 仓库锁
+        # 两条路径相遇就是死锁（草稿接口整体卡死，/health 仍 200）。
+        # 复现与回归脚本：``OUT/checks/deadlock-repro.py``。
+        self._lock = getattr(repository, "lock", None) or threading.RLock()
+        # **待确认计划的延迟消费暂存**：接受路径在业务层不消费计划，只暂存
+        # 「这一轮要消费哪份」，真正消费在最终提交事务里做（契约 0002 §6/§7）。
+        # 这张表**只在内存里**，不落库：进程重启就丢，丢了对用户没有影响
+        # （暂存没被消费 = 计划还在 = 用户还能再点一次「接受修改」）。
+        self._staging_lock = threading.Lock()
+        self._staged_plan_consumption: dict[str, str] = {}
+        # **选择锁的延迟写入暂存**：这一轮要写 / 清哪份菜单，先放内存里，
+        # 真正落库在最终提交事务里做（契约 0002 §6/§7）。
+        # 同样是**只在内存里**：暂存没被提交 = 菜单没变 = 用户还能重试。
+        self._staged_pending_choice: dict[str, dict[str, Any] | None] = {}
 
     @property
     def repository(self) -> SessionRepository:
@@ -342,8 +380,14 @@ class SessionService:
         response: AgentResponse,
         client_msg_id: str | None = None,
         request: AgentRequest | None = None,
+        strict: bool = False,
     ) -> SessionRecord | None:
-        """把一轮对话写入存储。返回落库后的会话记录。"""
+        """把一轮对话写入存储。返回落库后的会话记录。
+
+        `strict=True`：**失败要抛出去**，不吞。
+        草稿工作区要把「会话写 + 草稿版本写」放进同一笔事务时用它 ——
+        吞掉异常会让外层事务以为一切正常，把半份状态提交掉。
+        """
         is_advance = user_text.strip() == ADVANCE_MESSAGE
         # 先给这一轮补上方案版本身份：落库的消息体与返回给前端的响应
         # 都带着它，前端据此去重（工单 #66 AC4）。
@@ -385,6 +429,9 @@ class SessionService:
                 message_count=count,
             )
         except Exception as exc:  # noqa: BLE001
+            if strict:
+                # 严格模式：异常原样抛出去，外层事务据此回滚（不留半份状态）。
+                raise
             # 落库失败不能影响主链路
             # 异常原文不进日志（#61）：留栈不留原文。
             logger.exception(
@@ -909,9 +956,45 @@ class SessionService:
         if preview_context is not None:
             snapshot["previewContext"] = preview_context
 
-        editing_target = (response.debug or {}).get("editingTargetRegionId")
-        if editing_target is not None:
-            snapshot["editingTargetRegionId"] = editing_target
+        # 临时卡片目标：三种语义，缺一不可 ——
+        #   缺字段   = 这一轮**不更新**目标（沿用上一轮的值）；
+        #   显式 null = **释放**（回到草稿级，不再有活动目标）；
+        #   非空     = 这一轮的目标卡片。
+        #
+        # 前端按同一套规则处理（workbench.js 用 hasOwnProperty 判定），
+        # 两边必须一致：否则刷新恢复出来的会话会带着一个页面已经不选中的
+        # 目标，下一轮请求又把它当成「用户明确指定的那张」。
+        debug = response.debug or {}
+        if "editingTargetRegionId" in debug:
+            editing_target = debug["editingTargetRegionId"]
+            if editing_target:
+                snapshot["editingTargetRegionId"] = editing_target
+            # 显式 null：不写这个键 = 快照里没有活动目标（已释放）。
+        else:
+            previous_target = (previous_snapshot or {}).get("editingTargetRegionId")
+            if previous_target:
+                snapshot["editingTargetRegionId"] = previous_target
+
+        # 历史（**不是**活动目标）：最近一次**已应用**的卡片级修改所在卡片。
+        #
+        # 它的唯一用途是给「刚才那张」这类明确的历史指代当锚点：读它不会
+        # 选中卡片，也不会被当成 ``context.selectedRegionId`` 回传。
+        # 这一轮没有新的已应用修改就沿用上一轮的值。
+        history_region = debug.get(LAST_APPLIED_REGION_KEY)
+        if history_region:
+            snapshot[LAST_APPLIED_REGION_KEY] = history_region
+        else:
+            previous_history = (previous_snapshot or {}).get(LAST_APPLIED_REGION_KEY)
+            if previous_history:
+                snapshot[LAST_APPLIED_REGION_KEY] = previous_history
+
+        # 草稿对象身份（契约 0002 §6）：draftId 是**数据库对象身份**，
+        # 独立于 sessionId / conversationId / messageId。
+        # 会话快照里存它，是为了让「这条会话对应哪个草稿对象」在刷新、
+        # 重启之后仍然查得到；同一草稿跨会话共享身份与锁。
+        previous_draft_id = (previous_snapshot or {}).get(DRAFT_ID_KEY)
+        if previous_draft_id:
+            snapshot[DRAFT_ID_KEY] = previous_draft_id
 
         # 设计阶段与文字方案（#19）。恢复不能只依赖聊天正文、debug
         # 或浏览器本地变量：方案与阶段必须跟着会话一起存下来。
@@ -974,6 +1057,41 @@ class SessionService:
             )
             return updated
 
+    # ---------- 草稿对象身份（契约 0002 §6） ----------
+
+    def load_snapshot(self, session_id: str) -> dict[str, Any]:
+        """读回这条会话的**整块快照**（读，不改）。"""
+        record = self._repo.get_session(session_id)
+        return dict(record.snapshot) if record and record.snapshot else {}
+
+    def update_snapshot(
+        self,
+        session_id: str,
+        mutate: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """对会话快照做一次读-改-写（公开入口）。
+
+        草稿工作区（撤销 / 另存为）要把**恢复后的定义**写回会话快照，
+        这样刷新页面看到的才是撤销之后的状态，而不是又跳回旧版本。
+        """
+        return self._mutate_snapshot(session_id, mutate)
+
+    def load_draft_id(self, session_id: str) -> str | None:
+        """这条会话对应的**草稿对象 id**（没有就是 None）。"""
+        record = self._repo.get_session(session_id)
+        if not record or not record.snapshot:
+            return None
+        value = record.snapshot.get(DRAFT_ID_KEY)
+        return str(value) if value else None
+
+    def set_draft_id(self, session_id: str, draft_id: str) -> None:
+        """把这条会话绑到某个**草稿对象**上（只写这一个键）。"""
+        if not draft_id:
+            return
+        self._mutate_snapshot(
+            session_id, lambda snapshot: {**snapshot, DRAFT_ID_KEY: draft_id}
+        )
+
     # ---------- 已收集信息 ----------
 
     def load_collected_info(self, session_id: str) -> dict[str, Any]:
@@ -995,6 +1113,13 @@ class SessionService:
 
         选择锁存在库里而不是内存里，这样后端重启后恢复历史会话仍然能拿到锁，
         不会出现「前端放行自由输入、后端拒收」的前后端不一致。
+
+        **失败要抛出去**：选择锁是「这一轮菜单」的权威状态。吞掉的话，
+        调用方会以为菜单已经写好了，其实库里没有 —— 前端有菜单、后端没锁
+        = 用户能绕过确认（契约 0002 §6）。
+
+        需要「尽力而为」的恢复路径（清一张已经损坏的菜单）由**调用点**自己
+        ``try/except``：那里没有要掩盖的原始错误，失败不该掀翻整轮。
         """
         try:
             self._repo.set_pending_choice(session_id, choice)
@@ -1006,10 +1131,64 @@ class SessionService:
                 type(exc).__name__,
                 exc_info=(type(exc), None, exc.__traceback__),
             )
+            raise
 
     def load_pending_choice(self, session_id: str) -> dict[str, Any] | None:
         record = self._repo.get_session(session_id)
         return record.pendingChoice if record else None
+
+    # ---------- 选择锁的「延迟写入」 ----------
+
+    def stage_pending_choice(
+        self, session_id: str, choice: dict[str, Any] | None
+    ) -> None:
+        """暂存「这一轮要写 / 清选择锁」。**不落库。**
+
+        与 :meth:`stage_pending_plan_consumption` 同一个道理：菜单是这一轮
+        的**待决状态**，它必须与这一轮的消息、草稿、候选消费**一起成败**。
+        提前写的话，最终提交事务失败时菜单已经变了 —— 用户看到的是
+        「菜单被清掉 / 换掉了，但修改没生效」。
+
+        暂存的是**这一轮结束时的目标值**（写 / 清都算）。同一列上后写的
+        覆盖先写的，所以「先清锁、再写下一菜单」的结果就是「下一菜单」。
+        """
+        with self._staging_lock:
+            self._staged_pending_choice[session_id] = choice
+
+    def discard_staged_pending_choice(self, session_id: str) -> None:
+        """丢弃暂存：这一轮没有落成（被栅栏拒绝 / 落库失败），暂存作废。"""
+        with self._staging_lock:
+            self._staged_pending_choice.pop(session_id, None)
+
+    def staged_pending_choice(
+        self, session_id: str
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """当前暂存的选择锁：``(有没有暂存, 目标值)``。只读，不落库。
+
+        「暂存了一个清空」与「没有暂存」是两件事：前者要把菜单**清掉**，
+        后者是什么都不做。用 ``(False, None)`` 表示「没有暂存」。
+        """
+        with self._staging_lock:
+            if session_id not in self._staged_pending_choice:
+                return (False, None)
+            return (True, self._staged_pending_choice[session_id])
+
+    def commit_staged_pending_choice(self, session_id: str) -> bool:
+        """在**最终提交事务里**把暂存的选择锁落库。**在事务中调用。**
+
+        返回 True = 落过（写 / 清都算）；False = 这一轮没有暂存（普通轮次）。
+
+        写失败**抛出去**：外层事务据此整体回滚 —— 菜单、会话、草稿一起
+        回滚，不会留下「菜单已经变了、修改却没生效」的半份状态。
+        """
+        with self._staging_lock:
+            if session_id not in self._staged_pending_choice:
+                return False
+            choice = self._staged_pending_choice.pop(session_id)
+        # 仓储层服从外层事务（``_commit_if_standalone``）：事务失败时，
+        # 这一笔写入跟着回滚。
+        self._repo.set_pending_choice(session_id, choice)
+        return True
 
     # ---------- 编辑态：待确认计划 ----------
 
@@ -1077,6 +1256,35 @@ class SessionService:
             )
             return None
 
+    def clear_pending_plan(self, session_id: str) -> None:
+        """清掉待确认计划（停止后走「撤销（回到上一步）」时用）。
+
+        「撤销 B」只清 B 留下的待确认现场：**不动**上一个已完成单位 A
+        已经落库的内容（契约 0002 §7.3）。
+        """
+        try:
+            self._repo.clear_pending_edit_plan(session_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[session_service] 清待确认计划失败 sessionId=%s errorType=%s",
+                session_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
+
+    def load_last_applied_region_id(self, session_id: str) -> str | None:
+        """取回最近一次**已应用**的卡片级修改所在卡片（历史指代用）。
+
+        这是**历史**，不是活动目标：调用方只能拿它去解析「刚才那张」，
+        绝不回传成 ``context.selectedRegionId``，也不高亮卡片。
+        老会话没有这个键 = 没有历史，返回 ``None``。
+        """
+        record = self._repo.get_session(session_id)
+        if record is None or not record.snapshot:
+            return None
+        value = record.snapshot.get(LAST_APPLIED_REGION_KEY)
+        return str(value) if value else None
+
     def save_pending_plan_if_absent(
         self, session_id: str, plan: PendingEditPlan
     ) -> PendingEditPlan:
@@ -1109,6 +1317,62 @@ class SessionService:
                 if key != PENDING_PLAN_KEY
             },
         )
+
+    # ---------- 待确认计划的「延迟消费」 ----------
+
+    def stage_pending_plan_consumption(self, session_id: str, plan_id: str) -> None:
+        """暂存「这一轮要消费掉哪份待确认计划」。
+
+        **为什么不在这里就消费掉**：接受路径在业务层就把计划取走的话，
+        这一轮后面的**最终提交事务**失败时，用户那份计划已经被吃掉了 ——
+        用户没法重试这一轮（契约 0002 §6/§7）。
+
+        所以这里只**暂存**，真正消费发生在路由层那一笔事务里
+        （:meth:`commit_staged_plan_consumption`）：落库失败 → 整笔回滚 →
+        暂存作废 → 计划原样还在。
+        """
+        with self._staging_lock:
+            self._staged_plan_consumption[session_id] = str(plan_id)
+
+    def discard_staged_plan_consumption(self, session_id: str) -> None:
+        """丢弃暂存：这一轮没有落成（被栅栏拒绝 / 落库失败），暂存作废。"""
+        with self._staging_lock:
+            self._staged_plan_consumption.pop(session_id, None)
+
+    def staged_plan_consumption(self, session_id: str) -> str | None:
+        """当前暂存的待消费计划 id（没有则 None）。只读，不消费。"""
+        with self._staging_lock:
+            return self._staged_plan_consumption.get(session_id)
+
+    def commit_staged_plan_consumption(self, session_id: str) -> str | None:
+        """在**最终提交事务里**消费掉暂存的待确认计划。**在事务中调用。**
+
+        消费三件事，它们必须与草稿、会话**一起成败**：
+          - 取走待确认计划（那张卡作废，不再挂）；
+          - 清掉选择锁（菜单作废）；
+          - 清掉追问计数（这一项修改已经结束）。
+
+        没有暂存时什么都不做（普通轮次）。返回被消费掉的 planId（没有则 None）。
+
+        **取不到计划要抛出去**：计划已经被别人消费掉了，说明这一轮
+        基于一份**已经失效**的候选 —— 必须整笔回滚，不能拿它去改草稿
+        （否则同一份修改会被落两遍）。
+
+        这里清选择锁是「旧卡作废」的那一步；这一轮要写的**下一菜单**
+        由 :meth:`commit_staged_pending_choice` 在**之后**落库（同一笔
+        事务）：先清旧锁、再写新菜单。
+        """
+        with self._staging_lock:
+            plan_id = self._staged_plan_consumption.pop(session_id, None)
+        if not plan_id:
+            return None
+        if self.take_pending_plan(session_id, plan_id) is None:
+            raise PendingPlanConsumedError(
+                "待确认计划已经被处理，本轮不再落库。"
+            )
+        self.save_pending_choice(session_id, None)
+        self.reset_clarification(session_id)
+        return plan_id
 
     def take_pending_plan(
         self, session_id: str, plan_id: str

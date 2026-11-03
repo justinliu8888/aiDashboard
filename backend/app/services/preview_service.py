@@ -1358,6 +1358,35 @@ def resolve_preview_context(
     )
 
 
+def _is_container_region(region: dict[str, Any]) -> bool:
+    """这个区域是不是**容器**（分组）。
+
+    容器只管排列与阅读顺序：没有数据、没有统计口径，
+    因此造数与载荷两层都**跳过它**。
+    """
+    component = region.get("component") or {}
+    if not isinstance(component, dict):
+        return False
+    return str(component.get("type") or "").upper() == "CONTAINER"
+
+
+def _iter_leaf_regions(regions: Any) -> Any:
+    """按**阅读顺序**递归提取叶子区域（跳过容器本身）。
+
+    容器（分组）自己不造数、不进载荷；它里面的子卡片才要。
+    老平面定义没有 ``children`` 时，产出结果与改造前**逐条一致**。
+    """
+    if not isinstance(regions, list):
+        return
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        if _is_container_region(region):
+            yield from _iter_leaf_regions(region.get("children"))
+            continue
+        yield region
+
+
 def _prepare_definition_for_simulation(
     definition: dict[str, Any], *, plan: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -1366,15 +1395,18 @@ def _prepare_definition_for_simulation(
     票 03 之后落库的定义自带 ``templateBinding.previewSpec``；更早的
     定义没有 —— 这里按跨工单契约的顺序（方案指标意图 → 既有指标引用 →
     既有结构化列信息）只读适配一份，认不出来就给明确标注的 generic。
+
+    **容器（分组）会被摊平**（契约 0002 §4）：造数器与载荷组装只认
+    「顶层区域列表」这一种形状，把容器树原样传进去会让组内子卡**整批丢失**。
+    这里先递归把叶子按阅读顺序取出来、逐个适配 previewSpec，再摊平成
+    一份扁平定义交给造数器。摊平只发生在**给造数器的那一份副本**上，
+    原始定义（带容器树）不受影响。
     """
     regions = definition.get("regions")
     if not isinstance(regions, list):
         return definition
     prepared_regions: list[Any] = []
-    for region in regions:
-        if not isinstance(region, dict):
-            prepared_regions.append(region)
-            continue
+    for region in _iter_leaf_regions(regions):
         binding = region.get("templateBinding")
         binding = dict(binding) if isinstance(binding, dict) else {}
         binding["previewSpec"] = adapt_preview_spec(region, plan=plan)
@@ -1481,6 +1513,10 @@ def build_report_preview_payload(
     regions: list[dict[str, Any]] = []
     for region in prepared.get("regions") or []:
         if not isinstance(region, dict):
+            continue
+        if _is_container_region(region):
+            # 容器不进载荷：它没有数据，只负责排版与阅读顺序。
+            # （正常路径上这里已经是摊平后的叶子，这行是防御。）
             continue
         role = str(region.get("role") or "").upper()
         if role in TITLE_ROLES:

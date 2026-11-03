@@ -262,3 +262,69 @@ def test_a_bound_but_unexecutable_metric_still_yields_a_valid_definition():
     assert region["templateBinding"]["metricRefs"] == []
     payload = _payload(definition)
     assert isinstance(payload["value"], (int, float))
+
+
+# --------------------------------------------------------------------------
+# 6. 追加目录外指标：出数 + 「口径待确认」标注跟着**这一项**走
+#    （工单 20261102 B 包：选中卡片以后说「增加 abc」）
+# --------------------------------------------------------------------------
+
+
+def test_an_appended_out_of_catalog_metric_renders_a_number_and_its_assumption_note():
+    """目录外指标追加到卡片上：出数、带标注，**不带**编出来的单位。
+
+    载荷这一层是界面真正读的那一层：口径标注必须跟着**这一项指标**走 ——
+    只挂在区域说明上，界面就看不到（用户反馈里「一直缩在卡片上」说的
+    就是这个标注没露出来）。
+    """
+    from app.schemas.edit_plan import (
+        EditIntent,
+        EditMetricAddition,
+        EditOperation,
+        EditPlan,
+        EditTarget,
+    )
+    from app.services.template_edit_engine import template_edit_engine
+    from app.tools.context import ToolScope
+
+    plan = _plan({
+        "id": "section_1", "title": "总耗电概览", "metricIntents": ["总耗电"],
+        "componentType": "metric_card",
+    })
+    template = build_template_design(plan, subject_id="room_a")
+    definition = build_template_definition(
+        template.model_dump(mode="json"), plan, "room_a"
+    )
+    result = template_edit_engine.apply(
+        plan=EditPlan(
+            intent=EditIntent.ADD_METRIC,
+            confidence=0.9,
+            target=EditTarget(regionId="region_1", confidence=1.0),
+            operation=EditOperation(addMetrics=[
+                EditMetricAddition(
+                    intent="abc", label="abc", displayMode="simulated",
+                ),
+            ]),
+        ),
+        definition=definition,
+        scope=ToolScope(
+            project_id="project_001",
+            subject_ref="machine_room",
+            subject_id="room_a",
+        ),
+    )
+
+    updated = result.draftAfterEdit.model_dump(mode="json")
+    payload = _payload(updated)
+
+    abc = next(m for m in payload["metrics"] if m.get("label") == "abc")
+    # 目录外指标照样出数：模拟模式不因真实目录缺项被阻断。
+    assert isinstance(abc.get("value"), (int, float))
+    # 没有真实口径 → 不给单位。
+    assert abc.get("unit") == ""
+    # 口径标注跟着这一项指标走。
+    assert "仅模拟展示、业务口径待确认" in str(abc.get("pendingReason") or "")
+    # 模拟模式**不**标「能力待接通」：它照样出数。
+    assert abc.get("capabilityPending") is False
+    # 原有指标**保留**（追加不是替换）。
+    assert {m.get("label") for m in payload["metrics"]} == {"总耗电", "abc"}

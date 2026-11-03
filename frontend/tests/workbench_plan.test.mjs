@@ -176,6 +176,18 @@ function textOf(root) {
   return root.textContent;
 }
 
+/**
+ * 把一行 Markdown 折成它在页面上显示的纯文字（去掉标题号与列表符号）。
+ * 页面把 Markdown 逐行拆成 h1/h2/h3/li/p，下载文件保留原始标记，
+ * 比对「页面 vs 下载」时必须先去掉标记再比。
+ */
+function visibleTextOfMarkdownLine(line) {
+  const heading = /^#{1,3} (.*)$/.exec(line);
+  if (heading) return heading[1];
+  if (line.startsWith("- ")) return line.slice(2);
+  return line;
+}
+
 // ---------------------------------------------------------------- 契约样例
 // 来自冻结契约 v1 的共同测试样例。它**不是**生产数据、模板库资产或模型回复。
 
@@ -242,7 +254,7 @@ test("未接受的建议被单独标注，不会混进板块", () => {
   assert.ok(body.textContent.includes("以下建议尚未接受，不会自动进入上方板块。"));
   const sectionHeading = walk(body).find(node => node.tagName === "H3");
   assert.equal(sectionHeading.textContent, "1. PUE 总览");
-  assert.ok(!oneClass(root, "plan-ascii").textContent.includes("增加周对比趋势"));
+  assert.equal(byClass(root, "plan-ascii").length, 0, "方案里不再有 ASCII 布局图节点");
   assert.ok(body.textContent.includes("增加周对比趋势"));
 });
 
@@ -696,7 +708,7 @@ test("草稿阶段：折叠视图里是完整的已确认方案", () => {
   assert.ok(text.includes("PUE 总览"), "应含板块");
   assert.ok(text.includes("PUE 统计口径待核实"), "应含假设");
   assert.equal(byClass(details, "plan-markdown").length, 1, "应保留 Markdown 正文");
-  assert.equal(byClass(details, "plan-ascii").length, 1, "应保留布局示意");
+  assert.equal(byClass(details, "plan-ascii").length, 0, "折叠视图里也不应有 ASCII 布局图");
 });
 
 // T4 —— 草稿阶段没有任何动作入口
@@ -868,11 +880,10 @@ test("表格板块显示它声明的栏目", () => {
 
   const text = oneClass(root, "plan-markdown").textContent;
   assert.ok(text.includes("栏目：设备名称、告警级别"));
-  assert.ok(text.includes("C1：设备名称"));
-  assert.ok(text.includes("C2：告警级别"));
+  assert.ok(!text.includes("C1："), "不再有栏目编号行");
+  assert.ok(!text.includes("C2："), "不再有栏目编号行");
   assert.ok(!text.includes("section_alarm.device_name"), "技术取值键不混入正文");
-  assert.equal(oneClass(root, "plan-ascii").textContent,
-    "+----+----+\n| C1 | C2 |\n+----+----+\n|    |    |\n+----+----+\n");
+  assert.equal(byClass(root, "plan-ascii").length, 0, "不再渲染表格 ASCII 示意图");
 });
 
 test("方案里没有栏目声明时不显示栏目（不按标题猜列）", () => {
@@ -887,7 +898,7 @@ test("方案里没有栏目声明时不显示栏目（不按标题猜列）", ()
   }), {});
 
   assert.ok(!oneClass(root, "plan-markdown").textContent.includes("栏目："));
-  assert.equal(oneClass(root, "plan-ascii").textContent, "[ table columns to be confirmed ]\n");
+  assert.equal(byClass(root, "plan-ascii").length, 0, "没有栏目声明时也不出 ASCII 图");
 });
 
 test("栏目没有显示名时整项跳过（不拿 id 当栏目名）", () => {
@@ -912,8 +923,8 @@ test("栏目没有显示名时整项跳过（不拿 id 当栏目名）", () => {
 
   const text = oneClass(root, "plan-markdown").textContent;
   assert.ok(text.includes("栏目：告警级别"));
-  assert.ok(text.includes("C1：告警级别"));
-  assert.ok(!text.includes("C2："));
+  assert.ok(!text.includes("C1："), "不再有栏目编号行");
+  assert.ok(!text.includes("C2："), "不再有栏目编号行");
   assert.ok(!text.includes("col_device"));
 });
 
@@ -1259,7 +1270,7 @@ test("工作台把方案挂进左侧对话流，而不是页面里的静态容�
 
 // ---------------------------------------------------------------- Markdown 与卡片内输入
 
-test("Markdown 下载保留标题、正文与 ASCII 代码块，不泄露方案身份", () => {
+test("Markdown 下载保留标题与正文，不再带 ASCII 图，也不泄露方案身份", () => {
   const { root } = makeRoot();
   Plan.render(root, viewWith(), {});
   const body = oneClass(root, "plan-markdown");
@@ -1273,32 +1284,133 @@ test("Markdown 下载保留标题、正文与 ASCII 代码块，不泄露方案�
   const markdown = decodeURIComponent(href.slice(href.indexOf(",") + 1));
   assert.ok(markdown.startsWith("# PUE 专题报表\n\n版本：1\n"));
   assert.ok(markdown.includes("## 板块与展示建议\n\n### 1. PUE 总览"));
-  assert.ok(markdown.includes("```text\n[ K1   ]\n```"));
-  assert.ok(markdown.includes("- K1：PUE"));
+  assert.ok(!markdown.includes("```"), "下载内容里不再有代码围栏（ASCII 图已下线）");
+  assert.ok(!markdown.includes("[ K1   ]"), "下载内容里不再有 ASCII 布局图");
+  assert.ok(!markdown.includes("布局示意"), "下载内容里不再有布局示意标题");
+  assert.ok(!markdown.includes("- K1："), "下载内容里不再有 K 编号行");
+  assert.ok(!markdown.includes("- C1："), "下载内容里不再有 C 编号行");
+  assert.ok(markdown.includes("- 指标：PUE"), "下载内容仍保留真实指标名");
   assert.ok(!markdown.includes("plan_example_pue"));
 });
 
-test("各展示类型渲染 ASCII 布局示意，指标说明位于图外", () => {
-  const expected = {
-    metric_card: "[ K1   ]\n",
-    line_chart: "value\n  |       *---*\n  |   *--*     *\n  |--*\n  +---------------- time\n",
-    bar_chart: "K1 | ######\nK2 | ##########\nK3 | ####\n   +-------------- value\n",
-    pie_chart: "composition\n+---------------------+\n|   K1   | K2 |  K3   |\n+---------------------+\n",
-    table: "[ table columns to be confirmed ]\n",
-    text: "[ text / content ]\n",
-  };
-  for (const [componentType, ascii] of Object.entries(expected)) {
+test("各展示类型不再渲染 ASCII 布局示意，仍有文字说明", () => {
+  for (const componentType of ["metric_card", "line_chart", "bar_chart", "pie_chart", "table", "text"]) {
     const { root } = makeRoot();
     Plan.render(root, viewWith({ reportPlan: {
       ...SAMPLE_PLAN,
       sections: [{ id: "s1", title: "示意", metricIntents: ["PUE"], componentType }],
     } }), {});
-    const diagram = oneClass(root, "plan-ascii");
-    assert.equal(diagram.tagName, "PRE");
-    assert.equal(diagram.textContent, ascii, componentType);
-    assert.match(diagram.textContent, /^[\x00-\x7f]*$/);
-    assert.ok(oneClass(root, "plan-markdown").textContent.includes("K1：PUE"));
+    assert.equal(byClass(root, "plan-ascii").length, 0, componentType + " 不应渲染 ASCII 图");
+    assert.equal(byClass(root, "plan-code").length, 0, componentType + " 不应产生代码围栏节点");
+    const items = walk(oneClass(root, "plan-markdown")).filter(node => node.tagName === "LI").map(node => node.textContent);
+    assert.ok(items.includes("指标：PUE"), componentType + " 应仍有板块指标文字说明");
+    assert.ok(items.some(text => text.startsWith("展示方式：")), componentType + " 应仍有展示方式文字说明");
+    assert.ok(!items.some(text => /^K\d+：/.test(text)), componentType + " 不应再有 K 编号行");
   }
+});
+
+test("方案卡片里没有 ASCII 图、代码围栏与 K/C 编号行", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      sections: [
+        {
+          id: "section_alarm",
+          title: "当前告警列表",
+          metricIntents: ["告警", "PUE"],
+          componentType: "table",
+          displayIntent: "records",
+          selectionReason: "看明细",
+          columns: [
+            { id: "col_device", label: "设备名称", fieldRef: "section_alarm.device_name" },
+            { id: "col_level", label: "告警级别", fieldRef: "section_alarm.level" },
+          ],
+        },
+      ],
+    },
+  }), {});
+  assert.equal(byClass(root, "plan-ascii").length, 0, "页面不应有 .plan-ascii 节点");
+  assert.equal(byClass(root, "plan-code").length, 0, "页面不应有代码围栏节点");
+  const text = oneClass(root, "plan-markdown").textContent;
+  assert.ok(!text.includes("```"), "正文里不应出现代码围栏");
+  assert.ok(!text.includes("布局示意"), "正文里不应出现布局示意标题");
+  assert.ok(!/K\d+：/.test(text), "正文里不应出现 K 编号行");
+  assert.ok(!/C\d+：/.test(text), "正文里不应出现 C 编号行");
+  // 文字信息一条不少
+  assert.ok(text.includes("告警级别"), "栏目真实名仍在");
+  assert.ok(text.includes("设备名称"), "栏目真实名仍在");
+  assert.ok(text.includes("看明细"), "选择理由仍在");
+});
+
+test("页面正文与下载的 .md 承载同一份文字：都不含图，也都保留同样的信息", () => {
+  const { root } = makeRoot();
+  Plan.render(root, viewWith({
+    reportPlan: {
+      ...SAMPLE_PLAN,
+      suggestions: ["增加周对比趋势"],
+      sections: [
+        {
+          id: "section_alarm",
+          title: "当前告警列表",
+          metricIntents: ["告警"],
+          componentType: "table",
+          displayIntent: "records",
+          selectionReason: "看明细",
+          columns: [
+            { id: "col_device", label: "设备名称", fieldRef: "section_alarm.device_name" },
+            { id: "col_level", label: "告警级别", fieldRef: "section_alarm.level" },
+          ],
+        },
+      ],
+    },
+  }), {});
+  const pageText = oneClass(root, "plan-markdown").textContent;
+  const href = oneClass(root, "plan-markdown-download").getAttribute("href");
+  const markdown = decodeURIComponent(href.slice(href.indexOf(",") + 1));
+
+  // 两边都不含图
+  assert.equal(byClass(root, "plan-ascii").length, 0, "页面不应有 .plan-ascii 节点");
+  assert.ok(!markdown.includes("```"), "下载内容不应有代码围栏");
+  assert.ok(!pageText.includes("```"), "页面正文不应有代码围栏");
+  assert.ok(!/K\d+：/.test(markdown), "下载内容不应有 K 编号行");
+  assert.ok(!/C\d+：/.test(markdown), "下载内容不应有 C 编号行");
+
+  // 逐行对得上：下载里的每一行文字，页面上都读得到
+  for (const line of markdown.split("\n")) {
+    if (!line.trim()) continue;
+    assert.ok(
+      pageText.includes(visibleTextOfMarkdownLine(line)),
+      "页面应能读到下载内容里的这一行：" + line
+    );
+  }
+});
+
+test("旧方案仍能正常渲染：历史版本与已确认方案的折叠视图都只有文字", () => {
+  // 历史版本卡片
+  const history = makeRoot();
+  Plan.render(history.root, viewWith({
+    isHistory: true, canConfirm: false, collapsible: true, cardExpanded: false,
+    cardTitle: "历史版本 · 版本 1",
+  }), {});
+  const historyCard = oneClass(history.root, "plan-card-details");
+  assert.equal(byClass(historyCard, "plan-ascii").length, 0, "历史版本卡片不应有 ASCII 图");
+  assert.equal(byClass(historyCard, "plan-code").length, 0, "历史版本卡片不应有代码围栏节点");
+  const historyText = oneClass(historyCard, "plan-markdown").textContent;
+  assert.ok(historyText.includes("PUE 专题报表"), "历史版本仍应显示主题");
+  assert.ok(historyText.includes("PUE 总览"), "历史版本仍应显示板块");
+  assert.ok(historyText.includes("PUE 统计口径待核实"), "历史版本仍应显示假设");
+  assert.ok(!/K\d+：/.test(historyText), "历史版本不应有 K 编号行");
+
+  // 已确认方案的折叠视图
+  const collapsed = makeRoot();
+  Plan.render(collapsed.root, viewWith({ designPhase: "DRAFT_READY", canConfirm: false }), {});
+  const details = walk(collapsed.root).filter(node => node.tagName === "DETAILS")[0];
+  assert.equal(byClass(details, "plan-ascii").length, 0, "已确认方案折叠视图不应有 ASCII 图");
+  assert.equal(byClass(details, "plan-code").length, 0, "已确认方案折叠视图不应有代码围栏节点");
+  const collapsedText = oneClass(details, "plan-markdown").textContent;
+  assert.ok(collapsedText.includes("PUE 专题报表"), "已确认方案仍应显示主题");
+  assert.ok(collapsedText.includes("指标：PUE"), "已确认方案仍应显示指标");
 });
 
 test("选择其他修改只展开卡片内输入，选择确认收起输入并发出确认载荷", () => {

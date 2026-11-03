@@ -159,7 +159,7 @@ function loadApi(names, { extraStatements = [], globals = {} } = {}) {
 
 // 锁相关的纯函数沙箱（不碰 DOM）。
 function loadLockApi() {
-  const names = ["lockScopeOf", "isInputLocked", "inputControlState"];
+  const names = ["lockScopeOf", "isInputLocked", "isAuthoritativeChoice", "menuLocksInput", "inputControlState"];
   const sandbox = loadApi(names, {
     extraStatements: [
       extractConst("LOCK_SCOPE_NONE"),
@@ -352,7 +352,7 @@ test("服务端没给菜单时，待确认计划的菜单退回契约里的 id",
 // ==========================================================================
 
 function loadSyncApi(dom) {
-  const names = ["syncInputControls", "syncInputLockHint", "isBusy", "lockScopeOf", "isInputLocked", "inputControlState"];
+  const names = ["syncInputControls", "syncInputLockHint", "isBusy", "lockScopeOf", "isInputLocked", "isAuthoritativeChoice", "menuLocksInput", "inputControlState"];
   const sandbox = loadApi(names, {
     extraStatements: [
       extractConst("LOCK_SCOPE_NONE"),

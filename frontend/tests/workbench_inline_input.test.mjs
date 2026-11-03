@@ -107,7 +107,7 @@ function load() {
     showJsonPasteErrorHint() {}, appendAgentError() {}, appendPlanFailureNotice() {},
   };
   vm.createContext(sandbox);
-  const names = ["lockScopeOf", "isBusy", "isInputLocked", "inputControlState", "syncInputControls", "setChoiceLock", "clearChoiceLock",
+  const names = ["lockScopeOf", "isBusy", "isInputLocked", "isAuthoritativeChoice", "menuLocksInput", "inputControlState", "syncInputControls", "setChoiceLock", "clearChoiceLock",
     "otherAnswerLabel", "otherAnswerPlaceholder", "inlineAnswerAction", "renderQuestionOptions", "bindQuestionSelects",
     "renderOtherAnswerHtml", "showOtherAnswerHint", "bindOtherAnswers", "appendConfirmActions", "appendReadyActions", "appendAiQuestions", "pendingEditMenuQuestion", "appendPendingEditPlan", "isTemplateEditFailure", "restoreEditFailureMenu"];
   vm.runInContext(names.map(snippet).join("\n"), sandbox);
@@ -246,14 +246,16 @@ test("请求忙时禁用原卡输入，点击和 Enter 均不提交", async () =
 
 function realSender(sandbox, responses) {
   const messages = [];
+  const bodies = [];
   sandbox.postAgentStream = async (body) => {
     messages.push(body.message);
+    bodies.push(body);
     const response = responses.shift();
     if (response instanceof Error) throw response;
     return response;
   };
   vm.runInContext(snippet("sendMessage"), sandbox);
-  return messages;
+  return { messages, bodies };
 }
 
 test("编辑校验失败恢复新问题，保留草稿与载荷，旧接受菜单失效", async () => {
@@ -266,7 +268,7 @@ test("编辑校验失败恢复新问题，保留草稿与载荷，旧接受菜�
   sandbox.session.reportPreviewPayload = payload;
   const question = { id: "template_edit_action", allowsOther: true, options: [{ value: "改指标", label: "改指标" }] };
   const response = { state: "USER_EDITING_TEMPLATE", error: { code: "EDIT_VALIDATION_FAILED" }, questions: [question] };
-  const messages = realSender(sandbox, [response]);
+  const { messages } = realSender(sandbox, [response]);
   assert.equal(await sandbox.sendMessage("接受修改", { fromChoice: true }), response);
   assert.deepEqual(messages, ["接受修改"]);
   assert.equal(old.selects[0].disabled, true);
@@ -291,7 +293,7 @@ test("历史编辑失败返回恢复菜单；无新问题时释放旧计划锁",
 test("内联提交兼容既有协议：提交时才先动作后内容，中间不画追问卡", async () => {
   const { sandbox, cards } = load();
   sandbox.appendConfirmActions(draft);
-  const messages = realSender(sandbox, [{ state: "USER_EDITING_TEMPLATE" }, { state: "USER_EDITING_TEMPLATE" }]);
+  const { messages } = realSender(sandbox, [{ state: "USER_EDITING_TEMPLATE" }, { state: "USER_EDITING_TEMPLATE" }]);
   const result = await sandbox.sendMessage("修改", { fromChoice: true, inlineEditText: "增加温度" });
   assert.deepEqual(messages, ["修改", "增加温度"]);
   assert.equal(result.state, "USER_EDITING_TEMPLATE");
@@ -301,7 +303,7 @@ test("内联提交兼容既有协议：提交时才先动作后内容，中间�
 test("第二段请求失败保留卡内文字和聊天锁，重试不再发送修改动作", async () => {
   const { sandbox, cards, controls } = load();
   sandbox.appendConfirmActions(draft);
-  const messages = realSender(sandbox, [{ state: "USER_EDITING_TEMPLATE" }, new Error("network"), { state: "USER_EDITING_TEMPLATE" }]);
+  const { messages } = realSender(sandbox, [{ state: "USER_EDITING_TEMPLATE" }, new Error("network"), { state: "USER_EDITING_TEMPLATE" }]);
   const card = cards[0];
   card.selects[0].value = "修改";
   card.selects[0].fire("change");
@@ -318,7 +320,7 @@ test("第二段请求失败保留卡内文字和聊天锁，重试不再发送�
 test("动作失败不继续发送内容；普通聊天与伪造内联意图不能绕过菜单锁", async () => {
   const { sandbox, controls } = load();
   sandbox.appendConfirmActions(draft);
-  const messages = realSender(sandbox, [{ state: "USER_EDITING_TEMPLATE", error: { code: "CONFLICT" } }]);
+  const { messages } = realSender(sandbox, [{ state: "USER_EDITING_TEMPLATE", error: { code: "CONFLICT" } }]);
   await sandbox.sendMessage("修改", { fromChoice: true, inlineEditText: "增加温度" });
   await sandbox.sendMessage("普通聊天");
   await sandbox.sendMessage("增加温度", { fromChoice: true, fromInline: true });
@@ -348,5 +350,86 @@ test("名称占位沿用数值卡外形及数值区高度，但显式占位不�
 });
 
 test("HTML 使用新缓存版本", () => {
-  assert.match(html, /workbench\.js\?v=20261101-failure-recovery1/);
+  // 断言的是「带缓存号」这件事，不是某个具体版本号：
+  // workbench.js 与页面一起改动，版本号由改动它的人一起 bump；
+  // 断言具体版本号会在别人 bump 别的资源时误报。
+  assert.match(html, /workbench\.js\?v=2026\d{4}-\w+/);
+});
+
+// --------------------------------------------------------------------------
+// 临时卡片目标（20261102 工单「选中卡片以后增加不了」）
+//
+// 目标只属于**当前这一次操作**：新的普通一轮不能带上一轮的 selectedRegionId，
+// 显式卡片动作仍然要带；响应里的目标是三态（缺字段＝不变、null＝释放、非空＝设置）。
+// --------------------------------------------------------------------------
+
+/** 带一张「已高亮」的卡片，用来断言释放时高亮被清掉。 */
+function loadWithHighlight() {
+  const loaded = load();
+  const highlighted = element();
+  highlighted.classList.add("region-highlight");
+  loaded.sandbox.previewRoot = {
+    querySelectorAll: (selector) => (selector === ".region-highlight" ? [highlighted] : []),
+  };
+  vm.runInContext(snippet("clearRegionHighlight"), loaded.sandbox);
+  return { ...loaded, highlighted };
+}
+
+test("新的普通一轮不带上一轮留下的 selectedRegionId", async () => {
+  const { sandbox } = load();
+  sandbox.session.state = "USER_EDITING_TEMPLATE";
+  sandbox.session.editingTargetRegionId = "region_total_energy";
+  const { bodies } = realSender(sandbox, [{ state: "USER_EDITING_TEMPLATE" }]);
+  await sandbox.sendMessage("增加 abc");
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].context.selectedRegionId, undefined);
+});
+
+test("显式卡片动作仍然带上这张卡的 selectedRegionId", async () => {
+  const { sandbox } = load();
+  const { bodies } = realSender(sandbox, [{ state: "USER_EDITING_TEMPLATE" }]);
+  vm.runInContext(snippet("sendTemplateEditAction"), sandbox);
+  await sandbox.sendTemplateEditAction("删除这张卡片", "region_total_energy");
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].context.selectedRegionId, "region_total_energy");
+});
+
+test("内联两段请求都不带上一轮留下的 selectedRegionId", async () => {
+  const { sandbox } = load();
+  sandbox.appendConfirmActions(draft);
+  sandbox.session.state = "USER_EDITING_TEMPLATE";
+  sandbox.session.editingTargetRegionId = "region_total_energy";
+  const { bodies } = realSender(sandbox, [{ state: "USER_EDITING_TEMPLATE" }, { state: "USER_EDITING_TEMPLATE" }]);
+  await sandbox.sendMessage("修改", { fromChoice: true, inlineEditText: "增加温度" });
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].context.selectedRegionId, undefined);
+  assert.equal(bodies[1].context.selectedRegionId, undefined);
+});
+
+test("回答后端菜单（接受待确认计划）延续当前操作，带上当前目标", async () => {
+  const { sandbox } = load();
+  sandbox.session.state = "USER_EDITING_TEMPLATE";
+  sandbox.session.editingTargetRegionId = "region_total_energy";
+  const { bodies } = realSender(sandbox, [{ state: "USER_EDITING_TEMPLATE" }]);
+  await sandbox.sendMessage("接受修改", { fromChoice: true });
+  assert.equal(bodies[0].context.selectedRegionId, "region_total_energy");
+});
+
+test("响应三态：缺字段保持原值、显式 null 释放并清高亮、非空设置目标", async () => {
+  const { sandbox, highlighted } = loadWithHighlight();
+  sandbox.session.state = "USER_EDITING_TEMPLATE";
+  const { bodies } = realSender(sandbox, [
+    { state: "USER_EDITING_TEMPLATE", debug: { editingTargetRegionId: "region_total_energy" } },
+    { state: "USER_EDITING_TEMPLATE", debug: {} },
+    { state: "USER_EDITING_TEMPLATE", debug: { editingTargetRegionId: null } },
+  ]);
+  await sandbox.sendMessage("第一轮");
+  assert.equal(sandbox.session.editingTargetRegionId, "region_total_energy");
+  await sandbox.sendMessage("第二轮");
+  assert.equal(sandbox.session.editingTargetRegionId, "region_total_energy");
+  assert.equal(highlighted.classList.contains("region-highlight"), true);
+  await sandbox.sendMessage("第三轮");
+  assert.equal(sandbox.session.editingTargetRegionId, null);
+  assert.equal(highlighted.classList.contains("region-highlight"), false);
+  assert.equal(bodies[1].context.selectedRegionId, undefined);
 });

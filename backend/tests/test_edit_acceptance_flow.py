@@ -328,6 +328,167 @@ def test_stale_plan_is_blocked_after_draft_changed(post_chat, definition):
     assert session_service.repository.get_session("conv_test").snapshot["definition"]["metadata"]["revision"] == 1
 
 
+# ---------- 临时卡片目标：成功即释放 ----------
+
+
+def _target(debug: dict) -> tuple[bool, object]:
+    """响应里的临时卡片目标：键在不在、值是什么。
+
+    三种语义，缺一不可：缺字段＝这一轮不更新目标；显式 null＝释放；
+    非空＝这一轮的目标卡片。
+    """
+    return "editingTargetRegionId" in debug, debug.get("editingTargetRegionId")
+
+
+def _apply_bar_chart_change(post_chat, definition):
+    """走完整链路：改一张卡片 → 接受 → 应用成功。"""
+    candidate = post_chat(
+        "把设备耗电排名改成柱状图",
+        state="USER_EDITING_TEMPLATE",
+        snapshots=_snap(definition),
+        selectedRegionId="region_device_ranking",
+    ).json()
+    assert candidate["domainObjects"]["pendingEditPlan"] is not None
+    applied = post_chat(
+        "接受修改",
+        state="USER_EDITING_TEMPLATE",
+        snapshots=_snap(definition),
+        selectedRegionId="region_device_ranking",
+    ).json()
+    assert applied["uiActions"] == ["template_edit_applied"]
+    return applied
+
+
+def test_accepted_edit_releases_the_card_target(post_chat, definition):
+    """接受并成功应用之后：目标被**显式释放**，草稿 / 版本都还在。"""
+    applied = _apply_bar_chart_change(post_chat, definition)
+
+    has_key, value = _target(applied["debug"])
+    # 显式释放：键在、值是 null。缺字段会被前端当成「这一轮不更新目标」，
+    # 上一张卡片就留在了下一轮请求里 —— 那正是要修的残留。
+    assert has_key is True
+    assert value is None
+    # 释放的只是「当前选中的卡片」：草稿、版本、变更集都保留。
+    assert applied["domainObjects"]["reportDefinitionDraft"]["metadata"]["revision"] == 1
+    assert applied["domainObjects"]["changeSet"] is not None
+
+
+def test_applied_edit_leaves_no_stale_target_in_the_snapshot(post_chat, definition):
+    """刷新恢复不能带着一张已经不选中的卡片回来。"""
+    _apply_bar_chart_change(post_chat, definition)
+
+    record = session_service.repository.get_session("conv_test")
+    assert "editingTargetRegionId" not in (record.snapshot or {})
+    # 对话历史还在。
+    assert record.snapshot["definition"]["metadata"]["revision"] == 1
+
+
+def test_plain_modify_after_apply_returns_to_draft_level(post_chat, definition):
+    """成功应用 → 点普通「修改」→ 显式释放，下一轮是草稿级。"""
+    applied = _apply_bar_chart_change(post_chat, definition)
+    draft = applied["domainObjects"]["reportDefinitionDraft"]
+
+    resumed = post_chat(
+        "修改",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": draft},
+        # 客户端可能还带着上一轮的目标：这一轮必须**显式释放**它。
+        selectedRegionId="region_device_ranking",
+    ).json()
+
+    has_key, value = _target(resumed["debug"])
+    assert has_key is True
+    assert value is None
+
+
+def test_new_requirement_after_apply_is_not_narrowed_to_the_old_card(
+    post_chat, definition
+):
+    """释放之后的新要求是草稿级：多卡片时必须澄清是哪一张。"""
+    applied = _apply_bar_chart_change(post_chat, definition)
+    draft = applied["domainObjects"]["reportDefinitionDraft"]
+
+    post_chat(
+        "修改",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": draft},
+    ).json()
+    fresh = post_chat(
+        "把标题改成测试",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": draft},
+    ).json()
+
+    # 没有默认选第一张，也没有退回上一张卡片：直接问是哪一张。
+    assert fresh["domainObjects"]["pendingEditPlan"] is None
+    assert "哪张卡片" in fresh["reply"]
+
+
+def test_draft_level_requirement_is_not_truncated_by_the_old_card(
+    post_chat, definition
+):
+    """草稿整体要求不能被上一张卡片截断。"""
+    applied = _apply_bar_chart_change(post_chat, definition)
+    draft = applied["domainObjects"]["reportDefinitionDraft"]
+
+    post_chat(
+        "修改",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": draft},
+    ).json()
+    renamed = post_chat(
+        "报表名称改成新日报",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": draft},
+    ).json()
+
+    pending = renamed["domainObjects"]["pendingEditPlan"]
+    assert pending is not None
+    # 改的是整份报表，不是某张卡片：目标为空。
+    assert pending["targetRegionId"] == ""
+
+
+def test_recency_reference_points_at_the_last_applied_card(post_chat, definition):
+    """「刚才那张」= 上一次**已应用**修改的那张卡片（历史，不是活动目标）。"""
+    applied = _apply_bar_chart_change(post_chat, definition)
+    draft = applied["domainObjects"]["reportDefinitionDraft"]
+
+    post_chat(
+        "修改",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": draft},
+    ).json()
+    recency = post_chat(
+        "把刚才那张卡片的标题改为测试卡片",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": draft},
+    ).json()
+
+    pending = recency["domainObjects"]["pendingEditPlan"]
+    assert pending is not None
+    assert pending["targetRegionId"] == "region_device_ranking"
+
+
+def test_ordinary_demonstrative_after_apply_still_asks(post_chat, definition):
+    """历史**不是**选中：普通「这个」没有活动目标时仍然要问是哪一张。"""
+    applied = _apply_bar_chart_change(post_chat, definition)
+    draft = applied["domainObjects"]["reportDefinitionDraft"]
+
+    post_chat(
+        "修改",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": draft},
+    ).json()
+    asked = post_chat(
+        "把这个删掉",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": draft},
+    ).json()
+
+    assert asked["domainObjects"]["pendingEditPlan"] is None
+    assert "哪一张" in asked["reply"] or "哪一个" in asked["reply"]
+
+
 # ---------- Q18：追问轮次上限 ----------
 
 

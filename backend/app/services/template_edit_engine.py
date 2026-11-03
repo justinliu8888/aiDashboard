@@ -23,6 +23,7 @@ from app.schemas.edit_plan import (
     DISPLAY_MODE_SIMULATED,
     EditIntent,
     EditMetricAddition,
+    EditMetricDeletion,
     EditOperation,
     EditOperationStep,
     EditPlan,
@@ -78,7 +79,7 @@ logger = logging.getLogger(__name__)
 
 # ---------- 关键词匹配 ----------
 
-DELETE_WORDS = ("删掉", "删除", "去掉", "不要", "移除")
+DELETE_WORDS = ("删掉", "删除", "去掉", "不要", "移除", "去除", "删了")
 RENAME_WORDS = ("标题改成", "标题改为", "名字改成", "名字改为", "重命名为", "改名为", "叫做")
 REPORT_RENAME_WORDS = (
     "报表名称改成",
@@ -255,6 +256,15 @@ SIMULATED_MODE_WORDS = (
     "填上数值", "按示例出数", "照常出数", "出数值",
 )
 
+#: 主题名的说法 —— 「把这个主题存成 XXX」「保存主题为 XXX」。
+#:
+#: 只取名字本身（到标点为止）：名字后面跟的话（「存成蓝色主题并应用」）
+#: 也只取到第一个词组。
+_THEME_NAME_PATTERN = re.compile(
+    r"(?:保存为|保存成|存为|存成|命名为|改名为|叫做|名叫|主题为|主题叫|主题名)"
+    r"\s*([^\s，,。；;：:、]{1,30})"
+)
+
 #: 组合修改允许的意图：都只作用在同一个已有 region 上，
 #: 不新增 / 删除 / 改名 region，也不改报表本身。
 COMPOSABLE_INTENTS = frozenset({
@@ -266,7 +276,56 @@ COMPOSABLE_INTENTS = frozenset({
     EditIntent.CHANGE_TOP_N,
     EditIntent.CHANGE_SORT,
     EditIntent.RENAME_SECTION,
+    #: 同卡「删一个指标 + 加一个指标」走**同一条**复合链路（契约表 §4.3）。
+    EditIntent.DELETE_METRIC,
+    EditIntent.ADD_METRIC,
 })
+
+# --------------------------------------------------------------------------
+# 分句 / 动作 / 指标删除
+# --------------------------------------------------------------------------
+
+#: 句子里的**分句符号**。顿号不在其中 —— 它分隔的是**指标清单**。
+_CLAUSE_SEPARATORS = ("，", ",", "。", ".", "；", ";", "！", "!", "？", "?", "\n", "\r")
+
+#: 「删掉 X」里的 X 归一后可比的**引导词**（在前面）。
+#:
+#: 剥掉它们之后剩下的才是**指标名**：「把实时功率这个指标」→「实时功率」。
+_METRIC_PHRASE_LEAD_NOISE = (
+    "请帮我", "请把", "帮我", "麻烦", "给我", "把", "将",
+    "这一项", "那一项", "此项", "本项", "这一条", "那一条",
+    "这个", "那个", "该", "它们", "它", "这些", "那些",
+)
+
+#: 「删掉 X」里的 X 归一后可比的**成分词**（在后面）。
+_METRIC_PHRASE_TAIL_NOISE = (
+    "这个指标", "那个指标", "这项指标", "本项指标", "这一项指标", "那一项指标",
+    "这张卡片", "那张卡片", "这个卡片", "那个卡片", "这张图", "那个图",
+    "这个板块", "那个板块", "这块", "那块",
+    "这个", "那个", "该项", "本项",
+    "的指标", "指标", "度量", "项", "的", "了", "吧", "呢", "啊",
+)
+
+#: 明确指着**卡片本身**的说法。
+_CARD_OBJECT_WORDS = ("卡片", "面板", "区块", "模块", "这张图", "这张表", "整个", "全部")
+
+#: 明确指着**卡片里的一个指标**的说法。
+_METRIC_OBJECT_WORDS = ("指标", "度量", "这一项", "那一项", "此项", "本项", "各项")
+
+#: 追加说法前面可能带的**量词**（「再加一个温度」→ 名字是「温度」）。
+_METRIC_NAME_QUANTIFIERS = ("一个", "一张", "一条", "一项", "一块", "个", "张", "条", "项", "块")
+
+#: 动作动词 → 动作类别。扫描时同一位置**追加说法优先**（「再加」明确说这是
+#: **往已有卡片里加指标**，比「再加一个」更具体地说明语义）。
+_ACTION_VERB_KINDS: tuple[tuple[str, str], ...] = (
+    *(("replace", word) for word in REPLACE_CLAUSE_VERBS),
+    *(("delete", word) for word in DELETE_WORDS),
+    *(("append", word) for word in APPEND_WORDS),
+    *(("add_card", word) for word in ADD_WORDS),
+)
+
+#: 同一位置上各类动词的**优先级**（数字小的先被选中）。
+_ACTION_KIND_PRIORITY = {"replace": 0, "delete": 1, "append": 2, "add_card": 3}
 
 
 # ---------- 展示形式候选 ----------
@@ -406,6 +465,22 @@ class _IntentOutcome:
         )
 
 
+@dataclass(frozen=True)
+class _ClauseAction:
+    """一句话里的一个动作（删除 / 追加 / 替换）。
+
+    ``before`` 是动词**之前**的那段（上下文，通常指目标卡片），
+    ``after`` 是动词**之后**到**下一个动作动词**之间的那段（动作对象）。
+    """
+
+    kind: str
+    verb: str
+    start: int
+    end: int
+    before: str
+    after: str
+
+
 # ---------- 工具 ----------
 
 def _normalize_text(text: str) -> str:
@@ -541,6 +616,144 @@ def _region_aliases(region: dict[str, Any]) -> list[str]:
 
 def _definition_revision(definition: ReportDefinitionDraft) -> int:
     return int((definition.metadata or {}).get("revision") or 0)
+
+
+# --------------------------------------------------------------------------
+# 卡片内的指标实例
+# --------------------------------------------------------------------------
+#
+# 一个指标在定义里可能有**几处**表示：
+#   * ``templateBinding.previewSpec.metrics[]`` —— 渲染层的**底**；
+#   * ``component.columns[]`` / ``previewSpec.columns[]`` —— 追加进来的指标；
+#   * ``component.metric`` + ``data.pipeline.nodes[]`` —— **主指标**。
+#
+# 它们**不是**按下标一一对应的。删指标时必须知道「这一项指标」到底由哪几处
+# 表示 —— 所以这里先归一成一份**指标实例清单**：身份用稳定标识记
+# （``metricKey`` / ``simulatedId`` / ``fieldRef``），**不记数组下标**。
+
+def _region_metric_instances(region: dict[str, Any]) -> list[dict[str, Any]]:
+    """卡片内的**指标实例**清单。
+
+    每个实例带：``metricKey``（稳定身份）/ ``simulatedId``（目录外指标的
+    稳定模拟身份）/ ``fieldRef``（定义里的字段引用）/ ``label``（显示名）/
+    ``unit`` / ``bindingKind`` / ``isPrimary``（是不是主指标）。
+
+    ``previewSpec`` 缺失的历史定义，从 ``component.columns[]`` 与
+    ``component.metric`` 兜底 —— 一样是**实例**，不是下标。
+    """
+    binding = region.get("templateBinding")
+    binding = binding if isinstance(binding, dict) else {}
+    spec = binding.get("previewSpec")
+    spec = spec if isinstance(spec, dict) else {}
+    component = region.get("component")
+    component = component if isinstance(component, dict) else {}
+
+    raw_metrics = [
+        item for item in (spec.get("metrics") or []) if isinstance(item, dict)
+    ]
+    component_columns = [
+        item for item in (component.get("columns") or []) if isinstance(item, dict)
+    ]
+    spec_columns = [
+        item for item in (spec.get("columns") or []) if isinstance(item, dict)
+    ]
+
+    data = region.get("data") if isinstance(region.get("data"), dict) else {}
+    pipeline = data.get("pipeline") if isinstance(data.get("pipeline"), dict) else {}
+    primary_metric_ref = ""
+    for node in pipeline.get("nodes") or []:
+        if isinstance(node, dict) and node.get("type") == "METRIC":
+            primary_metric_ref = str(node.get("metricRef") or "")
+            if primary_metric_ref:
+                break
+    metric_component = component.get("metric")
+    metric_component = metric_component if isinstance(metric_component, dict) else {}
+    primary_field_ref = str(metric_component.get("fieldRef") or "")
+    primary_unit = ""
+    primary_format = metric_component.get("format")
+    if isinstance(primary_format, dict):
+        primary_unit = str(primary_format.get("unitLabel") or "")
+
+    def _column_field_ref(label: str, simulated_id: str | None) -> str:
+        for column in component_columns + spec_columns:
+            column_ref = str(column.get("fieldRef") or "")
+            if not column_ref:
+                continue
+            if simulated_id and column_ref == simulated_id:
+                return column_ref
+            if not simulated_id and str(column.get("label") or "") == label:
+                return column_ref
+        return ""
+
+    instances: list[dict[str, Any]] = []
+    for item in raw_metrics:
+        metric_key = str(item.get("metricKey") or "")
+        simulated_id = str(item.get("simulatedId") or "") or None
+        label = str(item.get("label") or "")
+        field_ref = _column_field_ref(label, simulated_id)
+        is_primary = bool(primary_metric_ref and metric_key == primary_metric_ref)
+        if not is_primary and not primary_metric_ref and primary_field_ref:
+            # 没有 METRIC 节点时，``component.metric`` 指认的就是主指标。
+            is_primary = bool(field_ref) and field_ref == primary_field_ref
+        if is_primary and not field_ref:
+            field_ref = primary_field_ref
+        instances.append({
+            "metricKey": metric_key,
+            "simulatedId": simulated_id,
+            "fieldRef": field_ref,
+            "label": label,
+            "unit": str(item.get("unit") or ""),
+            "bindingKind": str(item.get("bindingKind") or ""),
+            "isPrimary": is_primary,
+        })
+    if instances:
+        return instances
+
+    # 没有 ``previewSpec``（历史定义）：从组件列与主指标兜底。
+    fallback: list[dict[str, Any]] = []
+    for column in component_columns:
+        field_ref = str(column.get("fieldRef") or "")
+        if not field_ref:
+            continue
+        column_format = column.get("format")
+        unit = ""
+        if isinstance(column_format, dict):
+            unit = str(column_format.get("unitLabel") or "")
+        binding_kind = str(column.get("bindingKind") or "")
+        fallback.append({
+            "metricKey": field_ref,
+            "simulatedId": field_ref if binding_kind == "simulated" else None,
+            "fieldRef": field_ref,
+            "label": str(column.get("label") or ""),
+            "unit": unit,
+            "bindingKind": binding_kind,
+            "isPrimary": bool(primary_field_ref) and field_ref == primary_field_ref,
+        })
+    if primary_field_ref and not any(
+        item["fieldRef"] == primary_field_ref for item in fallback
+    ):
+        fallback.insert(0, {
+            "metricKey": primary_metric_ref or primary_field_ref,
+            "simulatedId": None,
+            "fieldRef": primary_field_ref,
+            "label": str(metric_component.get("label") or ""),
+            "unit": primary_unit,
+            "bindingKind": "catalog",
+            "isPrimary": True,
+        })
+    return fallback
+
+
+def _metric_instance_key(instance: dict[str, Any]) -> str:
+    """指标实例的**比较键**：稳定身份优先，显示名兜底。"""
+    return str(
+        instance.get("metricKey")
+        or instance.get("simulatedId")
+        or instance.get("fieldRef")
+        or instance.get("label")
+        or ""
+    )
+
 
 def _bump_revision(definition: ReportDefinitionDraft) -> None:
     definition.metadata = dict(definition.metadata or {})
@@ -804,6 +1017,843 @@ class TemplateEditEngine:
         lines.append("当前预览仍为 Mock 数据，尚未真实编译；接受修改后需要重新校验并预览。")
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------
+    # 展示批次（契约 0002 §3）：分组 / 排版 / 样式 / 隐藏 / 复制
+    # ------------------------------------------------------------------
+
+    #: 把卡片组成一组的说法。
+    _GROUP_WORDS = (
+        "组成一组",
+        "组成组",
+        "建一个组",
+        "建个组",
+        "分成一组",
+        "分成组",
+        "放在一起",
+        "放一起",
+        "并排",
+        "分组",
+    )
+
+    #: 取消分组（**保留子卡**）。
+    _UNGROUP_WORDS = (
+        "取消分组",
+        "解除分组",
+        "拆开组",
+        "拆开分组",
+        "拆散分组",
+        "解散分组",
+    )
+
+    #: 「取消分组」的其它说法：动词与「分组」之间可以夹一个组名
+    #: （「取消对比组的分组」「把这一组拆开」），所以不能只做整词匹配。
+    _UNGROUP_PATTERN = re.compile(
+        r"(?:取消|解除|拆开|拆散|解散)[^，。；;！!？?]{0,12}?分组"
+        r"|(?:分组|这一组|这个组|该组|这组|组)[^，。；;！!？?]{0,6}"
+        r"(?:取消|解除|拆开|拆散|解散)"
+    )
+
+    _HIDE_WORDS = ("隐藏", "先藏起来")
+    _SHOW_WORDS = ("取消隐藏", "恢复显示", "重新显示", "显示出来")
+    _COPY_WORDS = ("复制一张", "复制这张", "复制一份", "复制一下", "复制")
+
+    # ------------------------------------------------------------------
+    # 显示格式（SET_FORMAT）：契约 0002 §3.5 / §3.6
+    # ------------------------------------------------------------------
+
+    #: 显示格式的**话题词**：有它才谈「显示格式」。
+    #:
+    #: 「显示格式 / 格式」是显式的；「显示成 / 显示为」本身就是显示动作。
+    _FORMAT_TOPIC_PATTERN = re.compile(r"格式|显示成|显示为")
+
+    #: 显示格式的**取值位**：「…（设|改|变|显示|用）成/为 <取值>」。
+    #:
+    #: 取值词必须紧跟在动词后面 —— 「时间列显示格式设为日期」里的
+    #: 「时间」是**列名**，「日期」才是**取值**。
+    _FORMAT_VALUE_PATTERN = re.compile(
+        r"(?:显示成|显示为|设为|设置为|设成|改成|改为|变成|变更为|调成|调整为|用)"
+        r"\s*(?:为|成|到)?\s*"
+        r"(日期时间|百分比|币种|货币|金额|数值|数字|时长|日期|时间)"
+    )
+
+    #: 显示格式的**取值词** → 格式类型（白名单内的 kind）。
+    #:
+    #: 只认白名单里的类型；``dateTimePattern`` 这类键**不在规则里编造**
+    #: —— 日期走 strftime，默认样式由展示层决定（契约 0002 §3.5）。
+    _FORMAT_KIND_BY_WORD = {
+        "日期时间": "DATETIME",
+        "百分比": "PERCENT",
+        "币种": "CURRENCY",
+        "货币": "CURRENCY",
+        "金额": "CURRENCY",
+        "数值": "NUMBER",
+        "数字": "NUMBER",
+        "时长": "DURATION",
+        "日期": "DATE",
+        "时间": "DATETIME",
+    }
+
+    #: 「保存 / 更新**共享主题**」的动词。
+    #:
+    #: 只有「主题 + 这些动词」才走 SAVE_THEME —— 免得把「应用主题」
+    #: 「删除主题」误当成保存。
+    _SAVE_THEME_VERBS = (
+        "保存",
+        "存成",
+        "存为",
+        "更新",
+        "新建",
+        "创建",
+        "做成",
+    )
+
+    #: 中文数字 → 数量。
+    _CN_NUMBERS = {
+        "一": 1,
+        "两": 2,
+        "二": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+    }
+
+    def _parse_save_theme(
+        self,
+        text: str,
+        definition: ReportDefinitionDraft,
+    ) -> EditPlan | None:
+        """「保存主题」「更新主题」「把这个主题存成 XXX」→ SAVE_THEME。
+
+        规则只认「主题 + 保存类动词」这一组 —— 免得把「应用主题」
+        「删除主题」误当成保存。
+
+        **未确认不落库**：这里只写意图与参数；影响摘要由应用时
+        （:meth:`_apply_save_theme`）算给用户看，确认之后才提交。
+
+        主题的取值域、id 与版本**都问主题服务**（不硬编码主题注册表）。
+        """
+        normalized = _normalize_text(text)
+        if "主题" not in normalized:
+            return None
+        if not any(word in normalized for word in self._SAVE_THEME_VERBS):
+            return None
+
+        from app.services.report_theme_service import ThemeError, theme_service
+
+        theme = definition.theme if isinstance(definition.theme, dict) else {}
+        theme_ref = str(theme.get("themeRef") or "")
+        current: dict[str, Any] = {}
+        resolved: dict[str, Any] = {}
+        try:
+            current = theme_service.get_theme(theme_ref) or {}
+            resolved = theme_service.resolve_theme(definition) or {}
+        except ThemeError:
+            # 主题服务读不到就按「没有当前主题」处理：不影响解析，
+            # 真要保存时应用那一步会把主题服务的话带给用户。
+            current = current or {}
+            resolved = resolved or {}
+
+        name = self._extract_theme_name(text) or str(
+            current.get("name") or "自定义主题"
+        )
+        tokens = theme.get("tokens") if isinstance(theme.get("tokens"), dict) else {}
+        default_style = (
+            theme.get("defaultStyle")
+            if isinstance(theme.get("defaultStyle"), dict)
+            else {}
+        )
+        if not tokens:
+            # 当前生效外观由服务端解析（不认本地的主题注册表）。
+            tokens = resolved.get("tokens") or {}
+            default_style = default_style or (resolved.get("defaultStyle") or {})
+
+        # 「更新主题」= 改现有主题；其它说法 = 存成新主题。
+        updating = "更新" in normalized
+        operation: dict[str, Any] = {
+            "themeId": theme_ref if updating else "",
+            "name": name,
+            "tokens": tokens,
+            "defaultStyle": default_style,
+            "confirm": False,
+        }
+        plan = EditPlan(
+            isTemplateEdit=True,
+            intent=EditIntent.SAVE_THEME,
+            confidence=0.85,
+        )
+        plan.operation = EditOperation(themeOperations=[operation])
+        plan.summary = (
+            f"更新共享主题「{name}」"
+            if updating
+            else f"把当前外观存成共享主题「{name}」"
+        )
+        # 影响摘要**先算给用户看**（``save_theme`` 只算不落库）：
+        # 未确认不落库 —— 确认之后才提交。
+        impact, error = self._theme_impact_preview(operation)
+        if impact is not None:
+            operation["themeId"] = str(
+                impact.get("themeId") or operation.get("themeId") or ""
+            )
+            if operation.get("expectedThemeRevision") is None:
+                operation["expectedThemeRevision"] = impact.get("themeRevision")
+            plan.operation = EditOperation(themeOperations=[operation])
+            plan.needsClarification = True
+            plan.clarificationQuestion = self._theme_impact_question(impact)
+        elif error:
+            plan.needsClarification = True
+            plan.clarificationQuestion = error
+        return plan
+
+    @staticmethod
+    def _extract_theme_name(text: str) -> str:
+        """「存成 XXX」「命名为 XXX」→ 主题名；没起名返回空串。"""
+        match = _THEME_NAME_PATTERN.search(text or "")
+        if not match:
+            return ""
+        return match.group(1).strip()
+
+    def _parse_presentation(
+        self,
+        text: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """把展示类表达翻译成**受约束**的展示操作。
+
+        规则优先，识别不出来就返回空列表（交给后面的规则 / 追问）。
+        模糊的尺寸**不瞎填**：没给出具体数字就用约定默认值，
+        但**列数与间距都会写进计划**，用户看得见、可以改。
+        """
+        normalized = _normalize_text(text)
+        operations: list[dict[str, Any]] = []
+
+        set_style = self._parse_set_style(text, definition, target_region)
+        if set_style is not None:
+            return [set_style]
+
+        # --- 显示格式（SET_FORMAT）---
+        #
+        # 放在**最前面**：中文的「把日期明细表的时间列显示格式设为日期」里
+        # 含「明细表」，会被后面的 CHANGE_VISUALIZATION 规则抢走 ——
+        # 那条规则置信度 0.9 且**不产出任何展示操作**，直接返回，
+        # 于是真实入口根本走不到「设置显示格式」。
+        #
+        # 认不准就返回空（交给后面的规则 / 模型兜底）：
+        # **宁可 UNKNOWN，也不要高置信度的空操作**。
+        set_format = self._parse_set_format(normalized, target_region)
+        if set_format is not None:
+            operations.append(set_format)
+            return operations
+
+        # --- 取消分组 ---
+        if (
+            any(word in normalized for word in self._UNGROUP_WORDS)
+            or self._UNGROUP_PATTERN.search(normalized)
+        ):
+            group = self._find_container(definition, text, target_region)
+            if group is not None:
+                operations.append(
+                    {"op": "UNGROUP", "params": {"groupId": str(group.get("id"))}}
+                )
+                return operations
+
+        # --- 隐藏 / 恢复显示 ---
+        #
+        # 「取消隐藏」里也含「隐藏」两个字，所以**先判恢复显示**，
+        # 否则「取消隐藏 X」会被当成「隐藏 X」。
+        if any(word in normalized for word in self._SHOW_WORDS) and target_region is not None:
+            operations.append(
+                {"op": "SHOW_REGION", "params": {"regionId": str(target_region.get("id"))}}
+            )
+            return operations
+        if any(word in normalized for word in self._HIDE_WORDS) and target_region is not None:
+            operations.append(
+                {"op": "HIDE_REGION", "params": {"regionId": str(target_region.get("id"))}}
+            )
+            return operations
+
+        # --- 复制 ---
+        #
+        # 「复制」出现在**目标卡片的名字里**时，用户是在**指那张卡**，
+        # 不是在要求复制它 —— 「把复制件能耗的指标换成总耗电量」说的是
+        # 改指标，不是再复制一张。规则不能拿卡片名里的字当动作。
+        if (
+            any(word in self._without_region_name(normalized, target_region)
+                for word in self._COPY_WORDS)
+            and target_region is not None
+        ):
+            new_id = f"region_copy_{len(definition.regions or []) + 1}_{target_region.get('id')}"
+            operations.append(
+                {
+                    "op": "COPY_REGION",
+                    "params": {
+                        "regionId": str(target_region.get("id")),
+                        "newRegionId": new_id,
+                    },
+                }
+            )
+            return operations
+
+        # --- 组成一组 ---
+        if any(word in normalized for word in self._GROUP_WORDS):
+            # 只在**位置明确**的请求上走规则（「前两张」「这两张」）。
+            # 用户点名了卡片时，规则认不全就**不猜** —— 交给模型那条路，
+            # 别把「设备耗电排名和能耗趋势」组成了另外两张卡。
+            if not self._is_positional_group_request(text):
+                return operations
+            members = self._group_members(text, definition, target_region)
+            if len(members) >= 2:
+                columns = self._extract_columns(text) or len(members)
+                gap = self._extract_gap(text)
+                direction = "VERTICAL" if ("竖排" in normalized or "上下" in normalized) else "HORIZONTAL"
+                operations.append(
+                    {
+                        "op": "CREATE_GROUP",
+                        "params": {
+                            "groupId": self._next_group_id(definition),
+                            "name": self._extract_group_name(text),
+                            "memberRegionIds": members,
+                            "arrangement": {
+                                "mode": "GRID",
+                                "columns": columns,
+                                "direction": direction,
+                                "gap": {"value": gap, "unit": "PX"},
+                            },
+                        },
+                    }
+                )
+                return operations
+
+        return operations
+
+    @staticmethod
+    def _quoted_style_reference(text: str) -> re.Match[str] | None:
+        return re.match(
+            r"^\s*(?:把|将)?\s*[‘“\"'「『](?P<name>[^‘’“”\"'「」『』]+)[’”\"'」』]\s*的?\s*"
+            r"(?=(?:文字|字体|字号|圆角|左对齐|右对齐|居中对齐))",
+            text,
+        )
+
+    def _resolve_quoted_style_target(
+        self, definition: ReportDefinitionDraft, reference: str,
+    ) -> list[dict[str, Any]]:
+        regions = self._flatten_regions(definition.regions or [])
+        exact = []
+        for region in regions:
+            component = region.get("component") or {}
+            metric = component.get("metric") or {}
+            names = (region.get("id"), region.get("name"), component.get("title"), metric.get("label"))
+            if reference.strip() in [str(name).strip() for name in names if name]:
+                exact.append(region)
+        if exact:
+            return exact
+        overview = re.fullmatch(r"(昨日|昨天)?(?:能耗|耗电|用电)(?:总览|概览)", reference.strip())
+        if overview is None:
+            return []
+        matches = []
+        for region in regions:
+            if str(region.get("role") or "").upper() != "SUMMARY":
+                continue
+            component = region.get("component") or {}
+            if str(component.get("type") or "").upper() != "METRIC_CARD":
+                continue
+            labels = " ".join(_region_aliases(region))
+            if not re.search(r"总(?:耗电|用电|能耗)|(?:能耗|耗电|用电)(?:总览|概览)", labels):
+                continue
+            if overview[1] and not re.search(r"昨日|昨天", labels):
+                continue
+            matches.append(region)
+        return matches
+
+    def _parse_set_style(
+        self,
+        text: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Parse a complete, single-target appearance request, never a subset."""
+        if target_region is None:
+            return None
+        from app.services.report_theme_service import theme_service
+
+        reference = self._quoted_style_reference(text)
+        if reference is not None:
+            candidates = self._resolve_quoted_style_target(definition, reference["name"])
+            if len(candidates) != 1 or candidates[0].get("id") != target_region.get("id"):
+                return None
+            action = text[reference.end():]
+        else:
+            action = self._without_region_name(text, target_region)
+        action = re.sub(r"[‘’“”\"'「」『』]", "", action).strip()
+        action = re.sub(r"^(?:把|将)", "", action).lstrip("的 ")
+        clauses = re.split(r"[，,；;、]|(?:并且|并|同时)", action.rstrip("。.!！"))
+        style: dict[str, Any] = {}
+        current: dict[str, Any] | None = None
+        for clause in clauses:
+            clause = re.sub(r"\s+", "", clause)
+            align = re.fullmatch(r"(?:文字|字体)?(?:设为|设置为|改为|改成)?(左对齐|右对齐|居中对齐)", clause)
+            if align:
+                if "textAlign" in style:
+                    return None
+                style["textAlign"] = {"左对齐": "LEFT", "右对齐": "RIGHT", "居中对齐": "CENTER"}[align[1]]
+                continue
+            value = re.fullmatch(
+                r"(文字|字体|字号|圆角)(?:大小)?(?:设为|设置为|改为|改成|调成)(\d+)(?:px|像素)?",
+                clause, re.IGNORECASE,
+            )
+            relative = re.fullmatch(
+                r"(文字|字体|字号|圆角)(?:大小)?(调大|调小|放大|缩小)(?:一点|一些)?", clause,
+            )
+            if value is None and relative is None:
+                return None
+            match = value or relative
+            key = "borderRadius" if match[1] == "圆角" else "fontSize"
+            if key in style:
+                return None
+            if value:
+                number = int(value[2])
+            else:
+                if current is None:
+                    current = theme_service.resolve_region_style(definition, str(target_region.get("id")))
+                base = current.get(key)
+                if isinstance(base, dict):
+                    if str(base.get("unit") or "PX").upper() != "PX":
+                        return None
+                    base = base.get("value")
+                if isinstance(base, bool) or not isinstance(base, (int, float)):
+                    return None
+                # The small relative step is explicit in the candidate summary.
+                number = int(base) + (2 if relative[2] in ("调大", "放大") else -2)
+                number = max(0 if key == "borderRadius" else 1, min(200, number))
+            style[key] = number if key == "borderRadius" else {"value": number, "unit": "PX"}
+        if not style:
+            return None
+        return {"op": "SET_STYLE", "params": {"regionId": str(target_region.get("id")), "style": style}}
+
+    @staticmethod
+    def _without_region_name(normalized: str, target_region: dict[str, Any] | None) -> str:
+        """把目标卡片**名字里的字**从句子里摘掉。
+
+        规则认动作靠的是句子里的字，但用户也可能在**引用卡片的名字**
+        ——「把复制件能耗的指标换成总耗电量」里的「复制」是卡片名的一部分，
+        不是「复制一张」的复制动作。摘掉卡片名再认动作，才不会误判。
+
+        摘不掉（句子里没有卡片名）时原样返回。
+        """
+        if not isinstance(target_region, dict):
+            return normalized
+        out = normalized
+        for candidate in (
+            str(target_region.get("name") or ""),
+            _region_label(target_region),
+        ):
+            text = candidate.strip()
+            if text and text in out:
+                out = out.replace(text, "")
+        return out
+
+    def _parse_set_format(
+        self,
+        normalized: str,
+        target_region: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """「把 X 的显示格式设为日期」→ 一条 ``SET_FORMAT`` 操作。
+
+        认不准就返回 ``None``（不猜）：
+
+        - 没有话题词（「格式 / 显示成 / 显示为」）→ 不是显示格式请求；
+        - 没有取值位（「…设为 <日期|时间|数值|…>」）→ 不知道要设成什么；
+        - 没有目标卡片 → **不替用户挑卡片**。
+
+        取值类型只从 :data:`ALLOWED_FORMAT_KIND` 里取（契约 0002 §3.5），
+        **不在规则里编造** ``dateTimePattern`` 之类的键 —— 日期走 strftime，
+        默认样式由展示层决定。
+        """
+        from app.services.report_presentation_service import ALLOWED_FORMAT_KIND
+
+        if target_region is None:
+            return None
+        if not self._FORMAT_TOPIC_PATTERN.search(normalized):
+            return None
+        match = self._FORMAT_VALUE_PATTERN.search(normalized)
+        if match is None:
+            return None
+        kind = self._FORMAT_KIND_BY_WORD.get(match.group(1))
+        if kind is None or kind not in ALLOWED_FORMAT_KIND:
+            return None
+        return {
+            "op": "SET_FORMAT",
+            "params": {
+                "regionId": str(target_region.get("id")),
+                "format": {"kind": kind},
+            },
+        }
+
+    @staticmethod
+    def _is_positional_group_request(text: str) -> bool:
+        """这句是不是**位置明确**的分组请求（「前两张」「这两张」）。
+
+        点名了具体卡片的（「设备耗电排名和能耗趋势」）不算 —— 规则认不全，
+        不能替用户挑。
+        """
+        return bool(
+            re.search(r"(前|上面|最前面|这|前边)\s*(?:\d+|[一二两三四五六七八九十])\s*(?:张|个|块)", text)
+            or re.search(r"(前|上面|最前面)\s*(?:两|二|三|几)\s*(?:张|个|块)", text)
+        )
+
+    @staticmethod
+    def _find_container(
+        definition: ReportDefinitionDraft,
+        text: str,
+        target_region: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """找到要取消分组的那个容器（按名字 / 按目标卡片的父级）。
+
+        只有**一个**分组时，孤零零一句「取消分组」就指它；**多个**分组时
+        不猜（返回 ``None``，交给后面的追问）。
+        """
+        from app.services.report_presentation_service import (
+            is_container,
+            iter_regions,
+            region_parent,
+        )
+
+        normalized = _normalize_text(text)
+        containers: list[dict[str, Any]] = []
+        for region, _ancestors in iter_regions(definition):
+            if not is_container(region):
+                continue
+            containers.append(region)
+            name = _normalize_text(str(region.get("name") or ""))
+            if name and name in normalized:
+                return region
+        if target_region is not None:
+            parent = region_parent(definition, str(target_region.get("id") or ""))
+            if parent is not None and is_container(parent):
+                return parent
+        if len(containers) == 1:
+            return containers[0]
+        return None
+
+    def _group_members(
+        self,
+        text: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+    ) -> list[str]:
+        """要分组的卡片：消息里点名了的优先，否则取前 N 张。"""
+        from app.services.report_presentation_service import iter_leaves
+
+        normalized = _normalize_text(text)
+        named: list[str] = []
+        for region in iter_leaves(definition):
+            name = _normalize_text(str(region.get("name") or ""))
+            if name and len(name) >= 2 and name in normalized:
+                named.append(str(region.get("id")))
+        if len(named) >= 2:
+            return named
+
+        count = self._extract_count(text) or 2
+        leaves = [
+            str(region.get("id"))
+            for region in iter_leaves(definition)
+            if str(region.get("role") or "").upper() != "REPORT_TITLE"
+        ]
+        return leaves[: max(count, 2)]
+
+    def _extract_count(self, text: str) -> int | None:
+        """「前两张」「3 个」这类数量。"""
+        match = re.search(r"(\d+|[一二两三四五六七八九十])\s*(?:张|个|块)", text)
+        if match:
+            raw = match.group(1)
+            if raw.isdigit():
+                return int(raw)
+            return self._CN_NUMBERS.get(raw)
+        return None
+
+    def _extract_columns(self, text: str) -> int | None:
+        """「两列」「3 列」→ 列数。"""
+        match = re.search(r"(\d+|[一二两三四五六七八九十])\s*列", text)
+        if match:
+            raw = match.group(1)
+            if raw.isdigit():
+                return int(raw)
+            return self._CN_NUMBERS.get(raw)
+        return None
+
+    def _extract_gap(self, text: str) -> int:
+        """「间距 16」→ 16 像素；没给就用默认 12。"""
+        match = re.search(r"(?:间距|间隔|空隙|距离)\s*(\d+)", text)
+        if match:
+            return max(0, min(96, int(match.group(1))))
+        return 12
+
+    def _extract_group_name(self, text: str) -> str:
+        """「叫做 X」「命名为 X」「组名 X」。"""
+        match = re.search(r"(?:叫做|命名为|叫|组名)\s*([^\s，,。；;]{1,20})", text)
+        if match:
+            return match.group(1)
+        return "分组"
+
+    def _next_group_id(self, definition: ReportDefinitionDraft) -> str:
+        """新分组的 id：不能和现有的撞。"""
+        from app.services.report_presentation_service import find_region
+
+        index = 1
+        while find_region(definition, f"group_{index}") is not None:
+            index += 1
+        return f"group_{index}"
+
+    @staticmethod
+    def _presentation_summary(operations: list[dict[str, Any]]) -> str:
+        """给用户看的这批修改摘要（确认菜单直接展示这句话）。"""
+        labels = {
+            "CREATE_GROUP": "把卡片组成一个分组",
+            "SET_GROUP_ARRANGEMENT": "调整分组排列",
+            "MOVE_REGION": "移动卡片",
+            "UNGROUP": "取消分组（保留卡片）",
+            "DELETE_GROUP": "删除整个分组",
+            "COPY_REGION": "复制一张卡片",
+            "DELETE_REGION": "删除一张卡片",
+            "HIDE_REGION": "隐藏一张卡片",
+            "SHOW_REGION": "恢复显示一张卡片",
+            "SET_PLACEMENT": "调整排版",
+            "SET_STYLE": "调整外观",
+            "SET_FORMAT": "调整显示格式",
+            "SET_PAGE": "调整整页设置",
+            "SET_METADATA": "修改报表信息",
+            "SET_THEME": "应用主题",
+        }
+        parts = []
+        for op in operations:
+            label = labels.get(str(op.get("op") or ""), "调整展示")
+            if op.get("op") == "SET_STYLE":
+                style = (op.get("params") or {}).get("style") or {}
+                details = []
+                if isinstance(style.get("fontSize"), dict):
+                    size = style["fontSize"]
+                    details.append(f"字号 {size.get('value')} {size.get('unit', 'PX')}")
+                if style.get("textAlign") in ("LEFT", "CENTER", "RIGHT"):
+                    details.append({"LEFT": "左对齐", "CENTER": "居中对齐", "RIGHT": "右对齐"}[style["textAlign"]])
+                if "borderRadius" in style:
+                    details.append(f"圆角 {style['borderRadius']} PX")
+                if details:
+                    label += "：" + "、".join(details)
+            parts.append(label)
+        return "；".join(parts)
+
+    def _apply_presentation(
+        self,
+        draft: ReportDefinitionDraft,
+        plan: EditPlan,
+        base_revision: int,
+    ) -> tuple[ChangeSet | None, str]:
+        """执行一批展示操作。
+
+        整批成功才生效；任一步失败 → 返回 ``(None, 失败说明)``，
+        上层按失败处理（草稿不变，不留半份定义）。
+
+        引擎的约定是**就地修改** ``draft``（其它意图都这样），
+        所以这里把纯计算算出来的新定义**写回** draft。
+        """
+        from app.services.report_presentation_service import apply_presentation
+
+        result = apply_presentation(
+            draft,
+            plan.operation.presentationOperations,
+            base_revision=base_revision,
+        )
+        if not result.ok:
+            return None, result.failure or "这次修改没有生效，草稿保持不变。"
+        # 把新定义写回 draft（就地修改约定）。
+        payload = result.definition.model_dump()
+        for key, value in payload.items():
+            setattr(draft, key, value)
+        reply = self._presentation_summary(plan.operation.presentationOperations)
+        if result.affectedRegionIds:
+            reply = f"已完成：{reply}。"
+        return result.changeSet, reply
+
+    # ---- 共享主题：保存 / 更新（契约 0002 §8.2）--------------------------
+
+    @staticmethod
+    def _theme_impact_question(impact: dict[str, Any]) -> str:
+        """把影响摘要说成人话：受影响草稿的**数量 + 名称**。"""
+        name = str(impact.get("name") or "这个主题")
+        drafts = [
+            item for item in (impact.get("affectedDrafts") or [])
+            if isinstance(item, dict)
+        ]
+        count = int(impact.get("affectedCount") or 0)
+        if count:
+            listed = "、".join(
+                str(item.get("name") or item.get("draftId") or "") for item in drafts
+            )
+            head = f"保存主题「{name}」会影响 {count} 份正在用它的报表：{listed}。"
+        else:
+            head = f"保存主题「{name}」暂时没有报表在用，不影响已有报表。"
+        return head + "确认保存吗？（主题版本会 +1）"
+
+    @staticmethod
+    def _theme_impact_note(impact: dict[str, Any]) -> str:
+        """保存完成后的影响说明（写进回复）。"""
+        drafts = [
+            item for item in (impact.get("affectedDrafts") or [])
+            if isinstance(item, dict)
+        ]
+        count = int(impact.get("affectedCount") or 0)
+        if not count:
+            return "没有报表在用它，不影响其它报表。"
+        listed = "、".join(
+            str(item.get("name") or item.get("draftId") or "") for item in drafts
+        )
+        return f"同时更新了 {count} 份报表的外观：{listed}。"
+
+    @staticmethod
+    def _theme_impact_preview(
+        operation: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, str]:
+        """算主题保存的**影响摘要**（``save_theme`` 只算不落库）。
+
+        返回 ``(影响摘要, 错误说明)``：摘要为 ``None`` 时看错误说明。
+        """
+        from app.services.report_theme_service import ThemeError, theme_service
+
+        name = str(operation.get("name") or "").strip()
+        if not name:
+            return None, "要给这个主题起个名字才能保存，请告诉我叫什么。"
+        try:
+            impact = theme_service.save_theme(
+                name,
+                operation.get("tokens") or {},
+                theme_id=str(operation.get("themeId") or "").strip() or None,
+                default_style=operation.get("defaultStyle") or None,
+            )
+        except ThemeError as exc:
+            return None, f"这个主题没法保存：{exc.message}"
+        return impact, ""
+
+    def _apply_save_theme(
+        self,
+        *,
+        plan: EditPlan,
+        before: ReportDefinitionDraft,
+    ) -> EditResult:
+        """保存 / 更新**共享主题**（契约 0002 §8.2）。
+
+        两条硬约束：
+
+        1. **未确认不落库**：``confirm`` 不为真时只算影响摘要并追问，
+           主题一个字节都不写；
+        2. **不改报表定义**：主题是**共享对象**，不是报表内容修改 ——
+           ``regions`` / ``layout`` / ``format`` 一律不动，
+           定义版本也**不 bump**（所以这里不返回 ChangeSet）。
+        """
+        from app.services.report_theme_service import ThemeError, theme_service
+
+        operations = plan.operation.themeOperations or []
+        operation = dict(operations[0]) if operations else {}
+        name = str(operation.get("name") or "").strip()
+        tokens = operation.get("tokens") or {}
+        default_style = operation.get("defaultStyle") or {}
+        theme_id = str(operation.get("themeId") or "").strip()
+        confirmed = bool(operation.get("confirm"))
+
+        if not name:
+            return EditResult(
+                plan=plan,
+                draftBeforeEdit=before,
+                draftAfterEdit=before,
+                needsClarification=True,
+                clarificationQuestion="要给这个主题起个名字才能保存，请告诉我叫什么。",
+                debug={"intent": plan.intent.value, "reason": "theme_name_missing"},
+            )
+
+        # ``save_theme`` **只算影响摘要，不落库**（主题服务的约定）。
+        impact, error = self._theme_impact_preview(operation)
+        if impact is None:
+            return EditResult(
+                plan=plan,
+                draftBeforeEdit=before,
+                draftAfterEdit=before,
+                needsClarification=True,
+                clarificationQuestion=error or "这个主题没法保存。",
+                debug={"intent": plan.intent.value, "reason": "theme_invalid"},
+            )
+
+        # 影响摘要里带**具体**的 themeId 与当前版本：确认后按同一个 id 落库；
+        # 版本对不上就拒绝（乐观锁）。
+        theme_id = str(impact.get("themeId") or theme_id)
+        operation["themeId"] = theme_id
+        if operation.get("expectedThemeRevision") is None:
+            operation["expectedThemeRevision"] = impact.get("themeRevision")
+        plan.operation.themeOperations = [operation]
+
+        if not confirmed:
+            return EditResult(
+                plan=plan,
+                draftBeforeEdit=before,
+                draftAfterEdit=before,
+                needsClarification=True,
+                clarificationQuestion=self._theme_impact_question(impact),
+                debug={
+                    "intent": plan.intent.value,
+                    "reason": "theme_confirm_required",
+                    "themeId": theme_id,
+                },
+            )
+
+        try:
+            saved = theme_service.commit_theme_save(
+                theme_id,
+                name=name,
+                tokens=tokens,
+                default_style=default_style or None,
+                expected_revision=operation.get("expectedThemeRevision"),
+            )
+        except ThemeError as exc:
+            # 主题服务的问题**说给用户听**，不抛裸异常、不 500。
+            return EditResult(
+                plan=plan,
+                draftBeforeEdit=before,
+                draftAfterEdit=before,
+                needsClarification=True,
+                clarificationQuestion=f"主题没能保存：{exc.message}",
+                debug={
+                    "intent": plan.intent.value,
+                    "reason": "theme_commit_failed",
+                    "themeId": theme_id,
+                },
+            )
+
+        try:
+            after = theme_service.theme_impact(theme_id)
+        except ThemeError:
+            after = impact
+        revision = int(saved.get("themeRevision") or 0)
+        reply = (
+            f"已保存共享主题「{name}」（版本 {revision}）。"
+            f"{self._theme_impact_note(after)}"
+        )
+        return EditResult(
+            plan=plan,
+            draftBeforeEdit=before,
+            # 报表定义**一个字节都没变**：主题是共享对象。
+            draftAfterEdit=before,
+            reply=reply,
+            debug={
+                "intent": plan.intent.value,
+                "reason": "theme_saved",
+                "themeId": theme_id,
+                "themeRevision": revision,
+            },
+        )
+
     def parse(
         self,
         *,
@@ -844,12 +1894,45 @@ class TemplateEditEngine:
         # 定位目标 region
         regions = definition.regions or []
         target_region = self._find_region(regions, text, selected_region_id)
+        style_reference = self._quoted_style_reference(text)
+        if style_reference is not None:
+            candidates = self._resolve_quoted_style_target(definition, style_reference["name"])
+            if len(candidates) != 1:
+                plan.intent = EditIntent.UNKNOWN
+                plan.needsClarification = True
+                if candidates:
+                    names = "、".join(f"「{_region_label(region)}」" for region in candidates)
+                    plan.clarificationQuestion = f"找到多个可能的能耗总览：{names}。要调整哪一个？请使用具体卡片名称。"
+                else:
+                    plan.clarificationQuestion = f"无法唯一定位「{style_reference['name']}」。请提供要调整的具体卡片名称。"
+                return plan
+            target_region = candidates[0]
         if target_region is not None:
             plan.target = EditTarget(
                 regionId=str(target_region.get("id")),
                 matchedText=_region_label(target_region),
                 confidence=0.9,
             )
+
+        # ===== 0. 保存 / 更新共享主题 =====
+        #
+        # 放在展示批次**之前**：保存主题改的是**共享主题对象**，不是这份
+        # 报表的定义 —— 别被展示规则抢走。
+        theme_plan = self._parse_save_theme(text, definition)
+        if theme_plan is not None:
+            return theme_plan
+
+        # ===== 0.1 展示批次（分组 / 排版 / 样式 / 隐藏 / 复制）=====
+        #
+        # 放在最前面：这些表达很具体（「组成一组」「并排」「取消分组」），
+        # 不该被后面的删卡 / 改标题规则抢走。
+        presentation_operations = self._parse_presentation(text, definition, target_region)
+        if presentation_operations:
+            plan.intent = EditIntent.APPLY_PRESENTATION
+            plan.confidence = 0.85
+            plan.operation = EditOperation(presentationOperations=presentation_operations)
+            plan.summary = self._presentation_summary(presentation_operations)
+            return plan
 
         # ===== 1. 改报表名 =====
         report_name = self._extract_report_name(text)
@@ -864,7 +1947,7 @@ class TemplateEditEngine:
             plan.operation = EditOperation(newTitle=report_name)
             return plan
 
-        # ===== 2. 删除 =====
+        # ===== 2. 删除（整卡 / 单个指标）=====
         #
         # 「不要 X，改成 Y」是**替换**，不是删除：一句话里既出现否定词又
         # 出现替换动词时，替换说了算 —— 用户要的是「把 X 换成 Y」，不是
@@ -872,15 +1955,22 @@ class TemplateEditEngine:
         #
         # 判据是通用词法（否定词 + 替换动词共现），不认具体指标名。
         # 只有否定词、没有替换动词时，才是删除。
-        delete_hit = any(w in text for w in DELETE_WORDS)
-        replace_hit = any(w in text for w in REPLACE_CLAUSE_VERBS)
+        #
+        # **占位说法先摘掉**：「不要数值」里的「不要」说的是「这一项只占位」，
+        # 不是删除 —— 摘掉之后它既不触发删除，也不进指标名。
+        clean_text, placeholder_scopes = self._extract_placeholder_scopes(
+            text, target_region,
+        )
+        delete_hit = any(w in clean_text for w in DELETE_WORDS)
+        replace_hit = any(w in clean_text for w in REPLACE_CLAUSE_VERBS)
         if delete_hit and not replace_hit:
-            plan.intent = EditIntent.DELETE_SECTION
-            plan.confidence = 0.9
-            if target_region is None:
-                plan.needsClarification = True
-                plan.clarificationQuestion = "你想删掉哪张卡片？可以直接说：删掉昨日总耗电。"
-            return plan
+            return self._plan_delete_request(
+                clean_text=clean_text,
+                definition=definition,
+                target_region=target_region,
+                metrics=metrics,
+                placeholder_scopes=placeholder_scopes,
+            )
 
         # ===== 3. 在已有区块里追加指标 =====
         #
@@ -895,8 +1985,8 @@ class TemplateEditEngine:
         #
         # 追加的目标卡片：句子里点名的那张 > 用户当前选中的那张 >
         # 草稿里**唯一**的那张正文卡片。三者都定不下来才追问。
-        if not any(word in text for word in REPLACE_WORDS) and any(
-            word in text for word in APPEND_WORDS
+        if not any(word in clean_text for word in REPLACE_WORDS) and any(
+            word in clean_text for word in APPEND_WORDS
         ):
             append_target = target_region or self._sole_body_region(definition)
             if append_target is not None:
@@ -906,7 +1996,8 @@ class TemplateEditEngine:
                     confidence=0.9,
                 )
             append_plan = self._plan_append_metrics(
-                text, append_target, metrics, definition,
+                clean_text, append_target, metrics, definition,
+                placeholder_scopes=placeholder_scopes,
             )
             if append_plan is not None:
                 return append_plan
@@ -1243,6 +2334,14 @@ class TemplateEditEngine:
         base_revision = _definition_revision(definition)
         catalogs, metrics = self._visible_items(scope)
 
+        # **共享主题保存**：单独一条路 —— 它改的是**共享主题对象**，
+        # 不是这份报表的定义。
+        #
+        # 所以这里：既不走下面的「需要追问就返回」分支（待确认计划里
+        # ``confirm`` 已经翻成真了），也不 bump 定义版本。
+        if plan.intent == EditIntent.SAVE_THEME:
+            return self._apply_save_theme(plan=plan, before=before)
+
         # 需要追问 / 无法执行 → 返回 clarification
         if plan.needsClarification or plan.intent == EditIntent.UNKNOWN:
             return EditResult(
@@ -1381,6 +2480,7 @@ class TemplateEditEngine:
         base_revision: int,
         catalogs: dict[str, dict],
         metrics: dict[str, dict],
+        allow_empty_region: bool = False,
     ) -> _IntentOutcome:
         """在一个草稿副本上校验并应用单个意图。
 
@@ -1506,6 +2606,11 @@ class TemplateEditEngine:
             change_set, reply = self._apply_rename_report(draft, plan, base_revision)
         elif plan.intent == EditIntent.DELETE_SECTION:
             change_set, reply = self._apply_delete(draft, plan, base_revision)
+        elif plan.intent == EditIntent.DELETE_METRIC:
+            change_set, reply = self._apply_delete_metric(
+                draft, plan, base_revision, metrics,
+                allow_empty=allow_empty_region,
+            )
         elif plan.intent == EditIntent.RENAME_SECTION:
             change_set, reply = self._apply_rename(draft, plan, base_revision)
         elif plan.intent == EditIntent.ADD_SECTION:
@@ -1528,6 +2633,8 @@ class TemplateEditEngine:
             change_set, reply = self._apply_change_top_n(draft, plan, base_revision)
         elif plan.intent == EditIntent.CHANGE_SORT:
             change_set, reply = self._apply_change_sort(draft, plan, base_revision)
+        elif plan.intent == EditIntent.APPLY_PRESENTATION:
+            change_set, reply = self._apply_presentation(draft, plan, base_revision)
         else:
             return _IntentOutcome.failed(
                 "该编辑意图尚未实现，请换一种表达。", reason="not_implemented",
@@ -1597,7 +2704,8 @@ class TemplateEditEngine:
         replies: list[str] = []
         markdowns: list[str] = []
 
-        for index, step in enumerate(self._ordered_steps(steps)):
+        ordered_steps = self._ordered_steps(steps)
+        for index, step in enumerate(ordered_steps):
             step_plan = EditPlan(
                 isTemplateEdit=True,
                 intent=step.intent,
@@ -1605,12 +2713,19 @@ class TemplateEditEngine:
                 target=plan.target,
                 operation=step.operation.model_copy(deep=True),
             )
+            # 后面还有追加指标这一步 → 中间短暂空了**不算**「删空卡片」：
+            # 按**最终草稿**能不能渲染来判（契约表 §4.3）。
+            later_adds_metric = any(
+                other.intent == EditIntent.ADD_METRIC
+                for other in ordered_steps[index + 1:]
+            )
             outcome = self._apply_one_intent(
                 plan=step_plan,
                 draft=working,
                 base_revision=base_revision,
                 catalogs=catalogs,
                 metrics=metrics,
+                allow_empty_region=later_adds_metric,
             )
             if outcome.is_failed:
                 # 整组放弃：原草稿不动
@@ -1666,11 +2781,16 @@ class TemplateEditEngine:
         粒度是否可用取决于数据源登记的 supportedGrains，所以换源必须排在
         改粒度前面，否则后一步会拿旧数据源的能力做判断。
         同一类步骤之间保持调用方给定的顺序。
+
+        **删指标排在加指标前面** —— 用户说「删掉 X，再加 Y」就是这个顺序；
+        删完再加，中间短暂为空是允许的（按**最终草稿**判定能不能渲染）。
         """
         order = {
             EditIntent.CHANGE_DATA_SOURCE: 0,
             EditIntent.CHANGE_METRIC: 1,
             EditIntent.CHANGE_COMPILATION_GRAIN: 2,
+            EditIntent.DELETE_METRIC: 3,
+            EditIntent.ADD_METRIC: 4,
         }
         return sorted(
             steps,
@@ -1707,14 +2827,33 @@ class TemplateEditEngine:
     # ===== 解析辅助 =====
 
     @staticmethod
+    def _flatten_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把区域树摊平成一张表（容器在前、子区域按阅读顺序）。
+
+        分组（容器）落地之后，**组内的卡片也要能被点名**：
+        「把设备耗电排名改成 X」不能因为它在组里就找不到。
+        摊平只用于**定位**；改数据仍然改树里的那一个字典。
+        """
+        flat: list[dict[str, Any]] = []
+        for region in regions or []:
+            if not isinstance(region, dict):
+                continue
+            flat.append(region)
+            children = region.get("children")
+            if isinstance(children, list):
+                flat.extend(TemplateEditEngine._flatten_regions(children))
+        return flat
+
+    @staticmethod
     def _find_region(
         regions: list[dict[str, Any]],
         text: str,
         selected_region_id: str | None,
     ) -> dict[str, Any] | None:
+        candidates = TemplateEditEngine._flatten_regions(regions)
         normalized = _normalize_text(text)
         best: tuple[int, dict[str, Any]] | None = None
-        for region in regions:
+        for region in candidates:
             aliases = _region_aliases(region)
             score = 0
             for alias in aliases:
@@ -1731,7 +2870,7 @@ class TemplateEditEngine:
             return best[1]
         if selected_region_id:
             return next(
-                (region for region in regions if region.get("id") == selected_region_id),
+                (region for region in candidates if region.get("id") == selected_region_id),
                 None,
             )
         return None
@@ -1754,6 +2893,504 @@ class TemplateEditEngine:
             and str(region.get("role") or "").upper() != "REPORT_TITLE"
         ]
         return regions[0] if len(regions) == 1 else None
+
+    # ------------------------------------------------------------------
+    # 分句 / 动作扫描 / 占位语义
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _scan_actions(text: str) -> list["_ClauseAction"]:
+        """把一句话切成一个个**动作**（删除 / 追加 / 替换）。
+
+        通用动词扫描，**不认具体指标名**：每个动作的对象 = 动词**之后**到
+        **下一个动作动词**之间的那段话；动词**之前**的是上下文（通常指目标
+        卡片）。同一位置上**追加说法优先**（先认出「再加」才知道这是往已有
+        卡片里加指标）。
+        """
+        hits: list[tuple[int, int, str, str]] = []
+        for kind, word in _ACTION_VERB_KINDS:
+            start = 0
+            while True:
+                index = text.find(word, start)
+                if index < 0:
+                    break
+                hits.append((index, index + len(word), kind, word))
+                start = index + 1
+        hits.sort(key=lambda item: (
+            item[0], _ACTION_KIND_PRIORITY.get(item[2], 9), -(item[1] - item[0]),
+        ))
+        picked: list[tuple[int, int, str, str]] = []
+        cursor = 0
+        for index, end, kind, word in hits:
+            if index < cursor:
+                continue
+            picked.append((index, end, kind, word))
+            cursor = end
+        actions: list[_ClauseAction] = []
+        for order, (index, end, kind, word) in enumerate(picked):
+            next_start = picked[order + 1][0] if order + 1 < len(picked) else len(text)
+            actions.append(_ClauseAction(
+                kind=kind, verb=word, start=index, end=end,
+                before=text[:index], after=text[end:next_start],
+            ))
+        return actions
+
+    @staticmethod
+    def _normalize_metric_phrase(text: str) -> str:
+        """把「删掉 X」里的 X 归一成一个**可比的名字**。
+
+        剥掉引导词（「把」「这个」）与成分词（「这个指标」「的」）——
+        剩下的是**指标名**本身。
+        """
+        value = str(text or "").strip(" 　：:，,。.；;！!？?、")
+        changed = True
+        while changed and value:
+            changed = False
+            for token in _METRIC_PHRASE_LEAD_NOISE:
+                if value.startswith(token):
+                    value = value[len(token):].strip(" 　：:，,。.；;！!？?、")
+                    changed = True
+                    break
+            if changed:
+                continue
+            for token in _METRIC_PHRASE_TAIL_NOISE:
+                if value.endswith(token):
+                    value = value[:-len(token)].strip(" 　：:，,。.；;！!？?、")
+                    changed = True
+                    break
+        return value
+
+    @staticmethod
+    def _strip_leading_quantifier(name: str) -> str:
+        """剥掉指标名**前面**的量词（「一个温度」→ 「温度」）。"""
+        value = str(name or "").strip()
+        for token in _METRIC_NAME_QUANTIFIERS:
+            if value.startswith(token) and len(value) > len(token):
+                return value[len(token):].strip()
+        return value
+
+    @classmethod
+    def _extract_placeholder_scopes(
+        cls, text: str, region: dict[str, Any] | None = None,
+    ) -> tuple[str, list[str | None]]:
+        """摘掉**占位说法**，返回 (干净的文本, 每处占位说法的归属指标名)。
+
+        「不要数值」里的「不要」**不是删除** —— 它说的是「这一项只占位」。
+        归属指标名取「占位说法**前面**最近提到的那一个指标」；说不出是哪一个
+        就记 ``None``（这次占位对**这一句**里提到的指标都成立）。
+        """
+        source = str(text or "")
+        hits: list[tuple[int, int, str]] = []
+        for phrase in PLACEHOLDER_MODE_WORDS:
+            start = 0
+            while True:
+                index = source.find(phrase, start)
+                if index < 0:
+                    break
+                hits.append((index, index + len(phrase), phrase))
+                start = index + 1
+        hits.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+        kept: list[tuple[int, int, str]] = []
+        cursor = 0
+        for index, end, phrase in hits:
+            if index < cursor:
+                continue
+            kept.append((index, end, phrase))
+            cursor = end
+        if not kept:
+            return source, []
+        scopes: list[str | None] = []
+        pieces: list[str] = []
+        cursor = 0
+        for index, end, _phrase in kept:
+            scopes.append(cls._placeholder_owner(source[:index], region))
+            pieces.append(source[cursor:index])
+            cursor = end
+        pieces.append(source[cursor:])
+        return " ".join(piece.strip() for piece in pieces if piece.strip()), scopes
+
+    @classmethod
+    def _placeholder_owner(
+        cls, prefix: str, region: dict[str, Any] | None,
+    ) -> str | None:
+        """占位说法**归属**哪一个指标（说不准就 ``None``）。"""
+        boundary = -1
+        for separator in _CLAUSE_SEPARATORS:
+            boundary = max(boundary, prefix.rfind(separator))
+        segment = prefix[boundary + 1:]
+        segment = cls._text_without_region_label(segment, region).strip()
+        for word in sorted(APPEND_WORDS + ADD_WORDS, key=len, reverse=True):
+            if segment.startswith(word):
+                segment = segment[len(word):].strip()
+                break
+        names = cls._split_metric_list(segment)
+        if len(names) != 1:
+            return None
+        name = cls._strip_leading_quantifier(names[0])
+        return name or None
+
+    # ------------------------------------------------------------------
+    # 删除：指标级 / 卡片级
+    # ------------------------------------------------------------------
+
+    def _resolve_delete_metric(
+        self,
+        *,
+        phrase: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str]:
+        """把「删掉 X」里的 X 解析成**卡片内的指标实例**。
+
+        返回 ``(region, 实例清单, 状态)``：
+
+        - 状态 ``"matched"``：唯一命中，``region`` 与 ``实例清单`` 有值；
+        - 状态 ``"ambiguous"``：命中多处（同名指标 / 多张卡片都有），
+          上层**追问**，绝不删第一条匹配的；
+        - 状态 ``"none"``：没命中任何指标 —— 上层按**整卡删除**的既有口径
+          继续走（并按对象形态决定是追问还是删卡）。
+        """
+        needle = self._normalize_metric_phrase(phrase)
+        if not needle:
+            return None, [], "none"
+        hits: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        name_clash = False
+        for region in definition.regions or []:
+            if not isinstance(region, dict):
+                continue
+            for instance in _region_metric_instances(region):
+                label = self._normalize_metric_phrase(str(instance.get("label") or ""))
+                if label and label == needle:
+                    hits.append((region, instance))
+            if self._region_name_matches_phrase(region, phrase):
+                # 卡片**自己的名字**就叫这个 —— 「同名指标 / 卡片」：追问，
+                # 绝不替用户挑一个。
+                name_clash = True
+        if len(hits) == 1 and not name_clash:
+            region, instance = hits[0]
+            return region, [instance], "matched"
+        if len(hits) > 1 or name_clash:
+            return None, [], "ambiguous"
+        return None, [], "none"
+
+    @classmethod
+    def _region_name_matches_phrase(
+        cls, region: dict[str, Any], phrase: str,
+    ) -> bool:
+        """卡片**自己的名字**是不是就是这个词（别名不算）。"""
+        needle = cls._normalize_metric_phrase(phrase)
+        if not needle:
+            return False
+        component = region.get("component")
+        component = component if isinstance(component, dict) else {}
+        names = {str(region.get("name") or ""), str(component.get("title") or "")}
+        for name in names:
+            if name and cls._normalize_metric_phrase(name) == needle:
+                return True
+        return False
+
+    @classmethod
+    def _region_matches_phrase(
+        cls, region: dict[str, Any], phrase: str,
+    ) -> bool:
+        """这个词是不是**这张卡片**的名字或别名。"""
+        needle = _normalize_text(phrase)
+        if not needle:
+            return False
+        for alias in _region_aliases(region):
+            alias_key = _normalize_text(alias)
+            if not alias_key:
+                continue
+            if alias_key in needle or needle in alias_key:
+                return True
+        return False
+
+    def _plan_delete_metric(
+        self,
+        *,
+        phrase: str,
+        raw_object: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+    ) -> EditPlan | None:
+        """「删掉卡片里的某个指标」的计划（``DELETE_METRIC``）。
+
+        返回 ``None`` = 这句话**不是**在删指标（上层照整卡删除继续走）。
+        """
+        region, instances, status = self._resolve_delete_metric(
+            phrase=phrase, definition=definition, target_region=target_region,
+        )
+        if status == "none" or region is None:
+            return None
+        if status == "ambiguous":
+            return EditPlan(
+                isTemplateEdit=True,
+                intent=EditIntent.DELETE_METRIC,
+                confidence=0.6,
+                target=EditTarget(
+                    regionId=str(target_region.get("id")) if target_region else "",
+                    matchedText=_region_label(target_region) if target_region else "",
+                    confidence=0.0,
+                ),
+                operation=EditOperation(
+                    baseDefinitionRevision=_definition_revision(definition),
+                ),
+                needsClarification=True,
+                clarificationQuestion=(
+                    f"「{self._normalize_metric_phrase(phrase)}」在草稿里有多处，"
+                    "你想删的是哪一张卡片里的哪一个？"
+                ),
+            )
+        instance = instances[0]
+        region_id = str(region.get("id"))
+        label = _region_label(region)
+        metric_label = str(instance.get("label") or phrase)
+        deletion = EditMetricDeletion(
+            metricKey=str(instance.get("metricKey") or ""),
+            simulatedId=instance.get("simulatedId"),
+            fieldRef=instance.get("fieldRef") or None,
+            label=metric_label,
+            isPrimary=bool(instance.get("isPrimary")),
+            intent=self._normalize_metric_phrase(phrase),
+        )
+        return EditPlan(
+            isTemplateEdit=True,
+            intent=EditIntent.DELETE_METRIC,
+            confidence=0.9,
+            target=EditTarget(regionId=region_id, matchedText=label, confidence=0.9),
+            operation=EditOperation(
+                deleteMetrics=[deletion],
+                baseDefinitionRevision=_definition_revision(definition),
+            ),
+            summary=f"在「{label}」里删掉指标「{metric_label}」，卡片本身保留。",
+        )
+
+    def _plan_delete_request(
+        self,
+        *,
+        clean_text: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+        metrics: dict[str, dict],
+        placeholder_scopes: list[str | None],
+    ) -> EditPlan:
+        """删除请求：指标级 / 卡片级 / 同卡「删 + 加」复合。
+
+        「删掉某个指标」和「删掉整张卡片」在这里分开：判据是**删除对象**
+        指向卡片内的哪一个指标，而不是「句子里有没有删除词」。
+        """
+        actions = self._scan_actions(clean_text)
+        delete_actions = [item for item in actions if item.kind == "delete"]
+        append_actions = [item for item in actions if item.kind == "append"]
+        add_card_actions = [item for item in actions if item.kind == "add_card"]
+        action = delete_actions[0] if delete_actions else None
+        raw_object = (action.after if action else "").strip()
+        phrase = self._normalize_metric_phrase(raw_object)
+        if not phrase and action is not None:
+            # 「把 X 删掉」：对象在动词**之前**。
+            phrase = self._normalize_metric_phrase(action.before)
+
+        metric_plan = self._plan_delete_metric(
+            phrase=phrase,
+            raw_object=raw_object,
+            definition=definition,
+            target_region=target_region,
+        )
+        if metric_plan is not None:
+            if metric_plan.needsClarification:
+                return metric_plan
+            if append_actions:
+                composite = self._plan_delete_and_append(
+                    delete_plan=metric_plan,
+                    clean_text=clean_text,
+                    definition=definition,
+                    metrics=metrics,
+                    placeholder_scopes=placeholder_scopes,
+                )
+                if composite is not None:
+                    return composite
+                # 追加的那一半没认出来 → 追问，**不静默只做一半**。
+                return EditPlan(
+                    isTemplateEdit=True,
+                    intent=EditIntent.DELETE_METRIC,
+                    confidence=0.6,
+                    target=metric_plan.target,
+                    operation=EditOperation(
+                        baseDefinitionRevision=_definition_revision(definition),
+                    ),
+                    needsClarification=True,
+                    clarificationQuestion=(
+                        "要删的指标已经认出来了，但还要加的那个指标没认出名字。"
+                        "请把要加的指标名再说一次。"
+                    ),
+                )
+            return metric_plan
+
+        if append_actions or add_card_actions:
+            # 删整张卡片 + 加东西 —— 两步修改，一步做不了：**追问**，
+            # **不静默只做半句**。
+            plan = EditPlan(
+                isTemplateEdit=True,
+                intent=EditIntent.DELETE_SECTION,
+                confidence=0.6,
+                target=EditTarget(
+                    regionId=str(target_region.get("id")) if target_region else "",
+                    matchedText=_region_label(target_region) if target_region else "",
+                    confidence=0.9 if target_region else 0.0,
+                ),
+                operation=EditOperation(
+                    baseDefinitionRevision=_definition_revision(definition),
+                ),
+                needsClarification=True,
+                clarificationQuestion=(
+                    "删掉整张卡片和加指标是两步修改，请分两次说："
+                    "先说要删哪张卡片，再说要加哪个指标。"
+                ),
+            )
+            plan.baseCombination = _current_combination(definition)
+            return plan
+
+        # 这个词是不是**某张卡片**的名字或别名 → 删的是卡片。
+        card_shaped = any(word in raw_object for word in _CARD_OBJECT_WORDS)
+        named_region = next(
+            (
+                region for region in definition.regions or []
+                if isinstance(region, dict) and self._region_matches_phrase(region, phrase)
+            ),
+            None,
+        )
+        if not card_shaped and named_region is None and (
+            any(word in raw_object for word in _METRIC_OBJECT_WORDS)
+        ):
+            # 说得明明白白是「删一个指标」，但草稿里**没有这一项** ——
+            # 追问，**绝不回退成删整张卡片**。
+            plan = EditPlan(
+                isTemplateEdit=True,
+                intent=EditIntent.DELETE_METRIC,
+                confidence=0.6,
+                target=EditTarget(
+                    regionId=str(target_region.get("id")) if target_region else "",
+                    matchedText=_region_label(target_region) if target_region else "",
+                    confidence=0.9 if target_region else 0.0,
+                ),
+                operation=EditOperation(
+                    baseDefinitionRevision=_definition_revision(definition),
+                ),
+                needsClarification=True,
+                clarificationQuestion=(
+                    f"草稿里没找到「{phrase or raw_object}」这个指标。"
+                    "请说清楚要删哪张卡片里的哪一个指标。"
+                ),
+            )
+            plan.baseCombination = _current_combination(definition)
+            return plan
+
+        if not card_shaped and named_region is None and phrase:
+            # 说了一个词，但草稿里**既没有这个指标、也没有这张卡片** ——
+            # 追问，**不猜**要删哪张卡片（猜错 = 删错东西）。
+            plan = EditPlan(
+                isTemplateEdit=True,
+                intent=EditIntent.DELETE_SECTION,
+                confidence=0.6,
+                target=EditTarget(
+                    regionId=str(target_region.get("id")) if target_region else "",
+                    matchedText=_region_label(target_region) if target_region else "",
+                    confidence=0.9 if target_region else 0.0,
+                ),
+                operation=EditOperation(
+                    baseDefinitionRevision=_definition_revision(definition),
+                ),
+                needsClarification=True,
+                clarificationQuestion=(
+                    f"草稿里没找到「{phrase}」这张卡片或这个指标。"
+                    "你想删掉的是哪一张卡片、哪一个指标？"
+                ),
+            )
+            plan.baseCombination = _current_combination(definition)
+            return plan
+
+        # 删的是**卡片**（或没点名）→ 既有口径。
+        plan = EditPlan(
+            isTemplateEdit=True,
+            intent=EditIntent.DELETE_SECTION,
+            confidence=0.9,
+            target=EditTarget(
+                regionId=str(target_region.get("id")) if target_region else "",
+                matchedText=_region_label(target_region) if target_region else "",
+                confidence=0.9 if target_region else 0.0,
+            ),
+            operation=EditOperation(
+                baseDefinitionRevision=_definition_revision(definition),
+            ),
+        )
+        plan.baseCombination = _current_combination(definition)
+        if target_region is None:
+            plan.needsClarification = True
+            plan.clarificationQuestion = "你想删掉哪张卡片？可以直接说：删掉昨日总耗电。"
+        return plan
+
+    def _plan_delete_and_append(
+        self,
+        *,
+        delete_plan: EditPlan,
+        clean_text: str,
+        definition: ReportDefinitionDraft,
+        metrics: dict[str, dict],
+        placeholder_scopes: list[str | None],
+    ) -> EditPlan | None:
+        """同卡「删一个指标 + 加一个指标」→ 一次**原子复合**。
+
+        两步都在**同一份草稿副本**上执行：任一步失败整体放弃，原草稿与
+        revision 都不变（契约表 §4.3）。顶层 intent 指向**最后一步**，
+        摘要写清两步。
+        """
+        region_id = delete_plan.target.regionId
+        region = next(
+            (item for item in definition.regions or [] if item.get("id") == region_id),
+            None,
+        )
+        if region is None:
+            return None
+        append_plan = self._plan_append_metrics(
+            clean_text, region, metrics, definition,
+            placeholder_scopes=placeholder_scopes,
+        )
+        if append_plan is None or append_plan.needsClarification:
+            return None
+        additions = append_plan.operation.addMetrics
+        if not additions:
+            return None
+        deleted_labels = "、".join(
+            str(item.label or item.intent) for item in delete_plan.operation.deleteMetrics
+        )
+        added_labels = "、".join(
+            str(item.label or item.intent) for item in additions
+        )
+        region_label = _region_label(region)
+        return EditPlan(
+            isTemplateEdit=True,
+            intent=EditIntent.ADD_METRIC,
+            confidence=min(delete_plan.confidence, append_plan.confidence),
+            target=delete_plan.target,
+            operation=append_plan.operation.model_copy(deep=True),
+            operations=[
+                EditOperationStep(
+                    intent=EditIntent.DELETE_METRIC,
+                    operation=delete_plan.operation.model_copy(deep=True),
+                    summary=f"删除指标「{deleted_labels}」",
+                ),
+                EditOperationStep(
+                    intent=EditIntent.ADD_METRIC,
+                    operation=append_plan.operation.model_copy(deep=True),
+                    summary=f"追加指标「{added_labels}」",
+                ),
+            ],
+            summary=(
+                f"在「{region_label}」里删掉指标「{deleted_labels}」，"
+                f"并追加指标「{added_labels}」。"
+            ),
+            baseCombination=delete_plan.baseCombination,
+        )
 
     @staticmethod
     def _parse_component_type(text: str) -> tuple[str, str, str]:
@@ -1961,6 +3598,8 @@ class TemplateEditEngine:
         target_region: dict[str, Any] | None,
         metrics: dict[str, dict],
         definition: ReportDefinitionDraft,
+        *,
+        placeholder_scopes: list[str | None] | None = None,
     ) -> EditPlan | None:
         """「在已有区块里追加指标」的计划。
 
@@ -2043,6 +3682,7 @@ class TemplateEditEngine:
             ))
         if not additions:
             return None
+        self._apply_placeholder_scopes(additions, placeholder_scopes or [])
         return EditPlan(
             isTemplateEdit=True,
             intent=EditIntent.ADD_METRIC,
@@ -2053,6 +3693,42 @@ class TemplateEditEngine:
                 baseDefinitionRevision=_definition_revision(definition),
             ),
         )
+
+    @classmethod
+    def _apply_placeholder_scopes(
+        cls, additions: list[EditMetricAddition], scopes: list[str | None],
+    ) -> None:
+        """把占位说法落到**它说的那个指标**上。
+
+        「再加温度和湿度，湿度不要数值」→ 只有**湿度**占位，温度照常出数；
+        说不出是哪一个（归属记 ``None``）→ 这一句里提到的指标都占位。
+        """
+        if not scopes or not additions:
+            return
+        if any(scope is None for scope in scopes):
+            for addition in additions:
+                addition.displayMode = DISPLAY_MODE_PLACEHOLDER_ONLY
+            return
+        owners = {
+            cls._normalize_metric_phrase(scope)
+            for scope in scopes if scope
+        }
+        owners.discard("")
+        if not owners:
+            return
+        for addition in additions:
+            names = {
+                str(addition.label or "").strip(),
+                str(addition.intent or "").strip(),
+            }
+            keys = {cls._normalize_metric_phrase(name) for name in names}
+            keys |= {
+                cls._normalize_metric_phrase(cls._strip_leading_quantifier(name))
+                for name in names
+            }
+            keys.discard("")
+            if keys & owners:
+                addition.displayMode = DISPLAY_MODE_PLACEHOLDER_ONLY
 
     @staticmethod
     def _split_metric_list(text: str) -> list[str]:
@@ -2273,6 +3949,246 @@ class TemplateEditEngine:
             impact=[f"已从草稿中移除「{label}」。"],
         )
         return change_set, f"已删除「{label}」这张卡片。请检查右侧草稿，满意后点「同意」保存。"
+
+    @staticmethod
+    def _match_metric_instance(
+        request: EditMetricDeletion, instances: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """按**稳定身份**找指标实例。
+
+        模型给的旧身份 / 过期候选**不被信任**：给了身份却对不上，就是
+        「这一项已经不在了」—— **不退回按名字乱猜**。只有连身份都没给的
+        情况（只说了个显示名）才按名字找，而且必须**唯一**。
+        """
+        by_identity: list[dict[str, Any]] = []
+        has_identity = False
+        for instance in instances:
+            if request.metricKey:
+                has_identity = True
+                if instance.get("metricKey") == request.metricKey:
+                    by_identity.append(instance)
+                    continue
+            if request.simulatedId:
+                has_identity = True
+                if instance.get("simulatedId") == request.simulatedId:
+                    by_identity.append(instance)
+                    continue
+            if request.fieldRef:
+                has_identity = True
+                if instance.get("fieldRef") == request.fieldRef:
+                    by_identity.append(instance)
+                    continue
+        if has_identity:
+            return by_identity
+        label = str(request.label or request.intent or "").strip()
+        if not label:
+            return []
+        return [
+            item for item in instances
+            if str(item.get("label") or "") == label
+        ]
+
+    def _apply_delete_metric(
+        self, definition: ReportDefinitionDraft, plan: EditPlan, base_revision: int,
+        metrics: dict[str, dict], *, allow_empty: bool = False,
+    ) -> tuple[ChangeSet | None, str]:
+        """从一张**已有卡片**里删掉一个/多个指标（卡片本身保留）。
+
+        删的是**指标实例**：它在定义里的几处表示（``previewSpec.metrics[]`` /
+        ``previewSpec.columns[]`` / ``component.columns[]``）一起摘掉；
+        主指标被删时把下一项**提上来**，不让卡片空掉 —— 不是「删完重建」。
+        """
+        region_id = str(plan.target.regionId or "")
+        target = next((r for r in definition.regions if r.get("id") == region_id), None)
+        if target is None:
+            return None, "没有找到要删除指标的卡片。"
+        requests = plan.operation.deleteMetrics
+        if not requests:
+            return None, "没有解析出要删除的指标。"
+        instances = _region_metric_instances(target)
+        if not instances:
+            return None, f"「{_region_label(target)}」里没有可删除的指标。"
+
+        resolved: list[dict[str, Any]] = []
+        for request in requests:
+            matched = self._match_metric_instance(request, instances)
+            if not matched:
+                return None, (
+                    f"「{request.label or request.intent}」这一项已经不在"
+                    f"「{_region_label(target)}」里了，请重新说明要删哪一项。"
+                )
+            if len(matched) > 1:
+                return None, (
+                    f"「{request.label or request.intent}」在「{_region_label(target)}」"
+                    "里有多个同名项，请说得更具体一点。"
+                )
+            instance = matched[0]
+            if all(
+                _metric_instance_key(item) != _metric_instance_key(instance)
+                for item in resolved
+            ):
+                resolved.append(instance)
+
+        removed_keys = {
+            str(item.get("metricKey") or "") for item in resolved if item.get("metricKey")
+        }
+        removed_refs = {
+            str(item.get("fieldRef") or "") for item in resolved if item.get("fieldRef")
+        }
+        removed_simulated = {
+            str(item.get("simulatedId") or "") for item in resolved if item.get("simulatedId")
+        }
+        removed_labels = {
+            str(item.get("label") or "") for item in resolved if item.get("label")
+        }
+        remaining = [
+            item for item in instances
+            if not (
+                str(item.get("metricKey") or "") in removed_keys
+                or str(item.get("simulatedId") or "") in removed_simulated
+                or str(item.get("fieldRef") or "") in removed_refs
+                or str(item.get("label") or "") in removed_labels
+            )
+        ]
+        if not remaining and not allow_empty:
+            # 删掉最后一个指标 = 卡片空了。**不自动删卡**，也不留下空卡 ——
+            # 解释清楚，让用户自己决定。
+            return None, (
+                f"「{_region_label(target)}」里只有这一个指标了，删掉它卡片就空了；"
+                "要删整张卡片的话直接说「删掉这张卡片」。"
+            )
+
+        binding = target.get("templateBinding")
+        binding = copy.deepcopy(binding) if isinstance(binding, dict) else {}
+        spec = binding.get("previewSpec")
+        spec = copy.deepcopy(spec) if isinstance(spec, dict) else {}
+        component = target.get("component")
+        component = copy.deepcopy(component) if isinstance(component, dict) else {}
+
+        before_metrics = [
+            dict(item) for item in (spec.get("metrics") or []) if isinstance(item, dict)
+        ]
+        spec["metrics"] = [
+            item for item in before_metrics
+            if not (
+                str(item.get("metricKey") or "") in removed_keys
+                or str(item.get("simulatedId") or "") in removed_simulated
+                or str(item.get("label") or "") in removed_labels
+            )
+        ]
+        dropped_refs = removed_refs | removed_simulated
+        spec["columns"] = [
+            dict(item) for item in (spec.get("columns") or [])
+            if isinstance(item, dict) and str(item.get("fieldRef") or "") not in dropped_refs
+        ]
+        component["columns"] = [
+            dict(item) for item in (component.get("columns") or [])
+            if isinstance(item, dict) and str(item.get("fieldRef") or "") not in dropped_refs
+        ]
+        encodings = component.get("encodings")
+        if isinstance(encodings, list):
+            component["encodings"] = [
+                item for item in encodings
+                if not (
+                    isinstance(item, dict)
+                    and str(item.get("fieldRef") or "") in dropped_refs
+                )
+            ]
+        region_binding = target.get("binding")
+        if isinstance(region_binding, dict):
+            sorts = region_binding.get("sort")
+            if isinstance(sorts, list):
+                region_binding["sort"] = [
+                    item for item in sorts
+                    if not (
+                        isinstance(item, dict)
+                        and str(item.get("fieldRef") or "") in dropped_refs
+                    )
+                ]
+
+        # 主指标被删 → 把下一项**提上来**，卡片不留空、不重建。
+        if any(item.get("isPrimary") for item in resolved) and remaining:
+            promoted = remaining[0]
+            promoted_key = str(promoted.get("metricKey") or "")
+            catalog_entry = metrics.get(promoted_key) if promoted_key else None
+            new_ref = str(promoted.get("fieldRef") or "")
+            if catalog_entry is not None:
+                new_ref = str(catalog_entry.get("fieldRef") or new_ref)
+            metric_component = component.get("metric")
+            if isinstance(metric_component, dict):
+                metric_component["fieldRef"] = new_ref
+                fmt = metric_component.get("format")
+                if isinstance(fmt, dict):
+                    unit = str(
+                        (catalog_entry or {}).get("unit")
+                        or promoted.get("unit") or ""
+                    )
+                    if unit:
+                        fmt["unitLabel"] = unit
+            data = target.get("data")
+            data = data if isinstance(data, dict) else {}
+            pipeline = data.get("pipeline")
+            pipeline = pipeline if isinstance(pipeline, dict) else {}
+            for node in pipeline.get("nodes") or []:
+                if not isinstance(node, dict) or node.get("type") != "METRIC":
+                    continue
+                if catalog_entry is not None:
+                    node["metricRef"] = promoted_key
+                    node["metricVersion"] = catalog_entry.get("metricVersion")
+                else:
+                    # 目录外指标**不伪造 metricRef**（与既有换源口径一致）。
+                    node["metricRef"] = ""
+                    node.pop("metricVersion", None)
+                break
+            outputs = pipeline.get("outputs")
+            if isinstance(outputs, dict):
+                for output in outputs.values():
+                    expected = output.get("expectedFields")
+                    if not isinstance(expected, dict):
+                        continue
+                    for ref in list(expected.keys()):
+                        if ref in dropped_refs:
+                            expected.pop(ref, None)
+                    if new_ref and new_ref not in expected:
+                        expected[new_ref] = {
+                            "dataType": "DECIMAL",
+                            "unit": str(
+                                (catalog_entry or {}).get("unit")
+                                or promoted.get("unit") or ""
+                            ),
+                        }
+
+        target["component"] = component
+        binding["previewSpec"] = spec
+        target["templateBinding"] = binding
+
+        labels = "、".join(
+            str(item.get("label") or "") for item in resolved if item.get("label")
+        )
+        change_set = ChangeSet(
+            baseDefinitionRevision=base_revision,
+            changed=[ChangeSetEntry(
+                regionId=region_id,
+                path=f"/regions/{region_id}/templateBinding/previewSpec/metrics",
+                before={"metrics": before_metrics},
+                after={"metrics": spec["metrics"]},
+                summary=f"删除指标：{labels}",
+            )],
+            unchanged=[
+                ChangeSetUnchanged(regionId=str(item.get("id")), summary="未修改")
+                for item in definition.regions
+                if item.get("id") != region_id
+            ],
+            impact=[
+                f"「{_region_label(target)}」删掉了 {len(resolved)} 项指标：{labels}；"
+                "卡片本身与其它指标保留。",
+                "保存前需要重新校验并预览。",
+            ],
+        )
+        reply = (
+            f"已在「{_region_label(target)}」里删掉指标：{labels}。卡片本身保留。"
+        )
+        return change_set, reply
 
     @staticmethod
     def _apply_rename(
@@ -2684,21 +4600,76 @@ class TemplateEditEngine:
 
         new_columns: list[dict[str, Any]] = []
         new_metrics: list[dict[str, Any]] = []
-        for offset, addition in enumerate(additions):
+        # 追加项的**口径来源**：目录内指标带 metricRef，目录外指标没有 ——
+        # 目录外的那一项由服务端自己解析候选（用户原话 → 语义类别 / 单位），
+        # 不靠模型给的那份（模型只给线索）。
+        #
+        # 目录外指标**不因目录缺项被拒绝**：解析得出来就按通用模拟能力追加，
+        # 并带上「仅模拟展示、业务口径待确认」的标注。
+        mode = source_mode_of_definition(definition.model_dump(mode="json"))
+        # 已被占用的模拟身份：新增的**不能撞号**。
+        #
+        # 删掉中间一项之后列表变短了 —— 接着「列表长度」往后排会撞上**还没
+        # 删**的那一项的 id（实测：删掉第 2 项后再加，第 3 项会被覆盖）。
+        # 这里按**实际已用的身份**往后排；已有指标的 id **不重新编号**。
+        used_simulated_ids = {
+            str(item.get("simulatedId") or "")
+            for item in spec_metrics
+            if item.get("simulatedId")
+        }
+        used_simulated_ids |= {
+            str(column.get("fieldRef") or "")
+            for column in existing_columns
+            if str(column.get("bindingKind") or "") == "simulated"
+        }
+        next_metric_index = len(spec_metrics)
+        for addition in additions:
             candidate = candidate_from_dict(addition.metricCandidate)
             label = str(addition.label or addition.intent or "").strip()
             unit = str(addition.unit or (candidate.unit if candidate else "") or "")
             if addition.metricRef:
+                # 已登记指标：照既有口径走（真实单位 / 真实语义类别）。
                 kind = classify_metric_kind(
                     intent=label, metric_ref=addition.metricRef,
                 )
-            elif candidate is not None:
-                kind = str(candidate.kind or "generic")
+            elif candidate is None:
+                # 目录外指标（没有真实口径标识）：**服务端自己解析**候选。
+                #
+                # 模型只给线索（label / intent），口径由这里定 —— 与新增卡片
+                # 那条路（``_apply_add_out_of_catalog``）同一套解析，两处各
+                # 解析一次口径就会漂。
+                #
+                # 用的是 ``_resolve_metric_target``：它先判「是不是已登记
+                # 指标」（别名命中不等于识别成功），只有真的落在目录外才给
+                # 候选 —— 免得把一个已登记指标误标成「口径待确认」。
+                #
+                # 解析不出来 → 当作通用模拟指标追加，**不拒绝**：模拟模式下
+                # 用户点名的指标都能加。
+                resolved_ref, resolved = self._resolve_metric_target(
+                    label, metrics, strip_add_prefix=False,
+                )
+                candidate = resolved
+                if resolved_ref:
+                    # 落在**已登记指标**上（模型没给 metricRef）：照真实口径走 ——
+                    # 别把它降级成通用模拟指标，也别给它挂「口径待确认」。
+                    kind = classify_metric_kind(
+                        intent=label, metric_ref=resolved_ref,
+                    )
+                    if not unit:
+                        unit = str((metrics.get(resolved_ref) or {}).get("unit") or "")
+                else:
+                    kind = str(resolved.kind or "generic") if resolved else "generic"
+                    if resolved is not None and not unit:
+                        unit = str(resolved.unit or "")
             else:
-                kind = "generic"
+                kind = str(candidate.kind or "generic")
             # 同一板块里的第几个指标 → 同一个模拟身份：接着已有的往后排。
-            metric_index = len(spec_metrics) + offset
+            while simulated_metric_id(section_id, next_metric_index) in used_simulated_ids:
+                next_metric_index += 1
+            metric_index = next_metric_index
+            next_metric_index += 1
             simulated_id = simulated_metric_id(section_id, metric_index)
+            used_simulated_ids.add(simulated_id)
             display_mode = (
                 DISPLAY_MODE_PLACEHOLDER_ONLY
                 if str(addition.displayMode or "") == DISPLAY_MODE_PLACEHOLDER_ONLY
@@ -2719,12 +4690,33 @@ class TemplateEditEngine:
             # 展示模式**两处都记**：列上记一份，指标描述上也记一份 ——
             # 渲染层两处都读（口径一致，不会一处占位一处出数）。
             metric_entry["displayMode"] = display_mode
-            metric_entry["capabilityPending"] = False
-            metric_entry["pendingReason"] = (
-                "按用户要求只显示名称，不出数值。"
-                if display_mode == DISPLAY_MODE_PLACEHOLDER_ONLY
-                else "模拟示例数据，仅用于核对版式。"
-            )
+            if not addition.metricRef and candidate is not None:
+                # 目录外指标：标注写明「仅模拟展示、业务口径待确认」。
+                #
+                # 文案与新增卡片那条路**同一套**（``_apply_candidate_to_spec``
+                # + ``assumption_note()``）：一处改文案两处就漂。
+                #
+                # 模拟示例模式下它**照样出数**（模拟不因真实目录缺项被阻断），
+                # 所以不算「能力待接通」；用户 JSON 模式下没有真实口径可取，
+                # 仍标「能力待接通」。
+                if mode.mode == "simulated":
+                    metric_entry["capabilityPending"] = False
+                    metric_entry["pendingReason"] = (
+                        "模拟示例数据，仅用于核对版式。"
+                        f"{candidate.assumption_note()}"
+                    )
+                else:
+                    metric_entry["capabilityPending"] = True
+                    metric_entry["pendingReason"] = out_of_catalog_region_reason(
+                        candidate, source_mode=mode.mode,
+                    )
+            else:
+                metric_entry["capabilityPending"] = False
+                metric_entry["pendingReason"] = (
+                    "按用户要求只显示名称，不出数值。"
+                    if display_mode == DISPLAY_MODE_PLACEHOLDER_ONLY
+                    else "模拟示例数据，仅用于核对版式。"
+                )
             new_metrics.append(metric_entry)
 
         # 原有指标**保留**：列与指标描述都是「原有 + 新增」。
@@ -3372,7 +5364,14 @@ class TemplateEditEngine:
                     measure["asField"] = metric["fieldRef"]
                     metric_updated = True
                     break
-        if not metric_updated:
+        # 模拟示例模式：区域的指标身份在**绑定**里
+        # （``templateBinding.previewSpec.metrics[]``），不在真实管道里 ——
+        # 造数器按这份绑定出数。所以改指标要改的是**绑定**：
+        # 只改 ``component.metric.label`` 的话，屏上换了个名字、数值还是旧的。
+        binding_before = self._sync_simulated_metric_binding(
+            target, metric=metric, new_metric_ref=new_metric_ref,
+        )
+        if not metric_updated and binding_before is None:
             return None, "该卡片没有可替换的指标计算节点。"
 
         # 更新 component.metric 展示信息
@@ -3407,20 +5406,44 @@ class TemplateEditEngine:
         change_set = ChangeSet(
             baseDefinitionRevision=base_revision,
             changed=[
-                ChangeSetEntry(
-                    regionId=region_id,
-                    path=f"/regions/{region_id}/data/pipeline/metric",
-                    before=before_metric,
-                    after={
-                        "metricRef": new_metric_ref,
-                        "metricVersion": plan.operation.metricVersion or metric["metricVersion"],
-                    },
-                    summary=(
-                        "指标："
-                        f"{_metric_display_label(metrics, (before_metric or {}).get('metricRef'))}"
-                        f" → {_metric_display_label(metrics, new_metric_ref)}"
+                entry
+                for entry in (
+                    (
+                        ChangeSetEntry(
+                            regionId=region_id,
+                            path=f"/regions/{region_id}/data/pipeline/metric",
+                            before=before_metric,
+                            after={
+                                "metricRef": new_metric_ref,
+                                "metricVersion": plan.operation.metricVersion or metric["metricVersion"],
+                            },
+                            summary=(
+                                "指标："
+                                f"{_metric_display_label(metrics, (before_metric or {}).get('metricRef'))}"
+                                f" → {_metric_display_label(metrics, new_metric_ref)}"
+                            ),
+                        )
+                        if metric_updated else None
+                    ),
+                    (
+                        ChangeSetEntry(
+                            regionId=region_id,
+                            path=f"/regions/{region_id}/templateBinding/previewSpec/metrics",
+                            before=binding_before,
+                            after={
+                                "metricKey": new_metric_ref,
+                                "label": str(metric.get("label") or ""),
+                                "unit": str(metric.get("unit") or ""),
+                            },
+                            summary=(
+                                f"绑定里的指标身份：{binding_before.get('metricKey')}"
+                                f" → {new_metric_ref}"
+                            ),
+                        )
+                        if binding_before is not None else None
                     ),
                 )
+                if entry is not None
             ],
             unchanged=[
                 ChangeSetUnchanged(regionId=str(r.get("id")), summary="未修改")
@@ -3432,6 +5455,57 @@ class TemplateEditEngine:
             ],
         )
         return change_set, f"已把「{_region_label(target)}」的指标换成「{metric['label']}」。"
+
+    @staticmethod
+    def _sync_simulated_metric_binding(
+        target: dict[str, Any], *, metric: dict[str, Any], new_metric_ref: str,
+    ) -> dict[str, Any] | None:
+        """把**区域绑定**里的指标身份换成新指标（模拟示例模式）。
+
+        模拟示例模式下区域的指标身份在 ``templateBinding.previewSpec``
+        里（取值键 / 显示名 / 单位 / 量身份），**不在**真实管道里 ——
+        造数器按这份绑定出数。所以改指标必须改**绑定**：只改
+        ``component.metric.label`` 的话，屏上换了个名字、数值还是旧的。
+
+        **不动**复制件标记（``duplicateOfRegionId``）与数据身份
+        （``simulationIdentity``）：改指标不改变「它是谁的复制件」——
+        复制件照旧不参与总计（契约 0002 §2.1 / §2.2）。
+
+        返回改之前的指标身份；没有可改的绑定时返回 ``None``。
+        """
+        binding = target.get("templateBinding")
+        if not isinstance(binding, dict):
+            return None
+        spec = binding.get("previewSpec")
+        if not isinstance(spec, dict):
+            return None
+        metrics = spec.get("metrics")
+        if not isinstance(metrics, list):
+            return None
+        item = next((m for m in metrics if isinstance(m, dict)), None)
+        if item is None:
+            return None
+
+        before = {
+            "metricKey": item.get("metricKey"),
+            "label": item.get("label"),
+            "kind": item.get("kind"),
+            "unit": item.get("unit"),
+        }
+        unit = str(metric.get("unit") or item.get("unit") or "")
+        kind = str(metric.get("kind") or item.get("kind") or "generic")
+        item["metricKey"] = new_metric_ref
+        item["label"] = str(metric.get("label") or item.get("label") or "")
+        item["unit"] = unit
+        item["kind"] = kind
+        item["deterministicScope"] = deterministic_scope(
+            SCOPE_METRIC_FAMILY,
+            metric_family_seed_key(kind, new_metric_ref, unit),
+        )
+        # 区域级单位与量身份跟着主量走（区域级是主量的兜底）。
+        spec["unit"] = unit
+        spec["kind"] = kind
+        return before
 
     def _apply_change_metric_out_of_catalog(
         self, definition: ReportDefinitionDraft, plan: EditPlan, base_revision: int,

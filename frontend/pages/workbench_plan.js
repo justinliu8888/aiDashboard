@@ -744,33 +744,6 @@
     return safeText(value).replace(/[\r\n]+/g, " ");
   }
 
-  function sectionAscii(section) {
-    const keys = section.metricIntents.map((_, index) => "K" + (index + 1));
-    switch (section.componentType) {
-      case "metric_card": {
-        const rows = [];
-        for (let i = 0; i < keys.length; i += 2) {
-          rows.push(keys.slice(i, i + 2).map(key => "[ " + key.padEnd(4) + " ]").join("  "));
-        }
-        return rows.join("\n") || "[ metric ]";
-      }
-      case "line_chart":
-        return "value\n  |       *---*\n  |   *--*     *\n  |--*\n  +---------------- time";
-      case "bar_chart":
-        return "K1 | ######\nK2 | ##########\nK3 | ####\n   +-------------- value";
-      case "pie_chart":
-        return "composition\n+---------------------+\n|   K1   | K2 |  K3   |\n+---------------------+";
-      case "table": {
-        const cells = section.columns.map((_, index) => " C" + (index + 1) + " ");
-        if (!cells.length) return "[ table columns to be confirmed ]";
-        const rule = "+" + cells.map(cell => "-".repeat(cell.length)).join("+") + "+";
-        return rule + "\n|" + cells.join("|") + "|\n" + rule + "\n|" + cells.map(cell => " ".repeat(cell.length)).join("|") + "|\n" + rule;
-      }
-      default:
-        return "[ text / content ]";
-    }
-  }
-
   function planMarkdown(plan) {
     const view = normalizeView({ reportPlan: plan });
     const lines = ["# " + markdownLine(view.topic || "报表方案"), ""];
@@ -789,9 +762,6 @@
       if (section.explicitComponentType) lines.push("- 用户指定：" + componentTypeLabel(section.explicitComponentType));
       if (section.selectionReason) lines.push("- 选择理由：" + markdownLine(section.selectionReason));
       if (section.columns.length) lines.push("- 栏目：" + section.columns.map(c => markdownLine(c.label)).join("、"));
-      lines.push("", "布局示意（不代表数值）：", "", "```text", sectionAscii(section), "```", "");
-      section.metricIntents.forEach((label, i) => lines.push("- K" + (i + 1) + "：" + markdownLine(label)));
-      section.columns.forEach((column, i) => lines.push("- C" + (i + 1) + "：" + markdownLine(column.label)));
       lines.push("");
     }
     if (!view.sections.length) lines.push("暂无板块。", "");
@@ -819,7 +789,9 @@
     for (const line of markdown.split("\n")) {
       if (line.startsWith("```")) {
         if (code) { code = null; } else {
-          code = makeBlock(doc, "pre", "font-family:monospace;white-space:pre;overflow:auto;padding:10px 0;margin:8px 0;line-height:1.5;", "plan-ascii");
+          // 方案正文里不再有 ASCII 布局图；围栏分支保留成**通用**的代码块渲染，
+          // 类名取中性的 plan-code（不再是 plan-ascii），将来真有 JSON 之类要展示也安全。
+          code = makeBlock(doc, "pre", "font-family:monospace;white-space:pre;overflow:auto;padding:10px 0;margin:8px 0;line-height:1.5;", "plan-code");
           box.appendChild(code);
         }
         list = null;

@@ -1,0 +1,150 @@
+{
+  "schemaVersion": "1.0",
+  "updatedAt": "2026-11-02T00:00:00",
+  "themes": [
+    {
+      "themeId": "theme_default",
+      "name": "默认主题",
+      "builtin": true,
+      "updatedAt": "2026-11-02T00:00:00",
+      "tokens": {
+        "colorBackground": "#FFFFFF",
+        "colorSurface": "#F7F9FC",
+        "colorText": "#1F2329",
+        "colorTextMuted": "#646A73",
+        "colorPrimary": "#2F6BFF",
+        "colorBorder": "#E3E6EB",
+        "colorAccent": "#00B7A3",
+        "fontFamily": "PingFang SC, Microsoft YaHei, sans-serif",
+        "fontSizeBase": 14,
+        "lineHeightBase": 1.6,
+        "radiusBase": 8,
+        "gapBase": 12,
+        "spacingUnit": 8
+      },
+      "defaultStyle": {
+        "fontFamily": "PingFang SC, Microsoft YaHei, sans-serif",
+        "fontSize": {"value": 14, "unit": "PX"},
+        "fontWeight": 400,
+        "textColor": "#1F2329",
+        "backgroundColor": "#FFFFFF",
+        "textAlign": "LEFT",
+        "verticalAlign": "MIDDLE",
+        "lineHeight": {"value": 1.6, "unit": "PERCENT"},
+        "padding": {"value": 12, "unit": "PX"},
+        "margin": {"value": 0, "unit": "PX"},
+        "border": {"width": 1, "style": "SOLID", "color": "#E3E6EB"},
+        "borderRadius": 8,
+        "opacity": 1
+      }
+    },
+    {
+      "themeId": "theme_dark",
+      "name": "深色主题",
+      "builtin": true,
+      "updatedAt": "2026-11-02T00:00:00",
+      "tokens": {
+        "colorBackground": "#14171C",
+        "colorSurface": "#1D2127",
+        "colorText": "#E8EAED",
+        "colorTextMuted": "#9AA0A6",
+        "colorPrimary": "#4C8DFF",
+        "colorBorder": "#2C323A",
+        "colorAccent": "#2DD4BF",
+        "fontFamily": "PingFang SC, Microsoft YaHei, sans-serif",
+        "fontSizeBase": 14,
+        "lineHeightBase": 1.6,
+        "radiusBase": 6,
+        "gapBase": 12,
+        "spacingUnit": 8
+      },
+      "defaultStyle": {
+        "fontFamily": "PingFang SC, Microsoft YaHei, sans-serif",
+        "fontSize": {"value": 14, "unit": "PX"},
+        "fontWeight": 400,
+        "textColor": "#E8EAED",
+        "backgroundColor": "#1D2127",
+        "textAlign": "LEFT",
+        "verticalAlign": "MIDDLE",
+        "lineHeight": {"value": 1.6, "unit": "PERCENT"},
+        "padding": {"value": 12, "unit": "PX"},
+        "margin": {"value": 0, "unit": "PX"},
+        "border": {"width": 1, "style": "SOLID", "color": "#2C323A"},
+        "borderRadius": 6,
+        "opacity": 1
+      }
+    },
+    {
+      "themeId": "theme_soft",
+      "name": "柔和主题",
+      "builtin": true,
+      "updatedAt": "2026-11-02T00:00:00",
+      "tokens": {
+        "colorBackground": "#F4F1EC",
+        "colorSurface": "#FBF9F6",
+        "colorText": "#3A3A38",
+        "colorTextMuted": "#8A8781",
+        "colorPrimary": "#7A8B99",
+        "colorBorder": "#E4DFD8",
+        "colorAccent": "#C2A878",
+        "fontFamily": "PingFang SC, Microsoft YaHei, sans-serif",
+        "fontSizeBase": 14,
+        "lineHeightBase": 1.7,
+        "radiusBase": 14,
+        "gapBase": 16,
+        "spacingUnit": 10
+      },
+      "defaultStyle": {
+        "fontFamily": "PingFang SC, Microsoft YaHei, sans-serif",
+        "fontSize": {"value": 14, "unit": "PX"},
+        "fontWeight": 400,
+        "textColor": "#3A3A38",
+        "backgroundColor": "#FBF9F6",
+        "textAlign": "LEFT",
+        "verticalAlign": "MIDDLE",
+        "lineHeight": {"value": 1.7, "unit": "PERCENT"},
+        "padding": {"value": 16, "unit": "PX"},
+        "margin": {"value": 0, "unit": "PX"},
+        "border": {"width": 1, "style": "SOLID", "color": "#E4DFD8"},
+        "borderRadius": 14,
+        "opacity": 1
+      }
+    },
+    {
+      "themeId": "theme_print",
+      "name": "打印主题",
+      "builtin": true,
+      "updatedAt": "2026-11-02T00:00:00",
+      "tokens": {
+        "colorBackground": "#FFFFFF",
+        "colorSurface": "#FFFFFF",
+        "colorText": "#000000",
+        "colorTextMuted": "#333333",
+        "colorPrimary": "#000000",
+        "colorBorder": "#000000",
+        "colorAccent": "#000000",
+        "fontFamily": "Songti SC, SimSun, serif",
+        "fontSizeBase": 12,
+        "lineHeightBase": 1.4,
+        "radiusBase": 0,
+        "gapBase": 8,
+        "spacingUnit": 6
+      },
+      "defaultStyle": {
+        "fontFamily": "Songti SC, SimSun, serif",
+        "fontSize": {"value": 12, "unit": "PX"},
+        "fontWeight": 400,
+        "textColor": "#000000",
+        "backgroundColor": "#FFFFFF",
+        "textAlign": "LEFT",
+        "verticalAlign": "MIDDLE",
+        "lineHeight": {"value": 1.4, "unit": "PERCENT"},
+        "padding": {"value": 8, "unit": "PX"},
+        "margin": {"value": 0, "unit": "PX"},
+        "border": {"width": 1, "style": "SOLID", "color": "#000000"},
+        "borderRadius": 0,
+        "opacity": 1
+      }
+    }
+  ]
+}

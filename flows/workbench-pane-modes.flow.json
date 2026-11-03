@@ -1,0 +1,147 @@
+{
+  "outDir": "../.selfcheck/workbench-pane-modes",
+  "waitMs": 1500,
+  "timeout": 15000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "面板模式 01：默认双栏 → 只看对话 → 只看草稿 → 恢复双栏，按钮始终可访问",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#workspace-panes" },
+        { "wait": 400 },
+
+        { "eval": "document.getElementById('workspace-panes').getAttribute('data-pane-mode') === 'split'" },
+        { "eval": "!!document.getElementById('btn-pane-mode')" },
+        { "eval": "!!document.getElementById('pane-mode-menu')" },
+        { "eval": "document.querySelectorAll('#pane-mode-menu [data-pane-mode-option]').length === 3" },
+        { "eval": "(() => { const b = document.getElementById('btn-pane-mode'); const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; })()" },
+        { "eval": "(() => { const b = document.getElementById('btn-pane-mode'); return !document.getElementById('chat-pane').contains(b) && !document.getElementById('draft-pane').contains(b); })()" },
+        { "eval": "(() => { const b = document.getElementById('btn-pane-mode'); return !!(b.getAttribute('title') && b.getAttribute('aria-label')); })()" },
+        { "eval": "(() => { const m = document.getElementById('pane-mode-menu'); const st = getComputedStyle(m); const r = m.getBoundingClientRect(); return st.display === 'none' || st.visibility === 'hidden' || r.width === 0 || r.height === 0; })()" },
+        { "eval": "(() => { const c = document.getElementById('chat-pane'); const d = document.getElementById('draft-pane'); return c.getBoundingClientRect().width > 0 && d.getBoundingClientRect().width > 0; })()" },
+        { "eval": "document.documentElement.scrollWidth <= window.innerWidth + 1" },
+        { "screenshot": "面板模式-01-默认双栏" },
+
+        { "type": "#chat-input", "text": "未发送的草稿文字-面板模式自检" },
+        { "eval": "document.getElementById('chat-input').value.includes('未发送的草稿文字')" },
+
+        { "click": "#btn-pane-mode" },
+        { "wait": 300 },
+        { "eval": "(() => { const m = document.getElementById('pane-mode-menu'); const st = getComputedStyle(m); const r = m.getBoundingClientRect(); return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 0 && r.height > 0; })()" },
+        { "eval": "document.querySelectorAll('#pane-mode-menu [data-pane-mode-option]').length === 3" },
+        { "eval": "(() => { const cur = document.querySelector('#pane-mode-menu [data-pane-mode-option=\"split\"]'); return !!(cur && cur.getAttribute('aria-checked') === 'true'); })()" },
+        { "screenshot": "面板模式-02-菜单打开" },
+
+        { "press": "Escape" },
+        { "wait": 250 },
+        { "eval": "(() => { const m = document.getElementById('pane-mode-menu'); const st = getComputedStyle(m); const r = m.getBoundingClientRect(); return st.display === 'none' || st.visibility === 'hidden' || r.width === 0 || r.height === 0; })()" },
+
+        { "click": "#btn-pane-mode" },
+        { "wait": 250 },
+        { "click": "h1" },
+        { "wait": 250 },
+        { "eval": "(() => { const m = document.getElementById('pane-mode-menu'); const st = getComputedStyle(m); const r = m.getBoundingClientRect(); return st.display === 'none' || st.visibility === 'hidden' || r.width === 0 || r.height === 0; })()" },
+
+        { "click": "#btn-pane-mode" },
+        { "wait": 250 },
+        { "click": "[data-pane-mode-option=\"chat\"]" },
+        { "wait": 600 },
+        { "eval": "document.getElementById('workspace-panes').getAttribute('data-pane-mode') === 'chat'" },
+        { "eval": "getComputedStyle(document.getElementById('draft-pane')).display === 'none'" },
+        { "eval": "document.getElementById('draft-pane').offsetParent === null" },
+        { "eval": "(() => { const c = document.getElementById('chat-pane'); const w = document.getElementById('workspace-panes'); return c.getBoundingClientRect().width >= w.getBoundingClientRect().width - 2; })()" },
+        { "eval": "(() => { const c = document.getElementById('chat-pane'); return c.getBoundingClientRect().height > 200; })()" },
+        { "eval": "document.getElementById('chat-input').value.includes('未发送的草稿文字')" },
+        { "eval": "(() => { const m = document.getElementById('pane-mode-menu'); const st = getComputedStyle(m); const r = m.getBoundingClientRect(); return st.display === 'none' || st.visibility === 'hidden' || r.width === 0 || r.height === 0; })()" },
+        { "eval": "(() => { const b = document.getElementById('btn-pane-mode'); const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; })()" },
+        { "eval": "document.documentElement.scrollWidth <= window.innerWidth + 1" },
+        { "screenshot": "面板模式-03-只看对话" },
+
+        { "click": "#btn-pane-mode" },
+        { "wait": 250 },
+        { "click": "[data-pane-mode-option=\"draft\"]" },
+        { "wait": 600 },
+        { "eval": "document.getElementById('workspace-panes').getAttribute('data-pane-mode') === 'draft'" },
+        { "eval": "getComputedStyle(document.getElementById('chat-pane')).display === 'none'" },
+        { "eval": "document.getElementById('chat-pane').offsetParent === null" },
+        { "eval": "(() => { const d = document.getElementById('draft-pane'); const w = document.getElementById('workspace-panes'); return d.getBoundingClientRect().width >= w.getBoundingClientRect().width - 2; })()" },
+        { "eval": "document.documentElement.scrollWidth <= window.innerWidth + 1" },
+        { "screenshot": "面板模式-04-只看草稿" },
+
+        { "click": "#btn-pane-mode" },
+        { "wait": 250 },
+        { "click": "[data-pane-mode-option=\"split\"]" },
+        { "wait": 600 },
+        { "eval": "document.getElementById('workspace-panes').getAttribute('data-pane-mode') === 'split'" },
+        { "eval": "(() => { const c = document.getElementById('chat-pane'); const d = document.getElementById('draft-pane'); return c.getBoundingClientRect().width > 0 && d.getBoundingClientRect().width > 0; })()" },
+        { "eval": "document.getElementById('chat-input').value.includes('未发送的草稿文字')" },
+        { "screenshot": "面板模式-05-恢复双栏" }
+      ]
+    },
+    {
+      "name": "面板模式 02：隔离 fixture（方案 + 带图表草稿）下切换不丢内容，方案与下载均为纯文字",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "waitFor": "#workspace-panes" },
+        { "wait": 400 },
+
+        {
+          "eval": "(() => { const plan = { id: 'rplan_panemode_fixture', revision: 1, topic: 'A 机房能耗日报（面板自检隔离样例）', requirements: { subject: 'A 机房', timeRange: '昨天', metrics: ['总耗电'], exclusions: [] }, sections: [{ id: 'sec_total', title: '总电费概览', componentType: 'metric_card', displayIntent: 'total', selectionReason: '看总量，指标卡最直观', metricIntents: ['总耗电'], columns: [{ id: 'c1', label: '设备名称', fieldRef: 'section_1.col_1' }] }, { id: 'sec_trend', title: '耗电趋势', componentType: 'line_chart', displayIntent: 'trend', selectionReason: '看变化趋势，用曲线', metricIntents: ['总耗电'], columns: [] }], assumptions: ['口径待核实'], suggestions: ['加一个同比板块'], referenceTemplates: [] }; syncPlanFromResponse({ state: 'WAITING_USER_CONFIRM', reply: '（隔离 fixture：面板模式自检用，不是模型回复）', designPhase: 'PLAN_WAITING_CONFIRM', domainObjects: { reportPlan: plan }, debug: { planVersionId: 'planver_panemode_fixture', planId: plan.id, planRevision: 1 } }); return true; })()"
+        },
+        { "wait": 700 },
+
+        {
+          "eval": "(() => { const definition = { schemaVersion: '1.0', metadata: { id: 'def_panemode_fixture', revision: 3, name: 'A 机房能耗日报', status: 'DRAFT' }, regions: [{ id: 'region_total', name: '总耗电概览', role: 'TOTAL', component: { type: 'METRIC_CARD' }, binding: {}, layout: { placement: { type: 'GRID', column: 1, row: 1, columnSpan: 4, rowSpan: 1 } } }, { id: 'region_trend', name: '耗电趋势', role: 'TREND', component: { type: 'CHART' }, binding: {}, layout: { placement: { type: 'GRID', column: 1, row: 2, columnSpan: 12, rowSpan: 1 } } }] }; const payload = { previewContext: { definitionId: 'def_panemode_fixture', definitionVersion: 3, timezone: 'Asia/Shanghai', anchorTime: '2026-11-03T00:00:00+08:00', windowStart: '2026-11-02T00:00:00+08:00', windowEnd: '2026-11-03T00:00:00+08:00', grainUnit: 'HOUR', generatorVersion: 'sim-1' }, regions: [{ regionId: 'region_title', name: 'A 机房昨日能耗日报', componentType: 'TEXT', role: 'REPORT_TITLE', dataSource: 'simulated', capabilityPending: false, payload: { rendered: 'A 机房昨日能耗日报' } }, { regionId: 'region_total', name: '总耗电概览', componentType: 'METRIC_CARD', role: 'TOTAL', dataSource: 'simulated', capabilityPending: false, payload: { label: '总耗电', value: 306.1, unit: 'kWh', precision: 1, windowLabel: '2026-11-02 全天', dataSource: 'simulated', metrics: [{ metricKey: 'total_energy', label: '总耗电', kind: 'energy', unit: 'kWh', value: 306.1, precision: 1, capabilityPending: false }] } }, { regionId: 'region_trend', name: '耗电趋势', componentType: 'CHART', role: 'TREND', dataSource: 'simulated', capabilityPending: false, payload: { chartKind: 'LINE', xField: 'timestamp', yField: 'energyKwh', xLabels: ['09:00', '10:00', '11:00', '12:00'], yValues: [210.5, 233.1, 198.7, 221.4], points: [], unit: 'kWh', dataSource: 'simulated' } }] }; session.definition = definition; session.baseDefinitionRevision = definition.metadata.revision; session.reportPreviewPayload = payload; renderReportPanel(); return true; })()"
+        },
+        { "wait": 1200 },
+
+        { "eval": "document.querySelectorAll('#chat-scroll [data-plan-bubble]').length >= 1" },
+        { "eval": "document.getElementById('chat-scroll').innerText.includes('总电费概览')" },
+        { "eval": "document.querySelectorAll('#preview-root [data-region-id]').length >= 1" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "eval": "document.querySelectorAll('#preview-root canvas').length >= 1" },
+        { "screenshot": "面板模式-06-隔离fixture-双栏" },
+
+        { "eval": "(() => { const m = document.querySelector('#chat-scroll .plan-markdown'); if (!m) return false; const t = m.textContent; return !t.includes('布局示意') && !/K1：/.test(t) && !/C1：/.test(t); })()" },
+        { "eval": "document.querySelectorAll('#chat-scroll .plan-ascii').length === 0" },
+        { "eval": "(() => { const t = document.getElementById('chat-scroll').innerText; return t.includes('总电费概览') && t.includes('展示方式') && t.includes('总耗电'); })()" },
+        { "eval": "(() => { const a = document.querySelector('#chat-scroll .plan-markdown-download'); if (!a) return false; const md = decodeURIComponent(a.getAttribute('href').slice(a.getAttribute('href').indexOf(',') + 1)); return !md.includes('布局示意') && !md.includes('```text') && !/^- K1：/m.test(md) && !/^- C1：/m.test(md) && md.includes('总电费概览') && md.includes('展示方式'); })()" },
+        { "eval": "(() => { const a = document.querySelector('#chat-scroll .plan-markdown-download'); if (!a) return false; const md = decodeURIComponent(a.getAttribute('href').slice(a.getAttribute('href').indexOf(',') + 1)); return !md.includes('plan_example_pue') && !md.includes('rplan_panemode_fixture'); })()" },
+
+        { "click": "#btn-pane-mode" },
+        { "wait": 250 },
+        { "click": "[data-pane-mode-option=\"chat\"]" },
+        { "wait": 700 },
+        { "eval": "document.getElementById('workspace-panes').getAttribute('data-pane-mode') === 'chat'" },
+        { "eval": "document.getElementById('chat-scroll').innerText.includes('总电费概览')" },
+        { "eval": "document.querySelectorAll('#chat-scroll .plan-ascii').length === 0" },
+        { "eval": "(() => { const list = (typeof _chartInstances !== 'undefined' && Array.isArray(_chartInstances)) ? _chartInstances : []; if (!list.length) return false; const dom = list[0].getDom ? list[0].getDom() : null; if (!dom) return false; return getComputedStyle(document.getElementById('draft-pane')).display === 'none' && dom.clientWidth === 0 && dom.clientHeight === 0; })()" },
+        { "screenshot": "面板模式-07-隔离fixture-只看对话" },
+
+        { "click": "#btn-pane-mode" },
+        { "wait": 250 },
+        { "click": "[data-pane-mode-option=\"draft\"]" },
+        { "wait": 900 },
+        { "eval": "document.getElementById('workspace-panes').getAttribute('data-pane-mode') === 'draft'" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "eval": "document.querySelectorAll('#preview-root canvas').length >= 1" },
+        { "eval": "(() => { const c = document.querySelector('#preview-root canvas'); if (!c) return false; return c.width > 0 && c.height > 0; })()" },
+        { "eval": "(() => { const list = (typeof _chartInstances !== 'undefined' && Array.isArray(_chartInstances)) ? _chartInstances : []; if (!list.length) return false; const chart = list[0]; const dom = chart.getDom ? chart.getDom() : null; if (!dom || dom.clientWidth === 0) return false; return Math.abs(chart.getWidth() - dom.clientWidth) <= 2 && Math.abs(chart.getHeight() - dom.clientHeight) <= 2; })()" },
+        { "eval": "document.querySelectorAll('#chat-scroll .plan-ascii').length === 0" },
+        { "screenshot": "面板模式-08-隔离fixture-只看草稿" },
+
+        { "click": "#btn-pane-mode" },
+        { "wait": 250 },
+        { "click": "[data-pane-mode-option=\"split\"]" },
+        { "wait": 700 },
+        { "eval": "document.getElementById('workspace-panes').getAttribute('data-pane-mode') === 'split'" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "eval": "document.getElementById('chat-scroll').innerText.includes('总电费概览')" },
+        { "screenshot": "面板模式-09-隔离fixture-恢复双栏" }
+      ]
+    }
+  ]
+}

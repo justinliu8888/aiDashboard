@@ -12,6 +12,8 @@ import json
 import logging
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -66,7 +68,89 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_ws      ON sessions(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
+
+-- 草稿工作区（契约 0002 §6.1）：**只新增表**，既有表一个字节都不改。
+-- 草稿对象 = 一个可撤销的编辑链；版本表是内容快照；历史表是动作流水；
+-- 任务表是长任务的检查点；主题表是共享主题（§8 由 P4 接线）。
+CREATE TABLE IF NOT EXISTS draft_objects (
+    draft_id        TEXT PRIMARY KEY,
+    name            TEXT NOT NULL DEFAULT '',
+    description     TEXT NOT NULL DEFAULT '',
+    session_id      TEXT,
+    current_revision INTEGER NOT NULL DEFAULT 0,
+    saved_revision  INTEGER,
+    undo_cursor     INTEGER NOT NULL DEFAULT 0,
+    theme_id        TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS draft_versions (
+    draft_id    TEXT NOT NULL,
+    revision    INTEGER NOT NULL,
+    kind        TEXT NOT NULL,          -- 'edit' | 'saved'
+    definition_json TEXT NOT NULL,
+    snapshot_json   TEXT,
+    label       TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (draft_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS draft_history (
+    draft_id  TEXT NOT NULL,
+    seq       INTEGER NOT NULL,
+    revision  INTEGER NOT NULL,
+    action    TEXT NOT NULL,            -- 'commit' | 'undo' | 'redo' | 'save' | 'save_as'
+    label     TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (draft_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS draft_tasks (
+    task_id      TEXT PRIMARY KEY,
+    draft_id     TEXT NOT NULL,
+    operation_id TEXT NOT NULL DEFAULT '',
+    state        TEXT NOT NULL,         -- RUNNING|STOPPING|STOPPED|COMPLETED|ROLLED_BACK|FAILED
+    checkpoint_json TEXT,
+    commit_token TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS draft_themes (
+    theme_id       TEXT PRIMARY KEY,
+    theme_revision INTEGER NOT NULL DEFAULT 1,
+    name           TEXT NOT NULL,
+    tokens_json    TEXT NOT NULL,
+    builtin        INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_draft_tasks_draft ON draft_tasks(draft_id);
+
+-- 同草稿写互斥（P2 自有的小表；**不在**契约 0002 §6.1 的 5 张表里）。
+-- 锁是**工作区级**互斥（谁在编辑这个草稿），与乐观锁（expected_revision）互补：
+-- 乐观锁管「同一份内容的并发写」，锁管「同一个草稿同时只能一个人改」。
+CREATE TABLE IF NOT EXISTS draft_locks (
+    draft_id    TEXT PRIMARY KEY,
+    owner       TEXT NOT NULL,
+    acquired_at TEXT NOT NULL
+);
 """
+
+#: 草稿工作区的表名（契约 0002 §6.1 的 5 张 + P2 自有的锁表）。
+#: 迁移时用来判断老库缺哪几张。
+_DRAFT_TABLES = frozenset(
+    {
+        "draft_objects",
+        "draft_versions",
+        "draft_history",
+        "draft_tasks",
+        "draft_themes",
+        "draft_locks",
+    }
+)
 
 
 def _now() -> str:
@@ -96,6 +180,8 @@ class SqliteSessionRepository:
         self._db_path = Path(db_path)
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
+        #: 共享事务的嵌套深度（见 `transaction`）。
+        self._tx_depth = 0
 
     @property
     def db_path(self) -> Path:
@@ -109,6 +195,7 @@ class SqliteSessionRepository:
                 self._conn.close()
                 self._conn = None
             self._db_path = Path(value)
+            self._tx_depth = 0
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -126,6 +213,24 @@ class SqliteSessionRepository:
         同一把锁保证两边的写不会交错，同一条连接才能真的落进同一笔事务。
         """
         return self._lock
+
+    def _commit_if_standalone(self) -> None:
+        """只有「没有外层共享事务」时才自己提交。
+
+        为什么需要它：``upsert_session`` / ``append_message`` 这些老方法
+        各自 commit，**一旦被调用就会提前结束事务**，同事务提交就不成立
+        （设计存储早就踩过这个坑，见 `report_design_service._make_write_turn`）。
+
+        草稿工作区要把「会话写 + 草稿版本写」放进**同一笔事务**时，
+        这些方法必须服从外层事务：外层提交，它们跟着提交；
+        外层回滚，它们一起回滚 —— 不留半份状态（契约 0002 §6）。
+        """
+        if self._tx_depth == 0:
+            self.conn.commit()
+
+    def _in_shared_transaction(self) -> bool:
+        """当前是否在一笔**共享事务**里（外层已经开好了）。"""
+        return self._tx_depth > 0
 
     def _connect(self) -> sqlite3.Connection:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,6 +258,17 @@ class SqliteSessionRepository:
         if "pending_edit_plan" not in existing:
             conn.execute("ALTER TABLE sessions ADD COLUMN pending_edit_plan TEXT")
             logger.info("[session_store] 已迁移 sessions.pending_edit_plan 列")
+
+        # 草稿工作区的 5 张表：本次改动之前建的老库里没有。
+        # _SCHEMA 全是 CREATE TABLE IF NOT EXISTS，重跑一遍脚本即可补齐，
+        # 不动既有表结构，也不批量改历史数据。
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if not _DRAFT_TABLES.issubset(tables):
+            conn.executescript(_SCHEMA)
+            logger.info("[session_store] 已迁移草稿工作区表")
 
     def close(self) -> None:
         with self._lock:
@@ -345,7 +461,7 @@ class SqliteSessionRepository:
                 self.conn.execute(
                     f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params
                 )
-            self.conn.commit()
+            self._commit_if_standalone()
         record = self.get_session(session_id)
         assert record is not None  # 刚写入必然存在
         return record
@@ -373,7 +489,7 @@ class SqliteSessionRepository:
                 """,
                 (session_id, _dump(choice), now, now),
             )
-            self.conn.commit()
+            self._commit_if_standalone()
 
     def get_session(self, session_id: str) -> SessionRecord | None:
         with self._lock:
@@ -407,7 +523,7 @@ class SqliteSessionRepository:
                 """,
                 (session_id, _dump(plan), now, now),
             )
-            self.conn.commit()
+            self._commit_if_standalone()
 
     def save_pending_edit_plan_if_absent(
         self, session_id: str, plan: dict[str, Any]
@@ -416,11 +532,16 @@ class SqliteSessionRepository:
 
         `BEGIN IMMEDIATE` 立刻拿写锁，「读旧值 + 写新值」在一个事务里完成，
         避免两个进程同时以为自己是第一个。
+
+        已经在共享事务里时**不开新事务**：外层事务的写锁已经拿住了，
+        再开一笔会把外层提前提交掉（同事务提交就不成立）。
         """
         now = _now()
         with self._lock:
             conn = self.conn
-            self._begin_immediate(conn)
+            shared = self._in_shared_transaction()
+            if not shared:
+                self._begin_immediate(conn)
             try:
                 self._purge_soft_deleted(session_id)
                 row = conn.execute(
@@ -430,7 +551,8 @@ class SqliteSessionRepository:
                 ).fetchone()
                 existing = _load(row["pending_edit_plan"]) if row else None
                 if existing:
-                    conn.commit()
+                    if not shared:
+                        conn.commit()
                     return existing
                 conn.execute(
                     """
@@ -444,10 +566,12 @@ class SqliteSessionRepository:
                     """,
                     (session_id, _dump(plan), now, now),
                 )
-                conn.commit()
+                if not shared:
+                    conn.commit()
                 return plan
             except Exception:
-                conn.rollback()
+                if not shared:
+                    conn.rollback()
                 raise
 
     def take_pending_edit_plan(
@@ -457,10 +581,15 @@ class SqliteSessionRepository:
 
         读计划 + 删计划在同一个写事务里：删掉了才说明这份计划归本次调用所有，
         重复点击「接受修改」拿到的是 None，不会改两遍草稿。
+
+        已经在共享事务里时**不开新事务**（理由同
+        ``save_pending_edit_plan_if_absent``）。
         """
         with self._lock:
             conn = self.conn
-            self._begin_immediate(conn)
+            shared = self._in_shared_transaction()
+            if not shared:
+                self._begin_immediate(conn)
             try:
                 row = conn.execute(
                     "SELECT pending_edit_plan FROM sessions"
@@ -469,17 +598,20 @@ class SqliteSessionRepository:
                 ).fetchone()
                 plan = _load(row["pending_edit_plan"]) if row else None
                 if not plan or str(plan.get("planId") or "") != str(plan_id):
-                    conn.commit()
+                    if not shared:
+                        conn.commit()
                     return None
                 cursor = conn.execute(
                     "UPDATE sessions SET pending_edit_plan = NULL, updated_at = ?"
                     " WHERE id = ? AND pending_edit_plan IS NOT NULL",
                     (_now(), session_id),
                 )
-                conn.commit()
+                if not shared:
+                    conn.commit()
                 return plan if cursor.rowcount > 0 else None
             except Exception:
-                conn.rollback()
+                if not shared:
+                    conn.rollback()
                 raise
 
     def clear_pending_edit_plan(self, session_id: str) -> None:
@@ -490,7 +622,7 @@ class SqliteSessionRepository:
                 " WHERE id = ? AND deleted_at IS NULL",
                 (_now(), session_id),
             )
-            self.conn.commit()
+            self._commit_if_standalone()
 
     @staticmethod
     def _begin_immediate(conn: sqlite3.Connection) -> None:
@@ -502,6 +634,47 @@ class SqliteSessionRepository:
         if conn.in_transaction:
             conn.commit()
         conn.execute("BEGIN IMMEDIATE")
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """**共享事务入口**：同一条连接、同一把写锁、同一笔事务。
+
+        为什么要它：草稿工作区（P2）要「会话快照写 + 草稿版本写」落进
+        **同一笔事务**。另开连接做不到这件事 —— 两个连接是两个事务，
+        一个提交了另一个回滚，撤销就会留下半份状态。
+
+        用法（上层包一层，里面照常调各模块的写方法）：
+
+            with repo.transaction() as conn:
+                conn.execute("UPDATE sessions SET snapshot=? WHERE id=?", ...)
+                draft_workspace.commit_edit(...)   # 内部再开事务会复用这一笔
+
+        纪律：
+            - 复用既有 `_begin_immediate`（写事务立刻拿锁）与 `busy_timeout`；
+            - **不另开连接**；
+            - 支持嵌套：内层复用外层那笔事务，不会提前 commit；
+            - 最外层退出时统一 commit，异常时统一 rollback。
+
+        注意：既有那些**自己就 commit** 的老方法（如 `upsert_session`）
+        不要放进这个事务块里 —— 它们会提前把事务提交掉。
+        """
+        with self._lock:
+            conn = self.conn
+            outermost = self._tx_depth == 0
+            if outermost:
+                SqliteSessionRepository._begin_immediate(conn)
+            self._tx_depth += 1
+            try:
+                yield conn
+            except BaseException:
+                self._tx_depth -= 1
+                if outermost:
+                    conn.rollback()
+                raise
+            else:
+                self._tx_depth -= 1
+                if outermost:
+                    conn.commit()
 
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> SessionRecord:
@@ -618,7 +791,7 @@ class SqliteSessionRepository:
                         """,
                         (role, content, _dump(payload), now, existing["id"]),
                     )
-                    self.conn.commit()
+                    self._commit_if_standalone()
                     return self._get_message(existing["id"])
 
             next_seq = self.conn.execute(
@@ -633,7 +806,7 @@ class SqliteSessionRepository:
                 """,
                 (session_id, next_seq, role, content, _dump(payload), clientMsgId, now),
             )
-            self.conn.commit()
+            self._commit_if_standalone()
             return self._get_message(cursor.lastrowid)
 
     def _get_message(self, message_id: int) -> MessageRecord:

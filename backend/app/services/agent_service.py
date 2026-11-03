@@ -368,23 +368,37 @@ def _time_range_label(definition: ReportDefinitionDraft, region_id: str) -> str:
 
 
 def _build_agent():
-    """按配置选择 Agent 实现。"""
+    """按配置选择 Agent 实现。
+
+    ``agentscope`` 是**真实模型模式**：构造失败就让它失败，不降级 FakeAgent。
+    降级下去用户拿到的是规则拼出来的回复，看着像正常结果，
+    实际上模型根本没跑 —— 配置漏了却看不出来（契约表 §6.5 的诚实失败要求）。
+
+    ``fake`` 是显式测试模式：用 FakeReportAgent，不碰模型。
+    """
     impl = get_settings().agent_impl
     if impl == "agentscope":
+        settings = get_settings()
+        logger.info(
+            "使用 AgentScopeReportAgent（provider=%s model=%s）",
+            settings.provider_name,
+            settings.active_model,
+        )
         try:
             from app.agents.agentscope_report_agent import AgentScopeReportAgent
 
-            logger.info("使用 AgentScopeReportAgent（火山方舟）")
             return AgentScopeReportAgent()
         except Exception as e:  # noqa: BLE001
             # 异常原文不进日志（#61）：异常对象换成 None —— 调用栈还在，
             # 异常消息没了。只留原因类型。
             logger.exception(
-                "AgentScopeReportAgent 初始化失败，降级 FakeAgent errorType=%s",
+                "AgentScopeReportAgent 初始化失败，真实模型模式不降级 FakeAgent "
+                "errorType=%s",
                 type(e).__name__,
                 exc_info=(type(e), None, e.__traceback__),
             )
-            return FakeReportAgent()
+            # 原样抛出去：真实模型模式宁可启动失败，也不要装作正常。
+            raise
     logger.info("使用 FakeReportAgent")
     return FakeReportAgent()
 
@@ -409,7 +423,13 @@ class AgentService:
         if choice:
             # 选择锁存库（不是进程内存）：后端重启后恢复历史会话仍能拿到锁，
             # 不会出现「前端放行自由输入、后端拒收」的前后端不一致。
-            session_service.save_pending_choice(
+            #
+            # 但**不在这里落库**：这一轮的菜单是「这一轮的待决状态」，它
+            # 必须与这一轮的消息、草稿、候选消费**一起成败**。提前写的话，
+            # 最终提交事务失败时菜单已经变了 —— 用户看到的是「菜单被清掉
+            # / 换掉了，但修改没生效」（契约 0002 §6/§7）。
+            # 真正落库在路由层那一笔事务里（``commit_staged_pending_choice``）。
+            session_service.stage_pending_choice(
                 session_key,
                 {
                     "state": response.state.value,
@@ -767,7 +787,18 @@ class AgentService:
                     request.conversationId,
                     type(pending_raw).__name__,
                 )
-                session_service.save_pending_choice(session_key, None)
+                # 清这张已经损坏的菜单：**尽力而为**。这里没有要掩盖的
+                # 原始错误（不是在处理别的失败），清不掉不该掀翻整轮 ——
+                # 它只影响「下一次还能不能从菜单里选」。
+                try:
+                    session_service.save_pending_choice(session_key, None)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[agent.chat] 清损坏菜单失败 conversationId=%s errorType=%s",
+                        request.conversationId,
+                        type(exc).__name__,
+                        exc_info=(type(exc), None, exc.__traceback__),
+                    )
         pending_plan = session_service.load_pending_plan(session_key)
         if pending_plan:
             # 待决计划比旧的其他选择锁更权威；确认不能被迟到的题目覆盖。
@@ -809,7 +840,8 @@ class AgentService:
                 and not routing_rules.is_readonly_question(request.message)
             ):
                 # NEXT_ACTION 的「其他」进入编辑，不代表同意或保存草稿。
-                session_service.save_pending_choice(session_key, None)
+                # 旧菜单作废 → **暂存**清锁，与这一轮一起提交。
+                session_service.stage_pending_choice(session_key, None)
                 pending = None
         if pending:
             pending_state, question = pending
@@ -861,7 +893,13 @@ class AgentService:
                 if request.message not in allowed_values:
                     pending_guard = (pending_state, question)
                 else:
-                    session_service.save_pending_choice(session_key, None)
+                    # **接受入口**：用户从菜单里选了一项。
+                    #
+                    # 旧菜单作废 → **暂存**清锁。它不在这里落库：清锁必须
+                    # 与这一轮的消息、草稿、候选消费**一起成败**（契约 0002
+                    # §6/§7）。提前清的话，最终事务失败时菜单已经没了，
+                    # 用户看到的是「菜单被清掉，但修改没生效」。
+                    session_service.stage_pending_choice(session_key, None)
                     if question.id == EDIT_CHOICE_ID:
                         return self._handle_pending_edit_choice(request, session_key)
                     if question.id.startswith("template_preview_"):
@@ -1372,7 +1410,7 @@ class AgentService:
                         "impl": self._agent.__class__.__name__,
                         "execution": "async" if handle is not None else "sync",
                         "configuredModel": (
-                            get_settings().volc_model if self._agent.__class__.__name__ == "AgentScopeReportAgent"
+                            get_settings().active_model if self._agent.__class__.__name__ == "AgentScopeReportAgent"
                             else "local_rules"
                         ),
                     },
@@ -1783,6 +1821,7 @@ class AgentService:
                     reference_text, draft.regions,
                     visible_region_ids=request.context.visibleRegionIds,
                     selected_region_id=request.context.selectedRegionId,
+                    history_region_id=self._history_region_id(request),
                 )
                 if reference.status != "NOT_FOUND" and (
                     reference.regionId != candidate.targetRegionId
@@ -1997,9 +2036,17 @@ class AgentService:
             if request.message == EDIT_CANCEL:
                 # 取消 = 这件事结束了，下一件事按额度键规则重新开。
                 session_service.reset_clarification(session_key)
-                return self._edit_notice(
+                response = self._edit_notice(
                     request, "已撤回这次待确认修改，草稿没有变化。"
                 )
+                # 这次操作到此结束 → 显式释放临时卡片目标。必须给确定的
+                # 释放语义：缺字段＝「这一轮不更新目标」，目标会留在
+                # 下一轮请求里。
+                response.debug = {
+                    **(response.debug or {}),
+                    "editingTargetRegionId": None,
+                }
+                return response
             # 「继续调整」（规格第 58 条）：旧计划不再可接受，模板本身不变，
             # 回到**统一对话** —— 用户可以接着问、接着提反馈、接着改。
             #
@@ -2054,7 +2101,8 @@ class AgentService:
             session_service.clear_pending_plan(session_key)
             # 计划已经失效 → 这张卡片**没有对应计划了**：选择锁一起清掉，
             # 页面上别再挂一张答了也没用的卡。
-            session_service.save_pending_choice(session_key, None)
+            # 清锁**暂存**：与这一轮一起提交（契约 0002 §6/§7）。
+            session_service.stage_pending_choice(session_key, None)
             return self._edit_notice(
                 request, f"{exc}，本次没有修改草稿。请重新核对目标。",
                 code="STALE_EDIT_PLAN",
@@ -2106,16 +2154,34 @@ class AgentService:
             return self._remember_choice(response)
         if request.message != EDIT_ACCEPT:
             return self._edit_notice(request, "请先接受修改，草稿没有变化。")
-        if session_service.take_pending_plan(session_key, pending.planId) is None:
+        # 计划还在不在？**只读，不消费**。
+        #
+        # 消费推迟到**最终提交事务里**做（契约 0002 §6/§7）：这一轮落库失败时，
+        # 整笔回滚，用户那份待确认计划原样还在，还能重试这一轮 —— 不然
+        # 「计划在业务层就被吃掉、落库却失败」= 用户没法重试。
+        current = session_service.load_pending_plan(session_key)
+        if current is None or str(current.planId) != str(pending.planId):
             # 计划已经被处理过了 → 这张卡片同样失效，选择锁一起清掉。
-            session_service.save_pending_choice(session_key, None)
+            # 清锁**暂存**：与这一轮一起提交（契约 0002 §6/§7）。
+            session_service.stage_pending_choice(session_key, None)
             return self._edit_notice(
                 request, "这份修改计划已经被处理，草稿没有重复修改。",
                 code="EDIT_PLAN_ALREADY_HANDLED",
             )
-        # 计划已经落地 → 这张卡片**作废**：选择锁照旧清掉，页面上不再挂着
-        # 一张已经没有对应计划的卡片（「其他」纠正这条路也要清）。
-        session_service.save_pending_choice(session_key, None)
+        # 计划**不在这儿消费**（见上）。真正的消费在路由层那一笔事务里：
+        # 取走计划 + 清选择锁 + 清追问计数，与会话、草稿一起成败。
+        if plan.intent == EditIntent.SAVE_THEME:
+            # 用户点「接受修改」= 对**共享主题保存**的确认：
+            # 把 confirm 翻成真，引擎才走原子提交（否则会一直重复追问）。
+            #
+            # 主题保存改的是**共享主题对象**，不是这份报表的定义：
+            # 不 bump 定义版本、不产生 changeSet（契约 0002 §8）。
+            theme_ops = plan.operation.themeOperations or []
+            if theme_ops and not theme_ops[0].get("confirm"):
+                theme_ops[0]["confirm"] = True
+                plan.operation.themeOperations = theme_ops
+                plan.needsClarification = False
+                plan.clarificationQuestion = ""
         try:
             result = template_edit_engine.apply(
                 plan=plan, definition=definition, scope=scope
@@ -2128,14 +2194,26 @@ class AgentService:
                 type(exc).__name__,
                 exc_info=(type(exc), None, exc.__traceback__),
             )
+            # 计划**没有**被消费（消费推迟到提交事务）：草稿没变，用户还能
+            # 再点一次「接受修改」，不用重新发起一遍修改。
             return self._edit_notice(
                 request, "本轮修改执行遇到技术问题，草稿没有变化；请重新发起修改。",
                 code="EDIT_EXECUTION_FAILED",
             )
-        session_service.reset_clarification(session_key)
         if result.needsClarification:
-            # 已接受的计划校验失败：保留原草稿，恢复并持久化 NEXT_ACTION，
-            # 不再挂已消费计划的确认卡或没有下一步出口的追问卡。
+            # 已接受的计划校验失败：**这份计划作废**（消费掉），保留原草稿，
+            # 恢复并持久化 NEXT_ACTION，不再挂已消费计划的确认卡或没有下一步
+            # 出口的追问卡。
+            #
+            # 「作废」也在**最终提交事务里**做：取走计划 + 清选择锁 +
+            # 清追问计数，与会话、草稿**一起成败**（契约 0002 §6/§7）。
+            # 在业务层提前消费的话，事务失败时计划已经被吃掉 ——
+            # 用户那份候选回不来，也没法重试这一轮。
+            session_service.stage_pending_plan_consumption(session_key, pending.planId)
+            # 旧卡作废 → 暂存清锁。下面的 ``_remember_choice`` 会把
+            # NEXT_ACTION 菜单**暂存**成这一轮结束时的目标值（后写的覆盖
+            # 先写的），落库同样在那一笔事务里。
+            session_service.stage_pending_choice(session_key, None)
             return self._remember_choice(
                 self._edit_notice(
                     request,
@@ -2145,6 +2223,9 @@ class AgentService:
                     questions=self._editing_confirm_questions(),
                 )
             )
+        # 成功路径：只**暂存**消费计划，真正消费在最终提交事务里做。
+        # 那一笔事务失败 → 整笔回滚 → 暂存作废 → 计划原样还在，可重试。
+        session_service.stage_pending_plan_consumption(session_key, pending.planId)
         return self._remember_choice(
             self._build_template_edit_response(request, result, plan=plan_for_preview)
         )
@@ -2214,7 +2295,10 @@ class AgentService:
                 debug={
                     "editOutcome": "readonly_answer",
                     "editPlanSource": "rule_readonly",
-                    "editingTargetRegionId": plan.target.regionId or None,
+                    # 只读咨询**不动**临时卡片目标：这一轮既没开始也没结束
+                    # 任何修改操作，既不释放（那是擅自结束当前操作），
+                    # 也不改成咨询时提到的那张卡片（那不是用户选中的目标）。
+                    # 缺字段 = 这一轮不更新目标，前后端语义一致。
                 },
             )
         if plan.intent in {
@@ -2282,6 +2366,15 @@ class AgentService:
         )
         return response
 
+    def _history_region_id(self, request: AgentRequest) -> str | None:
+        """最近一次**已应用**的卡片级修改所在卡片。
+
+        这是**历史**，不是活动目标：只用来解析「刚才那张」这类明确的历史
+        指代，绝不当成 ``selectedRegionId`` 回传，也绝不因此高亮卡片。
+        """
+        session_key = current_session_key() or request.conversationId
+        return session_service.load_last_applied_region_id(session_key)
+
     def _readonly_target_region(
         self, request: AgentRequest, definition: ReportDefinitionDraft
     ) -> str | None:
@@ -2292,6 +2385,7 @@ class AgentService:
             definition.regions,
             visible_region_ids=request.context.visibleRegionIds,
             selected_region_id=selected_region_id,
+            history_region_id=self._history_region_id(request),
         )
         if reference.status == "RESOLVED" and self._reference_is_reliable(
             reference, request.context
@@ -2331,7 +2425,7 @@ class AgentService:
                 "editOutcome": "readonly_answer",
                 "editPlanSource": "rule_readonly",
                 "editingIntent": plan.intent.value,
-                "editingTargetRegionId": plan.target.regionId or None,
+                # 同上：只读咨询不更新临时卡片目标（缺字段 = 不更新）。
                 "supportedGrains": grains,
             },
         )
@@ -2569,6 +2663,7 @@ class AgentService:
             definition.regions,
             visible_region_ids=request.context.visibleRegionIds,
             selected_region_id=request.context.selectedRegionId,
+            history_region_id=self._history_region_id(request),
         )
         if reference.status == "RESOLVED" and self._reference_is_reliable(
             reference, request.context
@@ -2771,6 +2866,7 @@ class AgentService:
             definition.regions,
             visible_region_ids=request.context.visibleRegionIds,
             selected_region_id=request.context.selectedRegionId,
+            history_region_id=self._history_region_id(request),
         )
         selected_region_id = request.context.selectedRegionId
         if reference.status != "NOT_FOUND":
@@ -2787,6 +2883,8 @@ class AgentService:
                     "当前页面卡片顺序无法核对，请指出要改的卡片名称。",
                     intent="UNKNOWN", delegated=delegated,
                 )
+            # 用户这一轮明确指了对象（序数 / 名称 / 「刚才那张」）：
+            # 以这句话为准，**覆盖**任何还挂在请求里的目标卡片。
             selected_region_id = reference.regionId
 
         anchor = request.collectedInfo.get("pendingEditTimeAnchor")
@@ -2915,6 +3013,15 @@ class AgentService:
                     plan=plan, definition=definition, scope=scope
                 )
             )
+        if plan.intent == EditIntent.SAVE_THEME:
+            # 共享主题保存：影响摘要引擎已经算好了，这里把它变成
+            # **待确认的候选**，用户点「接受修改」才落库（契约 0002 §8）。
+            #
+            # 存进 pendingEditPlan 的计划**不带 needsClarification**：
+            # 澄清（影响摘要）已经在回复里说完了，别让装配层按
+            # 「候选与当前草稿不一致」把它拒掉。
+            plan.needsClarification = False
+            return self._save_theme_candidate(request, plan, definition)
         if plan.intent == EditIntent.UNKNOWN or plan.needsClarification or plan.confidence < 0.7:
             if delegated:
                 # 用户说了「别问了」：不再追问，改成可见假设 + 可选替代。
@@ -2986,17 +3093,77 @@ class AgentService:
             },
         )
 
+    def _save_theme_candidate(
+        self,
+        request: AgentRequest,
+        plan: EditPlan,
+        definition: ReportDefinitionDraft,
+    ) -> AgentResponse:
+        """共享主题保存：先把**影响范围**说清楚，让用户确认，再原子提交。
+
+        主题是数据库里的**共享对象**：保存它会影响所有在用这个主题的报表。
+        所以不能「一句话就改了」，必须先给影响摘要、再由用户接受
+        （契约 0002 §8）。
+
+        这里只产出**待确认的候选**：真正的落库在用户点「接受修改」之后，
+        由引擎的 SAVE_THEME 路径完成（confirm=True）。
+        """
+        summary = _sanitize_internal_ids(
+            plan.summary or self._describe_rule_edit(plan, definition)
+        )
+        operation_steps = [{
+            "intent": plan.intent.value,
+            "operation": plan.operation.model_dump(mode="json", exclude_none=True),
+            "summary": summary,
+        }]
+        candidate = {
+            "planId": f"plan_{uuid.uuid4().hex}",
+            "draftRevision": self._draft_revision(definition),
+            "targetRegionId": plan.target.regionId,
+            "operations": operation_steps,
+            "summary": summary,
+            "editPlan": plan.model_dump(mode="json"),
+        }
+        impact = (plan.clarificationQuestion or "").strip()
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=(
+                (f"{impact}\n\n" if impact else "")
+                + f"待确认的修改：{summary}\n"
+                "接受后才会保存主题。保存主题只改外观："
+                "不改任何报表的数据、统计口径与布局。"
+            ),
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportDefinitionDraft=definition,
+                reportPolicyDraft=request.snapshots.reportPolicy,
+            ),
+            questions=[self._pending_edit_question()],
+            uiActions=["pending_edit_plan"],
+            debug={
+                "editOutcome": "candidate",
+                "editPlanSource": "rule",
+                "editingTargetRegionId": plan.target.regionId or None,
+                "editingIntent": plan.intent.value,
+                "pendingEditPlan": candidate,
+            },
+        )
+
     @staticmethod
     def _describe_rule_edit(
         plan: EditPlan, definition: ReportDefinitionDraft
     ) -> str:
         if plan.intent == EditIntent.ADD_METRIC:
             return AgentService._describe_append_metrics(plan, definition)
+        if plan.intent == EditIntent.DELETE_METRIC:
+            return AgentService._describe_delete_metrics(plan, definition)
         label = plan.target.matchedText or (definition.metadata or {}).get("name") or "当前报表"
         operation = plan.operation
         action = {
             EditIntent.RENAME_REPORT: "修改报表名称",
             EditIntent.DELETE_SECTION: "删除卡片",
+            EditIntent.DELETE_METRIC: "删除卡片里的指标",
             EditIntent.RENAME_SECTION: "修改卡片标题",
             EditIntent.ADD_SECTION: "新增卡片",
             EditIntent.CHANGE_DATA_SOURCE: "更换数据源",
@@ -3006,6 +3173,8 @@ class AgentService:
             EditIntent.CHANGE_VISUALIZATION: "更换展示形式",
             EditIntent.CHANGE_TOP_N: "修改排名数量",
             EditIntent.CHANGE_SORT: "修改排序",
+            EditIntent.APPLY_PRESENTATION: "调整排版与外观",
+            EditIntent.SAVE_THEME: "保存共享主题",
         }.get(plan.intent, "修改")
         details = [
             f"{name}：{value}"
@@ -3040,6 +3209,33 @@ class AgentService:
         return (
             f"对「{label}」{action}" + (f"（{suffix}）" if suffix else "") + "。"
             "报表示意使用全虚拟模拟数据；只有明确要求名称占位的指标不出数值。"
+        )
+
+    @staticmethod
+    def _describe_delete_metrics(
+        plan: EditPlan, definition: ReportDefinitionDraft
+    ) -> str:
+        """删除指标的**建议文字**：说清楚删哪张卡片里的**哪一个指标**。
+
+        卡片本身**保留** —— 不能写成「删除卡片」，也不出现内部标识
+        （metricKey / simulatedId / fieldRef）。
+        """
+        deletions = list(plan.operation.deleteMetrics)
+        label = plan.target.matchedText or "当前卡片"
+        names = "、".join(
+            str(item.label or item.intent) for item in deletions if (
+                str(item.label or item.intent)
+            )
+        )
+        if not names:
+            return (
+                f"在「{label}」这张卡片上删掉指定的指标，卡片本身保留。"
+                "报表示意使用全虚拟模拟数据。"
+            )
+        return (
+            f"在「{label}」这张卡片上删掉 {len(deletions)} 个指标：{names}；"
+            "卡片本身和其它指标保留。"
+            "报表示意使用全虚拟模拟数据。"
         )
 
     @staticmethod
@@ -3124,7 +3320,6 @@ class AgentService:
         """把 TemplateEditEngine 的 EditResult 包成 AgentResponse。"""
         intent_value = result.plan.intent.value
         debug: dict[str, Any] = {
-            "editingTargetRegionId": result.editingTargetRegionId,
             "editingIntent": intent_value,
             "editPlan": result.plan.model_dump(mode="json"),
         }
@@ -3134,6 +3329,9 @@ class AgentService:
 
         # 需要追问：保留当前草稿，不写 ChangeSet
         if result.needsClarification:
+            # 这一轮的操作**还没结束**（还要追问）：保留必要的目标，
+            # 后面追问的答案要落在同一张卡片上。
+            debug["editingTargetRegionId"] = result.editingTargetRegionId
             questions = self._edit_clarification_questions(result)
             return AgentResponse(
                 conversationId=request.conversationId,
@@ -3154,6 +3352,8 @@ class AgentService:
 
         # SUGGEST_VISUALIZATION：只给候选，不改草稿
         if result.plan.intent == EditIntent.SUGGEST_VISUALIZATION:
+            # 候选待接受：操作还没结束，保留目标。
+            debug["editingTargetRegionId"] = result.editingTargetRegionId
             option_values = [
                 str(opt.get("label"))
                 for opt in result.plan.operation.displayOptions
@@ -3188,6 +3388,17 @@ class AgentService:
         # 正常应用成功：返回新草稿 + ChangeSet。
         #
         # 接受只批准本次修改，执行后回 NEXT_ACTION，不自动保存整份草稿。
+        #
+        # 修改**已经落地**：这一轮的操作到此结束 → 显式释放临时卡片目标
+        # （``None``），下一轮回到草稿级，不会再被上一张卡片框住。
+        #
+        # 草稿、版本、对话历史都不受影响：释放的只是「当前选中的卡片」。
+        debug["editingTargetRegionId"] = None
+        if result.editingTargetRegionId:
+            # 历史（不是活动目标）：这次改的是哪张卡片。只有明确说了
+            # 「刚才那张」才读得到它；它不会被回传成 selectedRegionId，
+            # 也不会高亮任何卡片。
+            debug["lastAppliedRegionId"] = result.editingTargetRegionId
         response = AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.USER_EDITING_TEMPLATE,
@@ -3234,7 +3445,16 @@ class AgentService:
             ),
             questions=self._editing_prompt_questions(),
             uiActions=["template_editing", "ask_template_edit_detail"],
-            debug={"editingIntent": "UNKNOWN"},
+            debug={
+                "editingIntent": "UNKNOWN",
+                # 显式释放（不是「缺字段」）：点普通「修改」= 开启**新一轮
+                # 草稿级**编辑，上一轮的临时卡片目标到此结束。
+                #
+                # 必须给确定的释放语义：前端按「有没有这个键」区分
+                # 「本轮不更新目标」和「本轮释放目标」，缺字段会被当成
+                # 「不更新」—— 上一张卡片就留在了下一轮请求里。
+                "editingTargetRegionId": None,
+            },
         )
 
     @staticmethod

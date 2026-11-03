@@ -18,11 +18,18 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from app.schemas.edit_plan import EditIntent
+from app.schemas.edit_plan import (
+    EditIntent,
+    EditMetricAddition,
+    EditOperation,
+    EditPlan,
+    EditTarget,
+)
 from app.services.effective_combination import COMBINATION_KEYS
 from app.services.metric_mock_service import list_metrics
 from app.services.preview_service import (
@@ -1066,3 +1073,248 @@ def test_known_device_energy_add_is_still_a_registered_metric(post_chat, definit
 
 
 
+# ==========================================================================
+# 工单 20261102（B 包）：目录外指标**追加**到已有卡片 —— 走到渲染，不只查 prompt
+# ==========================================================================
+
+
+def _template_bound_draft():
+    """带模板绑定的草稿：卡片上已有真实口径的指标（追加后要一个不少地保留）。"""
+    plan = _plan([
+        {
+            "id": "section_1", "title": "总耗电概览",
+            "metricIntents": ["总耗电"], "componentType": "metric_card",
+        },
+        {
+            "id": "section_2", "title": "设备耗电排名",
+            "metricIntents": ["设备耗电"], "componentType": "table",
+        },
+    ])
+    template = build_template_design(plan, subject_id="room_a")
+    return build_template_definition(template.model_dump(mode="json"), plan, "room_a")
+
+
+def _append_plan(region_id: str, label: str) -> EditPlan:
+    """构造一份「追加指标」计划。
+
+    只给线索（显示名 + 展示模式），**不给**口径：目录外的指标口径由服务端
+    自己解析 —— 与模型实际提交的那份一样。
+    """
+    return EditPlan(
+        intent=EditIntent.ADD_METRIC,
+        confidence=0.9,
+        target=EditTarget(regionId=region_id, confidence=1.0),
+        operation=EditOperation(
+            addMetrics=[
+                EditMetricAddition(
+                    intent=label, label=label, displayMode="simulated",
+                )
+            ],
+        ),
+        summary=f"追加 {label}",
+    )
+
+
+def test_out_of_catalog_metric_appended_to_a_card_keeps_the_original_metrics():
+    """追加目录外指标：卡片与原有指标**一个不少**，新指标没有单位、带口径标注。
+
+    这是用户反馈的那条链路（「增加 abc」被加到卡片上）：
+    追加 ≠ 替换，原有指标不能被顶掉。
+    """
+    draft = _template_bound_draft()
+    before = next(
+        item for item in draft.regions if item["id"] == "region_1"
+    )
+    assert [m["label"] for m in before["templateBinding"]["previewSpec"]["metrics"]] == ["总耗电"]
+
+    result = template_edit_engine.apply(
+        plan=_append_plan("region_1", "abc"),
+        definition=draft,
+        scope=SCOPE,
+    )
+
+    assert result.changeSet is not None, "目录外指标不该被拒绝"
+    updated = result.draftAfterEdit.model_dump(mode="json")
+    region = next(item for item in updated["regions"] if item["id"] == "region_1")
+    metrics = {
+        m["label"]: m
+        for m in region["templateBinding"]["previewSpec"]["metrics"]
+    }
+
+    # 原有指标保留，新指标加在旁边。
+    assert set(metrics) == {"总耗电", "abc"}
+    assert metrics["总耗电"]["unit"] == "kWh"
+    assert metrics["总耗电"]["bindingKind"] == "catalog"
+    # 目录外指标：没有真实口径 → 不给单位，不伪造 metricRef。
+    assert metrics["abc"]["unit"] == ""
+    assert metrics["abc"]["bindingKind"] == "simulated"
+    assert "metric.machine_room" not in str(metrics["abc"]["metricKey"])
+    # 口径待确认写在明面上（模拟模式下照样出数，不标「能力待接通」）。
+    assert "仅模拟展示、业务口径待确认" in str(metrics["abc"]["pendingReason"])
+    assert metrics["abc"]["capabilityPending"] is False
+
+
+def test_appended_out_of_catalog_metric_renders_a_simulated_number():
+    """追加的那一项**出模拟数值**：定义里不塞业务数字，数字由渲染层造。"""
+    draft = _template_bound_draft()
+    result = template_edit_engine.apply(
+        plan=_append_plan("region_1", "abc"),
+        definition=draft,
+        scope=SCOPE,
+    )
+    updated = result.draftAfterEdit.model_dump(mode="json")
+
+    # 数值不进定义：列上只有身份与单位。
+    region = next(item for item in updated["regions"] if item["id"] == "region_1")
+    for column in (region.get("component") or {}).get("columns") or []:
+        assert not isinstance(column.get("value"), (int, float))
+        assert not isinstance(column.get("values"), list)
+
+    payload = preview(updated)
+    target = next(
+        item for item in payload["regions"] if item["regionId"] == "region_1"
+    )
+    metrics = target["payload"].get("metrics") or []
+    abc = next((m for m in metrics if m.get("label") == "abc"), None)
+    assert abc is not None, target["payload"]
+    assert abc.get("unit") == ""
+    # 口径待确认的标注跟着这一项走。
+    assert "仅模拟展示、业务口径待确认" in str(abc.get("pendingReason") or "")
+
+
+def test_search_metric_description_does_not_treat_the_catalog_as_a_whitelist():
+    """工具说明：目录是**参考**，不是准入名单。
+
+    「必须使用查询到的指标」这类措辞会让模型把目录缺项当成拒绝理由，
+    是用户反馈里「授权目录里没有对应的指标口径」的来源之一。
+    """
+    from app.tools import search_metric_tool
+
+    text = search_metric_tool.DESCRIPTION
+    assert "禁止凭空编造指标名或单位" not in text
+    assert "必须使用查询到的指标" not in text
+    # 新的说法：查不到不等于不能提。
+    assert "目录外模拟指标" in text or "查不到" in text
+
+
+# ==========================================================================
+# 工单 20261102（B 包）：「增加 abc」这条链路 —— 目录外指标**真的能被加上**
+# ==========================================================================
+#
+# 用户反馈：选中卡片以后说「增加 abc」，指标加不上（模型直接拒绝），
+# 就算加上了也没有口径标注。
+#
+# 下面这几条钉住**服务端**那一半（模型那一半由协调方跑真实模型验）：
+#   1. 目录外指标追加上去 = 通用模拟指标 + 「口径待确认」标注；
+#   2. 不伪造口径、不静默映射成已登记指标；
+#   3. 已登记指标不被降级成通用模拟指标；
+#   4. 用户 JSON 模式的边界不动；
+#   5. 编辑态 prompt 不再把目录当准入名单。
+
+
+def test_appended_out_of_catalog_metric_is_not_mapped_to_a_registered_metric():
+    """追加目录外指标：**不伪造口径**，也不静默映射成已登记指标。
+
+    给了能耗量族就等于把陌生指标悄悄换成「总耗电」（规格第 6 条）。
+    """
+    draft = _template_bound_draft()
+    result = template_edit_engine.apply(
+        plan=_append_plan("region_1", "abc"),
+        definition=draft,
+        scope=SCOPE,
+    )
+
+    assert result.changeSet is not None
+    updated = result.draftAfterEdit.model_dump(mode="json")
+    region = next(item for item in updated["regions"] if item["id"] == "region_1")
+    metrics = {
+        m["label"]: m for m in region["templateBinding"]["previewSpec"]["metrics"]
+    }
+    appended = metrics["abc"]
+    # 没有真实口径 → 不给单位，也不给一个像模像样的 metricRef。
+    assert appended["unit"] == ""
+    assert not appended.get("metricRef")
+    # 语义类别是**通用**：不是能耗量族、不是成本族。
+    assert appended["kind"] == "generic"
+    # 身份是模拟身份，不是目录里的引用。
+    assert appended["simulatedId"].startswith("simulated.")
+    assert "metric.machine_room" not in appended["metricKey"]
+
+
+def test_appended_registered_metric_keeps_its_real_caliber():
+    """追加**已登记**指标：照真实口径走，不被降级、也不挂「口径待确认」。
+
+    模型没给 metricRef 时由服务端自己认 —— 认出来了就用真实口径
+    （设备耗电 = kWh / energy），别给它编一个空单位，也别标成目录外。
+    """
+    draft = _template_bound_draft()
+    result = template_edit_engine.apply(
+        plan=_append_plan("region_1", "设备耗电"),
+        definition=draft,
+        scope=SCOPE,
+    )
+
+    assert result.changeSet is not None
+    updated = result.draftAfterEdit.model_dump(mode="json")
+    region = next(item for item in updated["regions"] if item["id"] == "region_1")
+    metrics = {
+        m["label"]: m for m in region["templateBinding"]["previewSpec"]["metrics"]
+    }
+    appended = metrics["设备耗电"]
+    assert appended["unit"] == "kWh"
+    assert appended["kind"] == "energy"
+    # 已登记指标**不是**目录外指标：不能挂「口径待确认」。
+    assert "口径待确认" not in str(appended["pendingReason"])
+    assert appended["capabilityPending"] is False
+
+
+def test_appended_out_of_catalog_metric_in_user_json_mode_stays_capability_pending():
+    """用户 JSON 模式：目录外指标**仍然**标「能力待接通」。
+
+    模拟模式放松的是「模拟渲染能不能出数」，不是「真实口径存不存在」——
+    用户 JSON 模式下没有真实口径可取，那条边界不能跟着一起放松。
+    """
+    draft = _template_bound_draft()
+    draft.metadata["sourceMode"] = "user_json"
+    result = template_edit_engine.apply(
+        plan=_append_plan("region_1", "abc"),
+        definition=draft,
+        scope=SCOPE,
+    )
+
+    assert result.changeSet is not None
+    updated = result.draftAfterEdit.model_dump(mode="json")
+    region = next(item for item in updated["regions"] if item["id"] == "region_1")
+    metrics = {
+        m["label"]: m for m in region["templateBinding"]["previewSpec"]["metrics"]
+    }
+    appended = metrics["abc"]
+    assert appended["capabilityPending"] is True
+    assert str(appended["pendingReason"]).startswith("能力待接通：")
+
+
+def test_the_edit_prompt_does_not_treat_the_catalog_as_a_whitelist():
+    """编辑态 prompt：目录是**参考**，不是准入名单。
+
+    编辑态不再走通用路由（``agent_service`` 里直接短路成
+    ``template_edit_react``），模型分支是这条链路真正跑的那一条 ——
+    prompt 里留着「目录里没有就不能加」的说法，模型就会直接拒绝。
+    """
+    prompt = (
+        Path(__file__).resolve().parents[1]
+        / "app" / "agents" / "prompts" / "template_edit.md"
+    ).read_text(encoding="utf-8")
+
+    # 模拟模式下任何指标名都能加进草稿。
+    assert "都可以加进草稿" in prompt
+    # 不把用户逼回已登记的清单，也不输出那四项菜单。
+    assert "四项菜单" in prompt
+    assert "总耗电、设备耗电、PUE、能耗成本" not in prompt
+    # 目录外指标不编造口径、不静默映射。
+    assert "静默映射" in prompt
+    # 口径待确认是**标注**，不是需要用户回答的问题。
+    assert "口径待确认" in prompt
+    # 澄清只问一轮：问完就出候选计划，别让这次修改永远出不来。
+    assert "不要再问第二轮" in prompt
+    # 服务端把 confidence < 0.7 的计划改判成追问 —— 提示模型别自降信心。
+    assert "0.7" in prompt

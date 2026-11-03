@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>展示样式专项复现</title>
+  <script src="../pages/vendor/tailwindcss.js"></script>
+  <link rel="stylesheet" href="../pages/workbench_presentation.css">
+  <style>
+    body { padding: 24px; background: #f1f5f9; font-family: sans-serif; }
+    #preview-root { width: 720px; max-width: 100%; }
+    #preview-root .region-tools { display: none; }
+    #preview-root.preview-editable .region-tools { display: inline-flex; align-items: center; gap: 4px; }
+    #result { white-space: pre-wrap; margin-bottom: 16px; }
+    #mode-toggle { margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <h1 class="text-xl mb-4">展示样式专项：真实卡片渲染，无后端写入</h1>
+  <pre id="result">检查中</pre>
+  <button id="mode-toggle" class="border rounded px-3 py-1 bg-white">切换只读 / 编辑</button>
+  <div id="preview-root" class="preview-editable"></div>
+  <script src="../pages/workbench_presentation.js"></script>
+  <script src="./presentation_style_harness.js"></script>
+</body>
+</html>

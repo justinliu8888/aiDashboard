@@ -42,6 +42,24 @@ const session = {
   reportPreviewError: null,
   pendingResume: null, // 停止后等待重新执行的原请求
   workspaceId: null, // 归属项目
+  // 草稿对象身份（契约 0002 §6）：独立于 sessionId/conversationId/messageId。
+  // 同一草稿跨会话共享身份与锁；后端下发，前端只读。
+  draftId: null,
+  // 草稿版本：revision = 当前编辑版本；savedRevision = 显式保存版。
+  // 两者不同义：没显式保存过 savedRevision 就是 null。
+  draftRevision: null,
+  draftSavedRevision: null,
+  // 撤销 / 重做游标：能否撤销、能否重做由服务端给，前端不自己算。
+  canUndo: false,
+  canRedo: false,
+  // 解析好的主题（服务端下发）。前端不拼主题注册表。
+  resolvedTheme: null,
+  // 「显示隐藏内容」开关：纯视图状态，**不写报表定义**。
+  showHiddenContent: false,
+  // 被停止的那一轮：停完之后**只剩两个选项**（继续 / 撤销），输入与其他
+  // 同对象写动作都锁着（契约 0002 §7.1）。taskId 由 messageId 推导。
+  stoppedTaskId: null,
+  stoppedChoices: [],
 };
 
 // -------- 会话接口客户端 --------
@@ -79,6 +97,62 @@ const sessionApi = {
   },
   workspaces() {
     return this.request("/api/workspaces");
+  },
+};
+
+// -------- 草稿工作区接口（契约 0002 §7） --------
+// 草稿是**数据库对象**：有自己的 id、版本、撤销历史。
+// 这几个动作走服务端，不在前端自己改定义 —— 前端改了就和服务端对不上。
+const draftApi = {
+  async request(path, options = {}) {
+    const res = await fetch(API_BASE + path, {
+      headers: { "Content-Type": "application/json" },
+      ...options,
+    });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        const body = await res.json();
+        detail = body?.detail || body?.message || "";
+      } catch (e) { /* 响应体不是 JSON：只报状态码 */ }
+      throw new Error(detail ? `HTTP ${res.status}：${detail}` : `HTTP ${res.status}`);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+  },
+  list() {
+    return this.request("/api/drafts");
+  },
+  detail(draftId) {
+    return this.request("/api/drafts/" + encodeURIComponent(draftId));
+  },
+  action(draftId, action, payload = {}) {
+    return this.request("/api/drafts/" + encodeURIComponent(draftId) + "/actions", {
+      method: "POST",
+      body: JSON.stringify({ action, ...payload }),
+    });
+  },
+  // 打开草稿：把这条会话切到那个对象上（切的是对象身份，不是复制一份）。
+  open(draftId, sessionId) {
+    return this.request("/api/drafts/" + encodeURIComponent(draftId) + "/open", {
+      method: "POST",
+      body: JSON.stringify({ sessionId: sessionId || null }),
+    });
+  },
+  stopTask(taskId) {
+    return this.request("/api/draft-tasks/" + encodeURIComponent(taskId) + "/stop", {
+      method: "POST",
+    });
+  },
+  resumeTask(taskId) {
+    return this.request("/api/draft-tasks/" + encodeURIComponent(taskId) + "/resume", {
+      method: "POST",
+    });
+  },
+  discardTask(taskId) {
+    return this.request("/api/draft-tasks/" + encodeURIComponent(taskId) + "/discard", {
+      method: "POST",
+    });
   },
 };
 
@@ -787,6 +861,40 @@ function isInputLocked(question) {
 }
 
 /**
+ * 这份菜单是不是服务端**当前待决**的那一张。
+ *
+ * 刷新后的历史回放会兜底算出一张**旧菜单**（``restoreSession`` 里的
+ * ``resolveOpenMenuAfterReplay``）。那张菜单**不是**当前待决步骤 ——
+ * 权威状态是后端的 ``pendingChoice``：它说「现在没有待选项」，
+ * 输入就不该被锁住（规格第 60 条、契约表 §5.2）。
+ *
+ * ``authoritative: false`` 就是这条「非权威」的标记，**只有历史兜底那条
+ * 路径会打**。服务端 ``pendingChoice`` 带来的有效 dropdown 不带这个标记，
+ * 仍然全锁 —— 不能为了修历史误锁就把有效 dropdown 的锁放开。
+ */
+function isAuthoritativeChoice(choice) {
+  return choice?.authoritative !== false;
+}
+
+/**
+ * 这份菜单**锁不锁输入与发送**（前端引导；真正的边界在后端）。
+ *
+ * - 非权威菜单（历史兜底出来的旧菜单）→ 只摆出来，**不锁**；
+ * - 有效 dropdown（服务端 pendingChoice）→ 一律全锁，不受这里影响；
+ * - 有待确认计划时（``planWaiting``）→ 锁（计划卡里确认，不能走普通输入）。
+ */
+function menuLocksInput(choice, planWaiting = false) {
+  if (planWaiting) return true;
+  if (!isAuthoritativeChoice(choice)) return false;
+  const scope = lockScopeOf(choice);
+  return (
+    scope === LOCK_SCOPE_INPUT_AND_MENU
+    || Boolean(choice?.options?.length)
+    || choice?.allowsOther === true
+  );
+}
+
+/**
  * 输入区各控件的可用状态与提示文案。
  *
  * 单独抽成一个纯函数：界面锁定只是**引导**（规格第 56 条），
@@ -794,12 +902,16 @@ function isInputLocked(question) {
  */
 function inputControlState(lockedChoice, busy, planWaiting = false) {
   const scope = lockScopeOf(lockedChoice);
-  const locked = scope === LOCK_SCOPE_INPUT_AND_MENU || Boolean(lockedChoice?.options?.length) || lockedChoice?.allowsOther === true || planWaiting;
+  // 锁不锁输入：**有效 dropdown 全锁**（正确要求，不动）；
+  // 历史兜底出来的旧菜单不锁（那不是当前待决步骤）。
+  const locked = menuLocksInput(lockedChoice, planWaiting);
   return {
     scope,
     inputLocked: locked,
     inputDisabled: Boolean(busy) || locked,
     sendDisabled: Boolean(busy) || locked,
+    // 快捷入口按菜单本身判断：menu_only 的语义是「锁下拉框与快捷入口」，
+    // 输入框与发送按钮保持可用（见 LOCK_SCOPE_* 的注释）。
     quickDisabled: Boolean(busy) || Boolean(lockedChoice) || planWaiting,
     placeholder: locked
       ? (planWaiting ? "请在方案卡片内确认或填写修改要求" : INPUT_LOCK_HINT)
@@ -844,6 +956,15 @@ function syncInputControls() {
   send.disabled = controls.sendDisabled;
   send.classList.toggle("opacity-50", controls.sendDisabled);
   send.title = controls.hint;
+  // 被停止的那一轮：输入锁着，直到用户选「继续」或「撤销」。
+  // session 可能不存在（这函数也会被单独抽出来跑），没有会话就没有停止现场。
+  if (session?.stoppedTaskId) {
+    input.disabled = true;
+    send.disabled = true;
+    send.classList.add("opacity-50");
+    input.placeholder = "已停止，请选择「继续完成剩下的工作」或「撤销（回到上一步）」";
+    send.title = "已停止：先选择继续或撤销";
+  }
   $("btn-stop").classList.toggle("hidden", !busy);
   syncInputLockHint(controls);
   document.querySelectorAll("[data-quick], #btn-regenerate").forEach((button) => {
@@ -954,6 +1075,7 @@ function cancelActiveRequest() {
   for (const timer of advanceTimers) clearTimeout(timer);
   advanceTimers.clear();
   let resumable = false;
+  let stopMessageId = null;
   if (activeRequest) {
     const { controller, thinking, debugCard, resumeRequest } = activeRequest;
     // 确认/自动推进可能已有保存等副作用，不自动重放这些操作。
@@ -961,6 +1083,7 @@ function cancelActiveRequest() {
     session.pendingResume = resumable
       ? { body: resumeRequest.body, conversationId: resumeRequest.body.conversationId }
       : null;
+    stopMessageId = resumeRequest?.body?.messageId || null;
     activeRequest = null;
     controller.abort();
     if (thinking) removeBubble(thinking);
@@ -969,10 +1092,164 @@ function cancelActiveRequest() {
   // 后续消息改用新的请求会话，隔离已经发往后端但来不及终止的模型响应。
   session.conversationId = "conv_" + Date.now() + "_" + requestEpoch;
   clearChoiceLock();
+  // **服务端也停**：断 SSE 不等于停成功 —— 服务端把任务置为 STOPPED、
+  // 作废提交凭证，之后只剩「继续」与「撤销」两个选项（契约 0002 §7）。
+  if (stopMessageId) stopTurnOnServer(stopMessageId);
   syncInputControls();
   appendAiText(resumable
     ? "已停止。输入「继续工作」会重新执行上一条消息。"
     : "已停止。此步骤可能已经在后端执行，请检查结果；不能安全地自动重试。");
+}
+
+/**
+ * 让**服务端**停掉这一轮。
+ *
+ * 任务 id 由 messageId 推导（服务端同一套规则），所以前端不用等
+ * 服务端回传就能在模型还在跑的时候拼出它。
+ */
+async function stopTurnOnServer(messageId) {
+  if (!session.draftId || !messageId) return;
+  const taskId = "task_" + messageId;
+  // 服务端在**收到请求时**建任务；前端点停可能比那早几十毫秒 ——
+  // 这种情况重试两下就好，不要因此把「停止」判成失败。
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const result = await draftApi.stopTask(taskId);
+      session.stoppedTaskId = taskId;
+      session.stoppedChoices = result?.choices || ["继续完成剩下的工作", "撤销（回到上一步）"];
+      renderStoppedTurn();
+      syncInputControls();
+      return;
+    } catch (err) {
+      if (attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        continue;
+      }
+      // 停不下来的情况不打断对话：这一轮照常结束。
+      toast("停止失败：" + (err.message || err));
+    }
+  }
+}
+
+/** 停掉之后的那两个选项：继续 / 撤销。 */
+function renderStoppedTurn() {
+  const old = document.querySelector("[data-wp-stopped]");
+  if (old) old.remove();
+  if (!session.stoppedTaskId) return;
+  const box = document.createElement("div");
+  box.className = "wp-stopped flex flex-wrap items-center gap-2 mt-2 text-xs";
+  box.dataset.wpStopped = "1";
+  const label = document.createElement("span");
+  label.className = "text-slate-600";
+  label.textContent = "已停止，接下来只能：";
+  box.appendChild(label);
+  const resumeBtn = document.createElement("button");
+  resumeBtn.type = "button";
+  resumeBtn.className = "wp-btn-stop-resume rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700";
+  resumeBtn.dataset.wpStopResume = "1";
+  resumeBtn.textContent = "继续完成剩下的工作";
+  resumeBtn.addEventListener("click", resumeStoppedTurn);
+  box.appendChild(resumeBtn);
+  const discardBtn = document.createElement("button");
+  discardBtn.type = "button";
+  discardBtn.className = "wp-btn-stop-discard rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700";
+  discardBtn.dataset.wpStopDiscard = "1";
+  discardBtn.textContent = "撤销（回到上一步）";
+  discardBtn.addEventListener("click", discardStoppedTurn);
+  box.appendChild(discardBtn);
+  const host = document.querySelector("#chat-scroll")
+    || document.querySelector("#chat-messages")
+    || document.querySelector("#chat-panel");
+  if (host) host.appendChild(box);
+  else {
+    // 找不到聊天容器就退到页面顶部：选项**必须看得见**，
+    // 否则用户看到的是「停了，但什么都没发生」。
+    document.body.appendChild(box);
+  }
+}
+
+/** 继续：从服务端检查点接着做，**不重复已提交阶段**。 */
+async function resumeStoppedTurn() {
+  const taskId = session.stoppedTaskId;
+  if (!taskId) return;
+  let resumed = null;
+  try {
+    resumed = await draftApi.resumeTask(taskId);
+  } catch (err) {
+    toast("继续失败：" + (err.message || err));
+    return;
+  }
+  const pending = session.pendingResume;
+  session.stoppedTaskId = null;
+  session.stoppedChoices = [];
+  document.querySelector("[data-wp-stopped]")?.remove();
+  if (!pending) {
+    // 刷新之后续跑：前端手里没有原来的请求体。
+    // 但**服务端**的检查点里有本轮身份与原文（契约 0002 §7）——
+    // 用它重建这一轮再重发（同一个 messageId，幂等键不变），
+    // 否则就只是「显示已继续」，**没有任务执行**。
+    const checkpoint = (resumed && resumed.checkpoint) || {};
+    const messageId = checkpoint.messageId || (resumed && resumed.operationId) || null;
+    if (!messageId) {
+      syncInputControls();
+      toast("已继续，可以接着说下一步。");
+      return;
+    }
+    // 快照也要带上：服务端靠它知道「当前这份草稿长什么样」。
+    // 没有它，改稿请求会被当成新建（改的不是同一个东西）。
+    const snapshots = {};
+    if (session.policy) snapshots.reportPolicy = session.policy;
+    if (session.definition) snapshots.reportDefinition = session.definition;
+    if (session.lastReportRun) snapshots.lastReportRun = session.lastReportRun;
+    session.pendingResume = {
+      body: {
+        agentProtocolVersion: "1.0",
+        conversationId: session.conversationId,
+        sessionId: checkpoint.sessionId || session.sessionId,
+        messageId,
+        // **用这一轮当时的状态**：续跑是重做同一轮，不是把同一句话换个状态重跑。
+        // 写死 ANALYZING 会把「改这一版」变成「重新生成一份」。
+        state: checkpoint.state || "ANALYZING",
+        message: checkpoint.message || "继续工作",
+        context: { ...DEFAULT_CONTEXT, ...(checkpoint.context || {}) },
+        ...(Object.keys(snapshots).length ? { snapshots } : {}),
+      },
+      conversationId: session.conversationId,
+    };
+  }
+  // 走既有「继续工作」通道：复用原来的 messageId 重发，后端按幂等键处理，
+  // **已提交的阶段不会再落一次**（提交层按定义版本去重）。
+  await sendMessage("继续工作");
+}
+
+/** 撤销（回到上一步）：丢掉这次被停掉的操作，回到上一个完成状态。 */
+async function discardStoppedTurn() {
+  const taskId = session.stoppedTaskId;
+  if (!taskId) return;
+  try {
+    const result = await draftApi.discardTask(taskId);
+    session.stoppedTaskId = null;
+    session.stoppedChoices = [];
+    session.pendingResume = null;
+    document.querySelector("[data-wp-stopped]")?.remove();
+    if (result?.definition) {
+      session.definition = result.definition;
+      session.baseDefinitionRevision = result.definition?.metadata?.revision ?? null;
+    }
+    applyWorkspaceState(result);
+    if (result?.reportPreviewPayload) {
+      session.reportPreviewPayload = result.reportPreviewPayload;
+      session.reportPreviewError = null;
+    } else {
+      await refreshPreviewPayload();
+    }
+    renderReportPanel();
+    updateMeta();
+    syncInputControls();
+    toast("已撤销，回到上一步。");
+  } catch (err) {
+    toast("撤销失败：" + (err.message || err));
+  }
 }
 
 const DEBUG_STAGE_LABELS = {
@@ -2334,7 +2611,7 @@ async function postAgentStream(body, debugCard, signal) {
   return finalData;
 }
 
-async function sendMessage(text, { fromChoice = false, designAction = null, fromOther = false, fromPlan = false, inlineEditText = "", fromInline = false } = {}) {
+async function sendMessage(text, { fromChoice = false, designAction = null, fromOther = false, fromPlan = false, inlineEditText = "", fromInline = false, targetRegionId = null } = {}) {
   if (!text || activeRequest || advanceTimers.size) return;
   const inlineChoice = inlineEditText ? lockedChoice : null;
   if (
@@ -2342,7 +2619,7 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
     !fromPlan &&
     !designAction &&
     text !== "__advance__" &&
-    (isInputLocked(lockedChoice) || Boolean(lockedChoice?.options?.length) || lockedChoice?.allowsOther === true || hasPendingPlan())
+    menuLocksInput(lockedChoice, hasPendingPlan())
   ) {
     // 界面锁定只是**引导**（规格第 56 条）：这里挡的是「误发自由输入」，
     // 真正的边界在后端 —— 直接调接口在等待选择期间同样不能绕过确认。
@@ -2398,7 +2675,28 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
   // 设计动作（#19）：按钮明确传递动作与所依据的版本。
   // 服务端据此做版本冲突检查 —— 客户端带的版本只用来识别「过期」。
   if (designAction) Object.assign(context, designAction);
-  if (session.editingTargetRegionId) context.selectedRegionId = session.editingTargetRegionId;
+  // 本轮带不带卡片目标（context.selectedRegionId）—— 20261102 工单「临时卡片目标释放」。
+  //
+  // 临时卡片目标只属于**当前这一次操作**，不能从上一轮漏到下一轮：
+  //   - 显式卡片动作（用户点了某张卡片的操作入口，sendTemplateEditAction 传进来）：
+  //     带这张卡的 id；
+  //   - 延续当前操作（回答后端给出的菜单/问题：接受待确认计划、回答刚才的追问）：
+  //     带当前操作的目标 —— 未完成的澄清/待接受计划要保留目标，直到这次操作结束；
+  //   - 新的普通一轮（草稿里的自由输入、普通「修改」的内联两段请求、内部推进）：
+  //     草稿级，**不带** id。
+  //
+  // 以前这里是 `if (session.editingTargetRegionId) context.selectedRegionId = ...`：
+  // 上一轮选中的卡片会一直黏在后面每一轮上，新需求因此被旧卡片截断
+  // （用户看到的「选中卡片以后增加不了、一直缩在卡片上」）。
+  const isMenuAnswer = fromChoice || fromOther || fromPlan;
+  const isInlineTwoStage = Boolean(inlineEditText) || fromInline;
+  // 追问状态（NEEDS_CLARIFICATION）下的自由输入是**回答刚才的追问**，算延续。
+  const continuesCurrentOperation =
+    !isAdvance && !designAction && !isInlineTwoStage &&
+    (isMenuAnswer || session.state === "NEEDS_CLARIFICATION");
+  const roundTargetRegionId =
+    targetRegionId || (continuesCurrentOperation ? session.editingTargetRegionId : null);
+  if (roundTargetRegionId) context.selectedRegionId = roundTargetRegionId;
   // 客户可见正文卡片的顺序：后端按这个顺序理解「第三个」这类说法
   const visibleRegionIds = visibleBodyRegionIds();
   if (visibleRegionIds.length) {
@@ -2516,8 +2814,19 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
     setState(data.state);
   }
   if (data.designSessionId) session.designSessionId = data.designSessionId;
+  // 临时卡片目标的三态（20261102 工单）：
+  //   - **缺字段**：这一轮不更新目标，保持原值；
+  //   - **显式 null**：释放目标（这次操作结束，回到草稿级）；
+  //   - **非空**：本轮的目标就是这张卡。
+  //
+  // 只读回答不参与：只读咨询不结束正在进行的操作，不能擅自释放目标。
   if (!readOnlyKind && data.debug && Object.prototype.hasOwnProperty.call(data.debug, "editingTargetRegionId")) {
-    session.editingTargetRegionId = data.debug.editingTargetRegionId || null;
+    const nextTargetRegionId = data.debug.editingTargetRegionId || null;
+    if (!nextTargetRegionId && session.editingTargetRegionId) {
+      // 释放：屏上那张卡不该还留着「被选中」的痕迹。
+      clearRegionHighlight();
+    }
+    session.editingTargetRegionId = nextTargetRegionId;
   }
   // Keep the legacy action handshake at submit time, not when opening the input.
   if (inlineEditText && !readOnlyKind && data.state === "USER_EDITING_TEMPLATE" && !readPendingEditPlan(data)) {
@@ -2563,6 +2872,11 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
     session.reportDefinitionId = draftDefinition?.metadata?.id || session.reportDefinitionId;
     session.baseDefinitionRevision = draftDefinition?.metadata?.revision ?? session.baseDefinitionRevision;
   }
+
+  // 草稿工作区状态（契约 0002 §6）：草稿 id、版本、能不能撤销 / 重做。
+  // 服务端给什么就是什么 —— 前端不自己数历史。
+  const draftWorkspace = data.domainObjects?.draftWorkspace;
+  if (draftWorkspace) applyWorkspaceState(draftWorkspace);
 
   // 报示意载荷：草稿确认的**同一轮**响应就带它（不做二次请求）。
   //
@@ -2784,7 +3098,9 @@ function sendTemplateEditAction(message, regionId = null) {
   }
   session.editingTargetRegionId = regionId;
   setState("USER_EDITING_TEMPLATE");
-  return sendMessage(message);
+  // 本轮**显式**指定这张卡：请求带上它的 id。
+  // 普通的新一轮（自由输入、内联两段请求）不会带 —— 目标不从上一轮漏过来。
+  return sendMessage(message, { targetRegionId: regionId });
 }
 
 // 节点 12 READY：先选下一步，选“继续修改”后才开放输入。
@@ -3137,9 +3453,27 @@ function renderPreviewErrorNotice(error) {
 }
 
 /** 定义里的区域（按 id 找）：载荷只带 regionId，编辑入口与 topN 都要回定义里取。 */
+/**
+ * 在定义里按 id 找区域。
+ *
+ * **递归**（契约 0002 §1）：区域可能在分组（容器）的 children 里，
+ * 只在顶层找会漏掉组内的卡片 —— 漏了就渲染不出那张卡。
+ */
 function findDefinitionRegion(definition, regionId) {
   if (!definition || !regionId) return null;
-  return (definition.regions || []).find((item) => item?.id === regionId) || null;
+  const search = (regions) => {
+    for (const item of regions || []) {
+      if (!item || typeof item !== "object") continue;
+      if (item.id === regionId) return item;
+      const children = item.children;
+      if (Array.isArray(children)) {
+        const hit = search(children);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  };
+  return search(definition.regions);
 }
 
 /**
@@ -3304,11 +3638,18 @@ function readPrimaryMetric(metrics, payload, defRegion) {
   return null;
 }
 
-/** 载荷里的总量卡片（按单位索引）：表格勾稽要用它。 */
-function buildTotalsByUnit(regions) {
+/** 载荷里的总量卡片（按单位索引）：表格勾稽要用它。
+ *
+ * `excludedRegionIds`：**复制件**（契约 0002 §2.2）不参与总计 ——
+ * 源件与复制件数值相同，都算进去就把总量说大了。
+ * 排除口径由展示模块提供（`duplicateRegionIds`，唯一出处）。
+ */
+function buildTotalsByUnit(regions, excludedRegionIds) {
   const totals = new Map();
+  const excluded = excludedRegionIds instanceof Set ? excludedRegionIds : new Set();
   for (const region of regions) {
     if (region?.componentType !== "METRIC_CARD") continue;
+    if (excluded.has(region.regionId)) continue;
     const p = region.payload || {};
     const unit = String(p.unit || "").trim();
     // 没有值就是没有值：null / 空串**不是 0**（Number(null) === 0 会把
@@ -3414,6 +3755,18 @@ function formatMetricValue(value, precision) {
 // 组件类型、板块标题、表格栏目一律取自载荷与已确认方案 —— 前端不改写、不按标题猜。
 // --------------------------------------------------------------------------
 
+/**
+ * 清掉卡片上的高亮痕迹。
+ *
+ * 临时卡片目标被释放时调用：屏上不该再留着「这张卡还选着」的痕迹
+ * （高亮是渲染时加的 class，不重画面板就得单独摘掉）。
+ */
+function clearRegionHighlight() {
+  if (typeof previewRoot === "undefined" || !previewRoot) return;
+  const cards = previewRoot.querySelectorAll?.(".region-highlight") || [];
+  Array.prototype.forEach.call(cards, (card) => card.classList.remove("region-highlight"));
+}
+
 function renderReportPanel(highlightRegionIds = []) {
   // 先销毁旧图表实例：直接 innerHTML="" 只会移除 DOM，
   // ECharts 实例仍然持有对已脱离文档节点的引用，内存泄漏 + 后续 resize 报错。
@@ -3446,18 +3799,77 @@ function renderReportPanel(highlightRegionIds = []) {
     return;
   }
 
-  const totalsByUnit = buildTotalsByUnit(bodyRegions);
-  previewRoot.appendChild(renderPanelHeader(definition, payload, bodyRegions.length));
+  // 排版由**定义树**决定（契约 0002 §5）：分组、列数、间距、隐藏都由
+  // WorkbenchPresentation 排；载荷只提供数值（按 regionId 关联）。
+  // 新模块没加载时退回老的平铺路径 —— 页面不会白屏。
+  const presentation = window.WorkbenchPresentation;
+  // 总量表：**复制件不参与**（契约 0002 §2.2）。
+  // 排除口径由展示模块给（`duplicateRegionIds`，唯一出处）——
+  // 主脚本自己算一份的话，两边迟早对不上，总量就会把复制件算进去。
+  const duplicateIds = (presentation && typeof presentation.duplicateRegionIds === "function")
+    ? presentation.duplicateRegionIds(definition)
+    : new Set();
+  const totalsByUnit = buildTotalsByUnit(bodyRegions, duplicateIds);
 
-  for (const region of bodyRegions) {
-    const card = renderRegionCard(region, definition, payload, totalsByUnit);
-    if (highlightRegionIds.includes(region.regionId)) card.classList.add("region-highlight");
-    previewRoot.appendChild(card);
+  if (presentation && typeof presentation.render === "function" && definition) {
+    // 模块的 render() 会先 clear(root)，把它自己的内容清干净。所以它
+    // 渲染在**自己的子容器**里，面板头另放在前面 —— 顺序不能反。
+    const panel = document.createElement("div");
+    panel.className = "wp-panel";
+    previewRoot.appendChild(panel);
+    presentation.render(
+      panel,
+      {
+        definition,
+        previewPayload: payload,
+        resolvedTheme: session.resolvedTheme || null,
+        showHidden: !!session.showHiddenContent,
+      },
+      {
+        renderLeaf: (leafRegion, payloadRegion, ctx) => {
+          const region = payloadRegion || {
+            regionId: leafRegion?.id || "",
+            name: leafRegion?.name || "",
+            role: leafRegion?.role || "",
+            componentType: (leafRegion?.component || {}).type || "",
+            payload: {},
+          };
+          const card = renderRegionCard(region, definition, payload, (ctx || {}).totalsByUnit);
+          const highlight = (ctx || {}).highlightRegionIds || highlightRegionIds || [];
+          if (highlight.includes(region.regionId)) card.classList.add("region-highlight");
+          return card;
+        },
+        totalsByUnit,
+        highlightRegionIds,
+        // 容器尺寸变了（窄屏列数翻转、单栏/双栏切换）→ 图表跟着量新尺寸。
+        // 走工作台自己的 resize 逻辑：跳过隐藏 / 零尺寸容器，幂等不重渲染。
+        onResize: () => {
+          if (typeof resizeWorkbenchCharts === "function") resizeWorkbenchCharts();
+        },
+      },
+    );
+    // 面板头排在内容前面。
+    panel.insertBefore(renderPanelHeader(definition, payload, bodyRegions.length), panel.firstChild);
+  } else {
+    previewRoot.appendChild(renderPanelHeader(definition, payload, bodyRegions.length));
+    for (const region of bodyRegions) {
+      const card = renderRegionCard(region, definition, payload, totalsByUnit);
+      if (highlightRegionIds.includes(region.regionId)) card.classList.add("region-highlight");
+      previewRoot.appendChild(card);
+    }
   }
   syncPreviewEditability();
-  requestAnimationFrame(() => _chartInstances.forEach((chart) => {
-    try { chart.resize(); } catch (e) {}
-  }));
+  requestAnimationFrame(() => {
+    // 统一走工作台自己的 resize 逻辑（跳过隐藏 / 零尺寸容器）。
+    // 沙箱里没有这个函数时退回老写法，不抛错。
+    if (typeof resizeWorkbenchCharts === "function") {
+      resizeWorkbenchCharts();
+      return;
+    }
+    _chartInstances.forEach((chart) => {
+      try { chart.resize(); } catch (e) {}
+    });
+  });
 }
 
 /** 空态提示：没有草稿与「草稿已在、示意还没到」是两种情况，说清楚。 */
@@ -3681,6 +4093,295 @@ function definitionStatusLabel(raw) {
 }
 
 /** 面板顶部：报表名 + 一行来源说明（按来源模式说）。 */
+/**
+ * 草稿工具条：修改历史（撤销 / 重做）、显示隐藏内容、保存 / 另存为 / 打开草稿。
+ *
+ * 这些是**按钮与下拉**入口，不是"通用属性面板"：本批的排版与外观修改
+ * 全部通过对话完成（契约 0002 §0）。
+ *
+ * 撤销 / 重做的能力**由服务端给**（session.canUndo / session.canRedo），
+ * 前端不自己数历史 —— 自己数会和���务端对不上。
+ */
+function renderDraftToolbar() {
+  const bar = document.createElement("div");
+  bar.className = "wp-toolbar flex flex-wrap items-center gap-2 mt-3";
+  bar.dataset.wpToolbar = "1";
+
+  const canUndo = !!session.canUndo;
+  const canRedo = !!session.canRedo;
+
+  const history = document.createElement("select");
+  history.className = "wp-history-select question-select rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700";
+  history.setAttribute("data-wp-history", "1");
+  history.setAttribute("aria-label", "修改历史");
+  history.innerHTML = `
+    <option value="">修改历史</option>
+    <option value="undo"${canUndo ? "" : " disabled"}>撤销上一步</option>
+    <option value="redo"${canRedo ? "" : " disabled"}>重做</option>
+  `;
+  history.addEventListener("change", () => {
+    const action = history.value;
+    history.value = "";
+    if (action === "undo") runDraftAction("UNDO");
+    else if (action === "redo") runDraftAction("REDO");
+  });
+  bar.appendChild(history);
+
+  const hiddenBtn = document.createElement("button");
+  hiddenBtn.type = "button";
+  hiddenBtn.className = "wp-btn-show-hidden rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700";
+  hiddenBtn.dataset.wpShowHidden = "1";
+  hiddenBtn.textContent = session.showHiddenContent ? "隐藏隐藏内容" : "显示隐藏内容";
+  hiddenBtn.addEventListener("click", () => {
+    // 开关**不写报表定义**：只是视图状态（契约 0002 §9）。
+    session.showHiddenContent = !session.showHiddenContent;
+    renderReportPanel();
+  });
+  bar.appendChild(hiddenBtn);
+
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "wp-btn-save rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700";
+  saveBtn.dataset.wpSave = "1";
+  saveBtn.textContent = "保存草稿";
+  saveBtn.addEventListener("click", () => runDraftAction("SAVE"));
+  bar.appendChild(saveBtn);
+
+  const saveAsBtn = document.createElement("button");
+  saveAsBtn.type = "button";
+  saveAsBtn.className = "wp-btn-save-as rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700";
+  saveAsBtn.dataset.wpSaveAs = "1";
+  saveAsBtn.textContent = "另存为";
+  saveAsBtn.addEventListener("click", () => {
+    const name = window.prompt("另存为新草稿，名字是？", session.definition?.metadata?.name || "报表草稿");
+    if (!name) return;
+    runDraftAction("SAVE_AS", { name });
+  });
+  bar.appendChild(saveAsBtn);
+
+  const openBtn = document.createElement("button");
+  openBtn.type = "button";
+  openBtn.className = "wp-btn-open-drafts rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700";
+  openBtn.dataset.wpOpenDrafts = "1";
+  openBtn.textContent = "打开草稿";
+  openBtn.addEventListener("click", () => openDraftPicker());
+  bar.appendChild(openBtn);
+
+  if (session.draftId) {
+    const tag = document.createElement("span");
+    tag.className = "wp-draft-id text-[11px] text-slate-400";
+    tag.dataset.wpDraftId = session.draftId;
+    tag.textContent = "草稿 " + session.draftId;
+    bar.appendChild(tag);
+  }
+  return bar;
+}
+
+/**
+ * 打开草稿列表：只显示**名称与最近修改时间**（契约 0002 §6.2）。
+ */
+async function openDraftPicker() {
+  let drafts = [];
+  try {
+    drafts = await draftApi.list();
+  } catch (err) {
+    toast("打开草稿列表失败：" + (err.message || err));
+    return;
+  }
+  if (!Array.isArray(drafts) || !drafts.length) {
+    toast("还没有已保存的草稿。");
+    return;
+  }
+  const label = drafts
+    .map((d) => `${d.name || "未命名草稿"}（${d.updatedAt || ""}）`)
+    .join("\n");
+  const picked = window.prompt("打开哪个草稿？\n" + label, drafts[0].name || "");
+  if (!picked) return;
+  const hit = drafts.find((d) => (d.name || "未命名草稿") === picked) || drafts[0];
+  await openDraft(hit.draftId);
+}
+
+/** 打开一个草稿：把它的定义读回当前工作台。 */
+async function openDraft(draftId) {
+  try {
+    // 先确保有会话：草稿要**绑到会话**上。
+    // 绑定是后续那一轮写锁与任务登记的前提（契约 0002 §7）——
+    // 后端是按 `会话 → 草稿` 找写锁对象的（`load_draft_id`），
+    // 没有绑定的话，打开草稿后再提修改要求就**不受写锁保护**，
+    // 「停止 / 继续」那条链也建不起任务。
+    // 会话本来也是发第一条消息时才创建的（见 sendMessage），
+    // 这里只是把同一个动作提前，避免开了草稿却没绑上。
+    if (!session.sessionId) {
+      try {
+        const created = await sessionApi.create();
+        session.sessionId = created.sessionId;
+        writeLastSessionId(session.sessionId);
+      } catch (err) {
+        toast("创建会话失败：" + err.message);
+        return;
+      }
+    }
+    // 先让服务端**切对象身份**：切完之后后续对话提交落到这个草稿上，
+    // 而不是还挂在原来那个对象上（原草稿一个字节都不改）。
+    let state = null;
+    try {
+      state = await draftApi.open(draftId, session.sessionId);
+    } catch (err) {
+      // 切换失败也要把内容显示出来：读回定义至少能看见。
+      state = await draftApi.detail(draftId);
+    }
+    if (!state) {
+      toast("这个草稿不存在。");
+      return;
+    }
+    applyWorkspaceState(state);
+    if (state.definition) {
+      session.definition = state.definition;
+      session.baseDefinitionRevision = state.definition?.metadata?.revision ?? null;
+    }
+    // 载荷用**打开接口返回的那一份**：示意载荷不落库（ADR 0004），
+    // 会话里没有；再向会话要会把刚打开的草稿内容覆盖回去。
+    if (state.reportPreviewPayload) {
+      session.reportPreviewPayload = state.reportPreviewPayload;
+      session.reportPreviewError = null;
+    } else {
+      await refreshPreviewPayload({ keepDefinition: true });
+    }
+    renderReportPanel();
+    toast("已打开草稿「" + (state.name || draftId) + "」");
+  } catch (err) {
+    toast("打开草稿失败：" + (err.message || err));
+  }
+}
+
+/** 把服务端给的草稿状态收进 session（撤销能力、版本、主题）。 */
+function applyWorkspaceState(state) {
+  if (!state || typeof state !== "object") return;
+  if (state.draftId) session.draftId = state.draftId;
+  if (state.revision !== undefined && state.revision !== null) session.draftRevision = state.revision;
+  if (state.savedRevision !== undefined) session.draftSavedRevision = state.savedRevision;
+  if (state.canUndo !== undefined) session.canUndo = !!state.canUndo;
+  if (state.canRedo !== undefined) session.canRedo = !!state.canRedo;
+  // 主题要**完整**才生效：只有 themeId 的残缺主题没有 token，
+  // 拿它盖住已解析好的主题会让外观退回默认（契约 0002 §8）。
+  if (state.resolvedTheme && state.resolvedTheme.tokens) {
+    session.resolvedTheme = state.resolvedTheme;
+  } else if (state.themeId && !session.resolvedTheme) {
+    session.resolvedTheme = { themeId: state.themeId };
+  }
+  restoreStoppedTurn(state.activeTask);
+}
+
+/**
+ * 把「被停掉的那一轮」恢复到界面上。
+ *
+ * 服务端把还没收尾的任务放在 `activeTask` 里（**STOPPED 也在里面**，
+ * 契约 0002 §7）：被停掉的那一轮用户还没选「继续」或「撤销」，
+ * 对象也还锁着。刷新之后如果前端不认这个字段，用户看到的就是
+ * 「输入能打字、但服务端在锁着」——既看不到那两个选项，
+ * 也以为已经停干净了（实际那把写锁还在）。
+ *
+ * 所以这里按 activeTask 恢复现场：填回 taskId、画出两个选项、锁住输入。
+ */
+function restoreStoppedTurn(activeTask) {
+  const task = activeTask && typeof activeTask === "object" ? activeTask : null;
+  const stopped = task && String(task.state || "").toUpperCase() === "STOPPED" && task.taskId;
+  if (!stopped) {
+    // 没有待处理的停止现场：把界面上残留的选项清掉。
+    if (session.stoppedTaskId) {
+      session.stoppedTaskId = null;
+      session.stoppedChoices = [];
+      document.querySelector("[data-wp-stopped]")?.remove();
+      syncInputControls();
+    }
+    return;
+  }
+  if (session.stoppedTaskId === task.taskId) return;
+  session.stoppedTaskId = task.taskId;
+  session.stoppedChoices = ["继续完成剩下的工作", "撤销（回到上一步）"];
+  renderStoppedTurn();
+  syncInputControls();
+}
+
+/**
+ * 走一次草稿动作（撤销 / 重做 / 保存 / 另存为）。
+ *
+ * 动作在**服务端**做：前端不改定义，只把服务端返回的权威状态收回来重画。
+ */
+async function runDraftAction(action, payload = {}) {
+  if (!session.draftId) {
+    toast("这份报表还没有草稿对象，先做一次修改。");
+    return;
+  }
+  try {
+    const result = await draftApi.action(session.draftId, action, {
+      expectedRevision: session.draftRevision ?? undefined,
+      ...payload,
+    });
+    applyWorkspaceState(result);
+    if (result?.definition) {
+      session.definition = result.definition;
+      session.baseDefinitionRevision = result.definition?.metadata?.revision ?? null;
+    }
+    if (result?.reportPreviewPayload) {
+      session.reportPreviewPayload = result.reportPreviewPayload;
+      session.reportPreviewError = null;
+    } else if (action === "UNDO" || action === "REDO") {
+      await refreshPreviewPayload();
+    }
+    renderReportPanel();
+    updateMeta();
+    const label = { UNDO: "已撤销上一步", REDO: "已重做", SAVE: "草稿已保存", SAVE_AS: "已另存为新草稿" };
+    toast(label[action] || "完成");
+  } catch (err) {
+    toast("操作失败：" + (err.message || err));
+  }
+}
+
+/**
+ * 恢复草稿工作区状态：草稿 id、撤销 / 重做能力、解析好的主题。
+ *
+ * 快照里只存了 draftId（对象身份）；「能不能撤销」「当前主题是什么」要向
+ * **草稿对象**问 —— 前端不自己数历史，也不自己拼主题。
+ */
+async function restoreDraftWorkspace(detail) {
+  const draftId = detail?.snapshot?.draftId || null;
+  session.draftId = draftId;
+  session.canUndo = false;
+  session.canRedo = false;
+  if (!draftId) return;
+  try {
+    const state = await draftApi.detail(draftId);
+    applyWorkspaceState(state);
+  } catch (err) {
+    // 草稿对象取不到（老会话 / 库被换过）：不清空定义，也不报错打扰用户。
+    session.canUndo = false;
+    session.canRedo = false;
+  }
+}
+
+/** 按当前定义重新生成示意载荷（打开草稿 / 撤销后用）。 */
+async function refreshPreviewPayload(options = {}) {
+  if (!session.sessionId) return;
+  const keepDefinition = options.keepDefinition === true;
+  try {
+    const detail = await sessionApi.detail(session.sessionId);
+    const payload = detail?.reportPreviewPayload || detail?.snapshot?.reportPreviewPayload;
+    if (payload) {
+      session.reportPreviewPayload = payload;
+      session.reportPreviewError = null;
+    }
+    const definition = detail?.snapshot?.definition;
+    // keepDefinition：刚打开的草稿内容**不能**被会话里的定义覆盖掉。
+    if (definition && !keepDefinition) {
+      session.definition = definition;
+      session.baseDefinitionRevision = definition?.metadata?.revision ?? null;
+    }
+  } catch (err) {
+    /* 载荷拿不到就保留原来的，不清空。 */
+  }
+}
+
 function renderPanelHeader(definition, payload, regionCount) {
   const header = document.createElement("div");
   header.className = "bg-white rounded-xl border border-slate-200 p-5";
@@ -3715,6 +4416,16 @@ function renderPanelHeader(definition, payload, regionCount) {
     ` : ""}
     ${renderJsonInputIssuesHtml(definition)}
   `;
+
+  // 草稿工具条（撤销 / 重做 / 显示隐藏 / 保存 / 另存为 / 打开草稿）。
+  //
+  // 用 typeof 守卫：有些既有单测把 renderPanelHeader 单独抽进沙箱跑，
+  // 那里没有 renderDraftToolbar —— 直接调用会 ReferenceError。
+  // 拿不到工具条就不画（**不是**功能降级：真实页面里它一直在）。
+  if (typeof renderDraftToolbar === "function") {
+    const toolbar = renderDraftToolbar();
+    if (toolbar) header.appendChild(toolbar);
+  }
 
   const nameEl = header.querySelector(".report-name");
   nameEl.addEventListener("blur", () => {
@@ -3963,13 +4674,20 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
     const items = metrics.length ? metrics : [{
       metricKey: p.metricKey, label: p.label || "指标", value: p.value,
       precision: p.precision, unit, placeholderOnly: p.placeholderOnly,
+      displayValue: p.displayValue,
     }];
     const cards = items.map((m) => {
       const hasValue = p.placeholderOnly !== true && m.placeholderOnly !== true && m.value != null && m.value !== "";
+      // 显示串优先用**服务端按权威格式算好的** displayValue（契约 0002 §5）：
+      // 精度、千分位、单位标签都在服务端那一份格式里，
+      // 前端不再自己拼一套 —— 两边各拼一次迟早对不上。
+      const display = m.displayValue != null && m.displayValue !== ""
+        ? esc(String(m.displayValue))
+        : `${esc(formatMetricValue(m.value, m.precision))}<span class="text-[11px] font-normal text-slate-400 ml-1">${esc(m.unit || "")}</span>`;
       return `
           <div class="rounded-lg border border-slate-200 bg-white px-3 py-2" data-region-metric="${esc(m.metricKey || m.label || "")}">
             <div class="text-[11px] text-slate-500">${esc(m.label || m.metricKey || "指标")}</div>
-            <div class="text-base font-semibold text-slate-900 mt-0.5 min-h-6">${hasValue ? `${esc(formatMetricValue(m.value, m.precision))}<span class="text-[11px] font-normal text-slate-400 ml-1">${esc(m.unit || "")}</span>` : ""}</div>
+            <div class="text-base font-semibold text-slate-900 mt-0.5 min-h-6">${hasValue ? display : ""}</div>
           </div>`;
     }).join("");
     container.innerHTML = `
@@ -3980,6 +4698,9 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
   if (type === "TABLE") {
     const columns = Array.isArray(p.columns) ? p.columns : [];
     const rows = Array.isArray(p.rows) ? p.rows : [];
+    // 逐格显示串：服务端按权威格式算好的（{fieldRef: 显示串} 每行一份）。
+    // 有它就用它，没有才退回旧的本地拼法。
+    const displayRows = Array.isArray(p.displayRows) ? p.displayRows : null;
     const headCells = columns
       .map(
         (c) =>
@@ -3995,6 +4716,12 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
             // （用户明确说「先占位」的列就是这样：列名在，数值不在）。
             if (val == null || val === "") {
               return `<td class="px-3 py-2.5 text-slate-700"></td>`;
+            }
+            const display = displayRows && displayRows[idx]
+              ? displayRows[idx][c.fieldRef]
+              : undefined;
+            if (display != null && display !== "") {
+              return `<td class="px-3 py-2.5 text-slate-700 mono">${esc(String(display))}</td>`;
             }
             if (c.format?.kind === "NUMBER") {
               const num = Number(val);
@@ -4105,7 +4832,11 @@ const CHART_SERIES_COLORS = ["#2563eb", "#16a34a", "#d97706", "#9333ea", "#0891b
  */
 function renderChartPayload(container, region, p, unit) {
   const kind = String(p.chartKind || "LINE").toUpperCase();
-  const labels = Array.isArray(p.xLabels) ? p.xLabels : [];
+  // 横轴标签：优先用服务端按权威格式算好的 displayXLabels
+  // （比如日期格式 2026/11/03）；没有才退回原始 xLabels。
+  const labels = Array.isArray(p.displayXLabels) && p.displayXLabels.length
+    ? p.displayXLabels
+    : (Array.isArray(p.xLabels) ? p.xLabels : []);
   const values = Array.isArray(p.yValues) ? p.yValues : [];
   const series = Array.isArray(p.series) && p.series.length ? p.series : null;
 
@@ -4365,7 +5096,13 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   session.reportDefinitionId = detail.reportDefinitionId;
   session.workspaceId = detail.workspaceId;
   session.pendingResume = null;
-  session.editingTargetRegionId = detail.snapshot?.editingTargetRegionId ?? null;
+  // 恢复临时卡片目标：跟服务端业务状态一致（20261102 工单）。
+  //   - 还有待确认计划 = 这次操作还没结束：目标取计划自己的 targetRegionId；
+  //   - 没有待确认计划 = 操作已经结束：按快照里的临时目标
+  //     （服务端在释放时必须把这个字段清掉，否则刷新会带回一张「还选着」的卡）。
+  const pendingPlanTargetRegionId = detail.pendingEditPlan?.targetRegionId || null;
+  session.editingTargetRegionId =
+    pendingPlanTargetRegionId ?? detail.snapshot?.editingTargetRegionId ?? null;
   session.definition = detail.snapshot?.definition ?? null;
   session.policy = detail.snapshot?.policy ?? null;
   session.lastReportRun = detail.snapshot?.lastReportRun ?? null;
@@ -4382,6 +5119,10 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   // 刷新后原因不能只剩一片空白。
   session.reportPreviewError = readSessionRestoreError(detail);
   writeLastSessionId(detail.sessionId);
+
+  // 草稿工作区状态（契约 0002 §6）：草稿 id、能不能撤销 / 重做、解析好的主题。
+  // 快照里只存了 draftId；撤销能力与主题要向草稿对象问 —— 前端不自己数历史。
+  await restoreDraftWorkspace(detail);
 
   // 恢复文字方案（#19）：方案与阶段存在服务端快照里，
   // 不依赖聊天正文、debug 或浏览器本地变量。
@@ -4435,8 +5176,16 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
     // 回放兜底出来的菜单**不是**服务端当前的有效菜单：
     // 刷新后按服务端阶段恢复锁或不锁，不按历史消息推断（规格第 60 条、
     // 契约表 §5.2）。所以这里只把菜单摆出来，不锁输入。
+    //
+    // `authoritative: false` 就是「这不是当前待决的那张菜单」的标记：
+    // 权威状态（后端 pendingChoice）说没有待选项 → 输入与发送保持可用。
+    // 有效 dropdown 走上面 `pending` 分支，不带这个标记，全锁不变。
     if (openMenu) {
-      setChoiceLock({ ...openMenu, lockScope: LOCK_SCOPE_MENU_ONLY });
+      setChoiceLock({
+        ...openMenu,
+        lockScope: LOCK_SCOPE_MENU_ONLY,
+        authoritative: false,
+      });
     }
   }
 
@@ -4754,6 +5503,341 @@ $("btn-regenerate").addEventListener("click", () => {
   sendMessage("生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析");
 });
 $("btn-stop").addEventListener("click", cancelActiveRequest);
+
+/**
+ * 主题联动：窗口重新拿到焦点时，向服务端要一次**权威主题**。
+ *
+ * 共享主题是数据库里的对象（契约 0002 §8）：别的对象改了主题，
+ * 这边**已打开的视图**不能永远停在旧缓存上。主题由服务端解析后
+ * 下发，前端不拼主题注册表、也不自己算版本。
+ */
+let lastResolvedThemeRevision = null;
+async function refreshResolvedTheme() {
+  if (!session.draftId) return;
+  try {
+    const state = await draftApi.detail(session.draftId);
+    const theme = state?.resolvedTheme;
+    if (!theme) return;
+    const revision = theme.themeRevision ?? null;
+    if (session.resolvedTheme && revision === lastResolvedThemeRevision) return;
+    lastResolvedThemeRevision = revision;
+    session.resolvedTheme = theme;
+    renderReportPanel();
+  } catch (err) {
+    /* 取不到就保持原样：主题刷新失败不该打断正在做的事。 */
+  }
+}
+window.addEventListener("focus", refreshResolvedTheme);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshResolvedTheme();
+});
+
+// --------------------------------------------------------------------------
+// 工作台三视图模式：只看对话 / 双栏显示 / 只看草稿
+//
+// 这里只改**布局**，不动任何业务状态：会话、草稿、草稿 ID、版本、撤销/重做
+// 记录、未发送的文字、方案卡的折叠状态全都原样保留；切换不发任何请求。
+//
+// 模式值只存在内存里（#workspace-panes 上的 data-pane-mode 属性），
+// 刷新页面回到双栏，不写 localStorage。切换会话、收到新回复、草稿重渲染
+// 都不会动这个属性，所以当前模式不会被无故重置。
+//
+// 隐藏面板一律 display:none（CSS 侧）：既不占空间，也不在键盘 Tab 顺序里。
+// --------------------------------------------------------------------------
+
+/**
+ * 按 id 取元素。
+ *
+ * 页面结构变了（或者精简 harness 里根本没有外壳）就返回 null，
+ * 绝不抛错 —— 这一段代码不能把工作台带崩。
+ */
+function paneElement(id) {
+  try {
+    if (typeof document === "undefined" || !document) return null;
+    if (typeof document.getElementById !== "function") return null;
+    return document.getElementById(id) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 滚动位置记忆：元素 → { top, mode }。
+// mode 记的是「这个位置是在哪个模式下取得的」——
+// 恢复时只应用与**当前模式**一致的那一份：别的模式的位置在当前模式下没有意义，
+// 而且单栏模式下被截断出来的 0 不能覆盖双栏时记住的位置。
+//
+// 为什么要记 mode：窄屏上下排时，真正承担滚动的是外层 #workspace-panes。
+// 切到单栏后内容变短，这个容器滚不动，浏览器会把它的 scrollTop 截断成 0；
+// 那个 0 不是用户的位置，不能拿它去覆盖双栏时记住的真实位置。
+const paneScrollMemory = new Map();
+
+/** 元素当前有没有渲染出来（display:none 的元素没有布局盒）。 */
+function paneElementRendered(el) {
+  if (!el) return false;
+  try {
+    if (typeof el.getClientRects === "function") return el.getClientRects().length > 0;
+  } catch (e) { /* 取不到就按可见算 */ }
+  return true;
+}
+
+/** 元素当前是不是一个真的能滚的容器（内容比可视区高）。 */
+function paneElementScrollable(el) {
+  if (!el) return false;
+  try {
+    return el.scrollHeight > el.clientHeight + 1;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * 记下当前滚动容器的位置。
+ *
+ * 三种情况分开处理，不能一刀切：
+ * - **隐藏着**（display:none）：scrollTop 已被浏览器清零，那个 0 是被隐藏强制的，
+ *   不是用户的位置 → 既不记，也不删（记忆留着，等它显示时还原）。
+ * - **渲染着且滚得动**：scrollTop 就是用户的位置（含合法的 0：用户主动滚回了顶部）
+ *   → 记下来，覆盖本模式之前的值。
+ * - **渲染着但滚不动**：本模式下没有有效位置（单栏时内容变短，外层的 0 是截断出来的）
+ *   → 只清掉**本模式**那一份，其它模式记住的位置不能被这个 0 顶掉。
+ */
+function capturePaneScrollPositions() {
+  // 已经被替换掉的旧节点（重渲染过）不再记着，别让 Map 一直涨。
+  try {
+    for (const el of Array.from(paneScrollMemory.keys())) {
+      if (!el || el.isConnected === false) paneScrollMemory.delete(el);
+    }
+  } catch (e) { /* 忽略 */ }
+
+  const mode = readPaneMode();
+  const panes = paneElement("workspace-panes");
+  const chat = paneElement("chat-scroll");
+  const draft = paneElement("draft-pane");
+  const targets = [];
+  // 外层容器：窄屏上下排（< lg）时，整列滚动的是它，不是里面的面板。
+  if (panes) targets.push(panes);
+  if (chat) targets.push(chat);
+  if (draft) {
+    targets.push(draft);
+    try {
+      const nodes = typeof draft.querySelectorAll === "function" ? draft.querySelectorAll("*") : [];
+      for (const node of Array.prototype.slice.call(nodes || [])) {
+        if (!node || node === draft) continue;
+        // 只记真正能滚的容器（长表格、分组区域那些）。
+        if ((node.scrollTop || 0) > 0 || node.scrollHeight > node.clientHeight + 1) targets.push(node);
+      }
+    } catch (e) { /* 取不到就只记外层几个 */ }
+  }
+  for (const el of targets) {
+    // 隐藏着：它的 0 是被隐藏强制的，不记也不删。
+    if (!paneElementRendered(el)) continue;
+    if (paneElementScrollable(el)) {
+      // 现在滚得动：这个 scrollTop 就是用户的位置（合法的 0 也在内）。
+      try { paneScrollMemory.set(el, { top: el.scrollTop || 0, mode }); } catch (e) { /* 忽略 */ }
+      continue;
+    }
+    // 现在滚不动：本模式下的位置已失效（可能是被截断的 0），只清本模式那一份。
+    try {
+      const previous = paneScrollMemory.get(el);
+      if (previous && previous.mode === mode) paneScrollMemory.delete(el);
+    } catch (e) { /* 忽略 */ }
+  }
+}
+
+/**
+ * 按记忆恢复滚动位置。
+ *
+ * 只应用与当前模式一致的那一份：位置是「在某个模式下读到的」，
+ * 换个模式就不该直接套用。仍然隐藏着的面板恢复不了，记忆留着下次显示时再恢复。
+ */
+function restorePaneScrollPositions() {
+  const mode = readPaneMode();
+  for (const [el, entry] of paneScrollMemory.entries()) {
+    if (!el || el.isConnected === false) continue;
+    if (!paneElementRendered(el)) continue;
+    if (!entry || entry.mode !== mode) continue;
+    const top = entry.top || 0;
+    try {
+      if ((el.scrollTop || 0) !== top) el.scrollTop = top;
+    } catch (e) { /* 忽略 */ }
+  }
+}
+
+/**
+ * 布局变了以后，让**还活着**的图表重新量一次尺寸。
+ *
+ * 独立于展示模块（WorkbenchPresentation）：平铺 fallback 那条路也得能 resize，
+ * 所以这里自己遍历 _chartInstances。幂等：只调 chart.resize()，
+ * 不重建报表、不递归触发渲染。
+ * 隐藏容器与零尺寸容器一律跳过 —— resize 到 0 尺寸会把图画坏。
+ */
+function resizeWorkbenchCharts() {
+  const instances = (typeof _chartInstances !== "undefined" && Array.isArray(_chartInstances)) ? _chartInstances : [];
+  for (const chart of instances) {
+    try {
+      if (!chart || typeof chart.resize !== "function") continue;
+      const dom = typeof chart.getDom === "function" ? chart.getDom() : null;
+      if (dom) {
+        // 隐藏容器（单栏模式把对面那块藏起来时）：这会儿量不到尺寸，跳过。
+        if (dom.offsetParent === null) continue;
+        // 零尺寸容器：还没量出宽高，跳过。
+        if (!dom.clientWidth || !dom.clientHeight) continue;
+      }
+      chart.resize();
+    } catch (e) { /* 单个图失败不影响其它 */ }
+  }
+}
+
+/** 当前模式：split | chat | draft。认不出来就当 split。 */
+function readPaneMode() {
+  const panes = paneElement("workspace-panes");
+  const value = panes && typeof panes.getAttribute === "function"
+    ? panes.getAttribute("data-pane-mode")
+    : null;
+  return ["split", "chat", "draft"].indexOf(value) >= 0 ? value : "split";
+}
+
+/** 菜单里标出当前模式（勾号由 CSS 按 aria-checked 显示）。 */
+function syncPaneModeMenu(mode) {
+  const current = mode || readPaneMode();
+  const menu = paneElement("pane-mode-menu");
+  if (!menu || typeof menu.querySelectorAll !== "function") return;
+  let items = [];
+  try { items = Array.prototype.slice.call(menu.querySelectorAll("[data-pane-mode-option]") || []); } catch (e) { items = []; }
+  for (const item of items) {
+    if (!item || typeof item.setAttribute !== "function") continue;
+    item.setAttribute("aria-checked", item.getAttribute("data-pane-mode-option") === current ? "true" : "false");
+  }
+}
+
+/** 等布局落定（两帧）之后恢复滚动位置并让图表重新量尺寸。 */
+function schedulePaneLayoutRefresh() {
+  const raf = typeof requestAnimationFrame === "function" ? requestAnimationFrame : null;
+  if (!raf) {
+    restorePaneScrollPositions();
+    resizeWorkbenchCharts();
+    return;
+  }
+  raf(() => {
+    restorePaneScrollPositions();
+    raf(() => {
+      restorePaneScrollPositions();
+      resizeWorkbenchCharts();
+    });
+  });
+}
+
+/**
+ * 切到某个视图模式。
+ *
+ * 顺序很重要：先记滚动位置（隐藏之后浏览器会把 scrollTop 清零），
+ * 再改属性让 CSS 生效，最后等布局落定后恢复位置并让图表重新量尺寸。
+ * **不调用 renderReportPanel()** —— 报表不重建，只换布局。
+ */
+function applyPaneMode(mode) {
+  const next = ["split", "chat", "draft"].indexOf(mode) >= 0 ? mode : "split";
+  const panes = paneElement("workspace-panes");
+  capturePaneScrollPositions();
+  if (panes && typeof panes.setAttribute === "function") {
+    panes.setAttribute("data-pane-mode", next);
+  }
+  syncPaneModeMenu(next);
+  schedulePaneLayoutRefresh();
+}
+
+/** 开合小菜单。open 省略时是切换。 */
+function setPaneMenuOpen(open) {
+  const menu = paneElement("pane-mode-menu");
+  const button = paneElement("btn-pane-mode");
+  if (!menu || !menu.classList || !button) return;
+  const shouldOpen = open === undefined ? !menu.classList.contains("is-open") : Boolean(open);
+  menu.classList.toggle("is-open", shouldOpen);
+  if (typeof button.setAttribute === "function") {
+    button.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+  }
+  if (shouldOpen) {
+    let first = null;
+    try { first = menu.querySelector("[data-pane-mode-option]"); } catch (e) { first = null; }
+    if (first && typeof first.focus === "function") first.focus();
+  }
+}
+
+/** 关闭小菜单；restoreFocus 不为 false 时把焦点还给按钮。 */
+function closePaneMenu(restoreFocus) {
+  const menu = paneElement("pane-mode-menu");
+  if (!menu || !menu.classList) return;
+  const wasOpen = menu.classList.contains("is-open");
+  menu.classList.remove("is-open");
+  const button = paneElement("btn-pane-mode");
+  if (button && typeof button.setAttribute === "function") {
+    button.setAttribute("aria-expanded", "false");
+  }
+  if (wasOpen && restoreFocus !== false && button && typeof button.focus === "function") {
+    button.focus();
+  }
+}
+
+// ---- 面板模式的按钮与小菜单 ----
+// 外壳不在（精简 harness 只有局部骨架）时整段跳过，不初始化异常。
+(function bindPaneMode() {
+  const button = paneElement("btn-pane-mode");
+  const menu = paneElement("pane-mode-menu");
+  if (!button || !menu) return;
+
+  button.addEventListener("click", (event) => {
+    // 别让文档级监听器接着把刚打开的菜单又关掉。
+    if (event && typeof event.stopPropagation === "function") event.stopPropagation();
+    setPaneMenuOpen();
+  });
+
+  let items = [];
+  try { items = Array.prototype.slice.call(menu.querySelectorAll("[data-pane-mode-option]") || []); } catch (e) { items = []; }
+  for (const item of items) {
+    if (!item || typeof item.addEventListener !== "function") continue;
+    item.addEventListener("click", () => {
+      applyPaneMode(item.getAttribute("data-pane-mode-option"));
+      closePaneMenu(true);
+    });
+  }
+
+  // 点外面：关掉菜单。焦点不抢 —— 用户刚点到的输入框还要能继续打字。
+  document.addEventListener("click", (event) => {
+    if (!menu.classList.contains("is-open")) return;
+    const target = event ? event.target : null;
+    if (target && typeof menu.contains === "function" && menu.contains(target)) return;
+    if (target && typeof button.contains === "function" && button.contains(target)) return;
+    closePaneMenu(false);
+    const active = document.activeElement;
+    if (!active || active === document.body) {
+      if (typeof button.focus === "function") button.focus();
+    }
+  });
+
+  // 键盘：Escape 关闭（焦点回按钮）；上下/Home/End 在菜单项之间移动。
+  document.addEventListener("keydown", (event) => {
+    if (!event || !menu.classList.contains("is-open")) return;
+    if (event.key === "Escape") {
+      closePaneMenu(true);
+      return;
+    }
+    let list = [];
+    try { list = Array.prototype.slice.call(menu.querySelectorAll("[data-pane-mode-option]") || []); } catch (e) { list = []; }
+    if (!list.length) return;
+    const index = list.indexOf(document.activeElement);
+    if (index < 0) return;
+    let next = -1;
+    if (event.key === "ArrowDown") next = (index + 1) % list.length;
+    else if (event.key === "ArrowUp") next = (index - 1 + list.length) % list.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = list.length - 1;
+    if (next < 0) return;
+    if (typeof event.preventDefault === "function") event.preventDefault();
+    if (list[next] && typeof list[next].focus === "function") list[next].focus();
+  });
+
+  // 首次进入：按外壳上的 data-pane-mode 同步菜单勾选。
+  syncPaneModeMenu(readPaneMode());
+})();
 
 // 启动检查
 (async () => {

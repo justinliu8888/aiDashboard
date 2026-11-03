@@ -1,0 +1,24 @@
+{
+  "serve": "..",
+  "outDir": "../../.selfcheck/presentation-style-interaction",
+  "waitMs": 1800,
+  "flows": [{
+    "name": "presentation-style",
+    "path": "/tests/presentation_style_harness.html",
+    "steps": [
+      { "assertVisible": "#result[data-pass='true']" },
+      { "assertVisible": ".wp-leaf[data-region-id='metric'] .btn-display-options" },
+      { "click": ".wp-leaf[data-region-id='metric'] .btn-display-options" },
+      { "eval": "window.editCalls === 1" },
+      { "click": ".wp-leaf[data-region-id='metric'] .btn-grain-options" },
+      { "eval": "window.editCalls === 2" },
+      { "click": "#mode-toggle" },
+      { "assertHidden": ".wp-leaf[data-region-id='metric'] .region-tools" },
+      { "screenshot": "readonly" },
+      { "click": "#mode-toggle" },
+      { "assertVisible": ".wp-leaf[data-region-id='metric'] .btn-grain-options" },
+      { "eval": "Object.values(window.presentationChecks).every(Boolean)" },
+      { "screenshot": "editable" }
+    ]
+  }]
+}

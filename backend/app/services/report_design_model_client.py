@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 #: 比事实查询慢得多，但也不能无限等：超时必须变成可辨识的失败，
 #: 不能一直转圈，也不能让用户以为还在跑。
 #:
-#: 这里用**独立的**时限，不复用 ``VOLC_TIMEOUT``（30 秒）：
+#: 这里用**独立的**时限，不复用通用超时（30 秒）：
 #: 那个时限是给短问答用的，套在完整方案生成上会稳定超时。
-#: 实际取值见 ``Settings.volc_design_timeout``（环境变量 VOLC_DESIGN_TIMEOUT）。
+#: 实际取值见 ``Settings.llm_design_timeout``（环境变量 LLM_DESIGN_TIMEOUT）。
 DEFAULT_DESIGN_TIMEOUT_SECONDS = 120
 
 
@@ -48,17 +48,18 @@ class ReportDesignModelClient:
 
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._model = self._settings.volc_model
+        self._model = self._settings.design_model
         self._timeout = getattr(
-            self._settings, "volc_design_timeout", DEFAULT_DESIGN_TIMEOUT_SECONDS
+            self._settings, "llm_design_timeout", DEFAULT_DESIGN_TIMEOUT_SECONDS
         )
         self._client = None
-        if self._settings.volc_api_key:
+        if self._settings.active_api_key:
             from openai import AsyncOpenAI
 
             self._client = AsyncOpenAI(
-                api_key=self._settings.volc_api_key,
-                base_url=self._settings.volc_base_url,
+                api_key=self._settings.active_api_key,
+                # base_url 是 **API 根地址**，OpenAI SDK 自己拼 /chat/completions。
+                base_url=self._settings.active_base_url,
                 # 单次请求的超时也用方案设计的时限：
                 # 短问答的时限套在完整方案生成上会稳定超时。
                 timeout=self._timeout,
@@ -69,7 +70,10 @@ class ReportDesignModelClient:
                 max_retries=1,
             )
         else:
-            logger.warning("[report_design] 未配置 VOLC_API_KEY，方案设计不可用")
+            logger.warning(
+                "[report_design] 未配置 %s 的 API Key，方案设计不可用",
+                self._settings.provider_name,
+            )
 
     @property
     def available(self) -> bool:
@@ -92,7 +96,9 @@ class ReportDesignModelClient:
         耗时与结果不会互相覆盖。
         """
         if self._client is None:
-            raise RuntimeError("方案设计模型不可用：未配置 VOLC_API_KEY")
+            raise RuntimeError(
+                f"方案设计模型不可用：未配置 {self._settings.provider_name} 的 API Key"
+            )
 
         state = diagnostics.begin_model_call(model_id=self._model)
         started = perf_counter()
@@ -125,8 +131,11 @@ class ReportDesignModelClient:
         assert self._client is not None
         response = await self._client.chat.completions.create(
             model=self._model,
-            temperature=self._settings.volc_temperature,
+            temperature=self._settings.llm_temperature,
             messages=messages,
+            # MiniMax 默认把思考内联进 content，会污染 JSON 解析；
+            # 显式关思考，拿到的是纯 JSON 正文。
+            extra_body=self._settings.request_extra_body,
         )
         choices = getattr(response, "choices", None) or []
         if not choices:

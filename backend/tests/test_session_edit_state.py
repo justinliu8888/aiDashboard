@@ -565,3 +565,146 @@ def test_plan_and_clarification_survive_parallel_writes(service: SessionService)
     assert plan is not None and plan.planId == "plan_x"
     state = service.load_clarification("sess_1")
     assert state is not None and state.rounds == 20
+
+
+# ---------- 临时卡片目标：快照语义 ----------
+
+
+def _response_with_debug(**debug) -> AgentResponse:
+    """带 debug 的响应。debug 里的键决定这一轮怎么更新临时卡片目标。"""
+    return AgentResponse(
+        conversationId="conv_1",
+        state=AgentState.USER_EDITING_TEMPLATE,
+        reply="好的",
+        domainObjects={"reportDefinitionDraft": {"metadata": {"revision": 3}}},
+        debug=debug,
+    )
+
+
+def _record(service: SessionService, response: AgentResponse) -> dict:
+    service.record_turn(
+        session_id="sess_1",
+        user_text="把能耗趋势改成柱状图",
+        response=response,
+        request=_request(),
+    )
+    record = service.repository.get_session("sess_1")
+    return record.snapshot or {}
+
+
+def test_explicit_null_release_clears_the_persisted_target(service: SessionService):
+    """显式 null = 释放：快照里不再有活动目标。"""
+    snapshot = _record(
+        service, _response_with_debug(editingTargetRegionId="region_2")
+    )
+    assert snapshot["editingTargetRegionId"] == "region_2"
+
+    snapshot = _record(service, _response_with_debug(editingTargetRegionId=None))
+    assert "editingTargetRegionId" not in snapshot
+
+
+def test_absent_target_field_keeps_the_previous_target(service: SessionService):
+    """缺字段 = 这一轮不更新目标：沿用上一轮的值（与前端同一套语义）。"""
+    _record(service, _response_with_debug(editingTargetRegionId="region_2"))
+
+    snapshot = _record(service, _response_with_debug(editingIntent="UNKNOWN"))
+    assert snapshot["editingTargetRegionId"] == "region_2"
+
+
+def test_release_does_not_touch_the_pending_plan_target(service: SessionService):
+    """释放临时目标不能擦掉未完成计划自己的目标（它在独立列里）。"""
+    service.save_pending_plan("sess_1", _plan(targetRegionId="region_2"))
+
+    snapshot = _record(service, _response_with_debug(editingTargetRegionId=None))
+
+    assert "editingTargetRegionId" not in snapshot
+    plan = service.load_pending_plan("sess_1")
+    assert plan is not None
+    assert plan.targetRegionId == "region_2"
+
+
+def test_applied_edit_leaves_no_active_target_but_records_history(
+    service: SessionService,
+):
+    """成功应用：没有活动目标，但留下「刚刚改的是哪张卡片」的历史。"""
+    snapshot = _record(
+        service,
+        _response_with_debug(
+            editingTargetRegionId=None,
+            lastAppliedRegionId="region_2",
+        ),
+    )
+
+    assert "editingTargetRegionId" not in snapshot
+    assert snapshot["lastAppliedRegionId"] == "region_2"
+
+
+def test_history_survives_the_next_turn(service: SessionService):
+    """历史要能跨轮存活：刷新以后「刚才那张」还指得到。"""
+    _record(
+        service,
+        _response_with_debug(
+            editingTargetRegionId=None,
+            lastAppliedRegionId="region_2",
+        ),
+    )
+
+    snapshot = _record(service, _response_with_debug(editingIntent="UNKNOWN"))
+
+    assert snapshot["lastAppliedRegionId"] == "region_2"
+
+
+def test_history_is_absent_for_sessions_without_it(service: SessionService):
+    """老会话没有这个键 = 没有历史，不报错。"""
+    assert service.load_last_applied_region_id("sess_1") is None
+
+    _record(service, _response_with_debug(editingTargetRegionId=None))
+
+    assert service.load_last_applied_region_id("sess_1") is None
+
+
+def test_history_loader_returns_the_applied_card(service: SessionService):
+    _record(
+        service,
+        _response_with_debug(
+            editingTargetRegionId=None,
+            lastAppliedRegionId="region_2",
+        ),
+    )
+
+    assert service.load_last_applied_region_id("sess_1") == "region_2"
+
+
+def test_write_turn_inline_applies_the_same_release_semantics(tmp_path):
+    """同事务写入那条路（设计流）必须与 record_turn 同一套语义。"""
+    import sqlite3
+
+    from app.storage.sqlite_store import SqliteSessionRepository
+
+    repo = SqliteSessionRepository(tmp_path / "inline.db")
+    service = SessionService(repo)
+    try:
+        service.record_turn(
+            session_id="sess_1",
+            user_text="把能耗趋势改成柱状图",
+            response=_response_with_debug(editingTargetRegionId="region_2"),
+            request=_request(),
+        )
+
+        connection = sqlite3.connect(repo.db_path)
+        try:
+            service.write_turn_inline(
+                connection,
+                session_id="sess_1",
+                user_text="接受修改",
+                response=_response_with_debug(editingTargetRegionId=None),
+                request=_request(),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        snapshot = repo.get_session("sess_1").snapshot or {}
+        assert "editingTargetRegionId" not in snapshot
+    finally:
+        repo.close()

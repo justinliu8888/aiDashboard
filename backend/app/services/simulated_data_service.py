@@ -65,6 +65,10 @@ from app.services.mock_data_service import (
     resolve_room_name,
     room_id_of_definition,
 )
+from app.services.report_presentation_service import (
+    format_display_value,
+    region_authoritative_format,
+)
 from app.services.simulated_field_semantics import (
     BINDING_KIND_SIMULATED,
     SEMANTIC_KIND_ALARMS,
@@ -216,8 +220,8 @@ class _Context:
             f"{self.start.isoformat()}|{self.end.isoformat()}"
         )
 
-    def region_seed_scope(self, region_id: str) -> str:
-        """区域级种子材料：报表级种子 **+ 区域标识**。
+    def identity_seed_scope(self, identity: str) -> str:
+        """区域级种子材料：报表级种子 **+ 数据身份**。
 
         规格「确定性：按对象、逻辑日期、**区域**与字段组合哈希生成」——
         区域（报表板块）也是种子材料的一部分：同一份定义里两个板块的同类
@@ -225,8 +229,25 @@ class _Context:
 
         报表级前缀（定义 + 定义版本 + 生成器版本 + 时间窗）**原样保留**，
         所以两份不同方案仍然各自一套噪声，不会共用同一批数。
+
+        **这里放的是"数据身份"而不是"展示 id"**（契约 0002 §2）：
+        数据身份 = ``previewSpec.simulationIdentity``，老卡片缺这个字段时
+        回退成它原来的区域 id —— 所以老卡片的数值与改造前**逐字节一致**。
+
+        由此得到两条强约束：
+
+        - 移动 / 成组 / 改样式 → 身份不变 → 数值不漂；
+        - 复制 → 展示 id 换新的、身份沿用源的 → 复制件与源件数值一致。
         """
-        return f"{self.seed_scope}|{region_id}"
+        return f"{self.seed_scope}|{identity}"
+
+    def region_seed_scope(self, region_id: str) -> str:
+        """区域级种子材料的**旧名**：按区域 id 取。
+
+        等价于 :meth:`identity_seed_scope`。新代码请直接用
+        :meth:`identity_seed_scope` 并显式给数据身份。
+        """
+        return self.identity_seed_scope(region_id)
 
 
 @dataclass
@@ -703,6 +724,171 @@ def _preview_spec(region: dict[str, Any]) -> dict[str, Any]:
     binding = region.get("templateBinding") or {}
     spec = binding.get("previewSpec") if isinstance(binding, dict) else None
     return spec if isinstance(spec, dict) else {}
+
+
+#: 容器组件类型：容器**不造数**、**不进载荷**，它只是排版与阅读顺序的组织者。
+CONTAINER_COMPONENT_TYPE = "CONTAINER"
+
+
+def is_container_region(region: dict[str, Any]) -> bool:
+    """这个区域是不是**容器**（分组）。
+
+    容器只管排列与阅读顺序：它没有数据、没有统计口径，
+    因此造数与载荷两层都**跳过它**，只递归它的 ``children``。
+    """
+    component = region.get("component") or {}
+    if not isinstance(component, dict):
+        return False
+    return str(component.get("type") or "").upper() == CONTAINER_COMPONENT_TYPE
+
+
+def effective_simulation_identity(region: dict[str, Any]) -> str:
+    """这个区域的**数据身份**（契约 0002 §2）。
+
+    新身份 = ``templateBinding.previewSpec.simulationIdentity``；
+    老卡片没有这个字段 → **回退成它原来的区域 id**，
+    所以老卡片的种子与改造前完全一致（数值不漂）。
+
+    **绑定层的 ``templateBinding.simulationIdentity`` 是第二个出处**：
+    复制件把源身份写在绑定层（**不碰** ``previewSpec``）——
+    老卡片被复制时不必凭空造一个空壳 ``previewSpec``（空壳会让
+    ``adapt_preview_spec`` 的回退路径绕过去 → 整批丢数），
+    复制件与源件读到的却是**同一个身份** → 数值一致。
+
+    展示 id（``region["id"]``）与数据身份**分开**：
+    复制件换展示 id、沿用数据身份 → 复制件与源件数值一致。
+    """
+    binding = region.get("templateBinding") or {}
+    if not isinstance(binding, dict):
+        binding = {}
+    identity = str(_preview_spec(region).get("simulationIdentity") or "").strip()
+    if not identity:
+        identity = str(binding.get("simulationIdentity") or "").strip()
+    if identity:
+        return identity
+    return str(region.get("id") or "")
+
+
+def _column_formats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """表格载荷里**每一列自己的格式**：``{fieldRef: format}``。
+
+    显示串**按列自己的格式优先**，列没声明才回落到区域格式 ——
+    区域级设了 ``DATE`` 之后，同区域的数值列不该也被按日期渲染
+    （那不是显示，是语义错）。
+    """
+    formats: dict[str, dict[str, Any]] = {}
+    columns = payload.get("columns")
+    if not isinstance(columns, list):
+        return formats
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        field_ref = str(column.get("fieldRef") or "").strip()
+        fmt = column.get("format")
+        if not field_ref or not isinstance(fmt, dict) or not fmt:
+            continue
+        formats[field_ref] = fmt
+    return formats
+
+
+def _display_cell(
+    value: Any, region_format: dict[str, Any], column_format: dict[str, Any]
+) -> Any:
+    """一格的显示串：**列级优先**，列没声明的键回落到区域级。
+
+    两边都没有格式 → **原值**（这一列没有格式约定，就显示原值，
+    不替它编一个显示串）。
+    """
+    effective = {**region_format, **column_format}
+    if not effective:
+        return value
+    return format_display_value(value, effective)
+
+
+def _attach_authoritative_format(
+    payload: dict[str, Any], region: dict[str, Any]
+) -> dict[str, Any]:
+    """把该区域的**权威格式**挂进载荷，并按它算出显示串。
+
+    契约 0002 §3.5：显示格式走**权威格式**，
+    **不通过改数据精度或改统计结果实现外观格式** —— 所以：
+
+    - ``payload["format"]`` = 该区域的权威格式（``SET_FORMAT`` 写的那一份）；
+    - ``payload["value"] / rows / points`` **一个字节都不动**（底层值原样）；
+    - 显示串另开字段：``displayValue``（指标卡主值与逐项指标）、
+      ``displayRows``（表格逐格）、``displayXLabels``（图表横轴）。
+
+    **表格逐格按列自己的格式优先**（列没声明才回落到区域格式）：
+    区域级是兜底，列级才是这一列的 —— 否则区域级一设 ``DATE``，
+    同区域的数值列也跟着被按日期渲染。
+
+    **区域没有格式时，列自己的格式照样生效**（第三轮 R07）：
+    列级格式是这一列**自己**声明的，不该因为区域级是空的就整批不算 ——
+    否则页面显示裸 ISO 串 / 裸数值。
+    区域级与列级**都没有**时：不产出显示串（与改造前一致）。
+
+    没有格式的区域照样带 ``format``（空对象）—— 载荷结构是**封闭**的，
+    前端按同一个字段读，不用猜有没有。
+    """
+    fmt = region_authoritative_format(region)
+    payload["format"] = fmt
+
+    # 指标卡与图表横轴**只有区域级**格式可用（没有列的概念）。
+    if fmt:
+        if "value" in payload:
+            payload["displayValue"] = format_display_value(
+                payload.get("value"), fmt, unit=str(payload.get("unit") or "")
+            )
+        metrics = payload.get("metrics")
+        if isinstance(metrics, list):
+            for item in metrics:
+                if isinstance(item, dict) and "value" in item:
+                    item["displayValue"] = format_display_value(
+                        item.get("value"), fmt, unit=str(item.get("unit") or "")
+                    )
+    rows = payload.get("rows")
+    if isinstance(rows, list):
+        column_formats = _column_formats(payload)
+        # 有区域格式**或**有列格式，才算显示串（两边都没有 = 不产出）。
+        if fmt or column_formats:
+            payload["displayRows"] = [
+                {
+                    str(key): _display_cell(
+                        value, fmt, column_formats.get(str(key), {})
+                    )
+                    for key, value in row.items()
+                }
+                for row in rows
+                if isinstance(row, dict)
+            ]
+    x_field = str(payload.get("xField") or "")
+    points = payload.get("points")
+    if fmt and x_field and isinstance(points, list):
+        payload["displayXLabels"] = [
+            format_display_value(point.get(x_field), fmt)
+            for point in points
+            if isinstance(point, dict)
+        ]
+    return payload
+
+
+def _iter_leaf_regions(regions: Any) -> Any:
+    """按阅读顺序产出**要造数的叶子区域**。
+
+    容器（分组）本身跳过，递归它的 ``children``；老平面定义没有
+    ``children`` 时，产出结果与改造前**逐条一致**。
+    """
+    if not isinstance(regions, list):
+        return
+    for region in regions:
+        if not isinstance(region, dict):
+            raise SimulatedDataError(
+                "INVALID_DEFINITION", "regions 里存在不是对象的区域定义。"
+            )
+        if is_container_region(region):
+            yield from _iter_leaf_regions(region.get("children"))
+            continue
+        yield region
 
 
 def _binding_metric_refs(region: dict[str, Any]) -> set[str]:
@@ -1952,6 +2138,12 @@ def _generate_user_json_payloads(
         rows=rows,
         combination=combination,
     )
+    # 权威格式随载荷带出去（与模拟模式同一套字段）。
+    for region in _iter_leaf_regions(definition.get("regions")):
+        region_id = str(region.get("id") or "")
+        payload = payloads.get(region_id)
+        if isinstance(payload, dict):
+            _attach_authoritative_format(payload, region)
     for payload in payloads.values():
         payload[SOURCE_MODE_KEY] = SOURCE_MODE_USER_JSON
     return payloads
@@ -1994,11 +2186,7 @@ def generate_simulated_data(
     buckets = _buckets_for_grain(ctx, base, ctx.grain)
 
     result: dict[str, dict[str, Any]] = {}
-    for region in regions:
-        if not isinstance(region, dict):
-            raise SimulatedDataError(
-                "INVALID_DEFINITION", "regions 里存在不是对象的区域定义。"
-            )
+    for region in _iter_leaf_regions(regions):
         region_id = str(region.get("id") or "")
         if not region_id:
             raise SimulatedDataError(
@@ -2015,8 +2203,10 @@ def generate_simulated_data(
         # 列先算一遍：指标清单（目录外指标）与表格 / 图表都用同一份列。
         columns = _columns_of(region, spec)
         metrics = _resolve_metrics(region, spec, kind, columns=columns)
-        # 区域级种子材料：报表级种子 + 区域标识。
-        seed_scope = ctx.region_seed_scope(region_id)
+        # 区域级种子材料：报表级种子 + **数据身份**（不是展示 id）。
+        # 移动 / 成组 / 改样式 → 身份不变 → 数值不漂；
+        # 复制 → 展示 id 换新的、身份沿用源的 → 复制件数值与源件一致。
+        seed_scope = ctx.identity_seed_scope(effective_simulation_identity(region) or region_id)
         region_grain = _region_grain(region) or ctx.grain
         region_buckets = (
             buckets if region_grain == ctx.grain else _buckets_for_grain(ctx, base, region_grain)
@@ -2057,5 +2247,7 @@ def generate_simulated_data(
         # 区域级记录优先，没记录就用定义级 —— 一份报表不混两种来源的数字，
         # 真混了由校验层拦（``validation_service`` 的来源模式一致性规则）。
         payload[SOURCE_MODE_KEY] = _source_mode_of_region(region, definition_mode).mode
+        # 该区域的**权威格式**随载荷带出去（显示格式走权威格式）。
+        _attach_authoritative_format(payload, region)
         result[region_id] = payload
     return result

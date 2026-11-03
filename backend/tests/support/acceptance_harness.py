@@ -138,6 +138,16 @@ KNOWN_TABLES: frozenset[str] = frozenset(
         # 它不是模拟业务数值表，但仍要在白名单里，否则「临时库里没有业务
         # 数值表」这条断言会因为多了张表而失败。
         "report_design_json_inputs",
+        # 草稿工作区（契约 0002 §6.1）：存的是**定义结构与版本**，
+        # 不是模拟业务数值 —— 与 report_design_definitions 同一性质。
+        # 同样要进白名单，否则「临时库里没有业务数值表」这条断言会因为
+        # 多了几张表而失败。
+        "draft_objects",
+        "draft_versions",
+        "draft_history",
+        "draft_tasks",
+        "draft_themes",
+        "draft_locks",
     }
 )
 
@@ -555,6 +565,9 @@ def acceptance_harness(
     original_agent = agent_service._agent
     original_model_call = report_design_service._model_call
     original_agent_attrs: dict[str, Any] = {}
+    from app.config import get_settings
+
+    original_agent_impl = get_settings().agent_impl
 
     harness = AcceptanceHarness(
         client=TestClient(app),
@@ -574,6 +587,9 @@ def acceptance_harness(
         # ② 只替换外部模型调用这一处。
         report_design_service.reset_for_tests(model_call=harness.model)
         # 路由层同样不发外部模型请求（没有模型客户端 → 走规则兜底）。
+        # 显式置 fake：这套验收跑的是本地状态机，不是真实模型；
+        # 真实模型模式下「模型没接上」是明确失败，不会退到规则兜底。
+        get_settings().agent_impl = "fake"
         context_engine._client = None
         # ③ 记录业务 Agent 有没有被调用：
         #    方案流程若真的走了编排，模型替身才是唯一的外部调用。
@@ -605,6 +621,7 @@ def acceptance_harness(
         report_design_service._model_call = original_model_call
         report_design_service.reset_for_tests()
         context_engine._client = original_client
+        get_settings().agent_impl = original_agent_impl
         session_service._repo = original_repo
         try:
             repository.close()

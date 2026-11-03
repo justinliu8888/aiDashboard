@@ -1,0 +1,171 @@
+{
+  "outDir": "../.selfcheck/flow-delete-metric",
+  "serveCmd": "cd ../backend && AGENT_IMPL=agentscope AI_SESSION_DB_PATH=data/delete_metric_flow.db /opt/anaconda3/bin/python3.13 -m uvicorn app.main:app --host 127.0.0.1 --port 8165",
+  "port": 8165,
+  "waitMs": 1500,
+  "timeout": 900000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "删除指标：草稿 → 追加实时功率 → 删实时功率+加冰箱功率 → 接受 → 核对 → 刷新恢复",
+      "url": "http://127.0.0.1:8165/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析"
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "waitFor": ".plan-action-select",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.plan-action-select'); if (!s || s.disabled) return false; s.value = 'confirm'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled); for (let i = sels.length - 1; i >= 0; i--) { const s = sels[i]; const o = Array.from(s.options).find(x => x.textContent.trim() === '同意'); if (o) { s.value = o.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; } } return false; })()"
+        },
+        {
+          "waitText": "报表已就绪",
+          "timeout": 180000
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('总耗电')"
+        },
+        {
+          "screenshot": "dm-01-草稿已生成"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); const hit = cards.find(c => c.querySelector('[data-region-metric]')); return hit ? hit.querySelector('h3.region-name').innerText.trim() : ''; })()",
+          "save": "cardName",
+          "timeout": 30000
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled && !s.closest('[data-pending-plan]')); for (let i = sels.length - 1; i >= 0; i--) { const s = sels[i]; const o = Array.from(s.options).find(x => /^(修改|继续修改|继续调整)$/.test(x.textContent.trim())); if (o) { s.value = o.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; } } return false; })()"
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "eval": "(() => { const all = Array.from(document.querySelectorAll('.question-other-input')); const enabled = all.filter(i => !i.disabled); const visible = enabled.filter(i => i.offsetParent !== null); return enabled.length === 1 && visible.length === 1; })()"
+        },
+        {
+          "type": ".question-other-input:not([disabled])",
+          "text": "{{cardName}}再加一个实时功率的指标"
+        },
+        {
+          "click": ".question-other-submit:not([disabled])"
+        },
+        {
+          "waitFor": "[data-pending-plan]",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const c = document.querySelector('[data-pending-plan]'); if (!c) return false; const t = c.innerText; return t.includes('追加') && t.includes('实时功率'); })()"
+        },
+        {
+          "screenshot": "dm-02-追加实时功率候选卡"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const c = cards[cards.length - 1]; if (!c) return false; const s = c.querySelector('.question-select'); if (!s || s.disabled) return false; const o = Array.from(s.options).find(x => x.textContent.trim() === '接受修改'); if (!o) return false; s.value = o.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 5000
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('实时功率')"
+        },
+        {
+          "screenshot": "dm-03-已追加实时功率"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled && !s.closest('[data-pending-plan]')); for (let i = sels.length - 1; i >= 0; i--) { const s = sels[i]; const o = Array.from(s.options).find(x => /^(修改|继续修改|继续调整)$/.test(x.textContent.trim())); if (o) { s.value = o.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; } } return false; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('.question-select')).filter(s => !s.disabled && !s.closest('[data-pending-plan]')); for (let i = sels.length - 1; i >= 0; i--) { const s = sels[i]; const o = Array.from(s.options).find(x => x.textContent.trim() === '其他'); if (o) { s.value = o.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; } } return false; })()"
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "(() => { const all = Array.from(document.querySelectorAll('.question-other-input')); const enabled = all.filter(i => !i.disabled); const visible = enabled.filter(i => i.offsetParent !== null); return enabled.length === 1 && visible.length === 1; })()"
+        },
+        {
+          "type": ".question-other-input:not([disabled])",
+          "text": "{{cardName}}删除实时功率这个指标 再增加一个冰箱功率的指标"
+        },
+        {
+          "click": ".question-other-submit:not([disabled])"
+        },
+        {
+          "eval": "(() => { return document.querySelectorAll('[data-pending-plan]').length >= 2 ? 'two' : ''; })()",
+          "save": "secondPlan",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const c = cards[cards.length - 1]; if (!c) return false; const t = c.innerText; return t.includes('删除指标') && t.includes('实时功率') && t.includes('追加指标') && t.includes('冰箱功率'); })()"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const c = cards[cards.length - 1]; if (!c) return false; return !c.innerText.includes('删除卡片'); })()"
+        },
+        {
+          "screenshot": "dm-04-删加候选确认卡"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const c = cards[cards.length - 1]; if (!c) return false; const s = c.querySelector('.question-select'); if (!s || s.disabled) return false; const o = Array.from(s.options).find(x => x.textContent.trim() === '接受修改'); if (!o) return false; s.value = o.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 5000
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('冰箱功率')"
+        },
+        {
+          "eval": "!document.getElementById('preview-root').innerText.includes('实时功率')"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('总耗电')"
+        },
+        {
+          "screenshot": "dm-05-接受后卡片仍在且指标已换"
+        },
+        {
+          "eval": "(() => { window.location.reload(); return true; })()"
+        },
+        {
+          "wait": 10000
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('冰箱功率')"
+        },
+        {
+          "eval": "!document.getElementById('preview-root').innerText.includes('实时功率')"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('总耗电')"
+        },
+        {
+          "screenshot": "dm-06-刷新后恢复一致"
+        }
+      ]
+    }
+  ]
+}

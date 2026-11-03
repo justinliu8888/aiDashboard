@@ -774,7 +774,12 @@ def _exploding_module(name: str) -> types.ModuleType:
 def test_ac2_agent_init_failure_keeps_type_and_stack_but_not_original(
     caplog, monkeypatch
 ):
-    """AC#2 补漏：AgentScope 初始化失败 —— 原文不进日志，类型与栈还在。"""
+    """AC#2 补漏：AgentScope 初始化失败 —— 原文不进日志，类型与栈还在。
+
+    契约更新（MiniMax 迁移）：真实模型模式下初始化失败**不再降级 FakeAgent**，
+    而是明确抛出。降级会让用户拿到一条规则拼出来的回复，看着像正常结果，
+    实际上模型根本没跑 —— 配置漏了却看不出来。
+    """
     caplog.set_level(logging.INFO, logger="app")
     settings = get_settings()
     monkeypatch.setattr(settings, "agent_impl", "agentscope")
@@ -784,10 +789,9 @@ def test_ac2_agent_init_failure_keeps_type_and_stack_but_not_original(
         _exploding_module("app.agents.agentscope_report_agent"),
     )
 
-    agent = _build_agent()
-
-    # 降级行为逐字未变：仍然退回 FakeAgent
-    assert agent.__class__.__name__ == "FakeReportAgent"
+    # 真实模型模式：构造失败必须抛出来，不返回 FakeAgent。
+    with pytest.raises(ValueError):
+        _build_agent()
 
     text = caplog.text
     # 异常原文不进日志
@@ -800,6 +804,8 @@ def test_ac2_agent_init_failure_keeps_type_and_stack_but_not_original(
     # 级别没被降下来（原来是 ERROR）
     failure = [r for r in caplog.records if "初始化失败" in r.getMessage()]
     assert failure and failure[0].levelno == logging.ERROR
+    # 明确失败，不静默降级
+    assert "不降级 FakeAgent" in text
 
 
 def test_ac2_recorded_progress_read_failure_keeps_stack_but_not_original(

@@ -51,6 +51,19 @@ def test_留下的空括号被清掉():
     assert "保留" in out
 
 
+def test_只剩等号或冒号的括号残渣被清掉():
+    # 模型把 metricKey 写进摘要时：标识先被替换、字段名后被去掉，
+    # 括号里只剩一个等号。这种残渣不能留在用户可见文字里。
+    out = sanitize_internal_ids("先删除指标「实时功率」（metricKey=metric.power.section_1_2）")
+    assert "（=）" not in out
+    assert "=" not in out
+    assert "实时功率" in out
+
+    out = sanitize_internal_ids("（fieldRef: energyKwh）")
+    assert "（:）" not in out
+    assert ":" not in out
+
+
 def test_变更集摘要也洗一遍():
     steps = [
         {"intent": "ADD_METRIC", "summary": "追加 PUE（metric.machine_room.pue）"},

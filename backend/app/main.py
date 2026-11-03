@@ -10,6 +10,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.routers import agent as agent_router
+from app.routers import drafts as drafts_router
 from app.routers import mock_capability
 from app.routers import report as report_router
 from app.routers import sessions as sessions_router
@@ -45,6 +46,9 @@ app.include_router(agent_router.router)
 app.include_router(mock_capability.router)
 app.include_router(report_router.router)
 app.include_router(sessions_router.router)
+# 草稿工作区（契约 0002 §7）：打开 / 保存 / 撤销 / 重做 / 另存为。
+# 它是草稿级入口，**不替代**对话里的候选 → 接受那条提交链路。
+app.include_router(drafts_router.router)
 
 
 # 挂载前端静态目录：backend/../frontend

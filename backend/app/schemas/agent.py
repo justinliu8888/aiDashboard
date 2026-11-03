@@ -390,6 +390,10 @@ class AgentResponseDomainObjects(BaseModel):
     reportPlan: dict[str, Any] | None = None
     # 模板设计（工单 02）。同样是 dict：老会话没有这个字段时要能读出来。
     templateDesign: dict[str, Any] | None = None
+    # 草稿工作区状态（契约 0002 §6）：草稿对象身份、版本、能不能撤销 / 重做。
+    # 用 dict：它是**工作区快照**，字段随存储演进，不进领域类型。
+    # 前端只读它来决定「撤销上一步」这一项能不能点 —— 前端不自己数历史。
+    draftWorkspace: dict[str, Any] | None = None
 
 
 class AgentResponse(BaseModel):

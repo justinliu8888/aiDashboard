@@ -119,6 +119,9 @@ def sanitize_internal_ids(text: str) -> str:
     # 去掉替换后留下的空括号 / 空引号 / 多余空格 / 悬空标点。
     value = re.sub(r"[（(]\s*[）)]", "", value)
     value = re.sub(r"[「『]\s*[」』]", "", value)
+    # 只剩一个等号 / 冒号的括号：标识先被替换、字段名后被去掉时留下的残渣
+    # （「（metricKey=metric.power.section_1_2）」→「（=）」）。整组去掉。
+    value = re.sub(r"[（(]\s*[=＝:：]\s*[）)]", "", value)
     value = re.sub(r"[（(]\s*[，,]\s*", "（", value)
     value = re.sub(r"\s*[，,]\s*[）)]", "）", value)
     value = re.sub(r"[ \t]{2,}", " ", value)

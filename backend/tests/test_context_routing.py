@@ -797,3 +797,64 @@ def _request(message: str, state: str = "ANALYZING"):
             "subjectId": "room_a",
         },
     )
+
+
+# --------------------------------------------------------------------------
+# 工单 20261102（B 包）：编辑态的目录外指标**不经过**路由层的 BLOCK
+# --------------------------------------------------------------------------
+#
+# 「增加 abc」在编辑态被拒，根因**不在**路由层：
+# ``agent_service`` 在 ``USER_EDITING_TEMPLATE`` + 有草稿时把路由短路成
+# ``template_edit_react``（``CONTINUE_CURRENT``），``context_engine.route()``
+# —— 连同它里面的 ``_rule_block`` → ``detect_unknown_metric`` ——
+# 根本不跑。
+#
+# 下面两条把这个事实钉住：将来谁把编辑态接回通用路由，目录外指标就会
+# 重新被 BLOCK（那四项指标菜单就是这么回来的）。
+
+
+def test_an_edit_style_request_is_not_caught_by_the_unknown_metric_block():
+    """规则层的「未登记指标」阻断只认**生成请求**里的指标名。
+
+    「增加 abc」是编辑请求 —— 被它拦下就等于把编辑路径又堵回
+    「指标不在目录里，请从这四个里选」。
+    """
+    for message in ("增加 abc", "增加一个 abc", "再加一个 abc"):
+        assert routing_rules.detect_block(
+            message,
+            subject_ref="machine_room",
+            subject_id="room_a",
+            authorized_subject_ids=["room_a"],
+        ) is None
+
+
+def test_the_edit_state_never_routes_an_out_of_catalog_metric_to_block(
+    monkeypatch, post_chat,
+):
+    """编辑态（有草稿）不走通用路由：目录外指标不会被路由层 BLOCK 掉。
+
+    这条测试盯的是**可达性**：编辑态压根不调 ``context_engine.route()``，
+    深路由里那条「未登记指标 → 必须 BLOCK」的提示够不着这条链路。
+    """
+    from app.services.report_draft_service import build_definition_draft
+
+    routed: list[str] = []
+    original_route = context_engine.route
+
+    async def _spy(request, emit=None):
+        routed.append(request.message)
+        return await original_route(request, emit=emit)
+
+    monkeypatch.setattr(context_engine, "route", _spy)
+
+    definition = build_definition_draft("A 机房能耗日报", "room_a")
+    response = post_chat(
+        "增加 abc",
+        state="USER_EDITING_TEMPLATE",
+        snapshots={"reportDefinition": definition.model_dump(mode="json")},
+    ).json()
+
+    assert response["state"] != "BLOCKED_OR_UNSUPPORTED"
+    assert not response.get("blocks")
+    # 通用路由（含 ``_rule_block`` → ``detect_unknown_metric``）没跑。
+    assert routed == []

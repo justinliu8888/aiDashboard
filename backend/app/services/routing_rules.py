@@ -898,6 +898,13 @@ _OPERATION_VERBS: tuple[str, ...] = (
     "重新开始", "重新生成",
 )
 
+# Bare alignment clauses are commands; capability questions containing the
+# same words (e.g. "支持右对齐吗") are not.
+_APPEARANCE_COMMAND_PATTERN = re.compile(
+    r"(?:文字|字体|字号|圆角)(?:大小)?(?:调大|调小|放大|缩小|设为|设置为)"
+    r"|(?:^|[，,；;、])\s*(?:左对齐|右对齐|居中对齐)(?=$|[，,；;。.!！?？])"
+)
+
 
 def looks_like_question(message: str) -> bool:
     """这句话有没有**疑问语气**。
@@ -932,7 +939,8 @@ def has_operation_command(message: str) -> bool:
     text = (message or "").strip()
     if not text:
         return False
-    return any(word in text for word in _OPERATION_VERBS)
+    return (any(word in text for word in _OPERATION_VERBS)
+            or bool(_APPEARANCE_COMMAND_PATTERN.search(text)))
 
 
 def command_verbs_in(message: str) -> tuple[str, ...]:
@@ -952,6 +960,8 @@ def command_verbs_in(message: str) -> tuple[str, ...]:
         while start != -1:
             hits.append((start, start + len(verb), verb))
             start = text.find(verb, start + 1)
+    for match in _APPEARANCE_COMMAND_PATTERN.finditer(text):
+        hits.append((match.start(), match.end(), match.group().lstrip("，,；;、 ")))
     # 同一处起点取最长的词；再按出现位置从前往后挑不重叠的。
     hits.sort(key=lambda item: (item[0], -item[1]))
     picked: list[tuple[int, int, str]] = []

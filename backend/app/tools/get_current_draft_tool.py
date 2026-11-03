@@ -21,6 +21,7 @@ from typing import Any
 
 from app.services.session_context import current_session_key
 from app.services.session_fact_service import session_fact_service
+from app.services.report_theme_service import theme_service
 from app.schemas.fact import FactStatus
 from app.tools.base import LOOKUP_STATES, ToolCategory
 from app.tools.context import current_tool_context
@@ -60,6 +61,30 @@ def _region_summary(region: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _available_themes() -> list[dict[str, Any]]:
+    """可用的共享主题清单（**服务端给**，模型不自己编主题 id）。
+
+    主题是数据库里的共享对象（契约 0002 §8）：模型要「换个主题」时，
+    只能从这里挑一个 themeId，不能凭空写一个不存在的 id。
+    """
+    try:
+        themes = theme_service.list_themes()
+    except Exception:  # noqa: BLE001 — 主题读不到不该让整次工具调用失败
+        return []
+    result: list[dict[str, Any]] = []
+    for theme in themes or []:
+        if not isinstance(theme, dict):
+            continue
+        result.append(
+            {
+                "themeId": str(theme.get("themeId") or ""),
+                "name": str(theme.get("name") or ""),
+                "themeRevision": theme.get("themeRevision"),
+            }
+        )
+    return result
+
+
 def _from_request_snapshot(ctx: Any) -> dict[str, Any]:
     """没有会话标识时的兜底：用本轮请求快照，并且明确标注来源不是服务端。"""
     definition = ctx.definition
@@ -79,6 +104,7 @@ def _from_request_snapshot(ctx: Any) -> dict[str, Any]:
         "pendingSteps": [],
         "savedDefinition": None,
         "preview": None,
+        "availableThemes": _available_themes(),
         "source": "request_snapshot",
         "truncated": False,
         "reason": "",
@@ -136,6 +162,7 @@ def run() -> dict[str, Any]:
         "pendingSteps": list(draft.pendingSteps) if draft is not None else [],
         "savedDefinition": facts.savedDefinition,
         "preview": facts.preview,
+        "availableThemes": _available_themes(),
         "source": draft.source if draft is not None else "server_session",
         "truncated": False,
         "reason": facts.reason,

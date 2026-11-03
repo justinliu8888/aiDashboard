@@ -44,6 +44,8 @@ SUPPORTED_COMPONENT_TYPES = {
     "CHART",
     "DATA_QUALITY",
     "ANALYSIS",
+    # 容器（分组）：只管排列与阅读顺序，**没有数据**（契约 0002 §1）。
+    "CONTAINER",
 }
 SUPPORTED_CHART_KINDS = {"LINE", "AREA", "BAR", "PIE"}
 
@@ -58,6 +60,20 @@ SUPPORTED_DERIVED_KINDS = {
 SUPPORTED_COMPARISONS = {"GT", "GTE", "LT", "LTE", "EQ", "NE"}
 # 排序指令的比较符
 SUPPORTED_SORT_COMPARISONS = {"ASC", "DESC"}
+
+#: **提示级**问题的层：它**不阻断**校验（页面要可用、草稿要能存、撤销要能用）。
+WARNING_LAYER = "WARNING"
+
+#: 阻断校验的层。只有这些层里的问题会让 ``passed`` 变成 False。
+#:
+#: 历史上所有问题都落在这几层里 —— 所以这条规则**不改变**既有判定，
+#: 只是给「提示级」问题（``WARNING``）留一条不阻断的路。
+BLOCKING_LAYERS = frozenset({"STRUCTURE", "FIELD", "METRIC", "PERMISSION", "CAPABILITY"})
+
+#: 区域上**失效引用**标记的键（展示执行层写进来的）。
+#:
+#: 这个键是**允许**的：它不是未知键，校验层不因此判失败。
+REGION_ERRORS_KEY = "errors"
 
 
 def fixed_interval_error(window: dict[str, Any]) -> str | None:
@@ -135,6 +151,51 @@ def _is_template_row_key_column(region: dict[str, Any]) -> bool:
     return bool(spec.get("columns"))
 
 
+#: 容器（分组）组件类型：容器只管排列与阅读顺序，**没有数据**。
+CONTAINER_COMPONENT_TYPE = "CONTAINER"
+
+
+def _flatten_regions_for_validation(
+    regions: list[Any] | None, prefix: str = ""
+) -> list[tuple[str, dict[str, Any]]]:
+    """把区域树摊平成 ``(path, region)``，路径形如 ``/0``、``/0/children/1``。
+
+    分组落地之后，**组内的卡片也要被校验**：它们的 id、角色、组件类型、
+    数据绑定与顶层卡片一样受同一套规则约束。
+    容器本身不校验数据域（它没有数据）。
+    """
+    flat: list[tuple[str, dict[str, Any]]] = []
+    for index, region in enumerate(regions or []):
+        if not isinstance(region, dict):
+            continue
+        path = f"{prefix}/{index}"
+        flat.append((path, region))
+        children = region.get("children")
+        if isinstance(children, list):
+            flat.extend(_flatten_regions_for_validation(children, f"{path}/children"))
+    return flat
+
+
+def _is_container_region(region: dict[str, Any]) -> bool:
+    component = region.get("component") or {}
+    if not isinstance(component, dict):
+        return False
+    return str(component.get("type") or "").upper() == CONTAINER_COMPONENT_TYPE
+
+
+def _region_error_entries(region: dict[str, Any]) -> list[dict[str, Any]]:
+    """区域上的**失效引用**标记（``errors`` 键）。
+
+    这是展示执行层写进来的（强制删除后，引用方被标成引用失效）。
+    它**不是**未知键 —— 校验层认它，但只当**提示**看，不阻断校验：
+    页面要能用、这份「错误草稿」要能存、撤销也要能用。
+    """
+    errors = region.get(REGION_ERRORS_KEY)
+    if not isinstance(errors, list):
+        return []
+    return [item for item in errors if isinstance(item, dict)]
+
+
 def _validate_source_modes(
     definition_draft: dict[str, Any], issues: list[ValidationIssue]
 ) -> None:
@@ -167,16 +228,18 @@ def _validate_source_modes(
         )
     effective = definition_mode or DEFAULT_SOURCE_MODE
 
-    for idx, region in enumerate(definition_draft.get("regions") or []):
+    for order, (idx, region) in enumerate(
+        _flatten_regions_for_validation(definition_draft.get("regions") or [])
+    ):
         if not isinstance(region, dict):
             continue
         binding = region.get("templateBinding")
         binding = binding if isinstance(binding, dict) else {}
         candidates = [
-            (binding.get(SOURCE_MODE_KEY), f"/regions/{idx}/templateBinding/{SOURCE_MODE_KEY}"),
+            (binding.get(SOURCE_MODE_KEY), f"/regions{idx}/templateBinding/{SOURCE_MODE_KEY}"),
             (
                 (binding.get("previewSpec") or {}).get(SOURCE_MODE_KEY),
-                f"/regions/{idx}/templateBinding/previewSpec/{SOURCE_MODE_KEY}",
+                f"/regions{idx}/templateBinding/previewSpec/{SOURCE_MODE_KEY}",
             ),
         ]
         for value, path in candidates:
@@ -188,7 +251,7 @@ def _validate_source_modes(
                     _issue(
                         "FIELD",
                         "SOURCE_MODE_INVALID",
-                        f"区域 {region.get('id') or idx + 1} 的来源模式 {value!r} 不是合法取值。",
+                        f"区域 {region.get('id') or order + 1} 的来源模式 {value!r} 不是合法取值。",
                         path=path,
                         suggestion="改成 simulated 或 user_json。",
                     )
@@ -199,7 +262,7 @@ def _validate_source_modes(
                     _issue(
                         "FIELD",
                         "SOURCE_MODE_MISMATCH",
-                        f"区域 {region.get('id') or idx + 1} 的来源模式是 {mode}，"
+                        f"区域 {region.get('id') or order + 1} 的来源模式是 {mode}，"
                         f"与报表定义的 {effective} 不一致。",
                         path=path,
                         suggestion="一份报表只用一种来源：让区域与定义保持一致。",
@@ -486,7 +549,8 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
         )
 
     seen_ids: set[str] = set()
-    for idx, region in enumerate(regions):
+    for idx, region in _flatten_regions_for_validation(regions):
+        is_container = _is_container_region(region)
         rid = region.get("id") or ""
         context = region.get("context") or {}
         window = context.get("timeWindow")
@@ -495,15 +559,15 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
             if window_error:
                 issues.append(_issue(
                     "STRUCTURE", "FIXED_INTERVAL_INVALID", window_error,
-                    path=f"/regions/{idx}/context/timeWindow",
+                    path=f"/regions{idx}/context/timeWindow",
                 ))
         if not rid:
             issues.append(
                 _issue(
                     "STRUCTURE",
                     "REGION_ID_MISSING",
-                    f"第 {idx + 1} 个区域没有 id。",
-                    path=f"/regions/{idx}/id",
+                    f"第 {order + 1} 个区域没有 id。",
+                    path=f"/regions{idx}/id",
                 )
             )
         elif rid in seen_ids:
@@ -512,7 +576,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                     "STRUCTURE",
                     "REGION_ID_DUPLICATED",
                     f"区域 id 重复：{rid}",
-                    path=f"/regions/{idx}/id",
+                    path=f"/regions{idx}/id",
                 )
             )
         else:
@@ -525,7 +589,23 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                     "STRUCTURE",
                     "REGION_ROLE_MISSING",
                     f"区域 {rid} 缺少 role 字段。",
-                    path=f"/regions/{idx}/role",
+                    path=f"/regions{idx}/role",
+                )
+            )
+
+        # 区域上的**失效引用**标记：只报**提示**，**不阻断**校验。
+        #
+        # 它是展示执行层（强制删除引用方仍在）写进来的：这份定义照样能用、
+        # 能存、能撤销 —— 所以问题落 ``WARNING`` 层，不进阻断层。
+        for entry in _region_error_entries(region):
+            issues.append(
+                _issue(
+                    WARNING_LAYER,
+                    "REGION_BROKEN_REFERENCE",
+                    f"区域 {rid} 的引用已失效："
+                    f"{entry.get('message') or entry.get('code') or '引用失效'}",
+                    path=f"/regions{idx}/{REGION_ERRORS_KEY}",
+                    suggestion="重新绑定这张卡片，或把它删掉。",
                 )
             )
 
@@ -537,7 +617,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                     "STRUCTURE",
                     "COMPONENT_TYPE_MISSING",
                     f"区域 {rid} 没有 component.type。",
-                    path=f"/regions/{idx}/component/type",
+                    path=f"/regions{idx}/component/type",
                 )
             )
         elif ctype not in SUPPORTED_COMPONENT_TYPES:
@@ -546,10 +626,44 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                     "CAPABILITY",
                     "COMPONENT_TYPE_UNSUPPORTED",
                     f"区域 {rid} 使用了不支持的组件类型：{ctype}",
-                    path=f"/regions/{idx}/component/type",
+                    path=f"/regions{idx}/component/type",
                     suggestion="改成 METRIC_CARD / TABLE / CHART / DATA_QUALITY 之一。",
                 )
             )
+
+        if is_container:
+            # 容器（分组）：**没有数据**，只管排列与阅读顺序。
+            children = region.get("children")
+            if not isinstance(children, list) or not children:
+                issues.append(
+                    _issue(
+                        "STRUCTURE",
+                        "CONTAINER_CHILDREN_EMPTY",
+                        f"分组 {rid} 里没有卡片。",
+                        path=f"/regions{idx}/children",
+                        suggestion="把卡片移进来，或者取消这个分组。",
+                    )
+                )
+            if region.get("data") or region.get("binding"):
+                issues.append(
+                    _issue(
+                        "STRUCTURE",
+                        "CONTAINER_HAS_DATA",
+                        f"分组 {rid} 不该带数据或绑定：分组只管外观。",
+                        path=f"/regions{idx}/data",
+                        suggestion="把数据留在卡片上。",
+                    )
+                )
+            arrangement = (component or {}).get("arrangement") or {}
+            if not isinstance(arrangement, dict) or not arrangement:
+                issues.append(
+                    _issue(
+                        "STRUCTURE",
+                        "CONTAINER_ARRANGEMENT_MISSING",
+                        f"分组 {rid} 缺少排列设置。",
+                        path=f"/regions{idx}/component/arrangement",
+                    )
+                )
 
         if ctype == "CHART":
             chart_kind = component.get("chartKind")
@@ -559,7 +673,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                         "CAPABILITY",
                         "CHART_KIND_UNSUPPORTED",
                         f"区域 {rid} 使用了不支持的图表类型：{chart_kind}",
-                        path=f"/regions/{idx}/component/chartKind",
+                        path=f"/regions{idx}/component/chartKind",
                     suggestion="改成 LINE / AREA / BAR / PIE 之一。",
                     )
                 )
@@ -576,7 +690,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                         "FIELD",
                         "DATASET_REF_UNKNOWN",
                         f"区域 {rid} 的 input {input_name} 引用了未声明的数据集 {ds_ref}",
-                        path=f"/regions/{idx}/data/inputs/{input_name}/datasetRef",
+                        path=f"/regions{idx}/data/inputs/{input_name}/datasetRef",
                         suggestion=f"在 /datasets 中声明 {ds_ref}。",
                     )
                 )
@@ -602,7 +716,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                             "FIELD",
                             "METRIC_REF_UNKNOWN",
                             f"区域 {rid} 的节点 {node.get('id')} 引用了未登记的指标 {metric_ref}。",
-                            path=f"/regions/{idx}/data/pipeline/nodes/{node_idx}/metricRef",
+                            path=f"/regions{idx}/data/pipeline/nodes/{node_idx}/metricRef",
                             suggestion="改用目录里已登记的指标。",
                         )
                     )
@@ -615,7 +729,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                                 "METRIC_VERSION_MISMATCH",
                                 f"区域 {rid} 的指标 {metric_ref} 版本是 {version}，"
                                 f"注册表里是 {metric.get('metricVersion')}。",
-                                path=f"/regions/{idx}/data/pipeline/nodes/{node_idx}/metricVersion",
+                                path=f"/regions{idx}/data/pipeline/nodes/{node_idx}/metricVersion",
                             )
                         )
             # 过滤字段必须存在
@@ -630,7 +744,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                             "FILTER_FIELD_UNKNOWN",
                             f"区域 {rid} 按 {field_ref} 过滤，但数据源里没有这个字段。",
                             path=(
-                                f"/regions/{idx}/data/pipeline/nodes/{node_idx}"
+                                f"/regions{idx}/data/pipeline/nodes/{node_idx}"
                                 f"/conditions/{cond_idx}/fieldRef"
                             ),
                             suggestion=f"可用字段：{'、'.join(sorted(available_fields))}。",
@@ -646,7 +760,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                             "DERIVED_KIND_UNSUPPORTED",
                             f"区域 {rid} 使用了不支持的派生列类型 {kind}。",
                             path=(
-                                f"/regions/{idx}/data/pipeline/nodes/{node_idx}"
+                                f"/regions{idx}/data/pipeline/nodes/{node_idx}"
                                 f"/columns/{col_idx}/kind"
                             ),
                             suggestion="改成 PREVIOUS_PERIOD / GROWTH_RATE / SHARE_OF_TOTAL 之一。",
@@ -664,7 +778,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                             "DERIVED_SOURCE_FIELD_UNKNOWN",
                             f"区域 {rid} 的派生列基于 {source_field}，但数据源里没有这个字段。",
                             path=(
-                                f"/regions/{idx}/data/pipeline/nodes/{node_idx}"
+                                f"/regions{idx}/data/pipeline/nodes/{node_idx}"
                                 f"/columns/{col_idx}/sourceFieldRef"
                             ),
                         )
@@ -688,7 +802,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                         "CAPABILITY",
                         "DERIVED_KIND_UNSUPPORTED",
                         f"区域 {rid} 使用了不支持的派生列类型 {kind}。",
-                        path=f"/regions/{idx}/binding/derivedColumns",
+                        path=f"/regions{idx}/binding/derivedColumns",
                     )
                 )
 
@@ -704,7 +818,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                             "GRAIN_NOT_SUPPORTED",
                             f"区域 {rid} 用了 {region_grain} 粒度，"
                             f"数据源 {catalog.get('sourceRef')} 只支持 {'、'.join(supported)}。",
-                            path=f"/regions/{idx}/context/grain",
+                            path=f"/regions{idx}/context/grain",
                             suggestion=f"改成 {'、'.join(supported)} 之一。",
                         )
                     )
@@ -730,7 +844,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                         "COLUMN_FIELD_UNKNOWN",
                         f"区域 {rid} 的列 {column.get('label') or column.get('id')} "
                         f"引用了拿不到的字段 {field_ref}。",
-                        path=f"/regions/{idx}/component/columns/{col_idx}/fieldRef",
+                        path=f"/regions{idx}/component/columns/{col_idx}/fieldRef",
                         suggestion=f"可用字段：{'、'.join(sorted(available_fields))}。",
                     )
                 )
@@ -744,7 +858,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                         "FIELD",
                         "STYLE_HINT_FIELD_UNKNOWN",
                         f"区域 {rid} 的条件样式引用了拿不到的字段 {field_ref}。",
-                        path=f"/regions/{idx}/component/styleHints/{hint_idx}/fieldRef",
+                        path=f"/regions{idx}/component/styleHints/{hint_idx}/fieldRef",
                         suggestion=f"可用字段：{'、'.join(sorted(available_fields))}。",
                     )
                 )
@@ -758,7 +872,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                             "CAPABILITY",
                             "STYLE_HINT_COMPARISON_UNSUPPORTED",
                             f"区域 {rid} 的排序指令用了不支持的比较符 {comparison}。",
-                            path=f"/regions/{idx}/component/styleHints/{hint_idx}/comparison",
+                            path=f"/regions{idx}/component/styleHints/{hint_idx}/comparison",
                             suggestion="改成 ASC / DESC 之一。",
                         )
                     )
@@ -769,7 +883,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                         "CAPABILITY",
                         "STYLE_HINT_COMPARISON_UNSUPPORTED",
                         f"区域 {rid} 的条件样式用了不支持的比较符 {comparison}。",
-                        path=f"/regions/{idx}/component/styleHints/{hint_idx}/comparison",
+                        path=f"/regions{idx}/component/styleHints/{hint_idx}/comparison",
                         suggestion="改成 GT / GTE / LT / LTE / EQ / NE 之一。",
                     )
                 )
@@ -779,7 +893,7 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                         "STRUCTURE",
                         "STYLE_HINT_THRESHOLD_MISSING",
                         f"区域 {rid} 的条件样式缺少 threshold。",
-                        path=f"/regions/{idx}/component/styleHints/{hint_idx}/threshold",
+                        path=f"/regions{idx}/component/styleHints/{hint_idx}/threshold",
                     )
                 )
 
@@ -802,7 +916,11 @@ def validate_definition(definition_draft: dict[str, Any] | None) -> ValidationRe
                 )
             )
 
-    passed = len(issues) == 0
+    # 只有**阻断层**的问题才让校验失败。
+    #
+    # 提示级（``WARNING``）的问题只是提醒：带失效引用标记的卡片**不阻断**
+    # 校验 —— 页面要可用、这份「错误草稿」要能存、撤销也要能用。
+    passed = not any(issue.layer in BLOCKING_LAYERS for issue in issues)
     logger.info(
         "[validation_service] passed=%s issue_count=%d", passed, len(issues)
     )
