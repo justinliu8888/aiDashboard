@@ -3,6 +3,7 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     AGENT_IMPL=fake \
+    AI_REQUIRE_ACCESS_TOKEN=1 \
     AI_SESSION_DB_PATH=/data/haewu.db
 
 WORKDIR /app/backend
