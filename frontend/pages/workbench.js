@@ -49,6 +49,8 @@ const session = {
   // 两者不同义：没显式保存过 savedRevision 就是 null。
   draftRevision: null,
   draftSavedRevision: null,
+  // 草稿备注：用户自己写的一句话说明（服务端下发，前端只读）。
+  draftRemark: "",
   // 撤销 / 重做游标：能否撤销、能否重做由服务端给，前端不自己算。
   canUndo: false,
   canRedo: false,
@@ -125,6 +127,9 @@ const draftApi = {
   },
   detail(draftId) {
     return this.request("/api/drafts/" + encodeURIComponent(draftId));
+  },
+  remove(draftId) {
+    return this.request("/api/drafts/" + encodeURIComponent(draftId), { method: "DELETE" });
   },
   action(draftId, action, payload = {}) {
     return this.request("/api/drafts/" + encodeURIComponent(draftId) + "/actions", {
@@ -1263,6 +1268,25 @@ function renderStoppedTurn() {
     // 否则用户看到的是「停了，但什么都没发生」。
     document.body.appendChild(box);
   }
+  // 停止提示旁也有一个反馈入口（20261104）：针对**这次已停止的请求**，
+  // 明确是客户端观察，不冒充最终回复。
+  // 原菜单（继续 / 撤销）与草稿锁**一律不动**。
+  if (typeof registerFeedbackClientEvent !== "function") return;
+  registerFeedbackClientEvent("client_stopped", {
+    taskId: session.stoppedTaskId,
+    observation: "user_stopped",
+  }).then((target) => {
+    if (!target) return;
+    let feedbackHost = box.querySelector("[data-feedback-host]");
+    if (!feedbackHost) {
+      feedbackHost = document.createElement("div");
+      feedbackHost.className = "feedback-host";
+      feedbackHost.dataset.feedbackHost = "1";
+      box.appendChild(feedbackHost);
+    }
+    const module = feedbackModule();
+    if (module) module.attach(feedbackHost, target);
+  });
 }
 
 /** 继续：从服务端检查点接着做，**不重复已提交阶段**。 */
@@ -1549,12 +1573,14 @@ function appendUser(text) {
 
 function aiBubble(innerHTML) {
   const wrap = document.createElement("div");
-  wrap.className = "flex gap-2.5";
+  // ai-bubble / ai-bubble-body：给这一条气泡一个**稳定锚点**。
+  // 反馈入口挂在这条气泡里（20261104），不靠猜「最后一个气泡」。
+  wrap.className = "ai-bubble flex gap-2.5";
   wrap.innerHTML = `
     <div class="w-8 h-8 shrink-0 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
       <iconify-icon class="text-white" icon="mdi:robot-outline"></iconify-icon>
     </div>
-    <div class="flex-1 min-w-0 space-y-2.5">${innerHTML}</div>`;
+    <div class="ai-bubble-body flex-1 min-w-0 space-y-2.5">${innerHTML}</div>`;
   chatScroll.appendChild(wrap);
   chatBubbleObserver.observe(wrap);
   scrollChatBottom();
@@ -1562,7 +1588,86 @@ function aiBubble(innerHTML) {
 }
 
 function appendAiText(text) {
-  aiBubble(`<div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">${esc(text)}</div>`);
+  return aiBubble(`<div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-700 leading-relaxed">${esc(text)}</div>`);
+}
+
+// ===== 反馈入口（20261104 回复评价与反馈收件箱）=====
+//
+// 纪律（这一段只做「挂接」，不改任何业务行为）：
+//   - 反馈 Module 只暴露 attach / refreshSubmitted / destroy；
+//   - **不调用** sendMessage / queueAdvance / 停止 / 接受 / 保存；
+//   - **不改**报表状态、定义、版本、锁、候选、菜单；
+//   - 目标来自**服务端这一轮给的冻结值**，不靠全局最新会话去猜。
+
+function feedbackModule() {
+  return window.WorkbenchFeedback || null;
+}
+
+/** 已挂上的评价目标（刷新后用它问服务端「这个浏览器提交过哪些」）。 */
+const feedbackTargetIds = new Set();
+
+/** 当前对话区里已画出的 AI 气泡数量（用于定位「这一轮的第一条气泡」）。 */
+function aiBubbleCount() {
+  return chatScroll.querySelectorAll(".ai-bubble").length;
+}
+
+/**
+ * 给这一轮挂一个反馈入口。
+ * @param target 服务端登记好的冻结目标（没有就不挂）。
+ * @param sinceIndex 这一轮开始前的气泡数 —— 本轮的第一条气泡就是它。
+ */
+function mountFeedbackTarget(target, sinceIndex = 0) {
+  const module = feedbackModule();
+  if (!module || !target || !target.id) return;
+  const bubbles = chatScroll.querySelectorAll(".ai-bubble");
+  const bubble = bubbles[sinceIndex] || bubbles[bubbles.length - 1];
+  if (!bubble) return;
+  const body = bubble.querySelector(".ai-bubble-body") || bubble;
+  let host = body.querySelector("[data-feedback-host]");
+  if (!host) {
+    host = document.createElement("div");
+    host.className = "feedback-host";
+    host.dataset.feedbackHost = "1";
+    body.appendChild(host);
+  }
+  module.attach(host, target);
+  feedbackTargetIds.add(target.id);
+}
+
+/**
+ * 登记一个**客户端事件**（传输失败 / 用户主动停止），拿到评价目标。
+ *
+ * 服务端能核实的字段自己读；核实不了的只记受限的客户端观察 ——
+ * 这里**不**上传任何「后台事实」。
+ */
+async function registerFeedbackClientEvent(kind, options = {}) {
+  const module = feedbackModule();
+  if (!module) return null;
+  const taskId = options.taskId || session.stoppedTaskId || null;
+  const messageId =
+    options.messageId || (taskId ? String(taskId).replace(/^task_/, "") : null);
+  const clientAttemptId = options.clientAttemptId || messageId || newMessageId();
+  try {
+    const response = await fetch(API_BASE + "/api/feedback/client-events", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({
+        kind,
+        clientAttemptId,
+        sessionId: session.sessionId || undefined,
+        messageId: messageId || undefined,
+        taskId: taskId || undefined,
+        observation: options.observation || undefined,
+      }),
+    });
+    if (!response.ok) return null;
+    const target = await response.json();
+    return target && target.id ? target : null;
+  } catch (err) {
+    // 登记失败**不打扰用户**：反馈是辅助能力，不该在这里报错。
+    return null;
+  }
 }
 
 function appendDebugTrace({ text, state, isAdvance }) {
@@ -3084,7 +3189,16 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
   } catch (err) {
     if (epoch !== requestEpoch || err.name === "AbortError") return;
     finishDebugTrace(debugCard, "failed");
+    // 传输失败：**客户端观察**，不冒充服务端已停止或业务失败。
+    // 失败这一条也给一个反馈入口（独立接口签发目标）。
+    const failureMark = typeof aiBubbleCount === "function" ? aiBubbleCount() : 0;
     appendAiText("请求失败：" + err.message);
+    if (typeof registerFeedbackClientEvent !== "function") return;
+    registerFeedbackClientEvent("client_failure", {
+      clientAttemptId: body.messageId || newMessageId(),
+      messageId: body.messageId || undefined,
+      observation: "transport_error",
+    }).then((target) => mountFeedbackTarget(target, failureMark));
     return;
   } finally {
     if (activeRequest?.controller === controller) {
@@ -3101,6 +3215,10 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
   }
 
   if (epoch !== requestEpoch) return;
+  // 这一轮的气泡锚点：反馈入口挂在**本轮第一条** AI 气泡里
+  // （同一轮多个气泡/卡片共用一个入口，不逐个挂）。
+  // typeof 守卫：只抽走部分函数的测试沙箱里没有这个函数 —— 不该因此炸掉。
+  const feedbackBubbleMark = typeof aiBubbleCount === "function" ? aiBubbleCount() : 0;
   // 方案状态跟着响应走：成功、失败、冲突都如实反映到方案卡片上。
   syncPlanFromResponse(data);
   if (data.error) {
@@ -3116,6 +3234,8 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
       updateMeta();
       renderSessionList();
     }
+    // 失败回复**也可以评价**：服务端这一轮登记过的目标照样给入口。
+    if (typeof mountFeedbackTarget === "function") mountFeedbackTarget(data.feedbackTarget, feedbackBubbleMark);
     return data;
   }
   // 回答菜单之后**不主动解锁**：解锁由服务端这一轮给的权威菜单决定
@@ -3190,6 +3310,8 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
     }
     updateMeta();
     renderSessionList();
+    // 只读回答也是一轮真实回复：同样可以评价。
+    if (typeof mountFeedbackTarget === "function") mountFeedbackTarget(data.feedbackTarget, feedbackBubbleMark);
     return;
   }
 
@@ -3223,6 +3345,17 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
   // 服务端给什么就是什么 —— 前端不自己数历史。
   const draftWorkspace = data.domainObjects?.draftWorkspace;
   if (draftWorkspace) applyWorkspaceState(draftWorkspace);
+
+  // 「同意报表」这一轮：服务端已经把确认下来的定义落库，并建好了草稿对象
+  // （`draftId` 就在上面那份 `draftWorkspace` 里）。
+  //
+  // 这一轮之后弹「保存草稿」对话框，让用户给草稿起名、写备注 ——
+  // 名字与备注的落点是草稿对象，走的也是既有的草稿动作。
+  if (data.uiActions?.includes("save_definition_draft")) {
+    promptSaveConfirmedDraft().catch((err) => {
+      toast("保存草稿失败：" + (err?.message || err));
+    });
+  }
 
   // 报示意载荷：草稿确认的**同一轮**响应就带它（不做二次请求）。
   //
@@ -3408,6 +3541,8 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
     await syncChoiceLockFromServer();
     syncInputControls();
   }
+  // 这一轮的反馈入口：一个回复一个入口（挂在本轮第一条气泡里）。
+  if (typeof mountFeedbackTarget === "function") mountFeedbackTarget(data.feedbackTarget, feedbackBubbleMark);
   return data;
 }
 
@@ -4365,6 +4500,7 @@ function renderReportPanel(highlightRegionIds = []) {
   const definition = session.definition;
 
   if (!bodyRegions.length) {
+    if (definition) previewRoot.appendChild(renderPanelHeader(definition, payload || {}, 0));
     if (previewError) {
       // 失败就说失败：上面已经是原因条了，不再摆「示意数据还没生成」的
       // 空态（失败时那句话是错的），也不画空壳卡片。
@@ -4729,11 +4865,7 @@ function renderDraftToolbar() {
   saveAsBtn.className = "wp-btn-save-as rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700";
   saveAsBtn.dataset.wpSaveAs = "1";
   saveAsBtn.textContent = "另存为";
-  saveAsBtn.addEventListener("click", () => {
-    const name = window.prompt("另存为新草稿，名字是？", session.definition?.metadata?.name || "报表草稿");
-    if (!name) return;
-    runDraftAction("SAVE_AS", { name });
-  });
+  saveAsBtn.addEventListener("click", () => runDraftAction("SAVE_AS"));
   bar.appendChild(saveAsBtn);
 
   const openBtn = document.createElement("button");
@@ -4743,6 +4875,13 @@ function renderDraftToolbar() {
   openBtn.textContent = "打开草稿";
   openBtn.addEventListener("click", () => openDraftPicker());
   bar.appendChild(openBtn);
+
+  const manageBtn = openBtn.cloneNode(false);
+  manageBtn.removeAttribute("data-wp-open-drafts");
+  manageBtn.dataset.wpManageDrafts = "1";
+  manageBtn.textContent = "管理草稿";
+  manageBtn.addEventListener("click", () => openDraftPicker(true));
+  bar.appendChild(manageBtn);
 
   if (session.draftId) {
     const tag = document.createElement("span");
@@ -4755,9 +4894,80 @@ function renderDraftToolbar() {
 }
 
 /**
+ * 弹「保存草稿 / 另存为」对话框：**草稿名 + 备注**。
+ *
+ * 两个字段是**两件事**：名字是标识（草稿列表按它认草稿），备注是给
+ * 人看的一句话说明（落在草稿对象上）。两者都在「保存草稿」这一次动作里
+ * 一起提交，不额外分一次请求。
+ *
+ * 取消返回 `null` —— 调用方要能分清「用户取消了」和「用户填了空名字」。
+ */
+function requestDraftName(action) {
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "rounded-xl border border-slate-200 p-5 shadow-xl";
+    dialog.style.cssText = "width:min(420px,calc(100vw - 32px));";
+    dialog.innerHTML = `<form method="dialog" class="space-y-4">
+      <h2 class="text-lg font-semibold">${action === "SAVE_AS" ? "另存为草稿" : "保存草稿"}</h2>
+      <label class="block text-sm">草稿名称
+        <input name="draftName" required maxlength="100" class="block w-full mt-2 rounded-lg border border-slate-300 p-2" />
+      </label>
+      <label class="block text-sm">备注（可选）
+        <textarea name="draftRemark" rows="3" maxlength="500"
+          class="block w-full mt-2 rounded-lg border border-slate-300 p-2"
+          placeholder="这份草稿的用途，比如「给领导看的那份」"></textarea>
+      </label>
+      <div class="flex justify-end gap-2">
+        <button type="button" data-cancel class="rounded-lg border px-4 py-2">取消</button>
+        <button value="save" class="rounded-lg bg-blue-600 text-white px-4 py-2">保存</button>
+      </div></form>`;
+    const input = dialog.querySelector("input");
+    const remark = dialog.querySelector("textarea");
+    input.value = session.definition?.metadata?.name || "报表草稿";
+    remark.value = session.draftRemark || "";
+    dialog.querySelector("form").addEventListener("submit", (event) => {
+      if (!input.value.trim()) {
+        event.preventDefault();
+        input.setCustomValidity("请输入草稿名称");
+        input.reportValidity();
+      }
+    });
+    input.addEventListener("input", () => input.setCustomValidity(""));
+    dialog.querySelector("[data-cancel]").addEventListener("click", () => dialog.close());
+    dialog.addEventListener("close", () => {
+      const confirmed = dialog.returnValue === "save";
+      const name = confirmed ? input.value.trim() : null;
+      const note = confirmed ? remark.value.trim() : "";
+      dialog.remove();
+      resolve(name ? { name, remark: note } : null);
+    }, { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    input.select();
+  });
+}
+
+/**
+ * 「同意」之后弹**保存草稿**对话框：让用户起名、写备注。
+ *
+ * 同意那一轮服务端已经把定义落库，也把草稿对象建好了（`draftId` 在
+ * `domainObjects.draftWorkspace` 里）。这里只补「叫什么名字 / 什么备注」
+ * —— 走的是既有的草稿动作，不另起一套提交逻辑。
+ *
+ * 取消**不算失败**：定义已经确认落库，对话框取消只是这次没改名，
+ * 用户还能在右侧面板再点「保存草稿」。
+ */
+async function promptSaveConfirmedDraft() {
+  if (!session.draftId) return;
+  const draft = await requestDraftName("SAVE");
+  if (!draft) return;
+  await runDraftAction("SAVE", { name: draft.name, remark: draft.remark });
+}
+
+/**
  * 打开草稿列表：只显示**名称与最近修改时间**（契约 0002 §6.2）。
  */
-async function openDraftPicker() {
+async function openDraftPicker(manage = false) {
   let drafts = [];
   try {
     drafts = await draftApi.list();
@@ -4765,52 +4975,120 @@ async function openDraftPicker() {
     toast("打开草稿列表失败：" + (err.message || err));
     return;
   }
-  if (!Array.isArray(drafts) || !drafts.length) {
-    toast("还没有已保存的草稿。");
-    return;
-  }
-  const label = drafts
-    .map((d) => `${d.name || "未命名草稿"}（${d.updatedAt || ""}）`)
-    .join("\n");
-  const picked = window.prompt("打开哪个草稿？\n" + label, drafts[0].name || "");
-  if (!picked) return;
-  const hit = drafts.find((d) => (d.name || "未命名草稿") === picked) || drafts[0];
-  await openDraft(hit.draftId);
+  const dialog = document.createElement("dialog");
+  dialog.className = "rounded-xl border border-slate-200 p-5 shadow-xl";
+  dialog.style.cssText = "width:min(640px,calc(100vw - 32px));max-height:80vh;overflow:auto;";
+  dialog.innerHTML = `<div class="flex justify-between items-center gap-4 mb-4">
+    <h2 class="text-lg font-semibold">${manage ? "管理草稿" : "打开草稿"}</h2>
+    <button type="button" data-close class="rounded-lg border px-3 py-1">关闭</button>
+    </div><div data-draft-list class="space-y-3"></div>`;
+  const list = dialog.querySelector("[data-draft-list]");
+  const renderList = () => {
+    list.replaceChildren();
+    if (!drafts.length) list.textContent = "还没有草稿。";
+    for (const draft of drafts) {
+      const row = document.createElement("div");
+      row.className = "flex items-center gap-3 rounded-lg border border-slate-200 p-3";
+      const info = document.createElement("div");
+      info.className = "flex-1 min-w-0 break-words";
+      const title = document.createElement("div");
+      title.className = "font-medium";
+      title.textContent = (draft.name || "未命名草稿") + (draft.draftId === session.draftId ? "（当前打开）" : "");
+      const time = document.createElement("div");
+      time.className = "text-xs text-slate-500 mt-1";
+      time.textContent = (draft.updatedAt || "").replace("T", " ");
+      info.append(title, time);
+      row.appendChild(info);
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "rounded-lg border px-3 py-1 text-sm";
+      open.textContent = "打开";
+      open.addEventListener("click", async () => {
+        open.disabled = true;
+        if (await openDraft(draft.draftId)) dialog.close();
+        else open.disabled = false;
+      });
+      row.appendChild(open);
+      if (manage) {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "rounded-lg border px-3 py-1 text-sm text-red-600 disabled:opacity-40";
+        remove.textContent = "删除";
+        remove.disabled = draft.draftId === session.draftId;
+        remove.title = remove.disabled ? "请先打开其他草稿或新建对话，再删除这份草稿" : "删除这份草稿";
+        remove.addEventListener("click", async () => {
+          if (!window.confirm(`确定删除「${draft.name || "未命名草稿"}」？草稿及修改历史将永久删除，对话记录保留。`)) return;
+          remove.disabled = true;
+          open.disabled = true;
+          try {
+            await draftApi.remove(draft.draftId);
+            drafts = drafts.filter((item) => item.draftId !== draft.draftId);
+            renderList();
+            toast("草稿已删除");
+          } catch (err) {
+            toast("删除失败：" + (err.message || err));
+            remove.disabled = false;
+            open.disabled = false;
+          }
+        });
+        row.appendChild(remove);
+      }
+      list.appendChild(row);
+    }
+  };
+  dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  renderList();
+  document.body.appendChild(dialog);
+  dialog.showModal();
 }
 
-/** 打开一个草稿：把它的定义读回当前工作台。 */
+/**
+ * 打开一个草稿：把工作台**切到这份草稿的现场会话**。
+ *
+ * 「现场」= 这份草稿现在停在哪一步 —— 它的对话、待决菜单、状态。
+ * 服务端在响应里告诉我们切到了哪条会话（`sessionId`），这边把那条会话
+ * 整个恢复回来：右边换成这份草稿，左边回到它自己的对话现场。
+ *
+ * **不自己另开一条空会话**：空会话没有对话（连会话列表里都不出现），
+ * 打开后左边一片空白，而真正有对话的那条会话被落在了后面。
+ */
 async function openDraft(draftId) {
+  if (activeRequest || advanceTimers.size) {
+    toast("请先等当前请求结束，再打开草稿。");
+    return false;
+  }
   try {
-    // 先确保有会话：草稿要**绑到会话**上。
-    // 绑定是后续那一轮写锁与任务登记的前提（契约 0002 §7）——
-    // 后端是按 `会话 → 草稿` 找写锁对象的（`load_draft_id`），
-    // 没有绑定的话，打开草稿后再提修改要求就**不受写锁保护**，
-    // 「停止 / 继续」那条链也建不起任务。
-    // 会话本来也是发第一条消息时才创建的（见 sendMessage），
-    // 这里只是把同一个动作提前，避免开了草稿却没绑上。
-    if (!session.sessionId) {
-      try {
-        const created = await sessionApi.create();
-        session.sessionId = created.sessionId;
-        writeLastSessionId(session.sessionId);
-      } catch (err) {
-        toast("创建会话失败：" + err.message);
-        return;
-      }
-    }
-    // 先让服务端**切对象身份**：切完之后后续对话提交落到这个草稿上，
-    // 而不是还挂在原来那个对象上（原草稿一个字节都不改）。
-    let state = null;
-    try {
-      state = await draftApi.open(draftId, session.sessionId);
-    } catch (err) {
-      // 切换失败也要把内容显示出来：读回定义至少能看见。
-      state = await draftApi.detail(draftId);
-    }
+    // 先让服务端**切对象身份**，并问出这份草稿的现场会话是哪一条：
+    // 切完之后后续对话提交落到这个草稿上，而不是还挂在原来那个对象上
+    // （原草稿一个字节都不改）。
+    //
+    // **不传会话**：服务端会切到那份草稿的**现场会话**（有对话的那条）。
+    // 自己指定一条会话反而会把草稿搬离它的对话现场 —— 左边一片空白。
+    let state = await draftApi.open(draftId, "");
     if (!state) {
       toast("这个草稿不存在。");
-      return;
+      return false;
     }
+    let targetSessionId = String(state.sessionId || "").trim();
+    if (!targetSessionId) {
+      // 这份草稿还没有任何会话（从没在对话里用过）：给它开一条。
+      // 绑定是后续那一轮写锁与任务登记的前提（契约 0002 §7）——
+      // 后端是按 `会话 → 草稿` 找写锁对象的（`load_draft_id`），
+      // 没有绑定的话，打开草稿后再提修改要求就**不受写锁保护**。
+      try {
+        const created = await sessionApi.create();
+        targetSessionId = created.sessionId;
+        state = await draftApi.open(draftId, targetSessionId);
+      } catch (err) {
+        toast("创建会话失败：" + err.message);
+        return false;
+      }
+    }
+    // 把工作台换到那条会话：对话、待决菜单、状态一起回来。
+    // **状态与菜单始终是会话自己的** —— 服务端只在「这条会话还是空的」
+    // 时把草稿的现场写进去，之后一律以会话为准。
+    if (targetSessionId) await restoreSession(targetSessionId);
     applyWorkspaceState(state);
     if (state.definition) {
       session.definition = state.definition;
@@ -4818,16 +5096,16 @@ async function openDraft(draftId) {
     }
     // 载荷用**打开接口返回的那一份**：示意载荷不落库（ADR 0004），
     // 会话里没有；再向会话要会把刚打开的草稿内容覆盖回去。
-    if (state.reportPreviewPayload) {
-      session.reportPreviewPayload = state.reportPreviewPayload;
-      session.reportPreviewError = null;
-    } else {
-      await refreshPreviewPayload({ keepDefinition: true });
-    }
+    session.reportPreviewPayload = state.reportPreviewPayload || null;
+    session.reportPreviewError = state.reportPreviewError || null;
     renderReportPanel();
+    updateMeta();
+    if (readPaneMode() === "chat") applyPaneMode("split");
     toast("已打开草稿「" + (state.name || draftId) + "」");
+    return true;
   } catch (err) {
     toast("打开草稿失败：" + (err.message || err));
+    return false;
   }
 }
 
@@ -4837,6 +5115,7 @@ function applyWorkspaceState(state) {
   if (state.draftId) session.draftId = state.draftId;
   if (state.revision !== undefined && state.revision !== null) session.draftRevision = state.revision;
   if (state.savedRevision !== undefined) session.draftSavedRevision = state.savedRevision;
+  if (state.description !== undefined) session.draftRemark = state.description || "";
   if (state.canUndo !== undefined) session.canUndo = !!state.canUndo;
   if (state.canRedo !== undefined) session.canRedo = !!state.canRedo;
   // 主题要**完整**才生效：只有 themeId 的残缺主题没有 token，
@@ -4893,6 +5172,11 @@ async function runDraftAction(action, payload = {}) {
   if (!session.draftId) {
     toast("这份报表还没有草稿对象，先做一次修改。");
     return;
+  }
+  if ((action === "SAVE" || action === "SAVE_AS") && payload.name === undefined) {
+    const draft = await requestDraftName(action);
+    if (!draft) return;
+    payload = { ...payload, name: draft.name, remark: draft.remark };
   }
   try {
     const result = await draftApi.action(session.draftId, action, {
@@ -5845,6 +6129,21 @@ async function deleteSession(sessionId) {
   }
 }
 
+/**
+ * 那张待决菜单**是不是已经画在屏上**了。
+ *
+ * 不能只看「回放过没有」—— 回放画菜单有三条路径（确认卡 / 待确认计划卡 /
+ * 普通问题卡），只有其中两条会登记「画过了」。这里直接查屏上有没有这张卡：
+ * 卡的 select 上带 `data-question-id`，按 id 认。
+ */
+function pendingMenuCardShown(question) {
+  const id = String(question?.id || "").trim();
+  if (!id) return false;
+  return Array.from(document.querySelectorAll(".question-select")).some(
+    (el) => el.getAttribute("data-question-id") === id
+  );
+}
+
 // 还原会话：把消息逐条回放，再恢复状态机位置、报表预览和选择锁
 // 返回 { ok, missing }：
 //   ok=true            恢复成功
@@ -5944,6 +6243,7 @@ async function restoreSession(sessionId, { silent = false, token = null, detail:
       appendUser(message.content);
       replayEvents.push({ type: "user", content: message.content });
     } else if (message.payload) {
+      const bubbleMark = aiBubbleCount();
       const menu = replayAssistantMessage(message.payload, pending);
       replayEvents.push({ type: "assistant", response: message.payload, menu: menu || null });
       // 被撤销的那一步：消息文本**保留**，但那一步的控件失效并标成「已撤销」
@@ -5951,6 +6251,10 @@ async function restoreSession(sessionId, { silent = false, token = null, detail:
       if (isRevokedMessagePayload(message.payload)) {
         applyRevokedSteps(revokedStepIdsOfPayload(message.payload));
       }
+      // 历史评价目标（20261104）：**能可靠关联的才挂**。
+      // 老消息没有目标 → 明确不支持，不按最新回复补绑。
+      const historyTarget = message.feedbackTarget || message.payload?.feedbackTarget || null;
+      if (typeof mountFeedbackTarget === "function") mountFeedbackTarget(historyTarget, bubbleMark);
     } else {
       appendAiText(message.content);
     }
@@ -5959,6 +6263,13 @@ async function restoreSession(sessionId, { silent = false, token = null, detail:
   // 恢复失败：在对话区说清楚原因（与聊天响应的失败写法一致）。
   // 放在回放之后：这条不是历史消息，是**这一次恢复**的结果。
   if (session.reportPreviewError) appendAgentError(session.reportPreviewError);
+
+  // 刷新后恢复「已反馈」标记（同一个浏览器的匿名身份）。
+  // 服务端只返回**自己**提交过的目标，不返回别人的反馈。
+  const feedbackModuleApi = feedbackModule();
+  if (feedbackModuleApi && feedbackTargetIds.size) {
+    feedbackModuleApi.refreshSubmitted(Array.from(feedbackTargetIds));
+  }
 
   // 恢复右侧报表面板：只有一条渲染入口，数据只来自示意载荷。
   try {
@@ -5975,8 +6286,13 @@ async function restoreSession(sessionId, { silent = false, token = null, detail:
   // 后端没存（例如只有 changeSet 的变更方案）就用回放过程判断出来的那份菜单兜底，
   // 但只认**还没被答掉**的那份：问一句只读问题不会关掉菜单，
   // 答完菜单或后续业务动作则视为菜单已失效，恢复时不能把过时确认项摆回来。
-  if (pending) setChoiceLock(pending);
-  else {
+  if (pending) {
+    // 服务端说还有待决菜单、但**屏上没有那张卡**（会话是空的 —— 比如刚
+    // 打开一个草稿，对话区还没有历史可以回放它）：把它补上。
+    // 只有锁没有卡 = 用户看着输入框被锁住，却找不到那张卡可答。
+    if (!pendingMenuCardShown(pending)) appendAiQuestions([pending], { lock: true });
+    else setChoiceLock(pending);
+  } else {
     const openMenu = WorkbenchQuery.resolveOpenMenuAfterReplay(replayEvents);
     // 回放兜底出来的菜单**不是**服务端当前的有效菜单：
     // 刷新后按服务端阶段恢复锁或不锁，不按历史消息推断（规格第 60 条、
@@ -6327,6 +6643,8 @@ $("btn-regenerate").addEventListener("click", () => {
   sendMessage("生成 A 机房昨日能耗日报，包含总耗电、设备排名和趋势分析");
 });
 $("btn-stop").addEventListener("click", cancelActiveRequest);
+$("btn-save-draft").addEventListener("click", () => runDraftAction("SAVE"));
+$("btn-manage-drafts").addEventListener("click", () => openDraftPicker(true));
 
 /**
  * 主题联动：窗口重新拿到焦点时，向服务端要一次**权威主题**。
@@ -6676,6 +6994,16 @@ function closePaneMenu(restoreFocus) {
   setState("ANALYZING");
   updateMeta();
   await renderSessionList();
-  // 刷新后自动接回上次那条会话；接不回来也会明确提示，历史入口始终保留。
-  await autoRestoreSession();
+  // 深链：``?session=<sessionId>`` 直接打开那条会话（预览 / 自检要用它
+  // 定位到有评价目标的那一轮）。没带这个参数时，沿用「接回上次那条」。
+  const requestedSession = new URLSearchParams(window.location.search).get("session");
+  if (requestedSession) {
+    const opened = await restoreSession(requestedSession, { silent: true });
+    if (!opened.ok) {
+      toast("没能打开链接里的会话，历史入口在左边。");
+    }
+  } else {
+    // 刷新后自动接回上次那条会话；接不回来也会明确提示，历史入口始终保留。
+    await autoRestoreSession();
+  }
 })();

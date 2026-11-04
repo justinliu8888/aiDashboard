@@ -316,14 +316,20 @@ CREATE TABLE IF NOT EXISTS draft_themes (
 | `list_drafts() -> list[dict]` | 只返回 `draftId` / `name` / `updatedAt` |
 | `load_draft(draft_id) -> WorkspaceState \| None` | |
 | `commit_edit(draft_id, *, definition, snapshot, expected_revision, label) -> WorkspaceState` | **一次接受 = 一个修改单位**：写定义 + 写版本 + 写历史 + 推进 undo 指针，**同一事务** |
-| `save(draft_id, *, expected_revision) -> WorkspaceState` | 显式保存版：`savedRevision` 前进，**不自动发布** |
+| `save(draft_id, *, expected_revision, name?, remark?) -> WorkspaceState` | 显式保存版：`savedRevision` 前进，**不自动发布**；`name` 改草稿名、`remark` 改备注（**没给就不动原值**） |
 | `undo(draft_id) -> WorkspaceState` | 游标前移，恢复上一完成单位；**revision 仍单调递增**（不回退乐观锁数值） |
 | `redo(draft_id) -> WorkspaceState` | |
-| `save_as(draft_id, *, name) -> WorkspaceState` | 新 draftId；**不复制聊天、redo、旧修改历史**；可共用同一主题引用 |
+| `save_as(draft_id, *, name, remark?) -> WorkspaceState` | 新 draftId；**不复制聊天、redo、旧修改历史**；可共用同一主题引用；`remark` 给了就用它，不给就沿用源草稿的备注 |
 | `begin_task / checkpoint_task / complete_task / stop_task` | 任务状态机与检查点 |
 | `acquire(draft_id, owner) / release(draft_id, owner)` | 同草稿写互斥 |
 
 `WorkspaceState` 至少含：`draftId`、`revision`、`savedRevision`、`definition`、`businessState`、`prompt`、`pendingChoice`、`pendingEditPlan`、`undoPointer`、`redoPointer`、`activeTask`、`themeId`、`updatedAt`。
+
+**草稿名与草稿备注是两件事**（v1 增补）：
+
+- **草稿名**（`draft_objects.name`）是**标识** —— 草稿列表按它认草稿，默认取定义里的报表名；
+- **草稿备注**（`draft_objects.description`）是**给人看的一句话说明** —— 落点唯一，不写进 `definition.metadata.description`（那是系统自动生成的「X 由 AI 生成的首版草稿」，语义不同，不许被用户备注覆盖）；
+- 备注**只进草稿详情**，**不进草稿列表**：`list_drafts()` 仍然只返回 `draftId` / `name` / `updatedAt`。
 
 ### 6.3 版本语义
 
@@ -331,6 +337,19 @@ CREATE TABLE IF NOT EXISTS draft_themes (
 - 撤销移动历史游标并恢复内容，但**写入版本仍单调递增**。
 - 新修改提交**清掉旧 redo 分支**。
 - 重开恢复同一游标与菜单，**不自动续跑**。
+- **重开同时切到那份草稿当前的 state**（v1 增补）：「打开草稿」= 会话切到
+  那个草稿对象上 —— **内容、状态、待决菜单一起切**，不是只换右边那块内容。
+  - **切到「现场会话」**：现场会话 = **当前指向这份草稿、并且有对话记录**的
+    那条会话（`sessions.snapshot.draftId` 反查 + 消息条数）。打开草稿
+    **不另开空会话** —— 空会话没有对话（连会话列表里都不出现），打开后
+    左边一片空白，而真正有对话的那条会话被落在后面。
+    打开接口的 body 里 **指定了 `sessionId` 就照它来**（调用方要在这条
+    会话上打开这份草稿）；**没指定**才用现场会话。响应里的 `sessionId`
+    是实际用到的那一条。
+  - **状态与菜单始终是会话自己的**：已经有对话的那条会话，它的状态与待决
+    菜单**不许**被草稿快照覆盖（那份快照可能更旧）；只有**空会话**才把
+    草稿落库那一版的 `businessState` / `pendingChoice` 写进去当初始值。
+  - 工作区状态里 `pendingChoice` 是 **JSON 文本**，用的时候解析回对象。
 
 ---
 
@@ -340,7 +359,8 @@ CREATE TABLE IF NOT EXISTS draft_themes (
 | --- | --- | --- | --- |
 | GET | `/api/drafts` | — | `[{draftId, name, updatedAt}]` |
 | GET | `/api/drafts/{draftId}` | — | `WorkspaceState` |
-| POST | `/api/drafts/{draftId}/actions` | `{action: "SAVE"\|"UNDO"\|"REDO"\|"SAVE_AS", expectedRevision?: int, name?: str}` | `WorkspaceState` |
+| POST | `/api/drafts/{draftId}/open` | `{sessionId?: string}` | `WorkspaceState` + `sessionId`（实际用到的那条会话）+ `sceneSessionId`（那份草稿的现场会话）：**内容 + 状态 + 待决菜单一起切** |
+| POST | `/api/drafts/{draftId}/actions` | `{action: "SAVE"\|"UNDO"\|"REDO"\|"SAVE_AS", expectedRevision?: int, name?: str, remark?: str}` | `WorkspaceState` |
 | POST | `/api/draft-tasks/{taskId}/stop` | — | `{state, choices: ["继续完成剩下的工作","撤销（回到上一步）"]}` |
 | POST | `/api/draft-tasks/{taskId}/resume` | — | `{state}` |
 

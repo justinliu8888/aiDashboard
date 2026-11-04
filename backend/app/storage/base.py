@@ -61,6 +61,15 @@ class SessionRepository(Protocol):
     ) -> None:
         """写 / 清选择锁。传 None 表示清空（用户已经选过了）。"""
 
+    def count_messages(self, session_id: str) -> int:
+        """这条会话有多少条消息。"""
+
+    def find_sessions_by_draft_id(self, draft_id: str) -> list[tuple[str, int, str]]:
+        """哪些会话当前指向这份草稿，以及各自有多少条对话。
+
+        返回 ``[(sessionId, messageCount, updatedAt)]``。
+        """
+
     # ---------- 待确认的编辑计划 ----------
     #
     # 这三个操作必须是**数据库层面的原子操作**，不能靠进程内锁：

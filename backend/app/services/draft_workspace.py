@@ -129,6 +129,9 @@ class WorkspaceState:
     updatedAt: str
     sessionId: str | None = None
     name: str = ""
+    #: 草稿备注：用户自己写的一句话说明（落 `draft_objects.description`）。
+    #: 与草稿名**分属两件事** —— 名字是标识，备注是给人看的说明。
+    description: str = ""
     canUndo: bool = False
     canRedo: bool = False
 
@@ -150,6 +153,7 @@ class WorkspaceState:
             "updatedAt": self.updatedAt,
             "sessionId": self.sessionId,
             "name": self.name,
+            "description": self.description,
             "canUndo": self.canUndo,
             "canRedo": self.canRedo,
         }
@@ -456,13 +460,20 @@ class DraftWorkspace:
 
     # ---------- 显式保存 ----------
 
-    def save(self, draft_id: str, *, expected_revision: int | None = None) -> WorkspaceState:
+    def save(
+        self, draft_id: str, *, expected_revision: int | None = None,
+        name: str | None = None, remark: str | None = None,
+    ) -> WorkspaceState:
         """显式保存版：`savedRevision` 前进，**不自动发布**。
 
         保存会留一条 `kind='saved'` 的版本快照；`savedRevision` 记的是
         **那条保存版的版本号**（指向 `draft_versions` 里的一行），
         与编辑链版本号 `revision` **互不占用**：保存不动编辑链，
         也不动撤销单位。
+
+        `remark` 是**用户写的备注**，落在 `draft_objects.description`：
+        草稿名是标识、备注是给人看的说明，两者是两件事。
+        **没给就不动原备注**（传空字符串才是「清空备注」）。
         """
         with self.repo.transaction():
             obj = self.adapter.get_draft_object(draft_id)
@@ -479,11 +490,26 @@ class DraftWorkspace:
             cursor = _clamp_cursor(int(obj["undo_cursor"]), len(units))
             active = units[cursor] if units else None
             revision = self._next_revision(draft_id, current)
+            saved_name = name.strip() if name is not None else obj["name"]
+            # 备注：只有**显式给了**才覆盖。`None` = 这次不改备注，
+            # 空字符串 = 清空备注 —— 两种意思不能混。
+            saved_remark = (
+                remark.strip() if remark is not None else str(obj.get("description") or "")
+            )
+            definition = dict((active or {}).get("definition") or {})
+            if name is not None and isinstance(definition.get("metadata"), dict):
+                definition["metadata"] = {**definition["metadata"], "name": saved_name}
+                if active is not None:
+                    self.repo.conn.execute(
+                        "UPDATE draft_versions SET definition_json = ? "
+                        "WHERE draft_id = ? AND revision = ? AND kind = 'edit'",
+                        (json.dumps(definition, ensure_ascii=False), draft_id, active["revision"]),
+                    )
             self.adapter.insert_draft_version(
                 draft_id,
                 revision,
                 "saved",
-                (active or {}).get("definition") or {},
+                definition,
                 (active or {}).get("snapshot"),
                 "saved",
             )
@@ -497,6 +523,8 @@ class DraftWorkspace:
             # 保存**不推进编辑链版本号**：revision 仍是当前编辑版本。
             self.adapter.upsert_draft_object(
                 draft_id=draft_id,
+                name=saved_name,
+                description=saved_remark,
                 saved_revision=revision,
             )
         logger.info(
@@ -601,6 +629,7 @@ class DraftWorkspace:
         *,
         name: str,
         expected_revision: int | None = None,
+        remark: str | None = None,
     ) -> WorkspaceState:
         """另存为：新 `draftId`，**原草稿不变**。
 
@@ -609,6 +638,9 @@ class DraftWorkspace:
 
         `expected_revision` 对**源草稿**生效：两个窗口各改各的时，
         拿旧版本号来另存为会被拒绝。
+
+        `remark` 给了就用它当新草稿的备注；不给就沿用源草稿的备注
+        （另存为本来就要把这份内容整套带走）。
         """
         with self.repo.transaction():
             obj = self.adapter.get_draft_object(draft_id)
@@ -625,10 +657,16 @@ class DraftWorkspace:
             cursor = _clamp_cursor(int(obj["undo_cursor"]), len(units))
             active = units[cursor] if units else None
             new_id = f"draft_{uuid.uuid4().hex[:12]}"
+            definition = dict((active or {}).get("definition") or {})
+            if isinstance(definition.get("metadata"), dict):
+                definition["metadata"] = {**definition["metadata"], "name": name}
+            new_remark = (
+                remark.strip() if remark is not None else str(obj.get("description") or "")
+            )
             self.adapter.upsert_draft_object(
                 draft_id=new_id,
                 name=name or "未命名草稿",
-                description=obj["description"] or "",
+                description=new_remark,
                 # 聊天不跟着复制走：另存为之后由上层另行绑定会话。
                 session_id=None,
                 current_revision=1,
@@ -640,7 +678,7 @@ class DraftWorkspace:
                 new_id,
                 1,
                 "edit",
-                (active or {}).get("definition") or {},
+                definition,
                 (active or {}).get("snapshot"),
                 "saved_as",
             )
@@ -668,6 +706,21 @@ class DraftWorkspace:
             self.adapter.upsert_draft_object(
                 draft_id=draft_id, session_id=session_id
             )
+
+    def delete(self, draft_id: str) -> None:
+        """Delete one unlocked object, keeping conversations and other drafts."""
+        with self.repo.transaction():
+            if self.adapter.get_draft_object(draft_id) is None:
+                raise DraftNotFound("这个草稿不存在。")
+            self.require_unlocked(draft_id)
+            if self.adapter.active_task(draft_id) is not None:
+                raise DraftLocked("这个草稿还有未结束的任务，请先结束任务。")
+            self.repo.conn.execute(
+                "UPDATE sessions SET snapshot = json_remove(snapshot, '$.draftId') "
+                "WHERE json_extract(snapshot, '$.draftId') = ?",
+                (draft_id,),
+            )
+            self.adapter.delete_draft_object(draft_id)
 
     # ---------- 任务状态机 ----------
 
@@ -1035,6 +1088,7 @@ class DraftWorkspace:
             updatedAt=obj["updated_at"],
             sessionId=obj["session_id"],
             name=obj["name"] or "",
+            description=str(obj.get("description") or ""),
             canUndo=cursor > 0,
             canRedo=redo_pointer > 0,
         )

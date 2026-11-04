@@ -312,10 +312,18 @@ def _persist_turn(
     **同一笔事务**里提交掉的（由设计存储调用），这里再落一遍会写出
     重复消息。响应上的 ``turnPersisted`` 就是这个信号。
     """
-    if getattr(response, "turnPersisted", False):
-        return
     session_key = session_service.resolve_session_id(request)
     task_id = _task_id_of(request)
+    if getattr(response, "turnPersisted", False):
+        # 设计流的成功轮：会话这一轮已经由设计存储**同事务**提交掉了，
+        # 这里不能再记一遍（会写出重复消息）。
+        #
+        # 但「确认报表」这一轮要**建草稿基线**：草稿工作区是「草稿名 /
+        # 备注」的落点，用户确认完还要能命名、写备注（契约 0002 §6）。
+        _commit_confirmed_draft_workspace(
+            session_key, response, request=request
+        )
+        return
     try:
         with session_service.repository.transaction():
             # 栅栏先行：**会话一个字都还没写**的时候就把不能落库的轮挡掉。
@@ -497,12 +505,51 @@ def _complete_turn_task(task_id: str | None, state: Any) -> None:
     draft_workspace.complete_task(task_id, commit_token=uuid.uuid4().hex[:12])
 
 
+def _commit_confirmed_draft_workspace(
+    session_key: str,
+    response: AgentResponse,
+    *,
+    request: AgentRequest | None = None,
+) -> Any:
+    """「确认报表」这一轮：把确认下来的定义落成**草稿对象**。
+
+    设计流的成功轮里，会话消息已经由设计存储提交掉了（``turnPersisted``），
+    路由层不能再记一遍；但**草稿工作区还没建基线** —— 用户确认完还要
+    能命名、写备注，而「草稿名 / 备注」的落点是草稿对象（契约 0002 §6）。
+
+    **只在「确认报表」这一轮做**（``save_definition_draft``）：只读问答、
+    澄清轮、失败轮都**不许**凭空建草稿。
+
+    失败**不拖垮这一轮**：定义已经确认落库了，为一个草稿基线把整轮判
+    失败，用户会以为「同意」没生效。记错误类型与调用栈，不记异常原文（#61）。
+    """
+    if "save_definition_draft" not in (response.uiActions or []):
+        return None
+    try:
+        with session_service.repository.transaction():
+            return _commit_draft_workspace(
+                session_key,
+                response,
+                request=request,
+                separate_draft_on_change=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "[agent.chat] 确认报表后建草稿基线失败 sessionId=%s errorType=%s",
+            session_key,
+            type(exc).__name__,
+            exc_info=(type(exc), None, exc.__traceback__),
+        )
+        return None
+
+
 def _commit_draft_workspace(
     session_key: str,
     response: AgentResponse,
     *,
     request: AgentRequest | None = None,
     task_id: str | None = None,
+    separate_draft_on_change: bool = False,
 ) -> Any:
     """把这一轮的定义落进**草稿工作区**（契约 0002 §6）。**在事务里调用。**
 
@@ -510,6 +557,11 @@ def _commit_draft_workspace(
     - 定义变了 → 提交一次修改（= 一个撤销单位）；
     - 定义没变 → **不提交**：内容一样就不该多出一个修改单位
       （续跑时已提交的阶段不能再落第二个）。
+
+    `separate_draft_on_change=True` 时（**确认报表**那一轮），定义变了
+    **另起一个草稿对象**而不是当成对上一份草稿的修改 —— 确认的是
+    **另一份报表**时，两份报表不能挤进同一个草稿（用户刚命名过的草稿
+    会被下一份报表顶掉）。
 
     **失败要抛出去**：外层事务据此回滚（会话与草稿一起回滚），
     不留半份状态。这里不吞异常 —— 吞掉就等于「会话写了、草稿没写」。
@@ -522,16 +574,7 @@ def _commit_draft_workspace(
     draft_id = session_service.load_draft_id(session_key)
     workspace_snapshot = _workspace_snapshot(session_key, response, request)
     if not draft_id:
-        draft_id = f"draft_{uuid.uuid4().hex[:12]}"
-        name = str((definition.get("metadata") or {}).get("name") or "报表草稿")
-        state = draft_workspace.create_draft(
-            draft_id,
-            session_id=session_key,
-            name=name,
-            definition=definition,
-            snapshot=workspace_snapshot,
-        )
-        session_service.set_draft_id(session_key, draft_id)
+        _, state = _create_baseline_draft(session_key, definition, workspace_snapshot)
     else:
         current = draft_workspace.load_draft(draft_id)
         if current is None:
@@ -539,6 +582,9 @@ def _commit_draft_workspace(
         if _same_definition(current.definition, definition):
             # 内容没变 → 不产生新的修改单位（一个接受 = 一个修改单位）。
             state = current
+        elif separate_draft_on_change:
+            # 确认的是**另一份报表** → 另起一个草稿对象。
+            _, state = _create_baseline_draft(session_key, definition, workspace_snapshot)
         else:
             state = draft_workspace.commit_edit(
                 draft_id,
@@ -552,6 +598,26 @@ def _commit_draft_workspace(
         )
     _complete_turn_task(task_id, state)
     return state
+
+
+def _create_baseline_draft(
+    session_key: str, definition: dict[str, Any], workspace_snapshot: dict[str, Any]
+) -> tuple[str, Any]:
+    """建一份**基线草稿**（revision 1，无撤销条目）并把会话绑上去。
+
+    草稿名先取定义里的报表名 —— 用户确认后紧接着就能改名与写备注。
+    """
+    draft_id = f"draft_{uuid.uuid4().hex[:12]}"
+    name = str((definition.get("metadata") or {}).get("name") or "报表草稿")
+    state = draft_workspace.create_draft(
+        draft_id,
+        session_id=session_key,
+        name=name,
+        definition=definition,
+        snapshot=workspace_snapshot,
+    )
+    session_service.set_draft_id(session_key, draft_id)
+    return draft_id, state
 
 
 def _draft_workspace_payload(state: Any, *, definition: Any = None) -> dict[str, Any]:
@@ -571,6 +637,7 @@ def _draft_workspace_payload(state: Any, *, definition: Any = None) -> dict[str,
     return {
         "draftId": payload.get("draftId"),
         "name": payload.get("name"),
+        "description": payload.get("description"),
         "revision": payload.get("revision"),
         "savedRevision": payload.get("savedRevision"),
         "canUndo": bool(payload.get("canUndo")),

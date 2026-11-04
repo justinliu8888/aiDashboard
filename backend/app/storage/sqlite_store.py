@@ -46,7 +46,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     message_count        INTEGER NOT NULL DEFAULT 0,
     snapshot             TEXT,
     pending_choice       TEXT,
-    pending_edit_plan    TEXT,
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
     deleted_at           TEXT
@@ -694,6 +693,43 @@ class SqliteSessionRepository:
             updatedAt=row["updated_at"],
             deletedAt=row["deleted_at"],
         )
+
+    def count_messages(self, session_id: str) -> int:
+        """这条会话有多少条消息（按消息表实际行数算）。"""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM messages WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return int(row["c"] if row else 0)
+
+    def find_sessions_by_draft_id(self, draft_id: str) -> list[tuple[str, int, str]]:
+        """哪些会话**当前指向这份草稿**，以及各自**有多少条对话**。
+
+        打开草稿要回到那份草稿的**现场会话** —— 靠这个反查。
+
+        对话条数按**消息表实际行数**算，不靠会话行上那个计数器：那个
+        计数器只跟着落库轮次走，直接补写的消息不计数。
+
+        返回 ``[(sessionId, messageCount, updatedAt)]``，按最近更新的排。
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT s.id AS id,
+                       s.updated_at AS updated_at,
+                       (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                           AS message_count
+                FROM sessions s
+                WHERE s.deleted_at IS NULL
+                  AND json_extract(s.snapshot, '$.draftId') = ?
+                ORDER BY s.updated_at DESC
+                """,
+                (draft_id,),
+            ).fetchall()
+        return [
+            (row["id"], int(row["message_count"] or 0), row["updated_at"])
+            for row in rows
+        ]
 
     def list_sessions(
         self,

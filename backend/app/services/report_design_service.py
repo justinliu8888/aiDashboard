@@ -1046,7 +1046,8 @@ class ReportDesignService:
                                           ))
 
     def restart_design(
-        self, request: AgentRequest, *, state: dict[str, Any] | None
+        self, request: AgentRequest, *, state: dict[str, Any] | None,
+        response: AgentResponse | None = None,
     ) -> AgentResponse:
         """「重新开始」：把设计阶段复位回「需要生成方案」（工单 #44）。
 
@@ -1064,14 +1065,14 @@ class ReportDesignService:
         """
         if state is None:
             # 旧流程的会话没有设计阶段可复位：行为与原来完全一致。
-            return AgentResponse(
+            return response or AgentResponse(
                 conversationId=request.conversationId,
                 state=AgentState.ANALYZING,
                 reply="好的，我们重新开始。请描述你想生成的新报表。",
                 uiActions=["restart_from_template_editing"],
             )
 
-        response = AgentResponse(
+        response = response or AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.ANALYZING,
             reply="好的，我们重新开始。请描述你想生成的新报表。",
@@ -1082,6 +1083,7 @@ class ReportDesignService:
             designPhase=DESIGN_PHASE_PLAN_NEEDED,
             uiActions=["restart_from_template_editing"],
         )
+        response.designPhase = DESIGN_PHASE_PLAN_NEEDED
         write_turn = self._make_write_turn(request, response)
 
         def write_restart(connection) -> None:

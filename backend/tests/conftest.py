@@ -28,6 +28,11 @@ def disable_context_model(monkeypatch, tmp_path):
     # 每个测试用独立的 SQLite 文件，避免用例之间串数据
     repo = SqliteSessionRepository(tmp_path / "sessions.db")
     monkeypatch.setattr(session_service, "_repo", repo)
+    # 反馈表（20261104 反馈功能）：换库之后要把表建在这个临时库里。
+    # 建表是 DDL，必须在**事务外**做 —— 这里正是事务外。
+    from app.services.feedback_service import init_feedback_storage
+
+    init_feedback_storage(repo)
 
 
 @pytest.fixture()

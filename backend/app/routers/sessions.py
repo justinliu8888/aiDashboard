@@ -11,6 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.schemas.feedback import FeedbackTarget
 from app.schemas.session import (
     CreateSessionRequest,
     CreateWorkspaceRequest,
@@ -22,6 +23,7 @@ from app.schemas.session import (
     UpdateWorkspaceRequest,
     WorkspaceItem,
 )
+
 from app.services.plan_version_service import plan_version_service
 from app.services.preview_service import (
     PreviewContextError,
@@ -51,12 +53,27 @@ def _to_summary(record: SessionRecord) -> SessionSummary:
 
 
 def _to_message(record: MessageRecord) -> SessionMessage:
+    # 评价目标（20261104 反馈功能）：助手消息的 payload 里带着这一轮登记的
+    # 目标。**可选字段** —— 老消息没有就是 None（明确不支持反馈，
+    # 不按最新回复补绑）。
+    feedback_target = None
+    payload = record.payload
+    if isinstance(payload, dict):
+        raw = payload.get("feedbackTarget")
+        if isinstance(raw, dict) and raw.get("id"):
+            feedback_target = FeedbackTarget(
+                id=str(raw.get("id")),
+                kind=str(raw.get("kind") or ""),
+                createdAt=str(raw.get("createdAt") or ""),
+                available=bool(raw.get("available", True)),
+            )
     return SessionMessage(
         seq=record.seq,
         role=record.role,
         content=record.content,
-        payload=record.payload,
+        payload=payload,
         createdAt=record.createdAt,
+        feedbackTarget=feedback_target,
     )
 
 

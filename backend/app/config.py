@@ -160,6 +160,45 @@ class Settings:
         "1", "true", "yes"
     )
 
+    # ---------- 反馈收件箱（20261104）----------
+    #
+    # 维护者凭据**在部署环境配置**，不写前端、不提交仓库、不与 Demo 共用。
+    # 三项缺任何一项 → 管理登录**安全关闭**（503），不是放行。
+    feedback_admin_username: str = os.getenv("AI_FEEDBACK_ADMIN_USERNAME", "")
+    #: 有盐的密码哈希（``pbkdf2_sha256$iterations$salt$hash``）。
+    #: 本机生成：``python -m app.services.feedback_auth --generate-hash``
+    feedback_admin_password_hash: str = os.getenv("AI_FEEDBACK_ADMIN_PASSWORD_HASH", "")
+    #: 维护者会话 cookie 的签名密钥（HMAC-SHA256）。
+    feedback_session_secret: str = os.getenv("AI_FEEDBACK_SESSION_SECRET", "")
+    #: 私有截图目录。默认在**服务数据目录**里，**不在**公开静态目录。
+    feedback_attachment_dir: Path = Path(
+        os.getenv(
+            "AI_FEEDBACK_ATTACHMENT_DIR",
+            str(_BACKEND_DIR / "data" / "feedback_attachments"),
+        )
+    ).expanduser()
+    #: 反馈与附件的保留期限（天）。
+    feedback_retention_days: int = int(os.getenv("AI_FEEDBACK_RETENTION_DAYS", "180"))
+    #: 匿名浏览器身份的保留期限（天）。它只是防重复，不是账号。
+    feedback_visitor_ttl_days: int = int(
+        os.getenv("AI_FEEDBACK_VISITOR_TTL_DAYS", "180")
+    )
+    #: 单张截图上限（字节）。
+    feedback_max_attachment_bytes: int = int(
+        os.getenv("AI_FEEDBACK_MAX_ATTACHMENT_BYTES", str(5 * 1024 * 1024))
+    )
+    #: 提交节流：窗口内最多提交几次。
+    feedback_submit_rate_limit: int = int(
+        os.getenv("AI_FEEDBACK_SUBMIT_RATE_LIMIT", "20")
+    )
+    feedback_submit_rate_window_seconds: int = int(
+        os.getenv("AI_FEEDBACK_SUBMIT_RATE_WINDOW_SECONDS", "600")
+    )
+    #: 维护者会话有效期（秒）。
+    feedback_admin_session_seconds: int = int(
+        os.getenv("AI_FEEDBACK_ADMIN_SESSION_SECONDS", str(8 * 3600))
+    )
+
     # ---------- 解析后的有效配置 ----------
     #
     # 这一层是「当前到底在用哪家、哪个模型、怎么调」的唯一答案。

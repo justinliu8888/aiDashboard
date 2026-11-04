@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>反馈收件箱 · AI 报表</title>
+<script src="./vendor/tailwindcss.js?v=20261103-vendor1"></script>
+<script src="./vendor/iconify-icon.min.js?v=20261103-vendor1"></script>
+<link rel="stylesheet" href="./workbench_feedback.css?v=20261104-feedback1" />
+<link rel="stylesheet" href="./feedback_inbox.css?v=20261104-feedback1" />
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .no-bar { scrollbar-width: none; -ms-overflow-style: none; }
+  .no-bar::-webkit-scrollbar { width: 0; height: 0; display: none; }
+</style>
+</head>
+<body class="h-screen bg-slate-100 text-slate-800 flex flex-col">
+
+<!-- ===== 顶部 ===== -->
+<header class="shrink-0 h-14 bg-[#0d1f3a] flex items-center gap-4 px-6">
+  <a class="w-8 h-8 shrink-0 rounded-lg border border-slate-600/60 flex items-center justify-center text-slate-300 hover:bg-white/10" href="./workbench.html" title="回到工作台">
+    <iconify-icon class="text-base" icon="mdi:arrow-left"></iconify-icon>
+  </a>
+  <div class="flex items-center gap-2">
+    <div class="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center">
+      <iconify-icon class="text-white text-lg" icon="mdi:inbox"></iconify-icon>
+    </div>
+    <span class="text-white font-semibold tracking-wide">反馈收件箱</span>
+  </div>
+  <div class="ml-auto flex items-center gap-2">
+    <span id="feedback-admin-who" class="hidden text-[11px] text-slate-300"></span>
+    <button id="feedback-admin-export" type="button" class="hidden inline-flex items-center gap-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-medium px-3 py-1.5 border border-white/15">
+      <iconify-icon class="text-sm" icon="mdi:download"></iconify-icon>导出 CSV
+    </button>
+    <button id="feedback-admin-logout" type="button" class="hidden inline-flex items-center gap-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-medium px-3 py-1.5 border border-white/15">
+      <iconify-icon class="text-sm" icon="mdi:logout"></iconify-icon>退出
+    </button>
+  </div>
+</header>
+
+<!-- ===== 登录 ===== -->
+<section id="feedback-admin-login" class="shrink-0">
+  <div class="max-w-sm mx-auto mt-16 bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
+    <h2 class="text-sm font-semibold text-slate-900">维护者登录</h2>
+    <p class="mt-1 text-[11px] text-slate-500 leading-relaxed">
+      反馈正文、署名、截图与定位详情仅维护者可读。这里用单独的用户名密码，<span class="font-medium">与站点访问口令不是一回事</span>。
+    </p>
+    <form id="feedback-admin-login-form" class="mt-4 space-y-3">
+      <div>
+        <label class="block text-[11px] text-slate-600 mb-1" for="feedback-admin-username">用户名</label>
+        <input id="feedback-admin-username" type="text" autocomplete="username" class="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-100" />
+      </div>
+      <div>
+        <label class="block text-[11px] text-slate-600 mb-1" for="feedback-admin-password">密码</label>
+        <input id="feedback-admin-password" type="password" autocomplete="current-password" class="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-100" />
+      </div>
+      <p id="feedback-admin-login-error" class="hidden text-[11px] text-rose-600"></p>
+      <button id="feedback-admin-login-submit" type="submit" class="w-full rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-medium px-3 py-2">登录</button>
+      <p id="feedback-admin-login-hint" class="hidden text-[11px] text-amber-700 leading-relaxed"></p>
+    </form>
+  </div>
+</section>
+
+<!-- ===== 收件箱主体 ===== -->
+<main id="feedback-admin-app" class="flex-1 min-h-0 hidden flex-col">
+  <div class="shrink-0 bg-white border-b border-slate-200 px-5 py-3">
+    <div class="flex items-center gap-3 flex-wrap">
+      <h1 class="text-sm font-semibold text-slate-900">全部反馈</h1>
+      <span id="feedback-inbox-total" class="text-[11px] text-slate-500"></span>
+      <div class="ml-auto flex items-center gap-2 flex-wrap">
+        <select id="feedback-filter-rating" class="rounded-lg border border-slate-200 bg-white text-xs text-slate-700 px-2.5 py-1.5 outline-none focus:border-blue-400">
+          <option value="">全部满意度</option>
+          <option value="satisfied">满意</option>
+          <option value="neutral">一般</option>
+          <option value="dissatisfied">不满意</option>
+        </select>
+        <select id="feedback-filter-status" class="rounded-lg border border-slate-200 bg-white text-xs text-slate-700 px-2.5 py-1.5 outline-none focus:border-blue-400">
+          <option value="">全部处理状态</option>
+          <option value="pending">待处理</option>
+          <option value="in_progress">处理中</option>
+          <option value="resolved">已解决</option>
+        </select>
+        <button id="feedback-filter-refresh" type="button" class="rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-3 py-1.5">刷新</button>
+      </div>
+    </div>
+    <p id="feedback-inbox-notice" class="fb-notice hidden"></p>
+  </div>
+
+  <div class="flex-1 min-h-0 flex flex-col lg:flex-row overflow-hidden">
+    <!-- 列表 -->
+    <section class="lg:w-[420px] shrink-0 border-b lg:border-b-0 lg:border-r border-slate-200 bg-white flex flex-col min-h-0">
+      <div id="feedback-inbox-list" class="flex-1 min-h-0 overflow-y-auto no-bar p-3 space-y-2">
+        <div class="text-[11px] text-slate-400 px-2 py-3">登录后加载…</div>
+      </div>
+    </section>
+
+    <!-- 详情 -->
+    <section class="flex-1 min-h-0 overflow-y-auto no-bar bg-slate-100">
+      <div id="feedback-detail" class="p-5">
+        <div class="text-[11px] text-slate-400 px-2 py-3">从左边选一条反馈看详情。</div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script src="./feedback_inbox.js?v=20261104-feedback1"></script>
+</body>
+</html>

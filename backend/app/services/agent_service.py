@@ -4155,7 +4155,7 @@ class AgentService:
         reply = "草稿已保存，后续流程待接入。"
         response = AgentResponse(
             conversationId=request.conversationId,
-            state=AgentState.SAVE_DEFINITION_DRAFT,
+            state=AgentState.ANALYZING,
             reply=reply,
             designSessionId=request.context.designSessionId,
             domainObjects=AgentResponseDomainObjects(
@@ -4190,11 +4190,15 @@ class AgentService:
         #
         # 只多挂这一个字段；载荷**不落库**（模拟业务数值不进会话库，见
         # session_service._persisted_response_payload）。
-        return report_design_service._attach_report_preview_payload(
+        response = report_design_service._attach_report_preview_payload(
             request,
             response,
             definition=definition,
             plan=self._session_report_plan(request),
+        )
+        # Reset the persisted design phase too, so the next message starts a new plan.
+        return report_design_service.restart_design(
+            request, state=report_design_service.load_state(request), response=response,
         )
 
     # ---------- 节点 6-11 自动推进 ----------
@@ -4203,11 +4207,14 @@ class AgentService:
         """前端发来 __advance__ 时，根据当前 state 走对应 handler。"""
         state = request.state
         if state == AgentState.SAVE_DEFINITION_DRAFT:
-            return AgentResponse(
+            response = AgentResponse(
                 conversationId=request.conversationId,
-                state=AgentState.SAVE_DEFINITION_DRAFT,
+                state=AgentState.ANALYZING,
                 reply="草稿已保存，后续流程待接入。",
                 designSessionId=request.context.designSessionId,
+            )
+            return report_design_service.restart_design(
+                request, state=report_design_service.load_state(request), response=response,
             )
         if state == AgentState.VALIDATING:
             return self._handle_validating(request)

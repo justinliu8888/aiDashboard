@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 from .change_set import ChangeSet
+from .feedback import FeedbackTarget
 from .report_definition import ReportDefinitionDraft
 from .report_policy import ReportPolicyDraft
 from .session import PendingEditPlan
@@ -177,6 +178,7 @@ ALLOWED_TRANSITIONS: dict[AgentState, set[AgentState]] = {
         AgentState.INTERRUPT_CONFIRMING,
     },
     AgentState.SAVE_DEFINITION_DRAFT: {
+        AgentState.ANALYZING,
         AgentState.VALIDATING,
         AgentState.INTERRUPT_CONFIRMING,
     },
@@ -471,6 +473,12 @@ class AgentResponse(BaseModel):
     reportPreviewPayload: dict[str, Any] | None = None
     # 本轮性质。见 TURN_KIND_ACTION / TURN_KIND_QUERY_ANSWER。
     turnKind: str = TURN_KIND_ACTION
+
+    # 这一轮的评价目标（20261104 反馈功能）。**可选新增**字段：
+    # 旧客户端不认识它，缺了不影响；服务端没登记目标时就是 None。
+    #
+    # 只有四个字段（id / kind / createdAt / available）—— 定位信息留在服务端。
+    feedbackTarget: FeedbackTarget | None = None
 
     # 这一轮是不是已经落库了。设计流的成功轮由设计存储的同事务提交
     # 一起写掉了会话行与消息，路由层不能再落一遍。

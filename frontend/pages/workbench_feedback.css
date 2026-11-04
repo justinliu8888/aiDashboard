@@ -1,0 +1,283 @@
+/* 反馈模块样式（20261104 回复评价与反馈收件箱）。
+ *
+ * 只用普通 CSS，不依赖新框架；沿用工作台现有的白卡片观感。
+ * 关键布局（遮罩、面板宽度、窄屏）写在这里，不靠工具类 ——
+ * 工具类由 CDN 运行时生成，关键尺寸不能赌它一定生成出来。
+ */
+
+.fb-lock {
+  overflow: hidden;
+}
+
+/* ---------- 入口按钮 ---------- */
+
+.fb-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-top: 0.5rem;
+  padding: 0.15rem 0.55rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  background: #fff;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.7;
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease, background-color .15s ease;
+}
+
+.fb-trigger:hover:not(:disabled) {
+  color: #1d4ed8;
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.fb-trigger:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+.fb-trigger:disabled {
+  cursor: default;
+  color: #94a3b8;
+  background: #f8fafc;
+}
+
+.fb-trigger.fb-done {
+  color: #15803d;
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+}
+
+/* ---------- 弹窗 ---------- */
+
+.fb-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.fb-overlay.hidden {
+  display: none;
+}
+
+.fb-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.42);
+}
+
+.fb-panel {
+  position: relative;
+  width: 100%;
+  max-width: 460px;
+  max-height: min(88vh, 720px);
+  overflow-y: auto;
+  background: #fff;
+  border-radius: 14px;
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.24);
+  border: 1px solid #e2e8f0;
+}
+
+.fb-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.9rem 1.1rem;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.fb-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.fb-icon-btn {
+  border: 0;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.15rem 0.35rem;
+  border-radius: 6px;
+}
+
+.fb-icon-btn:hover {
+  color: #475569;
+  background: #f1f5f9;
+}
+
+.fb-body {
+  padding: 0.95rem 1.1rem 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.fb-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.fb-field.hidden {
+  display: none;
+}
+
+.fb-label {
+  font-size: 11px;
+  color: #475569;
+  font-weight: 500;
+}
+
+.fb-rating-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.fb-rating {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  font-size: 12px;
+  color: #334155;
+  cursor: pointer;
+  background: #fff;
+}
+
+.fb-rating:hover {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.fb-rating input {
+  accent-color: #2563eb;
+  margin: 0;
+}
+
+.fb-input {
+  width: 100%;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 0.4rem 0.55rem;
+  font-size: 12px;
+  color: #0f172a;
+  outline: none;
+  background: #fff;
+}
+
+.fb-input:focus {
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 2px #dbeafe;
+}
+
+.fb-textarea {
+  resize: vertical;
+  line-height: 1.6;
+}
+
+.fb-hint {
+  margin: 0;
+  font-size: 10px;
+  color: #94a3b8;
+  line-height: 1.6;
+}
+
+.fb-hint.fb-warn {
+  color: #b91c1c;
+}
+
+.fb-error {
+  margin: 0;
+  padding: 0.45rem 0.6rem;
+  border-radius: 8px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.fb-error.hidden {
+  display: none;
+}
+
+.fb-receipt {
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  color: #15803d;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.fb-receipt.hidden {
+  display: none;
+}
+
+.fb-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  padding-top: 0.15rem;
+}
+
+.fb-btn {
+  border-radius: 8px;
+  padding: 0.4rem 0.9rem;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.fb-btn-ghost {
+  background: #fff;
+  border-color: #e2e8f0;
+  color: #475569;
+}
+
+.fb-btn-ghost:hover {
+  background: #f8fafc;
+}
+
+.fb-btn-primary {
+  background: #1d4ed8;
+  color: #fff;
+}
+
+.fb-btn-primary:hover:not(:disabled) {
+  background: #1e40af;
+}
+
+.fb-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* 窄屏：面板贴底，别顶出屏幕 */
+@media (max-width: 480px) {
+  .fb-overlay {
+    padding: 0.5rem;
+    align-items: flex-end;
+  }
+
+  .fb-panel {
+    max-width: 100%;
+    max-height: 92vh;
+  }
+}

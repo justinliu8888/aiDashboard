@@ -27,6 +27,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Callable, Mapping
 
+
 from pydantic import ValidationError
 
 from app.config import get_settings
@@ -45,6 +46,7 @@ from app.schemas.session import (
     EditClarification,
     PendingEditPlan,
 )
+
 from app.services.mock_data_service import render_template, room_id_of_definition
 from app.services.preview_service import preview_service
 from app.storage.base import SessionRepository
@@ -471,13 +473,29 @@ class SessionService:
 
             # 2. assistant 消息：payload 存整个响应，恢复时可直接回放渲染
             # （模拟业务数值不进库，见 _persisted_response_payload）。
-            self._repo.append_message(
+            #
+            # 评价目标（20261104 反馈功能）**先登记再落消息**：登记要在
+            # 同一笔事务里，目标里的定位信息取的是**登记当时**的状态；
+            # 登记结果写回响应，消息体里就带着它（历史恢复要用）。
+            target = self._register_feedback_target(
+                connection=self._repo.conn,
+                session_id=session_id,
+                user_text=user_text,
+                response=response,
+                is_advance=is_advance,
+                client_msg_id=client_msg_id,
+            )
+            assistant_message = self._repo.append_message(
                 session_id=session_id,
                 role="assistant",
                 content=response.reply,
                 payload=_persisted_response_payload(response),
                 clientMsgId=self._reply_msg_id(client_msg_id),
             )
+            if target is not None:
+                self._fill_feedback_message_ref(
+                    self._repo.conn, target, getattr(assistant_message, "id", None)
+                )
 
             # 3. 更新会话
             count = len(self._repo.list_messages(session_id))
@@ -500,6 +518,69 @@ class SessionService:
                 exc_info=(type(exc), None, exc.__traceback__),
             )
             return None
+
+    # ---------- 评价目标（20261104 反馈功能）----------
+
+    def _register_feedback_target(
+        self,
+        *,
+        connection: Any,
+        session_id: str,
+        user_text: str,
+        response: AgentResponse,
+        is_advance: bool,
+        client_msg_id: str | None = None,
+    ) -> Any:
+        """在**本轮自己的事务里**登记评价目标。
+
+        * 内部推进轮（``__advance__``）**不登记**：那一条是「加载/进度」
+          提示，不是用户看到的一轮结果 —— 同一轮只该有一个反馈入口。
+        * 目标字段取**登记当时**的状态，之后不改。
+        * 登记失败**不影响这一轮对话**（反馈是辅助能力）。
+        """
+        if is_advance:
+            return None
+        try:
+            from app.services import feedback_service
+
+            target = feedback_service.register_reply_target(
+                connection,
+                self._repo,
+                session_id=session_id,
+                user_text=user_text,
+                response=response,
+                message_id=None,
+                client_msg_id=self._reply_msg_id(client_msg_id),
+            )
+        except Exception as exc:  # noqa: BLE001 — 登记失败不影响主链路
+            logger.warning(
+                "[session_service] 评价目标登记失败 sessionId=%s errorType=%s",
+                session_id,
+                type(exc).__name__,
+            )
+            return None
+        if target is not None:
+            response.feedbackTarget = target
+        return target
+
+    def _fill_feedback_message_ref(
+        self, connection: Any, target: Any, message_id: int | None
+    ) -> None:
+        """补原消息引用（消息落库之后）。只补引用，不改目标内容。"""
+        try:
+            from app.services import feedback_service
+
+            feedback_service.fill_target_message_ref(
+                self._repo,
+                connection,
+                str(getattr(target, "id", "") or ""),
+                message_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[session_service] 评价目标补引用失败 errorType=%s",
+                type(exc).__name__,
+            )
 
     def _state_to_store(self, session_id: str, response: AgentResponse) -> str:
         """这一轮要落库的业务状态。
@@ -772,7 +853,18 @@ class SessionService:
             )
         # assistant 消息：payload 存整个响应，恢复时可直接回放渲染。
         # 模拟业务数值不进库（见 _persisted_response_payload）。
-        self._append_message_inline(
+        #
+        # 评价目标（20261104 反馈功能）：**先登记再落消息**，登记在**同一笔
+        # 事务**里（这条连接就是设计存储的那条）。内部推进轮不登记。
+        target = self._register_feedback_target(
+            connection=connection,
+            session_id=session_id,
+            user_text=user_text,
+            response=response,
+            is_advance=is_advance,
+            client_msg_id=client_msg_id,
+        )
+        message_id = self._append_message_inline(
             connection,
             session_id=session_id,
             role="assistant",
@@ -780,6 +872,8 @@ class SessionService:
             payload=_persisted_response_payload(response),
             client_msg_id=self._reply_msg_id(client_msg_id),
         )
+        if target is not None and message_id is not None:
+            self._fill_feedback_message_ref(connection, target, message_id)
 
         count = connection.execute(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
@@ -797,8 +891,11 @@ class SessionService:
         content: str,
         payload: dict[str, Any] | None = None,
         client_msg_id: str | None = None,
-    ) -> None:
-        """写一条消息，不 commit。幂等口径与旧 ``append_message`` 一致。"""
+    ) -> int | None:
+        """写一条消息，不 commit。幂等口径与旧 ``append_message`` 一致。
+
+        返回落库后的消息 id（幂等覆盖时是**原来那条**的 id）。
+        """
         now = datetime.now().isoformat(timespec="seconds")
         if client_msg_id:
             existing = connection.execute(
@@ -813,12 +910,12 @@ class SessionService:
                     """,
                     (role, content, _dump_snapshot(payload), now, existing["id"]),
                 )
-                return
+                return int(existing["id"])
         next_seq = connection.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?",
             (session_id,),
         ).fetchone()[0]
-        connection.execute(
+        cursor = connection.execute(
             """
             INSERT INTO messages (session_id, seq, role, content, payload,
                                   client_msg_id, created_at)
@@ -834,6 +931,7 @@ class SessionService:
                 now,
             ),
         )
+        return int(cursor.lastrowid)
 
     @staticmethod
     def _reply_msg_id(client_msg_id: str | None) -> str | None:
@@ -1165,7 +1263,34 @@ class SessionService:
             return {}
         return dict(collected)
 
-    # ---------- 选择锁 ----------
+    # ---------- 状态与选择锁 ----------
+
+    def save_state(self, session_id: str, state: str) -> None:
+        """写会话状态（状态徽标那一列）。
+
+        **只改这一列**：标题、快照、菜单都不动 —— 用它的地方（打开草稿
+        时把会话切到草稿当前的 state）要的就是「换个状态」，不是「重写会话」。
+
+        空状态**不写**：写空会让状态徽标变成「空闲」，而调用方传空多半是
+        「这一版没有状态」而不是「把状态清空」。
+
+        **失败要抛出去**：状态是「这一轮走到哪了」的权威位置。吞掉的话，
+        调用方会以为已经切过去了，界面上却还是旧状态。
+        """
+        value = (state or "").strip()
+        if not session_id or not value:
+            return
+        try:
+            self._repo.upsert_session(session_id=session_id, state=value)
+        except Exception as exc:  # noqa: BLE001
+            # 异常原文不进日志（#61）：留栈不留原文。
+            logger.exception(
+                "[session_service] 写会话状态失败 sessionId=%s errorType=%s",
+                session_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
+            raise
 
     def save_pending_choice(
         self, session_id: str, choice: dict[str, Any] | None

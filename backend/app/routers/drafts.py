@@ -9,11 +9,12 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from app.services.agent_service import (
@@ -47,8 +48,11 @@ class DraftActionRequest(BaseModel):
     action: str
     #: 基本版本检查：客户端看到的版本与服务端不一致就拒绝（契约 0002 §6）。
     expectedRevision: int | None = None
-    #: 另存为的新名字。
+    #: 保存或另存为的名字。
     name: str | None = None
+    #: 草稿备注：用户自己写的一句话说明（落在 `draft_objects.description`）。
+    #: **没给就不动原备注**；给空字符串是「清空备注」。
+    remark: str | None = None
 
 
 class DraftOpenRequest(BaseModel):
@@ -83,6 +87,8 @@ def _state_payload(state: Any) -> dict[str, Any]:
             "activeTask",
             "themeId",
             "updatedAt",
+            "name",
+            "description",
             "canUndo",
             "canRedo",
         )
@@ -179,6 +185,73 @@ def _sync_session_snapshot(session_id: str | None, definition: Any, revision: in
             exc_info=(type(exc), None, exc.__traceback__),
         )
         raise
+
+
+def _resolve_draft_session(
+    draft_id: str, owner_session_id: str | None
+) -> tuple[str | None, bool]:
+    """这份草稿的**现场会话**是哪一条，以及它**有没有对话**。
+
+    打开草稿 = 回到那份草稿的对话现场（对话、待决菜单、状态一起回来）。
+    现场会话 = **当前指向这份草稿、并且有对话记录**的那条会话。
+
+    为什么不能只看草稿自己记的那个会话：打开草稿的旧做法是给草稿**另开**
+    一条空会话、再把草稿搬过去 —— 那条空会话没有对话（连会话列表里都
+    不出现），打开后左边一片空白，而真正有对话的那条会话被落在了后面。
+
+    找不到有对话的，就退回候选里最近更新的那条；再不行用草稿自己记的。
+
+    返回 ``(sessionId, 有没有对话)``。
+    """
+    candidates = session_service.repository.find_sessions_by_draft_id(draft_id)
+    with_dialog = [item for item in candidates if int(item[1] or 0) > 0]
+    pool = with_dialog or candidates
+    if pool:
+        picked = max(pool, key=lambda item: str(item[2] or ""))
+        return picked[0], int(picked[1] or 0) > 0
+    return owner_session_id, False
+
+
+def _sync_session_scene(session_id: str | None, state: Any) -> None:
+    """把草稿的**现场**接到一条**空会话**上：状态 + 待决菜单。
+
+    **只在「这条会话还没有对话」时写**（调用方用 `has_dialog` 判定）：
+    已经有对话的那条会话，状态与菜单是**它自己的**（它可能已经走到草稿
+    快照之后的那一步），覆盖它就是把会话往回退。
+
+    两个值都取**服务端给的权威现场**（契约 0002 §6.2）：状态取草稿落库
+    那一版的 `businessState`，菜单取它的 `pendingChoice`。
+
+    **失败要抛出去**：调用方在**同一笔事务**里用它 —— 写不回去就整笔
+    回滚，不留「草稿切了、状态没切」的半份状态。
+    """
+    if not session_id:
+        return
+    payload = _state_payload(state)
+    business_state = str(payload.get("businessState") or "").strip()
+    if business_state:
+        session_service.save_state(session_id, business_state)
+    session_service.save_pending_choice(
+        session_id, _pending_choice_of(payload.get("pendingChoice"))
+    )
+
+
+def _pending_choice_of(raw: Any) -> dict[str, Any] | None:
+    """把工作区状态里的待决选择还原成会话那一份结构。
+
+    工作区状态里 `pendingChoice` 声明为**文本**（结构化的内容用 JSON 文本
+    带着，见 `draft_workspace._as_text`）；会话那一列存的是结构化对象。
+    这里把文本解析回对象 —— 解析不出来就当「没有待决菜单」，不硬塞半份。
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _revoke_session_step(session_id: str | None, *, action: str = "UNDO") -> list[str]:
@@ -406,12 +479,33 @@ def get_draft(draft_id: str) -> dict[str, Any]:
     return _respond(state, session_id=_session_id_of(state))
 
 
+@router.delete("/drafts/{draft_id}", status_code=204)
+def delete_draft(draft_id: str) -> Response:
+    try:
+        draft_workspace.delete(draft_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _draft_error(exc) from exc
+    return Response(status_code=204)
+
+
 @router.post("/drafts/{draft_id}/open")
 def open_draft(draft_id: str, body: DraftOpenRequest) -> dict[str, Any]:
-    """打开一个草稿：把这条会话**切到这个草稿对象**上。
+    """打开一个草稿：把工作台**切到这份草稿的现场会话**。
 
     切的是**对象身份**（契约 0002 §6.4）：切完之后，后续对话的提交落到
     这个对象，而不是还挂在原来那个对象上；原草稿一个字节都不改。
+
+    **现场会话** = 当前指向这份草稿、并且有对话记录的那条会话（见
+    ``_resolve_draft_session``）。打开草稿不是给草稿另开一条空会话 ——
+    那条空会话没有对话，打开后左边一片空白，真正有对话的那条会话被
+    落在后面。
+
+    body 里的 ``sessionId`` = **调用方指定**要绑到哪条会话上；**没指定**
+    就用那份草稿的现场会话。响应里的 ``sessionId`` 是实际用到的那一条。
+
+    **状态与待决菜单也一起切**（契约 0002 §6.3「重开恢复同一游标与菜单」）：
+    只切内容不切状态的话，用户看到的是「右边是这份草稿、左边还停在
+    上一份报表的那一步」。
 
     「打开列表」只给名称与最近修改时间；定义与版本在这里读回。
     """
@@ -423,8 +517,18 @@ def open_draft(draft_id: str, body: DraftOpenRequest) -> dict[str, Any]:
     if state is None:
         raise HTTPException(status_code=404, detail="这个草稿不存在。")
 
-    session_id = (body.sessionId or "").strip() or None
+    scene_session, _scene_has_dialog = _resolve_draft_session(
+        draft_id, _session_id_of(state)
+    )
+    # 调用方指定了就照它来（它要在这条会话上打开这份草稿）；
+    # 没指定就用那份草稿的现场会话。
+    session_id = (body.sessionId or "").strip() or scene_session
     if session_id:
+        has_dialog = (
+            _scene_has_dialog
+            if session_id == scene_session
+            else session_service.repository.count_messages(session_id) > 0
+        )
         try:
             # 切换与快照写回在**同一笔事务**里：写不回去就整笔回滚，
             # 不留「对象切了一半」的半份状态。
@@ -434,6 +538,11 @@ def open_draft(draft_id: str, body: DraftOpenRequest) -> dict[str, Any]:
                 _sync_session_snapshot(
                     session_id, state.definition, state.revision
                 )
+                if not has_dialog:
+                    # **空会话**才写草稿的现场（状态 + 待决菜单）：已经有
+                    # 对话的那条会话，状态与菜单是它自己的，不许用草稿
+                    # 快照覆盖（契约 0002 §6.3）。
+                    _sync_session_scene(session_id, state)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[drafts] 切换草稿对象失败 draftId=%s code=%s errorType=%s",
@@ -442,7 +551,13 @@ def open_draft(draft_id: str, body: DraftOpenRequest) -> dict[str, Any]:
                 type(exc).__name__,
             )
             raise HTTPException(status_code=409, detail="切换草稿对象失败，请重试。") from exc
-    return _respond(state, session_id=session_id)
+    payload = _respond(state, session_id=session_id)
+    # 告诉前端**切到了哪条会话**（实际用到的那条）—— 前端据此把工作台
+    # 换过去（对话、待决菜单、状态一起回来）；并把现场会话也带出去，
+    # 方便调用方直接问「这份草稿的现场在哪条会话上」。
+    payload["sessionId"] = session_id
+    payload["sceneSessionId"] = scene_session
+    return payload
 
 
 @router.post("/drafts/{draft_id}/actions")
@@ -461,6 +576,16 @@ def draft_action(draft_id: str, body: DraftActionRequest) -> dict[str, Any]:
             status_code=400,
             detail=f"不支持的草稿动作：{body.action!r}。允许：{'、'.join(DRAFT_ACTIONS)}。",
         )
+    if action in ("SAVE", "SAVE_AS") and body.name is not None:
+        body.name = body.name.strip()
+        if not body.name or len(body.name) > 100:
+            raise HTTPException(status_code=422, detail="草稿名称不能为空，且不能超过 100 个字。")
+    if action in ("SAVE", "SAVE_AS") and body.remark is not None:
+        # 备注是**用户自己写的一句话**：可以留空（就是没备注），
+        # 但不能长到把草稿列表撑破。
+        body.remark = body.remark.strip()
+        if len(body.remark) > 500:
+            raise HTTPException(status_code=422, detail="草稿备注不能超过 500 个字。")
     state: Any = None
     session_id: str | None = None
     payload: dict[str, Any] = {}
@@ -475,7 +600,10 @@ def draft_action(draft_id: str, body: DraftActionRequest) -> dict[str, Any]:
             before_session = _session_id_of(before)
             if action == "SAVE":
                 state = draft_workspace.save(
-                    draft_id, expected_revision=body.expectedRevision
+                    draft_id,
+                    expected_revision=body.expectedRevision,
+                    name=body.name,
+                    remark=body.remark,
                 )
             elif action == "UNDO":
                 state = draft_workspace.undo(
@@ -490,6 +618,7 @@ def draft_action(draft_id: str, body: DraftActionRequest) -> dict[str, Any]:
                     draft_id,
                     name=body.name or "未命名草稿",
                     expected_revision=body.expectedRevision,
+                    remark=body.remark,
                 )
 
             session_id = _session_id_of(state) or before_session

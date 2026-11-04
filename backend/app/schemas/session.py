@@ -10,6 +10,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .feedback import FeedbackTarget
+
 
 # 一次生成或调整意图最多主动澄清**一轮**（规格第 13 条）。
 #
@@ -58,6 +60,9 @@ class SessionMessage(BaseModel):
     content: str = ""
     payload: dict[str, Any] | None = None
     createdAt: str = ""
+    # 这一条助手消息的评价目标（20261104 反馈功能）。**可选新增**：
+    # 历史消息没有可靠关联时就是 None —— 明确不支持，不按最新回复补绑。
+    feedbackTarget: FeedbackTarget | None = None
 
 
 class SessionDetail(BaseModel):
