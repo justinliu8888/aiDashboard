@@ -1,0 +1,141 @@
+{
+  "outDir": "../.selfcheck/night-d/flow",
+  "waitMs": 1500,
+  "timeout": 30000,
+  "ignore": [
+    "modao.cc",
+    "/health",
+    "api.simplesvg.com",
+    "simplesvg.com",
+    "api.iconify.design",
+    "iconify.design",
+    "api.unisvg.com",
+    "unisvg.com"
+  ],
+  "flows": [
+    {
+      "name": "T01-外观-原句闭环-接受-刷新-撤销",
+      "url": "http://127.0.0.1:8004/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "restoreSession('sess_night_d_flow_t01')",
+          "save": "restored"
+        },
+        {
+          "wait": 6000
+        },
+        {
+          "assertText": "请选择下一步操作"
+        },
+        {
+          "assertVisible": "#chat-scroll .question-select[data-question-id=\"template_edit_confirm\"]"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "eval": "document.getElementById('btn-send').disabled === true"
+        },
+        {
+          "eval": "Number(session.baseDefinitionRevision)",
+          "save": "beforeRev"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select')).filter(s => !s.disabled); for (const sel of sels.reverse()) { const opt = Array.from(sel.options).find(o => o.textContent.trim() === '修改'); if (!opt) continue; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; } return false; })()"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "assertVisible": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])"
+        },
+        {
+          "type": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])",
+          "text": "把\"昨日能耗总览\"的文字调大，右对齐，圆角调小一点"
+        },
+        {
+          "click": "#chat-scroll .question-other-submit:not([disabled]), #chat-scroll .question-text-submit:not([disabled])"
+        },
+        {
+          "waitFor": "[data-pending-plan]",
+          "timeout": 20000
+        },
+        {
+          "assertText": "待确认的修改"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan]').innerText; return t.includes('字号') && t.includes(' PX') && t.includes('右对齐'); })()"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan]').innerText; return t; })()",
+          "save": "candidateText"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); if (!el) return ''; return (el.style.fontSize || '') + '|' + (el.style.textAlign || ''); })()",
+          "save": "styleBefore"
+        },
+        {
+          "screenshot": "d-t01-01-外观候选待确认"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-pending-plan] select'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "session.baseDefinitionRevision === beforeRev + 1"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); if (!el) return false; const base = parseFloat(String(styleBefore).split('|')[0]) || 0; const now = parseFloat(el.style.fontSize) || 0; return now > base; })()"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); return !!el && el.style.textAlign === 'right'; })()"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); return !!el && /\\d+(\\.\\d+)?px/.test(el.style.borderRadius); })()"
+        },
+        {
+          "eval": "(() => { const card = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"] .wp-card'); return !!card && card.getAttribute('data-wp-font-size') === '1' && card.getAttribute('data-wp-text-align') === '1' && card.getAttribute('data-wp-border-radius') === '1'; })()"
+        },
+        {
+          "eval": "(() => { const card = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"] .wp-card'); return !!card && card.style.getPropertyValue('--wp-text-align').trim() === 'right'; })()"
+        },
+        {
+          "eval": "(() => { const els = Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId); return els.includes('region_device_ranking') && els.includes('region_hourly_trend'); })()"
+        },
+        {
+          "screenshot": "d-t01-02-接受后外观生效"
+        },
+        {
+          "eval": "(() => { location.reload(); return true; })()"
+        },
+        {
+          "wait": 5000
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); if (!el) return false; const card = el.querySelector('.wp-card'); return /\\d+(\\.\\d+)?px/.test(el.style.fontSize) && el.style.textAlign === 'right' && !!card && card.getAttribute('data-wp-font-size') === '1'; })()"
+        },
+        {
+          "screenshot": "d-t01-03-刷新后外观保持"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-wp-history]'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.value === 'undo'); if (!opt || opt.disabled) return false; sel.value = 'undo'; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); if (!el) return false; const parts = String(styleBefore).split('|'); return el.style.fontSize === parts[0] && el.style.textAlign === parts[1]; })()"
+        },
+        {
+          "screenshot": "d-t01-04-撤销后外观回退"
+        }
+      ]
+    }
+  ]
+}

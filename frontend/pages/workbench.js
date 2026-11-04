@@ -861,6 +861,17 @@ function isInputLocked(question) {
 }
 
 /**
+ * 这一步是不是**文字型待决**（服务端说「直接填写」）。
+ *
+ * 文字型待决的合法入口是**卡片里的专用输入**，不是底部那个普通聊天框。
+ * 所以它一旦成为当前待决步骤，普通输入 / 发送 / Enter / 快捷入口
+ * 都要锁住（契约 §3.3）—— 与「允许其他」的菜单同一套口径。
+ */
+function expectsFreeText(question) {
+  return String(question?.expects || "").trim().toUpperCase() === "TEXT";
+}
+
+/**
  * 这份菜单是不是服务端**当前待决**的那一张。
  *
  * 刷新后的历史回放会兜底算出一张**旧菜单**（``restoreSession`` 里的
@@ -891,6 +902,13 @@ function menuLocksInput(choice, planWaiting = false) {
     scope === LOCK_SCOPE_INPUT_AND_MENU
     || Boolean(choice?.options?.length)
     || choice?.allowsOther === true
+    // 文字型待决（「直接填写」）：合法入口是卡片里的**专用输入**，
+    // 普通聊天框必须锁住 —— 否则这一步就有两个入口，
+    // 用户能从普通输入绕过这一步的约束（契约 §3.3）。
+    //
+    // 判据就地写成表达式（不调用 expectsFreeText）：这段函数会被既有单测
+    // 单独抽进沙箱跑，沙箱里只有它原有的依赖 —— 少一个符号就直接抛错。
+    || String(choice?.expects || "").trim().toUpperCase() === "TEXT"
   );
 }
 
@@ -905,6 +923,15 @@ function inputControlState(lockedChoice, busy, planWaiting = false) {
   // 锁不锁输入：**有效 dropdown 全锁**（正确要求，不动）；
   // 历史兜底出来的旧菜单不锁（那不是当前待决步骤）。
   const locked = menuLocksInput(lockedChoice, planWaiting);
+  // 文字型待决的提示指向**卡片里的专用输入**（与方案待确认同一句口径）。
+  // 判据就地写成表达式：不调用 expectsFreeText —— 这段函数会被既有单测
+  // 单独抽进沙箱跑，沙箱里只有它原有的依赖。
+  const freeTextStep = String(lockedChoice?.expects || "").trim().toUpperCase() === "TEXT";
+  const lockedHint = planWaiting
+    ? "请在方案卡片内确认或填写修改要求"
+    : freeTextStep
+      ? "请在卡片内填写后提交"
+      : INPUT_LOCK_HINT;
   return {
     scope,
     inputLocked: locked,
@@ -914,11 +941,11 @@ function inputControlState(lockedChoice, busy, planWaiting = false) {
     // 输入框与发送按钮保持可用（见 LOCK_SCOPE_* 的注释）。
     quickDisabled: Boolean(busy) || Boolean(lockedChoice) || planWaiting,
     placeholder: locked
-      ? (planWaiting ? "请在方案卡片内确认或填写修改要求" : INPUT_LOCK_HINT)
+      ? lockedHint
       : lockedChoice
         ? "可以先问只读问题，或从上方下拉框选择"
         : "描述报表需求，或输入修改要求…",
-    hint: locked ? (planWaiting ? "请在方案卡片内确认或填写修改要求" : INPUT_LOCK_HINT) : "",
+    hint: locked ? lockedHint : "",
   };
 }
 
@@ -985,9 +1012,53 @@ function syncInputControls() {
       }
     }
   }
+  // **同一步**的判定用步骤身份（stepId）。
+  //
+  // 为什么：同一轮里服务端可能给**两张同一步**的卡 —— 一张是澄清菜单
+  // （带选项），一张是那张「直接填写」的专用输入卡（实测：模型路径的
+  // 澄清轮就是这样）。契约 §3.3 要开放的是「**本步**合法选项与专用输入」，
+  // 两样都属于这一步，所以两张卡上的控件都要开着 —— 只开一张会把用户
+  // 挡在模型给的那道问题外面。
+  //
+  // 步骤身份取卡片容器上的 data-step-id（没有步骤身份的旧会话退回
+  // id 对比：同 id 的多张卡里只有最后一张算当前）。
+  const currentStepId = lockedChoice?.stepId || "";
+  const stepIdOf = (el) => {
+    const card = typeof el?.closest === "function" ? el.closest("[data-step-id]") : null;
+    return card?.getAttribute?.("data-step-id") || "";
+  };
   selects.forEach((select, index) => {
-    const isActive = activeIndex >= 0 ? index === activeIndex : index === selects.length - 1;
-    select.disabled = busy || !(lockedChoice?.options?.length || lockedChoice?.allowsOther) || !isActive;
+    // 「修改历史」下拉（工具条上的撤销 / 重做）**不是**问答菜单。
+    //
+    // 它带着 question-select 这个类（样式上要与别的下拉一致），但它归
+    // **服务端给的 canUndo / canRedo** 管，不归选择锁管：按问答菜单那套
+    // 规则算，它在「有菜单待答」时被锁、在「没有菜单」时又被另一条规则
+    // 锁 —— 撤销入口就永远点不开了（BUG-008：撤销这条路必须能走）。
+    //
+    // 而且接受一次之后服务端会**再问一句「请选择下一步操作」** ——
+    // 也就是说「有菜单待答」恰恰是用户想撤销的时刻。撤销是**回退**，
+    // 不是新任务，不该被菜单锁挡住（契约 §2.3 的验收路径就是
+    // 接受 → 撤销）。真正该拦它的是「正在发请求」（别在请求途中改草稿）。
+    //
+    // 「能不能撤销」由服务端给的 canUndo / canRedo 决定（选项自带 disabled）。
+    if (select.getAttribute?.("data-wp-history") === "1") {
+      select.disabled = busy;
+      return;
+    }
+    // 当前卡片的判定：id 对得上（当前那张），**或**属于同一步（这一步的
+    // 另一张卡：澄清菜单 / 专用输入）。
+    //
+    // 原来在没有匹配项时退化成「页面最后一个下拉框算当前的」—— 文字型
+    // 待决那一步**没有**下拉框（它只有卡片内的专用输入），这时最后一个
+    // 下拉框其实是**历史轮**的菜单，退化会让旧菜单重新可点，
+    // 打破「被撤销 / 已失效的旧步骤不能再选」（契约 §2.3 第 2 条）。
+    const sameStep = Boolean(currentStepId) && stepIdOf(select) === currentStepId;
+    const isActive = activeId ? (sameStep || index === activeIndex) : index === selects.length - 1;
+    // 被撤销的那一步：旧 dropdown **不能再选**（契约 §2.3 第 2 条）。
+    // 标记由 applyRevokedSteps 打在控件上 —— 重新同步一次也不能把它打开。
+    const revoked = select.dataset?.revoked === "1";
+    const lockedHasEntry = Boolean(lockedChoice?.options?.length || lockedChoice?.allowsOther);
+    select.disabled = busy || revoked || !(lockedHasEntry || sameStep) || !isActive;
   });
   // 「重新开始」入口跟下拉框同一条规则：只有当前有效菜单那一个能点。
   const restarts = document.querySelectorAll(".question-restart");
@@ -1001,23 +1072,49 @@ function syncInputControls() {
     }
   }
   restarts.forEach((button, index) => {
-    const isActive = menuRestartIndex >= 0 ? index === menuRestartIndex : index === restarts.length - 1;
+    // 同下拉框：当前卡片必须 id 对得上（见上面 isActive 的说明）。
+    const isActive = activeId ? index === menuRestartIndex : index === restarts.length - 1;
     button.disabled = busy || !lockedChoice?.options?.length || !isActive;
   });
   // 「其他」输入框：只对**当前待答**的那张卡开放。
   // 已经答过的卡、历史回放出来的卡，输入框与提交按钮都是灰的 ——
   // 答案只能写进正在等的那张卡（刷新后由服务端 pending_choice 恢复，同样只开一张）。
   document.querySelectorAll("[data-question-other]").forEach((box) => {
-    const isCurrent = box.dataset.questionOther === (lockedChoice?.id || "") &&
-      box._questionSelect === selects[activeIndex] && Boolean(box.dataset.answerMode);
+    // 卡片所属的下拉框是不是本步可点的那个（上面刚算过它的启用状态）。
+    const selectActive = Boolean(box._questionSelect) && !box._questionSelect.disabled;
+    const sameStep = Boolean(currentStepId) && stepIdOf(box) === currentStepId;
+    const isCurrent = (box.dataset.questionOther === (lockedChoice?.id || "") || sameStep) &&
+      selectActive && Boolean(box.dataset.answerMode);
     const input = box.querySelector(".question-other-input");
     const submit = box.querySelector(".question-other-submit");
     if (input) {
-      input.disabled = busy || !isCurrent;
+      // 被撤销的那一步：专用输入也不能再提交。
+      input.disabled = busy || input.dataset?.revoked === "1" || !isCurrent;
       input.classList.toggle("opacity-50", input.disabled);
     }
     if (submit) {
-      submit.disabled = busy || !isCurrent;
+      submit.disabled = busy || submit.dataset?.revoked === "1" || !isCurrent;
+      submit.classList.toggle("opacity-50", submit.disabled);
+    }
+  });
+  // 文字型待决的**专用输入**：只对**当前这一步**开放。
+  // 这一步的普通输入框是锁着的（契约 §3.3），这个输入框是本步的合法入口，
+  // 所以它必须可填 —— 否则用户被锁在门外。
+  //
+  // 「当前这一步」按**步骤身份**判：同一轮里澄清菜单与这张专用输入卡
+  // 共用同一个 stepId，两张都属于这一步，两个入口都要开着。
+  document.querySelectorAll("[data-question-text]").forEach((box) => {
+    const sameStep = Boolean(currentStepId) && stepIdOf(box) === currentStepId;
+    const isCurrent = sameStep || box.dataset.questionText === (lockedChoice?.id || "");
+    const input = box.querySelector(".question-text-input");
+    const submit = box.querySelector(".question-text-submit");
+    if (input) {
+      // 被撤销的那一步：专用输入也不能再提交。
+      input.disabled = busy || input.dataset?.revoked === "1" || !isCurrent;
+      input.classList.toggle("opacity-50", input.disabled);
+    }
+    if (submit) {
+      submit.disabled = busy || submit.dataset?.revoked === "1" || !isCurrent;
       submit.classList.toggle("opacity-50", submit.disabled);
     }
   });
@@ -1725,9 +1822,13 @@ function inlineAnswerAction(question, value) {
 }
 
 function renderQuestionOptions(question) {
-  const options = (question.options || []).filter((option) => inlineAnswerAction(question, String(option.value ?? option.label)) !== "other");
-  return options.map((option) => `<option value="${esc(option.value ?? option.label)}">${esc(option.label ?? option.value)}</option>`).join("") +
-    (question.allowsOther === true ? `<option value="${OTHER_ANSWER_VALUE}">${esc(otherAnswerLabel(question))}</option>` : "");
+  const options = (question.options || []).filter((option) => {
+    const value = String(option.value ?? option.label);
+    const label = String(option.label ?? option.value);
+    return value !== OTHER_ANSWER_VALUE && !/^(其他|OTHER)$/i.test(value.trim()) &&
+      !/^(其他|OTHER)$/i.test(label.trim()) && inlineAnswerAction(question, value) !== "other";
+  });
+  return options.map((option) => `<option value="${esc(option.value ?? option.label)}">${esc(option.label ?? option.value)}</option>`).join("");
 }
 
 function bindQuestionSelects(container, questions) {
@@ -1755,9 +1856,9 @@ function bindQuestionSelects(container, questions) {
   });
 }
 
-/** 「其他」区块的 HTML。服务端没给 allowsOther 就返回空串（不画这个区块）。 */
+/** Dropdown text entry is only available through the edit action. */
 function renderOtherAnswerHtml(question) {
-  if (question?.allowsOther !== true && question?.inlineEdit !== true) return "";
+  if (question?.inlineEdit !== true) return "";
   return `
     <div class="question-other hidden mt-2 pt-2 border-t border-amber-100" data-question-other="${esc(question.id || "")}">
       <div class="question-other-label text-[11px] text-amber-800 mb-1">${esc(otherAnswerLabel(question))}</div>
@@ -1782,6 +1883,10 @@ function showOtherAnswerHint(hint, text) {
  * - Enter **只**提交这张卡的文本：事件在输入框上拦下，不冒泡成页面级发送；
  * - 提交后清空输入框、禁用输入框与提交按钮：这张卡已经答过；
  *   服务端给出新菜单时整张卡会被换掉。
+ *
+ * 同一段里也接**文字型待决**的专用输入（``.question-text``）：
+ * 服务端说这一步要一段文字时，合法入口就是卡片里那个输入框 ——
+ * 底部普通聊天框在这一步锁着（契约 §3.3 / BUG-009）。
  */
 function bindOtherAnswers(container) {
   const boxes = container?.querySelectorAll?.(".question-other") || [];
@@ -1833,6 +1938,49 @@ function bindOtherAnswers(container) {
       submitAnswer();
     });
   });
+
+  // 文字型待决的专用输入：Enter 与提交按钮都只提交这张卡的文本。
+  const textBoxes = container?.querySelectorAll?.(".question-text") || [];
+  Array.prototype.forEach.call(textBoxes, (box) => {
+    const questionId = String(box.dataset?.questionText || "");
+    const input = box.querySelector(".question-text-input");
+    const submit = box.querySelector(".question-text-submit");
+    const hint = box.querySelector(".question-text-hint");
+    if (!input || !submit) return;
+
+    const submitAnswer = async () => {
+      if (input.disabled || submit.disabled || isBusy()) return;
+      const text = String(input.value || "").trim();
+      if (!text) {
+        showOtherAnswerHint(hint, "先写下你的想法，再提交。");
+        input.focus();
+        return;
+      }
+      // 只有**当前待答**的那张卡才认这个输入框。
+      if (lockedChoice?.id !== questionId) {
+        showOtherAnswerHint(hint, "请先回答当前待确认的那张卡片。");
+        return;
+      }
+      if (hint) hint.classList.add("hidden");
+      input.disabled = true;
+      submit.disabled = true;
+      const epoch = requestEpoch;
+      // fromQuestionText：这一段文字就是**这一步**的答案（澄清待决的专用入口）。
+      const result = await sendMessage(text, { fromChoice: true, fromQuestionText: true });
+      if (epoch !== requestEpoch) return;
+      if (result && !result.error) input.value = "";
+      syncInputControls();
+    };
+
+    submit.addEventListener("click", submitAnswer);
+    input.addEventListener("keydown", (event) => {
+      // 卡片内的按键不冒泡：Enter 只提交这张卡的文本。
+      event.stopPropagation();
+      if (event.key !== "Enter" || event.shiftKey) return;
+      event.preventDefault();
+      submitAnswer();
+    });
+  });
 }
 
 // 草稿确认阶段只接受后端给出的单选值；选“修改”后才开放编辑输入。
@@ -1849,8 +1997,11 @@ function appendConfirmActions(question, { lock = true } = {}) {
     return null;
   }
   question = { ...question, inlineEdit: true };
+  // 步骤身份挂到卡片上：撤销之后要按它把「被撤销那一步」标出来
+  // （契约 §2.3 第 2 条：旧步骤失效，但消息文本保留）。
+  const stepAttr = question.stepId ? ` data-step-id="${esc(question.stepId)}"` : "";
   const wrap = aiBubble(`
-    <div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3">
+    <div class="rounded-xl rounded-tl-sm border border-slate-200 bg-white px-3.5 py-3"${stepAttr}>
       <label class="block text-sm text-slate-700 leading-relaxed mb-2.5">${esc(question.prompt || "请先选择如何处理当前草稿：")}</label>
       <select class="question-select w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700" data-question-id="${esc(question.id || "")}">
         <option value="">请选择</option>
@@ -1888,6 +2039,11 @@ function normalizeConfirmQuestion(question) {
     allowsOther: question.allowsOther === true,
     otherLabel: question.otherLabel,
     otherPlaceholder: question.otherPlaceholder,
+    // 步骤身份也要一起带过去：归一化不能把「这一步是谁」弄丢 ——
+    // 丢了，下一次提交就关联不上，后端会拒。
+    stepId: question.stepId,
+    stepVersion: question.stepVersion,
+    stepKind: question.stepKind,
     options,
   };
 }
@@ -1941,8 +2097,68 @@ function removeBubble(bubble) {
   scrollChatBottom();
 }
 
+/**
+ * 只读回答之后把**受限步骤**的锁接回去。
+ *
+ * 只读回答**不结束**这一步（契约 §3.3：「返回了一段文字」不是解锁理由）：
+ * 用户在受限输入里问了一句只读问题，普通输入必须**继续锁着**，合法入口
+ * 仍是那张卡的专用输入 —— 否则这一步就有两个入口，用户能从普通输入
+ * 绕过这一步的约束。
+ *
+ * 服务端把当前那一步带在响应里（questions）：按它上锁。屏幕上已经有
+ * 这张卡就**只上锁、不重画**（appendAiQuestions 内部按 stepId 去重）；
+ * 响应里没带就问服务端要一句（syncChoiceLockFromServer）。
+ */
+function restoreStepLockAfterReadOnly(data) {
+  const step = (data?.questions || []).find((q) => q?.stepId);
+  if (step) {
+    setChoiceLock(step);
+    syncInputControls();
+    return null;
+  }
+  if (typeof syncChoiceLockFromServer === "function") {
+    return syncChoiceLockFromServer();
+  }
+  return null;
+}
+
+/**
+ * 屏幕上有没有**同一步骤**（stepId 相同）的卡。
+ *
+ * 同一步骤的卡只应画一张：受限修改输入那一步，用户在卡里提了一句要
+ * 信息的话，服务端回了一段说明、这一轮**没有**给出新菜单，但这一步
+ * **还在**（服务端 pending_choice 仍记着它）。服务端把这张卡带回响应
+ * 时，前端再画一张，用户看到的就是「回答完了又跳出一张一模一样的
+ * 『请描述你想怎样修改当前草稿』」（用户现场截图）。
+ *
+ * 用**步骤身份**而不是 question.id：同一轮里澄清菜单与专用输入卡共用
+ * 一个 stepId，那是**同一步**的两张卡（两张的控件都要开着）。
+ */
+function renderedStepCard(stepId, questionKey = null) {
+  const id = String(stepId || "").trim();
+  if (!id) return null;
+  const cards = document.querySelectorAll("[data-step-id]");
+  for (const card of cards) {
+    if (card.getAttribute("data-step-id") === id &&
+        (questionKey === null || card.getAttribute("data-step-question") === questionKey)) return card;
+  }
+  return null;
+}
+
 function appendAiQuestions(questions, { lock = true } = {}) {
-  const list = (questions || []).filter(Boolean);
+  let list = (questions || []).filter(Boolean);
+  // Older responses attach a separate edit input to the clarification menu.
+  const editInput = list.find((q) => q.stepKind === "edit_request" && !q.options?.length);
+  const choice = list.find((q) => q !== editInput && q.options?.length && q.selectionOnly);
+  if (editInput && choice) {
+    list = list.filter((q) => q !== editInput).map((q) => q === choice ? {
+      ...editInput, ...q, id: editInput.id, stepKind: editInput.stepKind,
+      stepId: editInput.stepId, stepVersion: editInput.stepVersion,
+      stepDraftId: editInput.stepDraftId, allowedSubmissions: editInput.allowedSubmissions,
+      lockScope: editInput.lockScope, allowsOther: true,
+      otherLabel: "其他", otherPlaceholder: editInput.otherPlaceholder,
+    } : q);
+  }
   // 没有问题就别画一张空卡：空卡只有边框没有内容，用户看起来像卡住了。
   if (!list.length) {
     if (lock) appendAiText("暂时没有需要补充的信息，请直接描述你的报表需求。");
@@ -1966,10 +2182,56 @@ function appendAiQuestions(questions, { lock = true } = {}) {
     return Object.prototype.hasOwnProperty.call(EXPECTS_LABELS, key) ? EXPECTS_LABELS[key] : "";
   };
   // 待答的那张卡（要抢选择锁的那一张）。
-  const required = list.find((q) => (q.selectionOnly || q.allowsOther) && (q.options?.length || q.allowsOther));
-  const html = list
+  //
+  // 「文字型待决」（服务端说「直接填写」）也是待决的一种：合法入口就是
+  // 卡片里那个**专用输入**，普通聊天框在这一步锁着（契约 §3.3 / BUG-009）。
+  //
+  // 判据只看两件事：**没有选项** + **expects=TEXT**。
+  //
+  // 为什么不再看 allowsOther：服务端给的澄清卡（template_edit_request /
+  // template_edit_clarification）都是「TEXT + allowsOther + 无选项」。
+  // 这种卡如果按 allowsOther 走「其他」那条路，卡片上就只有一句
+  // 「直接填写」和一个下拉框，**下面没有可写的控件** —— 这正是 BUG-009
+  // 截图里的现象（澄清卡开着，普通输入也开着，卡片内却没地方填）。
+  // 所以这一类一律画专用输入，并且**不再**画下拉框与「其他」块：
+  // 这一步只有「写一段文字」一个入口，画两个入口会让人以为可以不写
+  // 文字直接提交。
+  //
+  // 判据就地写成表达式：不调用 expectsFreeText —— 这段函数会被既有单测
+  // 单独抽进沙箱跑，沙箱里只有它原有的依赖。
+  const isTextOnly = (q) =>
+    !q?.options?.length &&
+    String(q?.expects || "").trim().toUpperCase() === "TEXT";
+  const required =
+    // 受限修改输入那一步（stepKind=edit_request）优先。
+    //
+    // 为什么：服务端存 pending_choice 时用的是同一个口径
+    // （backend/app/services/agent_service.py：先取 stepKind==edit_request
+    // 的那张，再取 selectionOnly 的菜单）。模型路径可能一轮里同时给
+    // 一张澄清卡和那一步本身，锁必须落在**权威那一张**上 —— 否则刷新后
+    // （按 pending_choice 恢复）可填的那张卡会跟刷新前不是同一张。
+    list.find((q) => q?.stepKind === "edit_request") ||
+    list.find(
+      (q) => ((q.selectionOnly || q.allowsOther) && (q.options?.length || q.allowsOther)) || isTextOnly(q)
+    );
+  // The same edit step can move from text input to a new choice menu.
+  const questionKey = (q) => JSON.stringify([
+    q.id, q.expects, q.prompt || q.text || "", q.options || [], q.stepVersion,
+  ]);
+  const toDraw = list.filter((q) =>
+    !q.stepId || !renderedStepCard(q.stepId, questionKey(q))
+  );
+  if (!toDraw.length) {
+    // 全是屏幕上已有的那几张：不重画，但**锁要接着**（这一步还没结束，
+    // 普通输入继续锁着，专用输入仍然可填 —— 契约 §3.3）。
+    if (required && lock) setChoiceLock(required);
+    syncInputControls();
+    return;
+  }
+  const html = toDraw
     .map((q) => {
-      const useSelect = q.selectionOnly || q.allowsOther;
+      // 文字型待决只画专用输入（下拉框那一支见下面 useSelect 的说明）。
+      const useSelect = !isTextOnly(q) && (q.selectionOnly || q.allowsOther);
       let controls = "";
       if (useSelect && (q.options?.length || q.allowsOther)) {
         controls = `
@@ -1988,13 +2250,37 @@ function appendAiQuestions(questions, { lock = true } = {}) {
           )
           .join("")}</div>`;
       }
+      // 文字型待决的**专用输入**：没有它，澄清卡开着却只能去底部普通
+      // 输入框打字 —— 那正是 BUG-009 截图里的现象。
+      //
+      // 输入框上面那行字用服务端给的 otherLabel（例如「修改要求」「补充说明」）；
+      // 服务端没给就用「直接填写」—— 与题型提示同一句口径，用户一眼能看到
+      // 这一步该在这里写。
+      const textLabel = String(q.otherLabel || "").trim() || "直接填写";
+      const textControls = isTextOnly(q)
+        ? `
+          <div class="question-text mt-2" data-question-text="${esc(q.id || "")}">
+            <div class="question-text-label text-[11px] text-amber-800 mb-1">${esc(textLabel)}</div>
+            <textarea class="question-text-input w-full rounded-md border border-amber-200 bg-white px-2 py-1.5 text-xs text-slate-700 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-100" rows="2" placeholder="${esc(q.otherPlaceholder || "请在这里填写你的说明")}" data-question-text-input="${esc(q.id || "")}"></textarea>
+            <div class="flex items-center gap-2 mt-1.5">
+              <button type="button" class="question-text-submit shrink-0 rounded-md border border-amber-200 bg-amber-50 hover:bg-amber-100 text-amber-800 text-xs px-2 py-1.5" data-question-text-submit="${esc(q.id || "")}">提交</button>
+              <span class="question-text-hint hidden text-[11px] text-amber-700"></span>
+            </div>
+          </div>`
+        : "";
       const hint = [expectsLabel(q.expects), q.required ? "必填" : ""].filter(Boolean).join(" · ");
+      // 步骤身份挂到这张卡上：撤销之后按它把「被撤销那一步」标出来
+      // （契约 §2.3 第 2 条：旧步骤失效，消息文本保留）。
+      const stepAttr = q.stepId
+        ? ` data-step-id="${esc(q.stepId)}" data-step-question="${esc(questionKey(q))}"`
+        : "";
       return `
-        <div class="px-3.5 py-2.5 border border-amber-200 bg-white rounded-lg">
+        <div class="px-3.5 py-2.5 border border-amber-200 bg-white rounded-lg"${stepAttr}>
           <div class="font-medium text-amber-800 text-sm">${esc(q.prompt || q.text || "请选择：")}</div>
           ${hint ? `<div class="text-[11px] text-slate-500 mt-1">${esc(hint)}</div>` : ""}
           ${controls}
-          ${renderOtherAnswerHtml(q)}
+          ${textControls}
+          ${isTextOnly(q) ? "" : renderOtherAnswerHtml(q)}
         </div>`;
     })
     .join("");
@@ -2013,7 +2299,7 @@ function appendAiQuestions(questions, { lock = true } = {}) {
     btn.addEventListener("click", () => sendMessage(btn.dataset.answer));
   });
   if (required && lock) setChoiceLock(required);
-  bindQuestionSelects(wrap, list);
+  bindQuestionSelects(wrap, toDraw);
   wrap.querySelectorAll(".question-restart").forEach((button) => {
     button.addEventListener("click", () => {
       if (lockedChoice?.id === required?.id) sendMessage("重新开始", { fromChoice: true });
@@ -2363,6 +2649,17 @@ function resolvePlanQuestion(data) {
   return (data?.questions || []).find(hasContractChoices) || null;
 }
 
+/**
+ * 响应里那一张**受限修改输入**的卡（带步骤身份的那张）。
+ *
+ * 「修改」进入的下一步是受限输入：普通聊天在这一步锁着，只有这张卡的
+ * 专用输入能提交。取它是为了拿到**服务端的权威步骤身份** —— 下一轮
+ * 提交要靠它关联，后端才认得出这段文字确实来自当前这一步。
+ */
+function resolveEditStepQuestion(data) {
+  return (data?.questions || []).find((question) => question?.stepKind === "edit_request") || null;
+}
+
 // 客户可见正文卡片的顺序：以右侧实际渲染出来的正文卡片 DOM 顺序为准。
 // REPORT_TITLE 隐藏标题区根本不渲染，天然不在顺序里，
 // 「第三个」按这个顺序数，才是客户眼睛看到的第三个。
@@ -2439,6 +2736,11 @@ function pendingEditMenuQuestion(question, options) {
     allowsOther: question?.allowsOther === true,
     otherLabel: question?.otherLabel,
     otherPlaceholder: question?.otherPlaceholder,
+    // 步骤身份：候选菜单也要绑定**当前这一步** ——
+    // 旧卡片的答案不能被当成新菜单的答案。
+    stepId: question?.stepId,
+    stepVersion: question?.stepVersion,
+    stepKind: question?.stepKind,
   };
 }
 
@@ -2466,7 +2768,7 @@ function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
     .join("");
 
   const wrap = aiBubble(`
-    <div class="rounded-xl border border-amber-200 bg-white overflow-hidden" data-pending-plan="${esc(plan.planId || "")}">
+    <div class="rounded-xl border border-amber-200 bg-white overflow-hidden" data-pending-plan="${esc(plan.planId || "")}"${question?.stepId ? ` data-step-id="${esc(question.stepId)}"` : ""}>
       <div class="px-3.5 py-2.5 bg-amber-50 border-b border-amber-100 flex items-center gap-2">
         <iconify-icon class="text-amber-600" icon="mdi:clipboard-text-clock-outline"></iconify-icon>
         <span class="text-sm font-semibold text-amber-900">待确认的修改</span>
@@ -2475,9 +2777,13 @@ function appendPendingEditPlan(plan, { lock = true, question = null } = {}) {
         <div>
           <span class="text-slate-500">目标：</span>
           ${
-            targetIndex >= 0
-              ? `<span class="font-medium text-slate-800">第 ${targetIndex + 1} 个正文卡片「${esc(targetLabel)}」</span>`
-              : `<span class="text-rose-600">目标卡片不在当前可见正文顺序里</span>`
+            !plan.targetRegionId
+              // 整页级修改（排版、间距…）本来就没有「某一张卡」这个目标：
+              // 说成「不在当前可见正文顺序里」是误导 —— 那是**目标卡片失效**的提示。
+              ? `<span class="font-medium text-slate-800">整页（全部正文卡片）</span>`
+              : targetIndex >= 0
+                ? `<span class="font-medium text-slate-800">第 ${targetIndex + 1} 个正文卡片「${esc(targetLabel)}」</span>`
+                : `<span class="text-rose-600">目标卡片不在当前可见正文顺序里</span>`
           }
         </div>
         ${plan.summary ? `<div class="whitespace-pre-wrap">${esc(plan.summary)}</div>` : ""}
@@ -2611,7 +2917,7 @@ async function postAgentStream(body, debugCard, signal) {
   return finalData;
 }
 
-async function sendMessage(text, { fromChoice = false, designAction = null, fromOther = false, fromPlan = false, inlineEditText = "", fromInline = false, targetRegionId = null } = {}) {
+async function sendMessage(text, { fromChoice = false, designAction = null, fromOther = false, fromPlan = false, inlineEditText = "", fromInline = false, fromQuestionText = false, targetRegionId = null } = {}) {
   if (!text || activeRequest || advanceTimers.size) return;
   const inlineChoice = inlineEditText ? lockedChoice : null;
   if (
@@ -2637,7 +2943,12 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
     // 后端按「文本不在选项里 + 这张卡允许其他」把它认成纠正。
     const otherAnswer = fromOther && lockedChoice.allowsOther === true;
     const inlineAnswer = fromInline && lockedChoice.inlineEdit === true && lockedChoice.inlineEditStarted === true;
-    if (!allowed && !otherAnswer && !inlineAnswer) {
+    // 文字型待决：卡片里那个专用输入写的内容，就是**这一步**的答案。
+    // 判据就地写成表达式（不调用 expectsFreeText）：这段函数会被既有单测
+    // 单独抽进沙箱跑，沙箱里只有它原有的依赖。
+    const questionTextAnswer =
+      fromQuestionText && String(lockedChoice.expects || "").trim().toUpperCase() === "TEXT";
+    if (!allowed && !otherAnswer && !inlineAnswer && !questionTextAnswer) {
       toast("请先从下拉框选择");
       return;
     }
@@ -2688,7 +2999,7 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
   // 以前这里是 `if (session.editingTargetRegionId) context.selectedRegionId = ...`：
   // 上一轮选中的卡片会一直黏在后面每一轮上，新需求因此被旧卡片截断
   // （用户看到的「选中卡片以后增加不了、一直缩在卡片上」）。
-  const isMenuAnswer = fromChoice || fromOther || fromPlan;
+  const isMenuAnswer = fromChoice || fromOther || fromPlan || fromQuestionText;
   const isInlineTwoStage = Boolean(inlineEditText) || fromInline;
   // 追问状态（NEEDS_CLARIFICATION）下的自由输入是**回答刚才的追问**，算延续。
   const continuesCurrentOperation =
@@ -2697,6 +3008,18 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
   const roundTargetRegionId =
     targetRegionId || (continuesCurrentOperation ? session.editingTargetRegionId : null);
   if (roundTargetRegionId) context.selectedRegionId = roundTargetRegionId;
+  // 步骤关联（权威步骤契约）：本轮请求带上「当前这一步」的身份。
+  //
+  // 服务端拿它跟**持久化**的权威记录（pending_choice）核对 —— 不是相信
+  // 前端的布尔来源标志（fromChoice / fromOther / fromInline 只是本地参数，
+  // HTTP 请求里根本没有，后端校验不了）。
+  //
+  // 少了它：受限修改输入那一步会拒绝这次提交（旧的直接调用接口也绕不过）。
+  const stepRef = lockedChoice;
+  if (stepRef?.stepId) {
+    context.stepId = stepRef.stepId;
+    context.stepVersion = stepRef.stepVersion ?? null;
+  }
   // 客户可见正文卡片的顺序：后端按这个顺序理解「第三个」这类说法
   const visibleRegionIds = visibleBodyRegionIds();
   if (visibleRegionIds.length) {
@@ -2795,6 +3118,16 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
     }
     return data;
   }
+  // 回答菜单之后**不主动解锁**：解锁由服务端这一轮给的权威菜单决定
+  // （新菜单会自己 setChoiceLock 接管旧锁）。
+  //
+  // **受限步骤**（用户在专用输入里写的要求）例外：这一步只由服务端解除。
+  // 服务端这一轮可能只回了一段文字（没有新的菜单）—— 那**不代表**这一步
+  // 结束了（BUG-003：提了修改要求之后回了一段分析，回复完普通输入就开了）。
+  // 「没有候选」「返回了一段文字」**不是**解锁理由（契约 §3.3）。
+  // 受限步骤：用户在**专用输入**里写的要求（卡片内的文字输入 / 内联两段式）。
+  // 这一步只由服务端解除。
+  const restrictedTurn = Boolean(inlineEditText) || fromInline || fromQuestionText;
   if (fromChoice) clearChoiceLock();
 
   // JSON 输入被收下：说清这份数据的来路（契约表 §1.1）。
@@ -2820,7 +3153,7 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
   //   - **非空**：本轮的目标就是这张卡。
   //
   // 只读回答不参与：只读咨询不结束正在进行的操作，不能擅自释放目标。
-  if (!readOnlyKind && data.debug && Object.prototype.hasOwnProperty.call(data.debug, "editingTargetRegionId")) {
+  if ((!readOnlyKind || data.debug?.queryReturnedToDraft === true) && data.debug && Object.prototype.hasOwnProperty.call(data.debug, "editingTargetRegionId")) {
     const nextTargetRegionId = data.debug.editingTargetRegionId || null;
     if (!nextTargetRegionId && session.editingTargetRegionId) {
       // 释放：屏上那张卡不该还留着「被选中」的痕迹。
@@ -2830,17 +3163,30 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
   }
   // Keep the legacy action handshake at submit time, not when opening the input.
   if (inlineEditText && !readOnlyKind && data.state === "USER_EDITING_TEMPLATE" && !readPendingEditPlan(data)) {
-    setChoiceLock({ ...inlineChoice, inlineEditStarted: true });
+    // 以**服务端这一轮**给的步骤卡为准：它带步骤身份与锁范围，
+    // 下一轮提交要靠它关联。沿用上一张旧卡会把身份带错。
+    const stepQuestion = resolveEditStepQuestion(data) || inlineChoice;
+    setChoiceLock({ ...stepQuestion, inlineEdit: true, inlineEditStarted: true });
     return sendMessage(inlineEditText, { fromChoice: true, fromInline: true });
   }
 
   if (readOnlyKind) {
     // 只读回答单独展示：不画业务确认菜单、不改右侧预览、不触发自动推进。
     renderReadOnlyAnswer(data, readOnlyKind);
+    if (data.debug?.queryReturnedToDraft === true) {
+      clearChoiceLock();
+      appendConfirmActions(data.questions?.[0]);
+    }
     // 查询轮带回的原菜单：屏幕上还没有菜单时才补画（已有就不重复画）。
     if (!lockedChoice) {
       const preservedMenu = resolveQueryPreservedMenu(data);
       if (preservedMenu) appendConfirmActions(preservedMenu);
+    }
+    // 受限步骤：只读回答**不结束**这一步（契约 §3.3：「返回了一段文字」
+    // 不是解锁理由）。用户在受限输入里问了一句只读问题，普通输入必须
+    // **继续锁着**，合法入口仍是那张卡的专用输入。
+    if (restrictedTurn && !lockedChoice) {
+      await restoreStepLockAfterReadOnly(data);
     }
     updateMeta();
     renderSessionList();
@@ -2977,9 +3323,8 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
           session.baseDefinitionRevision = savedDraft.metadata.revision;
         }
       }
-      appendAiText(data.reply || "草稿已保存，接下来进入校验。");
-      // 自动推进到 VALIDATING（只读问答不推进）
-      if (WorkbenchQuery.shouldAutoAdvance(data)) queueAdvance(450, epoch);
+      appendAiText(data.reply || "草稿已保存，后续流程待接入。");
+      // 草稿确认到此结束，暂不进入后续校验和预览流程。
       break;
     case "VALIDATING":
       appendAiText(data.reply || "正在校验报表定义…");
@@ -3051,6 +3396,18 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
 
   updateMeta();
   renderSessionList();
+  // 受限步骤：这一轮**没有**给出新的权威菜单 → 不因为「请求结束」就解锁。
+  // 「没有候选」「返回了一段文字」不是解锁理由（契约 §3.3）。
+  // 问服务端一句「现在还有没有待决步骤」，按答案上锁 / 解锁 ——
+  // 锁只由服务端说了算，前端不自己判断这一步结束了没有。
+  //
+  // typeof 守卫：这段函数会被既有单测单独抽进沙箱跑，沙箱里没有
+  // syncChoiceLockFromServer —— 跳过即可（**不是**功能降级：
+  // 真实页面里它与主脚本同文件，一定在）。
+  if (restrictedTurn && !lockedChoice && typeof syncChoiceLockFromServer === "function") {
+    await syncChoiceLockFromServer();
+    syncInputControls();
+  }
   return data;
 }
 
@@ -3375,18 +3732,33 @@ function isTemplateEditFailure(data) {
 }
 
 function restoreEditFailureMenu(data, { lock = true, pending = null } = {}) {
-  // The failed acceptance consumed the old plan; only the response's new menu is actionable.
-  lastPendingPlan = null;
-  if (lock) clearChoiceLock();
+  // 失败这一轮**不一定**消费了旧计划：部分执行失败时后端仍留着它，
+  // 候选菜单也就还有效。旧代码在这里一律「假定旧计划已消费」→ 清锁 →
+  // 放开普通聊天，后端却还留着计划 —— 两边对不上，用户能在计划还在的
+  // 时候去改别的东西。
+  //
+  // 现在按**明确语义**恢复：响应里给了新的权威菜单就换锁；没给就**保持
+  // 原锁**，普通聊天继续锁着（后端仍有的计划 / 当前步骤还在等用户处理）。
   const questions = (data.questions || []).filter(Boolean).map((question) =>
     pending?.id === question.id ? pending : question
   );
   const confirm = questions.find((question) => question.id === "template_edit_confirm");
-  if (confirm) return appendConfirmActions(confirm, { lock });
-  if (questions.length) appendAiQuestions(questions, { lock });
-  return questions.find((question) =>
-    (question.selectionOnly || question.allowsOther) && (question.options?.length || question.allowsOther)
-  ) || null;
+  if (confirm) {
+    lastPendingPlan = null;
+    return appendConfirmActions(confirm, { lock });
+  }
+  if (questions.length) {
+    lastPendingPlan = null;
+    appendAiQuestions(questions, { lock });
+    return questions.find((question) =>
+      (question.selectionOnly || question.allowsOther) && (question.options?.length || question.allowsOther)
+    ) || null;
+  }
+  // 没有新的权威菜单：**保持原来的锁**。旧计划 / 当前步骤还在，
+  // 普通聊天不能因为一次失败就被放开。
+  lastPendingPlan = null;
+  syncInputControls();
+  return null;
 }
 
 /**
@@ -3746,6 +4118,211 @@ function formatMetricValue(value, precision) {
   const digits = Number.isFinite(Number(precision)) ? Number(precision) : 1;
   return num.toFixed(Math.max(0, Math.min(6, digits)));
 }
+
+// --------------------------------------------------------------------------
+// 权威显示格式（契约 0002 §3.5 / BUG-010）
+// --------------------------------------------------------------------------
+//
+// 格式的**唯一出处**是服务端写下的那一份：
+// `backend/app/services/report_presentation_service.py` 的
+// `region_authoritative_format()` —— 它读的是区域定义里的 `region.format`
+// （`SET_FORMAT` 写下的那一份），只保留白名单里的键。
+//
+// 前端**不自己造格式**：这里按同一份白名单读同一份定义，再按服务端
+// `format_display_value()` 的同一套口径把值渲染成显示串。
+// 服务端已经在载荷里算好显示串时优先用服务端的（两边各拼一次迟早对不上），
+// 拿不到时才用这里这份 —— 两边口径一致，结果一致。
+//
+// 注意：显示格式**只改显示**，底层数值一个字节都不动
+// （不改数据精度、不改统计结果、不改单位口径）。
+
+/** 权威格式的白名单键（与后端 ALLOWED_FORMAT_KEYS 一一对应）。 */
+const AUTHORITATIVE_FORMAT_KEYS = [
+  "kind",
+  "precision",
+  "unitLabel",
+  "thousandSeparator",
+  "dateTimePattern",
+  "nullText",
+  "roundingMode",
+];
+
+/** 数值型的格式类型（与后端 _NUMERIC_FORMAT_KINDS 一致）。 */
+const AUTHORITATIVE_NUMERIC_FORMAT_KINDS = ["NUMBER", "PERCENT", "CURRENCY", "DURATION"];
+/** 日期型的格式类型（与后端 _DATE_FORMAT_KINDS 一致）。 */
+const AUTHORITATIVE_DATE_FORMAT_KINDS = ["DATE", "DATETIME"];
+
+/**
+ * 这个区域的**权威显示格式**（与后端 region_authoritative_format() 同一口径）。
+ *
+ * 来源是**定义**里的 `region.format` —— 那是服务端写下的那一份。
+ * 定义里没有就退回载荷里的 `format`（服务端也是从同一份定义抄过去的）。
+ */
+function regionAuthoritativeFormat(defRegion, payload) {
+  const raw = defRegion && typeof defRegion === "object" && defRegion.format && typeof defRegion.format === "object"
+    ? defRegion.format
+    : payload && typeof payload === "object" && payload.format && typeof payload.format === "object"
+      ? payload.format
+      : null;
+  if (!raw) return {};
+  const out = {};
+  for (const key of AUTHORITATIVE_FORMAT_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(raw, key) && raw[key] !== null && raw[key] !== undefined) {
+      out[key] = raw[key];
+    }
+  }
+  return out;
+}
+
+/** 舍入方式 → toFixed 之前用的取整函数（与后端 _ROUNDING_MODES 同一组取值）。 */
+const AUTHORITATIVE_ROUNDING_MODES = {
+  HALF_UP: (value) => (value < 0 ? -Math.round(-value) : Math.round(value)),
+  HALF_DOWN: (value) => (value < 0 ? -Math.round(-value - 0.5) : Math.round(value - 0.5)),
+  FLOOR: (value) => Math.floor(value),
+  CEIL: (value) => Math.ceil(value),
+};
+
+/**
+ * 按权威格式把一个数值渲染成显示串（只改显示，数值本身不动）。
+ *
+ * 与后端 `_format_number()` 同一口径：精度 → 舍入 → 千分位。
+ */
+function formatAuthoritativeNumber(value, fmt) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  const spec = fmt || {};
+  let text;
+  const precision = spec.precision;
+  if (precision !== undefined && precision !== null) {
+    const digits = Math.max(0, Math.min(6, Number.parseInt(precision, 10) || 0));
+    const mode = AUTHORITATIVE_ROUNDING_MODES[String(spec.roundingMode || "HALF_UP").toUpperCase()]
+      || AUTHORITATIVE_ROUNDING_MODES.HALF_UP;
+    const factor = 10 ** digits;
+    const rounded = mode(num * factor) / factor;
+    text = rounded.toFixed(digits);
+  } else {
+    text = String(num);
+  }
+  if (spec.thousandSeparator === true) {
+    const negative = text.startsWith("-");
+    const body = negative ? text.slice(1) : text;
+    const [integer, fraction] = body.split(".");
+    const grouped = integer ? integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",") : integer;
+    text = (negative ? "-" : "") + grouped + (fraction !== undefined ? "." + fraction : "");
+  }
+  return text;
+}
+
+/** 日期值按 dateTimePattern 渲染（认不出来就原样返回，不猜）。 */
+function formatAuthoritativeDate(value, fmt, kind) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  let date = null;
+  if (raw) {
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) date = parsed;
+  }
+  if (!date) return String(value);
+  const pattern = String(fmt?.dateTimePattern || "").trim();
+  const pad = (num) => String(num).padStart(2, "0");
+  if (!pattern) {
+    const day = kind === "DATETIME"
+      ? `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+      : `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    return day;
+  }
+  // 只支持日期格式里最常用的一组占位符；认不出来的原样输出，
+  // 宁可少格式化，也不显示错日期。
+  return pattern.replace(/%[YmdHMS]/g, (token) => {
+    switch (token) {
+      case "%Y": return String(date.getFullYear());
+      case "%m": return pad(date.getMonth() + 1);
+      case "%d": return pad(date.getDate());
+      case "%H": return pad(date.getHours());
+      case "%M": return pad(date.getMinutes());
+      case "%S": return pad(date.getSeconds());
+      default: return token;
+    }
+  });
+}
+
+/**
+ * 按**权威格式**把一个值渲染成显示串（与后端 format_display_value() 同一口径）。
+ *
+ * - 数值：按 precision / thousandSeparator / roundingMode 显示；
+ * - 日期：按 dateTimePattern 显示；
+ * - 单位标签：格式里声明了 unitLabel 就用它（可以空串 = 不带单位），
+ *   没声明就用传入的 unit。
+ */
+function formatDisplayValueByFormat(value, fmt, unit = "") {
+  const spec = fmt && typeof fmt === "object" ? fmt : {};
+  const kind = String(spec.kind || "").toUpperCase();
+  if (value === null || value === undefined || value === "") {
+    return String(spec.nullText || "");
+  }
+  let text;
+  let numeric = false;
+  if (kind === "TEXT") {
+    text = String(value);
+  } else if (AUTHORITATIVE_DATE_FORMAT_KINDS.includes(kind)) {
+    text = formatAuthoritativeDate(value, spec, kind);
+  } else if (AUTHORITATIVE_NUMERIC_FORMAT_KINDS.includes(kind)) {
+    text = formatAuthoritativeNumber(value, spec);
+    numeric = typeof value === "number" && Number.isFinite(value);
+  } else if (typeof value === "boolean") {
+    text = String(value);
+  } else if (typeof value === "number" && Number.isFinite(value)) {
+    text = formatAuthoritativeNumber(value, spec);
+    numeric = true;
+  } else if (spec.dateTimePattern) {
+    text = formatAuthoritativeDate(value, spec, kind || "DATETIME");
+  } else {
+    text = String(value);
+  }
+  if (numeric) {
+    const label = String(
+      Object.prototype.hasOwnProperty.call(spec, "unitLabel") ? spec.unitLabel : unit || ""
+    ).trim();
+    if (label) text = `${text} ${label}`;
+  }
+  return text;
+}
+
+/**
+ * 这条数据**按权威格式**该显示成什么。
+ *
+ * - 服务端已经按权威格式算好显示串（displayValue）→ 用它
+ *   （两边各拼一次迟早对不上，以服务端那份为准）；
+ * - 否则按同一份权威格式本地渲染（服务端那份拿不到时用，例如用户 JSON 模式）；
+ * - 这份格式**没有改显示** → 返回 null，调用方退回原来的写法。
+ *
+ * columnFormat：表格列自己的格式（列优先，列没声明才继承区域这一份，
+ * 与后端 `{**region_format, **column_format}` 的口径一致）。
+ *
+ * 真实页面里这个函数一定在（与主脚本同文件）；既有单测把渲染函数单独抽进
+ * 沙箱跑，那边没有这个符号 —— 调用方用 typeof 守卫跳过（**不是**功能降级）。
+ */
+function authoritativeDisplayValue(value, defRegion, payload, unit, serverDisplay, columnFormat) {
+  if (serverDisplay !== null && serverDisplay !== undefined && serverDisplay !== "") {
+    return String(serverDisplay);
+  }
+  const fmt = regionAuthoritativeFormat(defRegion, payload);
+  const spec = columnFormat && typeof columnFormat === "object" ? { ...fmt, ...columnFormat } : fmt;
+  if (!hasAuthoritativeFormat(spec)) return null;
+  return formatDisplayValueByFormat(value, spec, unit || "");
+}
+
+/**
+ * 这份格式**有没有真的改显示**。
+ *
+ * 只声明 `kind` 不算 —— 那一档服务端与前端原本的口径一致
+ * （表格按 kind=NUMBER 走 toFixed），别为了统一而改掉既有观感。
+ */
+function hasAuthoritativeFormat(fmt) {
+  if (!fmt || typeof fmt !== "object") return false;
+  return ["precision", "unitLabel", "thousandSeparator", "dateTimePattern", "nullText", "roundingMode"]
+    .some((key) => Object.prototype.hasOwnProperty.call(fmt, key) && fmt[key] !== null && fmt[key] !== undefined);
+}
+
 
 // --------------------------------------------------------------------------
 // 渲染：右侧报表面板（草稿阶段与预览阶段共用一套）
@@ -4307,6 +4884,10 @@ function restoreStoppedTurn(activeTask) {
  * 走一次草稿动作（撤销 / 重做 / 保存 / 另存为）。
  *
  * 动作在**服务端**做：前端不改定义，只把服务端返回的权威状态收回来重画。
+ *
+ * 撤销 / 重做**还要把左侧的会话现场整份回退**（BUG-008）：
+ * 只重画右边的话，左边还留着被撤销那一步的摘要、旧菜单与旧候选 ——
+ * 右边已经撤了，左边还说「生效成功」，用户看到的是两份互相矛盾的现场。
  */
 async function runDraftAction(action, payload = {}) {
   if (!session.draftId) {
@@ -4329,12 +4910,185 @@ async function runDraftAction(action, payload = {}) {
     } else if (action === "UNDO" || action === "REDO") {
       await refreshPreviewPayload();
     }
+    if (action === "UNDO" || action === "REDO") {
+      await restoreSessionSceneAfterHistoryAction(action, result);
+      // 场景恢复用的是会话快照；**动作响应里那一份**才是这次动作的权威结果，
+      // 重新盖上去（会话绑到别的草稿对象时快照可能是旧的，不能拿它覆盖）。
+      if (result?.definition) {
+        session.definition = result.definition;
+        session.baseDefinitionRevision = result.definition?.metadata?.revision ?? null;
+      }
+      if (result?.reportPreviewPayload) {
+        session.reportPreviewPayload = result.reportPreviewPayload;
+        session.reportPreviewError = null;
+      }
+    }
     renderReportPanel();
     updateMeta();
     const label = { UNDO: "已撤销上一步", REDO: "已重做", SAVE: "草稿已保存", SAVE_AS: "已另存为新草稿" };
     toast(label[action] || "完成");
   } catch (err) {
     toast("操作失败：" + (err.message || err));
+  }
+}
+
+// --------------------------------------------------------------------------
+// 撤销 / 重做之后：左侧会话现场的整份恢复（BUG-008）
+// --------------------------------------------------------------------------
+//
+// **权威现场从服务端来**，前端不自己算「哪一步被撤销了」：
+//
+//   1. 动作响应里的 `sessionScene`（契约 §2.3 第 3 条，优先）；
+//   2. 退一步：`GET /api/sessions/{id}` 的 `pendingChoice` 与 `messages`
+//      （既有权威接口 —— 会话快照与消息历史都在那里）。
+//
+// 前端**不自己决定**能不能撤销、不自己清锁、不自己算失效步骤：
+// 服务端没给失效清单时，前端只保证「旧 dropdown 不能再点」
+// （只有当前有效菜单那一个能点），**不写**「已撤销」——
+// 不拿猜测当事实。
+
+/** 这条消息是不是被服务端标成了「已撤销 / 只读」。 */
+function isRevokedMessagePayload(payload) {
+  return payload?.revoked === true;
+}
+
+/** 权威现场里被撤销的步骤 id（服务端给的清单）。 */
+function revokedStepIdsOf(actionResult) {
+  const raw = actionResult?.revokedStepIds;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((id) => String(id || "").trim()).filter(Boolean);
+}
+
+/** 一条消息带出来的步骤 id（它画出来的那些卡片各自属于哪一步）。 */
+function revokedStepIdsOfPayload(payload) {
+  const out = [];
+  const questions = Array.isArray(payload?.questions) ? payload.questions : [];
+  for (const question of questions) {
+    const stepId = String(question?.stepId || "").trim();
+    if (stepId) out.push(stepId);
+  }
+  return out;
+}
+
+/**
+ * 把服务端给的现场归一成前端要的那一份。
+ *
+ * 失效步骤两个来源：
+ *   1. 动作响应里的 `revokedStepIds`（服务端在撤销那一笔事务里给的）；
+ *   2. 会话历史里被标成已撤销的消息（`payload.revoked`）——
+ *      刷新后靠它保持一致（消息文本保留，只是那一步失效）。
+ *
+ * 当前有效菜单：会话的 `pendingChoice`（服务端的权威待决选择）。
+ * 撤销之后服务端已经把它清掉了 → 这时**不锁**旧的菜单。
+ */
+function authoritativeSceneOf(actionResult, sessionDetail) {
+  const revokedStepIds = new Set(revokedStepIdsOf(actionResult));
+  const messages = Array.isArray(sessionDetail?.messages) ? sessionDetail.messages : [];
+  for (const message of messages) {
+    if (!isRevokedMessagePayload(message?.payload)) continue;
+    for (const stepId of revokedStepIdsOfPayload(message.payload)) revokedStepIds.add(stepId);
+  }
+  return {
+    // 当前有效菜单：服务端说没有待决选择就是没有（撤销之后正是如此）。
+    pendingQuestion: sessionDetail?.pendingChoice?.question || null,
+    state: sessionDetail?.state || null,
+    revokedStepIds: Array.from(revokedStepIds),
+    // 服务端有没有给出失效清单：没有的话前端**不写**「已撤销」。
+    hasRevokedList: revokedStepIds.size > 0,
+  };
+}
+
+/**
+ * 把被撤销的那一步在界面上标出来：**保留消息文本**，但旧控件失效。
+ *
+ * - 下拉框 / 输入框 / 按钮一律 disabled（不能再选、不能再提交）；
+ * - 挂一条「已撤销」标记，明确说这一步已经不算数了；
+ * - 消息正文与更早的历史**一个字都不删**（契约 §2.3 第 2 条）。
+ */
+function applyRevokedSteps(stepIds) {
+  const ids = new Set((stepIds || []).map((id) => String(id || "").trim()).filter(Boolean));
+  if (!ids.size) return 0;
+  let marked = 0;
+  document.querySelectorAll("[data-step-id]").forEach((el) => {
+    const stepId = el.getAttribute("data-step-id");
+    if (!stepId || !ids.has(stepId)) return;
+    if (el.getAttribute("data-revoked") === "1") return;
+    el.setAttribute("data-revoked", "1");
+    el.classList.add("wp-revoked");
+    // 旧控件失效：不能选、不能提交。
+    el.querySelectorAll("select, input, textarea, button").forEach((control) => {
+      control.disabled = true;
+      control.classList.add("opacity-50");
+      // 同步控件状态时（syncInputControls）要认这个标记 ——
+      // 否则重新同步一次会把旧 dropdown 又打开。
+      if (control.dataset) control.dataset.revoked = "1";
+    });
+    // 明确标为「已撤销」（历史保留，不删消息）。
+    const badge = document.createElement("div");
+    badge.className = "wp-revoked-badge";
+    badge.setAttribute("data-revoked-badge", "1");
+    badge.textContent = "已撤销";
+    el.appendChild(badge);
+    marked += 1;
+  });
+  return marked;
+}
+
+/**
+ * 受限步骤的锁**只由服务端解除**。
+ *
+ * 服务端这一轮可能只回了一段文字（没有新的菜单）—— 那**不代表**这一步
+ * 结束了（BUG-003：提了修改要求之后回了一段分析，回复完普通输入就开了）。
+ * 前端不自己判断「结束了没」，只向服务端问一句「现在还有没有待决步骤」，
+ * 按服务端的答案上锁 / 解锁（契约 §3.3：「没有候选」「返回了一段文字」
+ * 不是解锁理由）。
+ */
+async function syncChoiceLockFromServer() {
+  const sessionId = session.sessionId;
+  if (!sessionId) return;
+  let detail = null;
+  try {
+    detail = await sessionApi.detail(sessionId);
+  } catch (err) {
+    // 问不到就不动锁：宁可锁着（后端仍可能锁着），也不擅自放开。
+    return;
+  }
+  const pending = detail?.pendingChoice?.question || null;
+  if (!pending) {
+    // 服务端说这一步不在了 → 放锁。
+    clearChoiceLock();
+    return;
+  }
+  // 服务端说这一步还在 → 把那张卡画出来（专用输入要真的在屏幕上，
+  // 用户才有地方作答），并按它上锁。
+  appendAiQuestions([pending], { lock: true });
+}
+
+/**
+ * 撤销 / 重做之后：把**左侧会话现场**整份恢复成服务端的权威状态。
+ *
+ * 做法：按服务端的会话详情把左侧重画一遍（历史保留、菜单按权威阶段恢复、
+ * 锁按服务端那份菜单重新上），再把被撤销的步骤标出来。
+ */
+async function restoreSessionSceneAfterHistoryAction(action, result) {
+  const sessionId = session.sessionId;
+  if (!sessionId) return;
+  let detail = null;
+  try {
+    detail = await sessionApi.detail(sessionId);
+  } catch (err) {
+    // 拿不到权威现场就**不动**左侧：宁可保持原样，也不自己编一份现场。
+    return;
+  }
+  if (!detail) return;
+  const scene = authoritativeSceneOf(result, detail);
+  await restoreSession(sessionId, { silent: true, detail, scene });
+  applyRevokedSteps(scene.revokedStepIds);
+  // 服务端没有给出失效清单：前端**不写**「已撤销」（不拿猜测当事实），
+  // 但要说清楚左侧现在是什么状态 —— 否则右边撤了、左边那条「已生效」
+  // 还挂着，用户看到的是矛盾。
+  if (!scene.hasRevokedList) {
+    appendAiText("已" + (action === "UNDO" ? "撤销" : "重做") + "上一步。服务端没有给出失效步骤清单，左侧历史按当前记录显示，旧步骤的控件已停用。");
   }
 }
 
@@ -4670,6 +5424,13 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
   }
 
   if (type === "METRIC_CARD") {
+    // 权威格式：服务端写进定义里的那一份 region.format（契约 0002 §3.5 / BUG-010）。
+    // 服务端已经按它算好了 displayValue；这里优先用服务端的，
+    // 拿不到（例如用户 JSON 模式）才按同一份格式本地渲染。
+    //
+    // typeof 守卫：这段渲染函数会被既有单测单独抽进沙箱跑，那边没有
+    // authoritativeDisplayValue —— 跳过即可（**不是**功能降级：
+    // 真实页面里它与主脚本同文件，一定在）。
     const metrics = Array.isArray(p.metrics) ? p.metrics.filter((m) => m && typeof m === "object") : [];
     const items = metrics.length ? metrics : [{
       metricKey: p.metricKey, label: p.label || "指标", value: p.value,
@@ -4681,9 +5442,16 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
       // 显示串优先用**服务端按权威格式算好的** displayValue（契约 0002 §5）：
       // 精度、千分位、单位标签都在服务端那一份格式里，
       // 前端不再自己拼一套 —— 两边各拼一次迟早对不上。
-      const display = m.displayValue != null && m.displayValue !== ""
-        ? esc(String(m.displayValue))
-        : `${esc(formatMetricValue(m.value, m.precision))}<span class="text-[11px] font-normal text-slate-400 ml-1">${esc(m.unit || "")}</span>`;
+      const formatted = hasValue && typeof authoritativeDisplayValue === "function"
+        ? authoritativeDisplayValue(m.value, ctx.defRegion, p, m.unit || unit, m.displayValue)
+        : null;
+      // 服务端已经按权威格式算好的显示串（最高优先）。
+      const serverDisplay = m.displayValue != null && m.displayValue !== "" ? String(m.displayValue) : null;
+      const display = formatted !== null
+        ? esc(formatted)
+        : serverDisplay !== null
+          ? esc(serverDisplay)
+          : `${esc(formatMetricValue(m.value, m.precision))}<span class="text-[11px] font-normal text-slate-400 ml-1">${esc(m.unit || "")}</span>`;
       return `
           <div class="rounded-lg border border-slate-200 bg-white px-3 py-2" data-region-metric="${esc(m.metricKey || m.label || "")}">
             <div class="text-[11px] text-slate-500">${esc(m.label || m.metricKey || "指标")}</div>
@@ -4722,6 +5490,16 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
               : undefined;
             if (display != null && display !== "") {
               return `<td class="px-3 py-2.5 text-slate-700 mono">${esc(String(display))}</td>`;
+            }
+            // 列自己的格式优先，列没声明才继承区域这一份（服务端同一口径）。
+            // typeof 守卫：这段渲染函数会被既有单测单独抽进沙箱跑，
+            // 那边没有 authoritativeDisplayValue —— 跳过即可。
+            const columnFmt = c.format && typeof c.format === "object" ? c.format : null;
+            const formatted = typeof authoritativeDisplayValue === "function"
+              ? authoritativeDisplayValue(val, ctx.defRegion, p, "", display, columnFmt)
+              : null;
+            if (formatted !== null) {
+              return `<td class="px-3 py-2.5 text-slate-700 mono">${esc(formatted)}</td>`;
             }
             if (c.format?.kind === "NUMBER") {
               const num = Number(val);
@@ -4839,6 +5617,15 @@ function renderChartPayload(container, region, p, unit) {
     : (Array.isArray(p.xLabels) ? p.xLabels : []);
   const values = Array.isArray(p.yValues) ? p.yValues : [];
   const series = Array.isArray(p.series) && p.series.length ? p.series : null;
+  // 主题生效时，**图里的文字**也要跟着主题走（BUG-009）：
+  // 画布上的坐标轴文字不受 CSS 影响，深色主题下默认的深色字会糊在深底上。
+  // 颜色取服务端解析好的主题 token（前端不自己造主题）。
+  const themeTextColor = (() => {
+    if (typeof session === "undefined" || !session) return "";
+    const color = session.resolvedTheme?.tokens?.colorText;
+    return typeof color === "string" ? color : "";
+  })();
+  const axisLabel = themeTextColor ? { fontSize: 11, color: themeTextColor } : { fontSize: 11 };
 
   if (!labels.length || (!values.length && !(series && series[0]?.yValues?.length))) {
     container.innerHTML = `<div class="rounded-lg bg-slate-50 border border-slate-200 px-4 py-3 text-xs text-slate-500">这个图表还没有数据点。</div>`;
@@ -4878,14 +5665,14 @@ function renderChartPayload(container, region, p, unit) {
         xAxis: {
           type: "category",
           data: labels,
-          axisLabel: { fontSize: 11 },
+          axisLabel,
         },
         yAxis: {
           type: "value",
           // 纵轴单位一律从载荷读：PUE、总电费、实时功率都不是 kWh。
           name: unit || undefined,
-          nameTextStyle: { fontSize: 10, color: "#64748b" },
-          axisLabel: { fontSize: 11 },
+          nameTextStyle: { fontSize: 10, color: themeTextColor || "#64748b" },
+          axisLabel,
         },
         series: seriesOption,
       });
@@ -5063,19 +5850,26 @@ async function deleteSession(sessionId) {
 //   ok=true            恢复成功
 //   ok=false,missing  会话已经不存在（404），自动恢复的落点可以清掉
 //   ok=false,其他      忙 / 网络故障 / 被更新的操作作废，落点要留着下次再试
-async function restoreSession(sessionId, { silent = false, token = null } = {}) {
+//
+// detail / scene 是**外部已经取好的权威现场**：撤销之后左侧要整份恢复时，
+// 由调用方把会话详情与权威现场一起带进来，省掉一次重复请求。
+// scene.pendingChoice 优先于 detail 里的 pendingChoice —— 动作响应里那份
+// 是这次动作的权威现场（契约 §2.3）。
+async function restoreSession(sessionId, { silent = false, token = null, detail: preloadedDetail = null, scene = null } = {}) {
   if (isBusy()) {
     if (!silent) toast("请先停止正在生成的请求");
     return { ok: false, missing: false };
   }
   const myToken = token ?? ++sessionRestoreToken;
-  let detail;
-  try {
-    detail = await sessionApi.detail(sessionId);
-  } catch (err) {
-    const missing = /404/.test(err.message || "");
-    if (!silent) toast(missing ? "这个会话已经不存在了。" : "打开会话失败：" + err.message);
-    return { ok: false, missing };
+  let detail = preloadedDetail;
+  if (!detail) {
+    try {
+      detail = await sessionApi.detail(sessionId);
+    } catch (err) {
+      const missing = /404/.test(err.message || "");
+      if (!silent) toast(missing ? "这个会话已经不存在了。" : "打开会话失败：" + err.message);
+      return { ok: false, missing };
+    }
   }
   // 恢复途中用户点了「新建对话」：这次恢复作废，不要把旧会话画到新会话界面上。
   if (myToken !== sessionRestoreToken) return { ok: false, missing: false };
@@ -5091,7 +5885,8 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
 
   session.sessionId = detail.sessionId;
   session.conversationId = "conv_" + Date.now() + "_" + requestEpoch;
-  session.state = detail.state;
+  // 阶段：动作响应里带的权威现场优先（撤销之后要回到被撤销前的那一步）。
+  session.state = scene?.state || detail.state;
   session.designSessionId = detail.designSessionId;
   session.reportDefinitionId = detail.reportDefinitionId;
   session.workspaceId = detail.workspaceId;
@@ -5129,8 +5924,13 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
   restorePlanFromDetail(detail);
 
   // 选择锁以后端为准：回放时用它替换历史问题对象，
-  // 这样回放出来的下拉框与 lockedChoice 是同一个引用，选完能正常继续
-  const pending = detail.pendingChoice?.question || null;
+  // 这样回放出来的下拉框与 lockedChoice 是同一个引用，选完能正常继续。
+  //
+  // 撤销之后：动作响应里带的权威现场优先（契约 §2.3）——
+  // 服务端在撤销那一笔事务里作废了待决选择，那份才是「现在该锁什么」。
+  const pending = scene && Object.prototype.hasOwnProperty.call(scene, "pendingChoice")
+    ? scene.pendingChoice?.question || null
+    : detail.pendingChoice?.question || null;
 
   // 回放消息：assistant 消息带 payload，能重建结构化卡片
   // 顺带记下回放过程：哪些是业务菜单、哪些是只读问答，
@@ -5146,6 +5946,11 @@ async function restoreSession(sessionId, { silent = false, token = null } = {}) 
     } else if (message.payload) {
       const menu = replayAssistantMessage(message.payload, pending);
       replayEvents.push({ type: "assistant", response: message.payload, menu: menu || null });
+      // 被撤销的那一步：消息文本**保留**，但那一步的控件失效并标成「已撤销」
+      // （契约 §2.3 第 2 条）。标记由服务端给的 revoked 决定 —— 前端不自己猜。
+      if (isRevokedMessagePayload(message.payload)) {
+        applyRevokedSteps(revokedStepIdsOfPayload(message.payload));
+      }
     } else {
       appendAiText(message.content);
     }
@@ -5219,7 +6024,18 @@ async function autoRestoreSession() {
 function replayAssistantMessage(data, pending = null) {
   const bindPending = (questions) => {
     if (!pending || !questions?.length) return questions;
-    return questions.map((q) => (q.id === pending.id ? pending : q));
+    return questions.map((q) => {
+      if (q?.id !== pending.id) return q;
+      // **已经带自己步骤身份**的历史问题不换掉：换掉之后那张旧卡片就
+      // 失去了步骤身份，撤销标记（服务端给的 ``revokedStepIds``）找不到
+      // 对应卡片，「已撤销」徽标也就挂不出来（BUG-008）。
+      //
+      // 当前那一步的问题带着**当前**步骤身份（与服务端 pending_choice
+      // 一致），照旧换成服务端那份权威菜单：下拉框与 lockedChoice 是
+      // 同一个引用，选完能正常继续。
+      if (q?.stepId && pending?.stepId && q.stepId !== pending.stepId) return q;
+      return pending;
+    });
   };
 
   if (isTemplateEditFailure(data)) {
@@ -5452,9 +6268,14 @@ $("btn-send").addEventListener("click", () => {
   //
   // 例外：服务端说「正等下一步操作选择」时，发送按钮是锁住的，
   // 这里再挡一次 —— 免得 DOM 被绕过时把自由输入发出去（规格第 75 条）。
+  //
+  // 判据与输入框的 disabled **同一处**（inputControlState）：原来这里用的
+  // isInputLocked 只看 lockScope，比真实的锁窄 —— 「有选项但 lockScope 是
+  // menu_only」的菜单同样锁着输入，发送按钮却还能发。两处口径必须一致。
   if (activeRequest || advanceTimers.size) return;
-  if (isInputLocked(lockedChoice)) {
-    toast(INPUT_LOCK_HINT);
+  const controls = inputControlState(lockedChoice, isBusy(), hasPendingPlan());
+  if (controls.inputDisabled) {
+    toast(controls.hint || INPUT_LOCK_HINT);
     return;
   }
   const text = $("chat-input").value.trim();
@@ -5468,8 +6289,11 @@ $("chat-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     // Enter 发送与输入框、发送按钮一起锁（规格第 75 条）。
-    if (isInputLocked(lockedChoice)) {
-      toast(INPUT_LOCK_HINT);
+    // 判据与输入框的 disabled **同一处**（inputControlState），
+    // 别用只看 lockScope 的 isInputLocked —— 那比真实的锁窄。
+    const controls = inputControlState(lockedChoice, isBusy(), hasPendingPlan());
+    if (controls.inputDisabled) {
+      toast(controls.hint || INPUT_LOCK_HINT);
       return;
     }
     $("btn-send").click();

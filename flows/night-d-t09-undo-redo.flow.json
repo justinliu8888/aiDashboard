@@ -1,0 +1,170 @@
+{
+  "outDir": "../.selfcheck/night-d/flow",
+  "waitMs": 1500,
+  "timeout": 30000,
+  "ignore": [
+    "modao.cc",
+    "/health",
+    "api.simplesvg.com",
+    "simplesvg.com",
+    "api.iconify.design",
+    "iconify.design",
+    "api.unisvg.com",
+    "unisvg.com"
+  ],
+  "flows": [
+    {
+      "name": "T09-完整撤销-接受A-接受B-连续撤销-重做恢复A",
+      "url": "http://127.0.0.1:8004/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "restoreSession('sess_night_d_flow_t09')",
+          "save": "restored"
+        },
+        {
+          "wait": 6000
+        },
+        {
+          "assertText": "请选择下一步操作"
+        },
+        {
+          "eval": "Number(session.baseDefinitionRevision)",
+          "save": "rev0"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); if (!el) return ''; return (el.style.fontSize || '') + '|' + (el.style.textAlign || ''); })()",
+          "save": "styleBeforeA"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select')).filter(s => !s.disabled); for (const sel of sels.reverse()) { const opt = Array.from(sel.options).find(o => o.textContent.trim() === '修改'); if (!opt) continue; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; } return false; })()"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "type": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])",
+          "text": "把\"总耗电概览\"的文字调大，右对齐，圆角调小一点"
+        },
+        {
+          "click": "#chat-scroll .question-other-submit:not([disabled]), #chat-scroll .question-text-submit:not([disabled])"
+        },
+        {
+          "waitFor": "[data-pending-plan]",
+          "timeout": 20000
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const card = cards[cards.length - 1]; if (!card) return false; const sel = card.querySelector('select'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "session.baseDefinitionRevision === rev0 + 1"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); if (!el) return false; const card = el.querySelector('.wp-card'); return !!card && card.getAttribute('data-wp-font-size') === '1'; })()",
+          "save": "changeA"
+        },
+        {
+          "screenshot": "d-t09-01-第一次接受A"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const card = cards[cards.length - 1]; return card ? (card.getAttribute('data-pending-plan') || '') : ''; })()",
+          "save": "planIdA"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select')).filter(s => !s.disabled); for (const sel of sels.reverse()) { const opt = Array.from(sel.options).find(o => o.textContent.trim() === '修改'); if (!opt) continue; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; } return false; })()"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "type": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])",
+          "text": "把\"设备耗电排名\"移到\"能耗趋势分析\"后面"
+        },
+        {
+          "click": "#chat-scroll .question-other-submit:not([disabled]), #chat-scroll .question-text-submit:not([disabled])"
+        },
+        {
+          "waitFor": "[data-pending-plan]:not([data-pending-plan=\"{{planIdA}}\"])",
+          "timeout": 20000
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const card = cards[cards.length - 1]; if (!card) return false; const sel = card.querySelector('select'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "session.baseDefinitionRevision === rev0 + 2"
+        },
+        {
+          "eval": "(() => { const ids = Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId); return ids.indexOf('region_hourly_trend') < ids.indexOf('region_device_ranking'); })()",
+          "save": "changeB"
+        },
+        {
+          "screenshot": "d-t09-02-第二次接受B"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-wp-history]'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.value === 'undo'); if (!opt || opt.disabled) return false; sel.value = 'undo'; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "(() => { const ids = Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId); return ids.indexOf('region_device_ranking') < ids.indexOf('region_hourly_trend'); })()"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); if (!el) return false; const card = el.querySelector('.wp-card'); return !!card && card.getAttribute('data-wp-font-size') === '1'; })()",
+          "save": "aStillThere"
+        },
+        {
+          "screenshot": "d-t09-03-撤销B后A仍在"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-wp-history]'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.value === 'undo'); if (!opt || opt.disabled) return false; sel.value = 'undo'; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); if (!el) return false; const parts = String(styleBeforeA).split('|'); return el.style.fontSize === parts[0] && el.style.textAlign === parts[1]; })()"
+        },
+        {
+          "eval": "(() => { const ids = Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId); return ids.indexOf('region_device_ranking') < ids.indexOf('region_hourly_trend'); })()"
+        },
+        {
+          "screenshot": "d-t09-04-连续撤销A后回到基线"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-wp-history]'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.value === 'redo'); if (!opt || opt.disabled) return false; sel.value = 'redo'; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); if (!el) return false; const card = el.querySelector('.wp-card'); return !!card && card.getAttribute('data-wp-font-size') === '1'; })()"
+        },
+        {
+          "screenshot": "d-t09-05-重做恢复A"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select')).filter(s => !s.disabled); return sels.some(s => Array.from(s.options).some(o => o.textContent.trim() === '修改')); })()",
+          "save": "modifyMenuEnabledAfterRedo"
+        },
+        {
+          "eval": "(async () => { const d = await sessionApi.detail('sess_night_d_flow_t09'); return d && d.pendingChoice ? ('pendingChoice=' + d.pendingChoice.question.id) : 'pendingChoice=null'; })()",
+          "save": "serverPendingChoiceAfterRedo"
+        },
+        {
+          "eval": "(() => { const el = document.getElementById('chat-input'); return !!el && el.disabled === false; })()",
+          "save": "chatInputEnabledAfterRedo"
+        },
+        {
+          "screenshot": "d-t09-06-重做后左侧现场-菜单已恢复可操作"
+        }
+      ]
+    }
+  ]
+}

@@ -109,7 +109,7 @@ function load() {
   vm.createContext(sandbox);
   const names = ["lockScopeOf", "isBusy", "isInputLocked", "isAuthoritativeChoice", "menuLocksInput", "inputControlState", "syncInputControls", "setChoiceLock", "clearChoiceLock",
     "otherAnswerLabel", "otherAnswerPlaceholder", "inlineAnswerAction", "renderQuestionOptions", "bindQuestionSelects",
-    "renderOtherAnswerHtml", "showOtherAnswerHint", "bindOtherAnswers", "appendConfirmActions", "appendReadyActions", "appendAiQuestions", "pendingEditMenuQuestion", "appendPendingEditPlan", "isTemplateEditFailure", "restoreEditFailureMenu"];
+    "renderOtherAnswerHtml", "showOtherAnswerHint", "bindOtherAnswers", "appendConfirmActions", "appendReadyActions", "renderedStepCard", "appendAiQuestions", "pendingEditMenuQuestion", "appendPendingEditPlan", "isTemplateEditFailure", "resolveEditStepQuestion", "restoreEditFailureMenu"];
   vm.runInContext(names.map(snippet).join("\n"), sandbox);
   return { sandbox, cards, controls, calls, warnings };
 }
@@ -141,25 +141,45 @@ test("NEXT_ACTION 修改只展开原卡输入，空输入不提交，普通聊�
   assert.equal(calls[0].options.inlineEditText, "增加温度");
 });
 
-test("所有 allowsOther 题型都提供下拉其他项，选择后才显示输入，Enter 只提交卡片文本", async () => {
+test("所有 dropdown 不再自动添加其他或渲染其输入区", () => {
   for (const selectionOnly of [true, false]) {
-    const { sandbox, cards, calls } = load();
+    const { sandbox, cards } = load();
     sandbox.appendAiQuestions([{ id: "clarify", selectionOnly, allowsOther: true, otherLabel: "其他想法", options: [{ value: "A", label: "A" }] }]);
     const card = cards[0];
-    assert.match(card.markup, /<option value="__question_other__">其他想法<\/option>/);
-    assert.ok(card.boxes[0].classList.contains("hidden"));
-    card.selects[0].value = "__question_other__";
-    card.selects[0].fire("change");
-    assert.equal(calls.length, 0);
-    const input = card.boxes[0].querySelector(".question-other-input");
-    input.value = "改为温度";
-    let prevented = false;
-    let stopped = false;
-    await input.fire("keydown", { key: "Enter", preventDefault() { prevented = true; }, stopPropagation() { stopped = true; } });
-    assert.equal(prevented && stopped, true);
-    assert.equal(calls[0].text, "改为温度");
-    assert.equal(calls[0].options.fromOther, true);
+    assert.match(card.markup, /<option value="A">A<\/option>/);
+    assert.doesNotMatch(card.markup, /__question_other__|其他想法/);
+    assert.equal(card.boxes.length, 0);
   }
+});
+
+test("dropdown 过滤后端显式其他选项，保留修改和业务选项", () => {
+  const { sandbox } = load();
+  for (const allowsOther of [true, false]) {
+    const markup = sandbox.renderQuestionOptions({ allowsOther, options: [
+      { value: "修改", label: "修改" }, { value: "A", label: "其他设备" },
+      { value: "其他", label: "其他" }, { value: "other", label: "Other" },
+      { value: "custom", label: "其他" }, { value: "__question_other__", label: "补充说明" },
+    ] });
+    assert.equal(markup, '<option value="修改">修改</option><option value="A">其他设备</option>');
+  }
+});
+
+test("澄清下拉与受限输入合并后无其他入口，保留步骤身份", () => {
+  const { sandbox, cards } = load();
+  const questions = [
+    { id: "clarify", expects: "SINGLE_CHOICE", selectionOnly: true, prompt: "选择修改方式", options: [{ value: "A", label: "A" }] },
+    { id: "template_edit_request", expects: "TEXT", stepKind: "edit_request", stepId: "step-current", stepVersion: 2,
+      lockScope: "input_and_menu", allowsOther: true, otherLabel: "修改要求", otherPlaceholder: "填写要求" },
+  ];
+  sandbox.appendAiQuestions(questions);
+  const card = cards[0];
+  assert.equal(card.selects.length, 1);
+  assert.doesNotMatch(card.markup, /class="question-text /);
+  assert.doesNotMatch(card.markup, /__question_other__/);
+  assert.equal(card.boxes.length, 0);
+  assert.equal(sandbox.lockedChoice.stepId, "step-current");
+  assert.equal(sandbox.lockedChoice.stepVersion, 2);
+  assert.equal(questions[0].id, "clarify");
 });
 
 test("同 id 历史卡不可展开或提交，当前卡可切回普通选项并隐藏输入", () => {
@@ -278,7 +298,7 @@ test("编辑校验失败恢复新问题，保留草稿与载荷，旧接受菜�
   assert.equal(sandbox.session.reportPreviewPayload, payload);
 });
 
-test("历史编辑失败返回恢复菜单；无新问题时释放旧计划锁", () => {
+test("历史编辑失败返回恢复菜单；无新问题时保持旧锁（后端仍可能留着计划）", () => {
   const { sandbox } = load();
   vm.runInContext(snippet("replayAssistantMessage"), sandbox);
   const question = { id: "template_edit_action", allowsOther: true, options: [{ value: "改标题", label: "改标题" }] };
@@ -286,7 +306,9 @@ test("历史编辑失败返回恢复菜单；无新问题时释放旧计划锁",
   assert.equal(sandbox.replayAssistantMessage(response), question);
   sandbox.appendConfirmActions(draft);
   sandbox.restoreEditFailureMenu({ ...response, questions: [] });
-  assert.equal(sandbox.lockedChoice, null);
+  // 没有新的权威菜单 → **保持原锁**：失败这一轮不一定消费了旧计划
+  // （部分执行失败时后端仍留着它），普通聊天不能因此被放开。
+  assert.equal(sandbox.lockedChoice.id, "template_edit_confirm");
   assert.equal(sandbox.lastPendingPlan, null);
 });
 
@@ -404,6 +426,28 @@ test("内联两段请求都不带上一轮留下的 selectedRegionId", async () 
   assert.equal(bodies.length, 2);
   assert.equal(bodies[0].context.selectedRegionId, undefined);
   assert.equal(bodies[1].context.selectedRegionId, undefined);
+});
+
+test("属性查询完成后释放目标并切回草稿菜单，不恢复修改追问", async () => {
+  const { sandbox, cards, highlighted } = loadWithHighlight();
+  sandbox.session.state = "USER_EDITING_TEMPLATE";
+  sandbox.session.editingTargetRegionId = "region_hourly_trend";
+  sandbox.appendConfirmActions({ ...draft, id: "template_edit_request", expects: "TEXT" });
+  sandbox.WorkbenchQuery.readOnlyAnswerKind = () => "answer";
+  sandbox.renderReadOnlyAnswer = () => {};
+  sandbox.resolveQueryPreservedMenu = () => null;
+  const { messages } = realSender(sandbox, [{
+    state: "USER_EDITING_TEMPLATE", turnKind: "query_answer",
+    debug: { queryReturnedToDraft: true, editingTargetRegionId: null },
+    questions: [{ ...draft, stepId: "new-draft-menu", stepKind: "menu" }],
+  }]);
+  await sandbox.sendMessage("告诉我趋势的位置和样式", { fromChoice: true, fromQuestionText: true });
+  assert.equal(messages.length, 1);
+  assert.equal(sandbox.session.editingTargetRegionId, null);
+  assert.equal(highlighted.classList.contains("region-highlight"), false);
+  assert.equal(sandbox.lockedChoice.id, draft.id);
+  assert.equal(sandbox.lockedChoice.stepKind, "menu");
+  assert.equal(cards.at(-1).selects[0].disabled, false);
 });
 
 test("回答后端菜单（接受待确认计划）延续当前操作，带上当前目标", async () => {

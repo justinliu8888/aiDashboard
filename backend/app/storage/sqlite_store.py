@@ -847,3 +847,23 @@ class SqliteSessionRepository:
             )
             self.conn.commit()
             return cursor.rowcount
+
+    def update_message_payload(
+        self, session_id: str, message_id: int, payload: dict[str, Any]
+    ) -> bool:
+        """更新一条消息的 payload（按消息 id）。
+
+        撤销标记就落在这里 —— 业务层算出「这条消息属于哪一步、要不要标成
+        已撤销」，存储层只负责把新的 payload 写回去。
+        """
+        if not session_id or message_id is None:
+            return False
+        with self._lock:
+            cursor = self.conn.execute(
+                "UPDATE messages SET payload = ? WHERE id = ? AND session_id = ?",
+                (_dump(payload), message_id, session_id),
+            )
+            if cursor.rowcount:
+                self.conn.commit()
+                return True
+            return False

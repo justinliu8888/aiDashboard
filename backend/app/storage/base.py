@@ -127,6 +127,15 @@ class SessionRepository(Protocol):
 
     def list_messages(self, session_id: str) -> list[MessageRecord]: ...
 
+    def update_message_payload(
+        self, session_id: str, message_id: int, payload: dict[str, Any]
+    ) -> bool:
+        """更新一条消息的 payload（按消息 id）。
+
+        撤销标记就落在这里 —— 业务层算出「这条消息属于哪一步、要不要标成
+        已撤销」，存储层只负责把新的 payload 写回去。
+        """
+
     def delete_messages_by_client_msg_id(
         self, session_id: str, client_msg_id: str
     ) -> int: ...

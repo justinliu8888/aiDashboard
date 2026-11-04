@@ -90,6 +90,34 @@
   /* 有方案时，右侧草稿预览的空态不再说「还没有草稿」—— 那会误导 */
   #preview-root.plan-active #preview-empty { display: none; }
 
+  /* ===== 被撤销的那一步（BUG-008 / 契约 §2.3）=====
+     撤销之后，左侧那条被撤销的步骤要**明确失效**：
+       - 消息文本**保留**（不删聊天历史）；
+       - 那一步的下拉框 / 输入框 / 按钮一律停用（不能再选、不能再提交）；
+       - 卡片上挂一条「已撤销」标记，别让用户以为它还是当前结果。
+     标记由 workbench.js 按服务端的失效清单打上（前端不自己算哪一步被撤销）。 */
+  [data-revoked="1"] {
+    opacity: 0.72;
+  }
+  [data-revoked="1"] select,
+  [data-revoked="1"] input,
+  [data-revoked="1"] textarea,
+  [data-revoked="1"] button {
+    cursor: not-allowed;
+  }
+  .wp-revoked-badge {
+    display: inline-flex;
+    align-items: center;
+    margin-top: 6px;
+    padding: 1px 7px;
+    border: 1px solid #fecaca;
+    border-radius: 999px;
+    background: #fef2f2;
+    color: #b91c1c;
+    font-size: 11px;
+    line-height: 1.7;
+  }
+
   /* ===== 工作台三视图模式（只看对话 / 双栏显示 / 只看草稿） =====
      状态挂在 #workspace-panes 的 data-pane-mode 上（split | chat | draft），
      只存在内存里（DOM 属性），刷新页面回到 split。
@@ -394,10 +422,10 @@
 <script src="./workbench_plan.js?v=20261103-text-plan1"></script>
 <!-- 展示模块（契约 0002）：分组 / 排版 / 样式 / 隐藏视图。
      它只管排版，不发请求、不改会话；主工作台把既有叶子渲染注入给它。 -->
-<link rel="stylesheet" href="./workbench_presentation.css?v=20261103-rework2">
+<link rel="stylesheet" href="./workbench_presentation.css?v=20261103-nightb1">
 <script src="./workbench_presentation.js?v=20261103-rework2"></script>
 <!-- 主工作台：规则模块与方案模块先加载（它们是普通脚本，按文档顺序执行），
      主脚本用 defer：文档解析完执行、在 DOMContentLoaded 之前，不阻塞首帧。 -->
-<script src="./workbench.js?v=20261103-rework2" defer></script>
+<script src="./workbench.js?v=20261104-propertyquery1" defer></script>
 </body>
 </html>

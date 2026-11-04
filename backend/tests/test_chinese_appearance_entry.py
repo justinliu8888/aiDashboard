@@ -9,6 +9,7 @@ from app.services import routing_rules
 from app.services.draft_workspace import draft_workspace
 from app.services.session_service import session_service
 from app.services.template_edit_engine import template_edit_engine
+from tests.support.step_contract import step_ref
 
 
 ORIGINAL = "把‘昨日能耗总览’的文字调大，右对齐，圆角调小一点"
@@ -145,8 +146,12 @@ def test_appearance_candidate_still_rejects_stale_acceptance(post_chat):
     post_chat(ORIGINAL, state="USER_EDITING_TEMPLATE", snapshots=snapshots)
     accepted = post_chat("接受修改", state="USER_EDITING_TEMPLATE", snapshots=snapshots).json()
     current = {"reportDefinition": accepted["domainObjects"]["reportDefinitionDraft"]}
-    post_chat("修改", state="USER_EDITING_TEMPLATE", snapshots=current)
-    candidate = post_chat(ORIGINAL, state="USER_EDITING_TEMPLATE", snapshots=current).json()
+    # 「修改」进入**受限修改输入**这一步：下一步提交要带上步骤关联。
+    modify = post_chat("修改", state="USER_EDITING_TEMPLATE", snapshots=current).json()
+    candidate = post_chat(
+        ORIGINAL, state="USER_EDITING_TEMPLATE", snapshots=current,
+        **step_ref(modify),
+    ).json()
     assert candidate["domainObjects"]["pendingEditPlan"] is not None
     stale = post_chat("接受修改", state="USER_EDITING_TEMPLATE", snapshots=snapshots).json()
     assert stale["error"]["code"] == "STALE_EDIT_PLAN"

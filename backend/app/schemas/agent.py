@@ -52,6 +52,30 @@ LOCKED_INPUT_MENU_PROMPT = "请选择下一步操作："
 PENDING_EDIT_MENU_QUESTION_ID = "pending_edit_plan_confirm"
 
 # --------------------------------------------------------------------------
+# 权威步骤契约
+# --------------------------------------------------------------------------
+#
+# 「当前这一步」到底是什么，**服务端**要持久记着：步骤身份、会话/草稿归属、
+# 步骤版本、允许提交什么。前端请求带上**步骤关联**，后端拿它跟权威记录核对
+# —— 不是相信前端的布尔来源标志（``fromChoice`` / ``fromOther`` / ``fromInline``
+# 只是本地参数，HTTP 请求里根本没有，校验不了）。
+#
+# 落点：``sessions.pending_choice.question`` 里新增的键（既有列里的**新增键**，
+# 不另开表、不另开列，与 ``lockScope`` 同一口径）。刷新 / 重连后从库里读回的
+# 就是同一份权威记录。
+
+#: 菜单步骤：用户从下拉框里选一项。
+STEP_KIND_MENU = "menu"
+#: 受限修改输入步骤：用户正在**专用输入**里写修改要求。
+STEP_KIND_EDIT_REQUEST = "edit_request"
+#: 受限步骤允许的提交方式：提交当前步骤的修改要求文字。
+STEP_SUBMISSION_EDIT_TEXT = "edit_text"
+#: 缺步骤关联（受限步骤）时的拒绝码。
+STEP_REF_REQUIRED_CODE = "STEP_REF_REQUIRED"
+#: 步骤关联与权威记录对不上时的拒绝码。
+STEP_REF_MISMATCH_CODE = "STEP_REF_MISMATCH"
+
+# --------------------------------------------------------------------------
 # 方案版本身份（契约表 §4.1.2，工单 #66）
 # --------------------------------------------------------------------------
 #
@@ -201,6 +225,13 @@ class AgentRequestContext(BaseModel):
     templateId: str | None = None
     baseTemplateRevision: int | None = Field(default=None, ge=1)
 
+    # ---------- 权威步骤关联 ----------
+    #
+    # 本轮请求关联的**步骤**。后端拿它跟持久化的权威记录（``pending_choice``
+    # 里那一份）核对：对不上就拒，不执行任何业务动作。
+    stepId: str | None = None
+    stepVersion: int | None = None
+
 
 class ValidationIssue(BaseModel):
     layer: str
@@ -313,6 +344,20 @@ class AgentQuestion(BaseModel):
     otherLabel: str = "其他"
     #: 卡片内输入框的提示文案（可空）。
     otherPlaceholder: str = ""
+
+    # ---------- 权威步骤契约（落在 pending_choice.question 里） ----------
+    #
+    #: 这一步的**身份**。同一步在刷新 / 重连之后必须还是同一个 id ——
+    #: 前端拿它关联下一次提交，后端拿它核对。
+    stepId: str | None = None
+    #: 这一步的**版本**。步骤内容变了就 +1；旧版本的提交要被拒。
+    stepVersion: int | None = None
+    #: 步骤类型：``"menu"``（选一项）/ ``"edit_request"``（受限修改输入）。
+    stepKind: str | None = None
+    #: 这一步归属的草稿 id（会话 / 草稿归属）。
+    stepDraftId: str | None = None
+    #: 这一步允许提交什么（``"edit_text"`` …）。
+    allowedSubmissions: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod

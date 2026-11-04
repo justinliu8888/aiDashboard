@@ -42,6 +42,7 @@ from tests.support.acceptance_harness import (
     acceptance_harness,
     plan_candidate,
 )
+from tests.support.step_contract import step_ref
 
 
 SCOPE = ToolScope(
@@ -302,8 +303,12 @@ def _drive_to_edit_accept(harness, *, user_json: bool = False) -> tuple[dict[str
         plan_payload = harness.send("生成 A 机房最近 7 天能耗报表")
 
     confirmed = harness.confirm_plan(plan_payload["domainObjects"]["reportPlan"])
-    harness.send("修改", state="WAITING_USER_CONFIRM")
-    candidate = harness.send("加个冰箱明细", state="USER_EDITING_TEMPLATE")
+    # 点「修改」进入**受限修改输入**这一步：服务端持久记下步骤身份，
+    # 下一轮提交必须带上它（权威步骤契约）。
+    modify = harness.send("修改", state="WAITING_USER_CONFIRM")
+    candidate = harness.send(
+        "加个冰箱明细", state="USER_EDITING_TEMPLATE", context=step_ref(modify),
+    )
     assert (candidate.get("domainObjects") or {}).get("pendingEditPlan") is not None
 
     accepted = harness.send("接受修改", state="USER_EDITING_TEMPLATE")

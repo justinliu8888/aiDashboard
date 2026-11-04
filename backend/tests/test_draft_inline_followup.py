@@ -90,20 +90,28 @@ def test_inline_text_direct_and_two_request_handshake(client, monkeypatch, hands
     _, plan = _plan(client, monkeypatch)
     ready = _confirm_plan(client, plan)
     draft = ready["domainObjects"]["reportDefinitionDraft"]
+    context: dict = {}
     if handshake:
         action = _post(client, "修改", message_id="inline_action", state=ready["state"]).json()
         assert action["error"] is None
         assert action["state"] == "USER_EDITING_TEMPLATE"
         assert action["domainObjects"]["pendingEditPlan"] is None
         menu = action["questions"][0]
-        assert menu["id"] == "template_edit_action"
+        # 「修改」进入**受限修改输入**这一步：步骤身份持久记在库里，
+        # 下一轮提交必须带上它（权威步骤契约）。
+        assert menu["id"] == "template_edit_request"
         assert menu["allowsOther"] is True
         assert menu["selectionOnly"] is False
-        assert menu["lockScope"] == "none"
-        assert session_service.load_pending_choice("sess_tpl_1") is None
+        assert menu["lockScope"] == "input_and_menu"
+        assert menu["stepKind"] == "edit_request"
+        stored = session_service.load_pending_choice("sess_tpl_1")
+        assert stored is not None
+        assert stored["question"]["stepId"] == menu["stepId"]
+        context = {"stepId": menu["stepId"], "stepVersion": menu["stepVersion"]}
     proposal = _post(
         client, "报表名称改成内联日报", message_id="inline_text",
         state="USER_EDITING_TEMPLATE" if handshake else ready["state"],
+        context=context,
     ).json()
     assert proposal["error"] is None
     assert proposal["uiActions"] == ["pending_edit_plan"]
@@ -147,10 +155,23 @@ def test_edit_menus_support_inline_action_then_text(post_chat, accepted):
     assert action["domainObjects"]["pendingEditPlan"] is None
     assert action["questions"][0]["allowsOther"] is True
     assert action["questions"][0]["selectionOnly"] is False
-    assert action["questions"][0]["lockScope"] == "none"
-    assert session_service.load_pending_choice("conv_test") is None
+    context = {}
+    if accepted:
+        # 「修改」进入**受限修改输入**这一步：步骤身份持久记在库里，
+        # 下一轮提交必须带上它（权威步骤契约）。
+        menu = action["questions"][0]
+        assert menu["id"] == "template_edit_request"
+        assert menu["stepKind"] == "edit_request"
+        assert menu["lockScope"] == "input_and_menu"
+        assert session_service.load_pending_choice("conv_test") is not None
+        context = {"stepId": menu["stepId"], "stepVersion": menu["stepVersion"]}
+    else:
+        # 「继续修改」回到**统一对话**：自由输入入口照旧可用。
+        assert action["questions"][0]["lockScope"] == "none"
+        assert session_service.load_pending_choice("conv_test") is None
     proposal = post_chat(
         "报表名称改成内联后续日报", state="USER_EDITING_TEMPLATE", snapshots=snapshot,
+        **context,
     ).json()
     assert proposal["error"] is None
     assert proposal["uiActions"] == ["pending_edit_plan"]

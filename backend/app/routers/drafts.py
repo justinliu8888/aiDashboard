@@ -10,11 +10,17 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.services.agent_service import (
+    CONFIRM_BUTTON_VALUE,
+    MODIFY_BUTTON_VALUE,
+    RESTART_BUTTON_VALUE,
+)
 from app.services.draft_workspace import draft_workspace
 from app.services.preview_service import (
     PreviewContextError,
@@ -175,6 +181,136 @@ def _sync_session_snapshot(session_id: str | None, definition: Any, revision: in
         raise
 
 
+def _revoke_session_step(session_id: str | None, *, action: str = "UNDO") -> list[str]:
+    """撤销 / 重做之后，让**左侧会话的当前待决步骤**失效。
+
+    BUG-008：撤销只回滚了右侧的定义，左侧仍然挂着那一轮的菜单与摘要 ——
+    用户看到的是"报表已经撤销了，对话却还停在刚才那一步"。
+
+    这里做三件事：
+
+    1. **清掉会话的待决选择与待确认计划**：那张旧菜单不再是权威待决步骤，
+       旧步骤的提交会被后端按"步骤关联对不上"拒掉（前后端都关掉）。
+    2. **返回被失效的步骤 id**：前端据此把旧菜单标成"已撤销"（保留文字，
+       不再能操作）。
+    3. **撤销 / 重做对应到「一个修改单位」**：
+       一次接受整批算一个撤销单位（契约 §2.3）。所以连续撤销 B / A 时，
+       第二次撤的是**再往前一个已生效的修改**；重做则把**最后撤掉的**
+       那一个恢复回来。
+
+    **历史消息保留**：聊天记录不清 —— 只是不再是当前有效现场。
+    """
+    if not session_id:
+        return []
+    revoked: list[str] = []
+    try:
+        record = session_service.repository.get_session(session_id)
+    except Exception:  # noqa: BLE001 — 取不到就当没有待决步骤
+        logger.warning("[drafts] 读取会话待决步骤失败 sessionId=%s", session_id)
+        return []
+    choice = getattr(record, "pendingChoice", None) or {}
+    question = choice.get("question") if isinstance(choice, dict) else None
+    if isinstance(question, dict):
+        step_id = str(question.get("stepId") or "")
+        if step_id:
+            revoked.append(step_id)
+    pending_plan = getattr(record, "pendingEditPlan", None) or {}
+    if isinstance(pending_plan, dict):
+        plan = pending_plan.get("editPlan")
+        plan = plan if isinstance(plan, dict) else {}
+        step_id = str(plan.get("stepId") or "")
+        if step_id and step_id not in revoked:
+            revoked.append(step_id)
+    try:
+        session_service.repository.set_pending_choice(session_id, None)
+        session_service.repository.clear_pending_edit_plan(session_id)
+    except Exception:  # noqa: BLE001 — 清不掉不算致命，步骤关联本身也会拒
+        logger.warning("[drafts] 清理会话待决步骤失败 sessionId=%s", session_id)
+    if action == "REDO":
+        # 重做：把**最后撤掉**的那一个已生效修改恢复回来（撤销是 LIFO）。
+        session_service.restore_last_revoked_applied_step(session_id)
+    else:
+        # 撤销：还要失效**最近一个已生效的修改** —— 它留在历史里的
+        # 「已完成：……」在撤销之后已经不算数了。
+        applied_step = session_service.revoke_latest_applied_step(session_id)
+        if applied_step and applied_step not in revoked:
+            revoked.append(applied_step)
+    # **历史消息上落撤销标记**：不落的话，刷新之后左侧那一步又是可操作的
+    # —— 用户看到的是"报表撤了，对话里那一步还能点"（BUG-008）。
+    # 标记只让那一步变只读，**消息文本与更早历史一个字都不删**。
+    for step_id in revoked:
+        session_service.mark_step_revoked(session_id, step_id)
+    return revoked
+
+
+def _restore_session_menu(
+    session_id: str | None,
+    *,
+    draft_id: str | None,
+    definition: Any,
+    reply: str,
+) -> None:
+    """撤销 / 重做之后，重新给会话发一张**当前合法的下一步菜单**。
+
+    契约（``docs/agent/state-and-undo.md`` 第 50 行）：
+    「完整现场包括草稿定义、业务状态、提示、**可操作菜单**及权限」；
+    第 44 行：「每次撤销最新单位……**当前步骤提供入口**」。
+
+    旧菜单随那一轮一起失效了（否则用户能对着已经撤销的步骤继续操作），
+    所以要**补一张新的** —— 否则撤销之后左侧只剩历史回放，
+    用户既没有可操作的菜单，普通输入也因为「撤销后没有待决选择」
+    而处于一种说不清的状态。
+
+    新菜单**写进历史消息**（前端刷新 / 回放时把它画出来），
+    同时写进 ``pending_choice``（服务端权威待决选择 = 选择锁的来源）。
+
+    尽力而为：发不出去不掀翻已经成功的撤销（定义已经回滚了）。
+    """
+    if not session_id:
+        return
+    question = {
+        "id": "template_edit_confirm",
+        "prompt": "请选择下一步操作：",
+        "expects": "SINGLE_CHOICE",
+        "selectionOnly": True,
+        "allowsOther": True,
+        "otherLabel": "其他",
+        "otherPlaceholder": "直接输入修改要求",
+        "options": [
+            {"value": CONFIRM_BUTTON_VALUE, "label": CONFIRM_BUTTON_VALUE},
+            {"value": MODIFY_BUTTON_VALUE, "label": MODIFY_BUTTON_VALUE},
+            {"value": RESTART_BUTTON_VALUE, "label": RESTART_BUTTON_VALUE},
+        ],
+        "lockScope": "input_and_menu",
+        # 新步骤身份：旧菜单的那一步已经失效，不能复用同一个 id。
+        "stepId": f"step_{uuid.uuid4().hex}",
+        "stepVersion": 1,
+        "stepKind": "menu",
+        "stepDraftId": draft_id,
+    }
+    payload: dict[str, Any] = {
+        "state": "USER_EDITING_TEMPLATE",
+        "reply": reply,
+        "questions": [question],
+        "uiActions": ["template_editing"],
+    }
+    if isinstance(definition, dict):
+        payload["domainObjects"] = {"reportDefinitionDraft": definition}
+    try:
+        session_service.repository.append_message(
+            session_id=session_id,
+            role="assistant",
+            content=reply,
+            payload=payload,
+        )
+        session_service.save_pending_choice(
+            session_id,
+            {"state": "USER_EDITING_TEMPLATE", "question": question},
+        )
+    except Exception:  # noqa: BLE001 — 补菜单失败不掀翻已成功的撤销
+        logger.warning("[drafts] 撤销后补发菜单失败 sessionId=%s", session_id)
+
+
 def _respond(state: Any, *, session_id: str | None = None) -> dict[str, Any]:
     payload = _state_payload(state)
     definition = payload.get("definition")
@@ -328,6 +464,8 @@ def draft_action(draft_id: str, body: DraftActionRequest) -> dict[str, Any]:
     state: Any = None
     session_id: str | None = None
     payload: dict[str, Any] = {}
+    #: 撤销 / 重做之后**失效的步骤 id**（前端据此把旧菜单标成"已撤销"）。
+    revoked_step_ids: list[str] = []
     try:
         with draft_workspace.repo.transaction():
             # 锁检查与写入在**同一笔事务**里：事务一开始就拿住写锁，
@@ -372,6 +510,23 @@ def draft_action(draft_id: str, body: DraftActionRequest) -> dict[str, Any]:
                     _sync_session_snapshot(
                         session_id, payload.get("definition"), payload.get("revision")
                     )
+                    # **左侧会话现场同步回退**（BUG-008）：只回滚定义不够 ——
+                    # 旧菜单 / 旧候选仍是当前待决步骤的话，用户看到的
+                    # 仍然是"报表撤销了、对话没回退"。
+                    revoked_step_ids = _revoke_session_step(session_id, action=action)
+                    # **补一张当前合法的下一步菜单**：完整现场要包含
+                    # 「可操作菜单」（docs/agent/state-and-undo.md 第 50 行），
+                    # 旧菜单随那一轮失效了，得给用户留一个能走的下一步。
+                    _restore_session_menu(
+                        session_id,
+                        draft_id=draft_id,
+                        definition=payload.get("definition"),
+                        reply=(
+                            "已撤销上一步修改。"
+                            if action == "UNDO"
+                            else "已重做上一步修改。"
+                        ),
+                    )
                 else:
                     # 旧对象仍可作为**独立对象**做自己的撤销 / 重做
                     # （它自己的版本与内容照旧生效），只是不再回写会话。
@@ -409,6 +564,10 @@ def draft_action(draft_id: str, body: DraftActionRequest) -> dict[str, Any]:
     result = _respond(state, session_id=session_id)
     if action == "SAVE_AS":
         result["previousDraftId"] = draft_id
+    if action in ("UNDO", "REDO"):
+        # **总是**给这个键（可能是空数组）：前端据此知道"这一步之后没有
+        # 被失效的步骤"，而不是"服务端没回这个字段、不知道是什么情况"。
+        result["revokedStepIds"] = revoked_step_ids
     return result
 
 

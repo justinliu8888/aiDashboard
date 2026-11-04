@@ -61,12 +61,31 @@ SET_PLACEMENT 的 placement.type 只能是 GRID / FLOW / ABSOLUTE；
 SET_STYLE 的 style 只能给字体、字号、字重、文字色、背景色、对齐、行高、
 内外边距、边框、圆角、透明度；SET_PAGE 只能给 webMaxWidth 与 arrangement；
 SET_METADATA 只能给 name / description / tags。
+**长度类参数的形状是硬要求**（写错会在候选展示前就被拦下来，用户只能重新说一遍）：
+字号、字重之外的一切"长度"（style.fontSize / lineHeight / padding / margin、
+placement.width / minHeight、arrangement.gap、page.webMaxWidth）都必须写成
+{"value": 数字, "unit": "PX"}（unit 只允许 PX 或 PERCENT），**不能**写裸数字，
+也不能写 "28px" 这种字符串。例如字号 28 像素要写
+{"fontSize": {"value": 28, "unit": "PX"}}，间距 16 像素要写
+{"gap": {"value": 16, "unit": "PX"}}。borderRadius 与 fontWeight 是**纯数字**。
+**改数字显示格式用 SET_FORMAT**（params 给 regionId 与 format），
+format 里可以给 kind / precision（0..6）/ unitLabel / thousandSeparator（布尔）/
+dateTimePattern / nullText / roundingMode。用户说「两位小数」「加千分位」
+「保留原单位」时给 {"precision": 2, "thousandSeparator": true}，**保留原单位就
+不要给 unitLabel**（单位不动）。**不要**用改展示类型（componentType /
+chartKind）来代替改数字格式 —— 那会把"改格式"变成"换展示"，用户要的没做到。
+**移动到某张卡后面**用 MOVE_REGION 的 params 给 regionId 与 afterRegionId
+（放到前面用 beforeRegionId），或者给 targetGroupId + index（移入某个分组 / 移到根层）；
+不要给 index 之外的自造字段。**移动 / 分组的目标 id 必须来自
+get_current_draft**，组里的子卡也在正文卡片 id 清单里。
 **不要**编造成员卡片的 id：memberRegionIds 必须来自 get_current_draft
 返回的正文卡片 id（隐藏 REPORT_TITLE）。用户点名了卡片但你认不准是哪几张时，
 用 needsClarification 追问是哪几张，不要自己挑。
 分组**只管外观**：不改变卡片的时间范围、设备范围与统计口径。
 **换主题**用 SET_THEME，params 给 themeId；themeId 只能取自 get_current_draft 返回的
 availableThemes（服务端给的共享主题清单），**不要自己编主题 id**。
+「给这份报表应用暗色主题」说的是**整份报表**：目标不是某一张卡片，
+不要因为找不到"要改的卡片"就去追问选卡片。
 用户要**保存 / 更新共享主题**（「保存主题」「把这个主题存成 XXX」「更新主题」）
 时：用 intent=SAVE_THEME，在 operation.themeOperations 里给出
 {"themeId", "name", "tokens", "defaultStyle", "expectedThemeRevision", "confirm"}。

@@ -229,23 +229,37 @@ def test_old_pending_choice_without_lock_scope_reads_as_menu_only(post_chat, def
 # --------------------------------------------------------------------------
 
 
-def test_modify_choice_returns_to_unified_dialog(design_ready):
-    """选「修改」：回到统一对话，输入不再锁，也不用再选一次「询问」。"""
+def test_modify_choice_enters_restricted_edit_input(design_ready):
+    """选「修改」：进入**受限修改输入**这一步，普通聊天继续锁着。
+
+    这一步的权威记录是服务端持久化的那一份（``pending_choice``）：
+    步骤身份、版本、归属草稿、允许提交什么都在里面。前端下一次提交要带
+    上这份关联，后端拿它核对 —— 不靠前端的布尔来源标志。
+    """
     client, _payload = design_ready
 
     response = _post_design(client, "修改", message_id="msg_3").json()
 
     assert response["state"] == "USER_EDITING_TEMPLATE"
-    # 统一对话的入口问题不是「只能选」的菜单 → 前端不锁输入。
+    # 走的是受限输入这张卡：不是「只能选」的菜单 → 卡片内提供专用输入。
     menus = [
         question
         for question in response["questions"]
         if question.get("selectionOnly") and question.get("options")
     ]
     assert menus == []
-    assert response["questions"][0]["lockScope"] == LOCK_SCOPE_NONE
-    # 菜单已失效：服务端不再挂着待确认选择。
-    assert session_service.load_pending_choice(DESIGN_SESSION_ID) is None
+    question = response["questions"][0]
+    assert question["id"] == "template_edit_request"
+    assert question["stepKind"] == "edit_request"
+    # 受限输入：输入框与发送按钮一起锁住，只有这张卡的专用输入能提交。
+    assert question["lockScope"] == LOCK_SCOPE_INPUT_AND_MENU
+    assert question["stepId"]
+    assert question["stepVersion"] == 1
+    assert question["allowedSubmissions"] == ["edit_text"]
+    # 步骤是**持久**的权威记录：刷新后仍然受限。
+    stored = session_service.load_pending_choice(DESIGN_SESSION_ID)
+    assert stored is not None
+    assert stored["question"]["stepId"] == question["stepId"]
 
 
 def test_continue_adjust_returns_to_unified_dialog(post_chat, definition):
@@ -374,12 +388,20 @@ def test_query_toolset_has_no_execution_capability():
 
 
 def test_answered_menu_stops_locking_the_input(design_ready):
-    """菜单被答掉之后就不再锁：历史菜单不永久锁住输入。"""
+    """菜单被答掉之后就不再锁：历史菜单不永久锁住输入。
+
+    答掉菜单之后接管锁的是**新的一步**（受限修改输入），不是旧菜单 ——
+    旧菜单本身已经作废（``pending_choice`` 里存的那张卡换成了步骤卡）。
+    """
     client, _payload = design_ready
 
     _post_design(client, "修改", message_id="msg_3")
 
-    assert session_service.load_pending_choice(DESIGN_SESSION_ID) is None
+    stored = session_service.load_pending_choice(DESIGN_SESSION_ID)
+    assert stored is not None
+    # 旧菜单（template_edit_confirm）已经不在了。
+    assert stored["question"]["id"] != "template_edit_confirm"
+    assert stored["question"]["stepKind"] == "edit_request"
 
 
 def test_restore_reads_the_lock_scope_from_the_server(design_ready):

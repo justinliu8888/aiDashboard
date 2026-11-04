@@ -1,0 +1,244 @@
+{
+  "outDir": "../.selfcheck/night-b-frontend/flow",
+  "waitMs": 1500,
+  "timeout": 60000,
+  "ignore": [
+    "modao.cc",
+    "/health"
+  ],
+  "flows": [
+    {
+      "name": "包B-撤销后左侧现场回退-澄清门禁-候选待选-数字格式与两列渲染",
+      "url": "http://127.0.0.1:8005/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "restoreSession('sess_night_b_frontend')",
+          "save": "restored"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "assertText": "请选择下一步操作"
+        },
+        {
+          "assertVisible": "#chat-scroll .question-select[data-question-id=\"template_edit_confirm\"]"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "eval": "document.getElementById('btn-send').disabled === true"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('[data-quick]')).every(b => b.disabled) === true"
+        },
+        {
+          "screenshot": "nightb-01-菜单待选时普通输入全锁"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select[data-question-id=\"template_edit_confirm\"]')).filter(s => !s.disabled); const sel = sels[sels.length - 1]; if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 900
+        },
+        {
+          "assertVisible": "#chat-scroll .question-other-input:not([disabled])"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "eval": "document.getElementById('btn-send').disabled === true"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('[data-quick]')).every(b => b.disabled) === true"
+        },
+        {
+          "screenshot": "nightb-02-受限输入步骤专用输入可用普通输入仍锁"
+        },
+        {
+          "type": "#chat-scroll .question-other-input:not([disabled])",
+          "text": "改一下"
+        },
+        {
+          "click": "#chat-scroll .question-other-submit:not([disabled])"
+        },
+        {
+          "waitFor": "#chat-scroll .question-text-input",
+          "timeout": 150000
+        },
+        {
+          "wait": 800
+        },
+        {
+          "assertVisible": "#chat-scroll .question-text-input:not([disabled])"
+        },
+        {
+          "assertVisible": "#chat-scroll .question-text-submit:not([disabled])"
+        },
+        {
+          "assertVisible": "#chat-scroll .question-select[data-question-id=\"template_edit_clarification\"]:not([disabled])"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "eval": "document.getElementById('btn-send').disabled === true"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('[data-quick]')).every(b => b.disabled) === true"
+        },
+        {
+          "screenshot": "nightb-03-澄清待决-卡片内有可填专用输入普通输入仍锁"
+        },
+        {
+          "type": "#chat-scroll .question-text-input:not([disabled])",
+          "text": "把总耗电概览的字号改成 20 像素"
+        },
+        {
+          "click": "#chat-scroll .question-text-submit:not([disabled])"
+        },
+        {
+          "waitFor": "[data-pending-plan]",
+          "timeout": 90000
+        },
+        {
+          "wait": 800
+        },
+        {
+          "assertText": "待确认的修改"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "eval": "document.getElementById('btn-send').disabled === true"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('[data-quick]')).every(b => b.disabled) === true"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return root ? root.getAttribute('data-arrangement-mode') + ':' + root.getAttribute('data-gap') : 'none'; })()",
+          "save": "beforeLayout"
+        },
+        {
+          "screenshot": "nightb-04-候选待选"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-pending-plan] select'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 8000
+        },
+        {
+          "eval": "(() => { const els = Array.from(document.querySelectorAll('#preview-root *')).filter(el => (el.style?.getPropertyValue('--wp-font-size') || '').trim() === '20px'); return els.length >= 1; })()"
+        },
+        {
+          "eval": "(() => { const els = Array.from(document.querySelectorAll('#preview-root *')).filter(el => el.getAttribute('data-wp-font-size') === '1'); return els.length >= 1; })()"
+        },
+        {
+          "eval": "(() => { const h = document.querySelector('[data-wp-history]'); return !!h && h.disabled === false; })()"
+        },
+        {
+          "screenshot": "nightb-05-接受后右侧字号生效"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-wp-history]'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.value === 'undo'); if (!opt || opt.disabled) return false; sel.value = 'undo'; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 8000
+        },
+        {
+          "eval": "(() => { const els = Array.from(document.querySelectorAll('#preview-root *')).filter(el => (el.style?.getPropertyValue('--wp-font-size') || '').trim() === '20px'); return els.length === 0; })()"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return root ? root.getAttribute('data-arrangement-mode') + ':' + root.getAttribute('data-gap') : 'none'; })()",
+          "save": "afterLayout"
+        },
+        {
+          "eval": "afterLayout === beforeLayout"
+        },
+        {
+          "eval": "document.querySelectorAll('#chat-scroll [data-revoked-badge]').length >= 1"
+        },
+        {
+          "eval": "(() => { const badge = document.querySelector('#chat-scroll [data-revoked-badge]'); return !!badge && badge.textContent.trim() === '已撤销'; })()"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('#chat-scroll [data-revoked=\"1\"]')); return cards.length >= 1 && cards.every(c => Array.from(c.querySelectorAll('select, input, textarea, button')).every(x => x.disabled)); })()"
+        },
+        {
+          "eval": "document.querySelectorAll('#chat-scroll .user-bubble, #chat-scroll [data-step-id]').length >= 2"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true",
+          "save": "chatLockedAfterUndo"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select')).filter(s => !s.disabled); return sels.some(s => Array.from(s.options).some(o => o.textContent.trim() === '修改')); })()",
+          "save": "freshMenuAfterUndo"
+        },
+        {
+          "screenshot": "nightb-06-撤销后左侧已撤销右侧回退"
+        },
+        {
+          "eval": "(() => { location.reload(); return true; })()"
+        },
+        {
+          "wait": 8000
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return !!root && root.getAttribute('data-arrangement-mode') === 'GRID'; })()"
+        },
+        {
+          "eval": "(() => { const revoked = Array.from(document.querySelectorAll('#chat-scroll [data-revoked=\"1\"]')); return revoked.length >= 1 && revoked.every(c => Array.from(c.querySelectorAll('select, input, textarea, button')).every(x => x.disabled)); })()"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select')).filter(s => !s.disabled); return sels.some(s => Array.from(s.options).some(o => o.textContent.trim() === '修改')); })()",
+          "save": "freshMenuAfterReload"
+        },
+        {
+          "screenshot": "nightb-07-刷新后旧菜单仍不可选"
+        }
+      ]
+    },
+    {
+      "name": "包B-本轮实例上的门禁与渲染（只读核对）",
+      "url": "http://127.0.0.1:8003/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "restoreSession('sess_page_compact_k4')",
+          "save": "restored"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "assertText": "请选择下一步操作"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "eval": "document.getElementById('btn-send').disabled === true"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('[data-quick]')).every(b => b.disabled) === true"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return !!root && root.getAttribute('data-arrangement-mode') === 'GRID'; })()"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return root ? root.getAttribute('data-arrangement-mode') + ':' + root.getAttribute('data-gap') : 'none'; })()",
+          "save": "layout"
+        },
+        {
+          "screenshot": "nightb-08-本轮实例-待选门禁与右侧排版"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,141 @@
+{
+  "outDir": "../.selfcheck/night-d/flow",
+  "waitMs": 1500,
+  "timeout": 30000,
+  "ignore": [
+    "modao.cc",
+    "/health",
+    "api.simplesvg.com",
+    "simplesvg.com",
+    "api.iconify.design",
+    "iconify.design",
+    "api.unisvg.com",
+    "unisvg.com"
+  ],
+  "flows": [
+    {
+      "name": "T04-创建分组-原句闭环-接受-刷新-撤销",
+      "url": "http://127.0.0.1:8004/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "restoreSession('sess_night_d_flow_t04')",
+          "save": "restored"
+        },
+        {
+          "wait": 6000
+        },
+        {
+          "assertText": "请选择下一步操作"
+        },
+        {
+          "eval": "Number(session.baseDefinitionRevision)",
+          "save": "beforeRev"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select')).filter(s => !s.disabled); for (const sel of sels.reverse()) { const opt = Array.from(sel.options).find(o => o.textContent.trim() === '修改'); if (!opt) continue; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; } return false; })()"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "assertVisible": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])"
+        },
+        {
+          "type": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])",
+          "text": "把总耗电概览和能耗趋势分析放进能耗概览分组"
+        },
+        {
+          "click": "#chat-scroll .question-other-submit:not([disabled]), #chat-scroll .question-text-submit:not([disabled])"
+        },
+        {
+          "waitFor": "[data-pending-plan]",
+          "timeout": 20000
+        },
+        {
+          "assertText": "待确认的修改"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan]').innerText; return t.includes('能耗概览'); })()"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan]').innerText; return t.includes('总耗电概览') && t.includes('能耗趋势分析'); })()"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan]').innerText; return !t.includes('设备耗电排名'); })()",
+          "save": "rankingNotInGroup"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan]').innerText; return t; })()",
+          "save": "candidateText"
+        },
+        {
+          "eval": "session.baseDefinitionRevision === beforeRev"
+        },
+        {
+          "screenshot": "d-t04-01-建组候选待确认"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-pending-plan] select'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "session.baseDefinitionRevision === beforeRev + 1"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-presentation=\"group\"]'); return !!el && el.getAttribute('data-region-id') !== null; })()"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-presentation=\"group\"]'); return !!el && el.getAttribute('data-arrangement-mode') === 'GRID'; })()"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-presentation=\"group\"]'); return !!el && Number(el.getAttribute('data-arrangement-columns')) === 2; })()"
+        },
+        {
+          "eval": "(() => { const g = document.querySelector('#preview-root [data-presentation=\"group\"]'); if (!g) return false; const ids = Array.from(g.querySelectorAll('[data-region-id]')).map(el => el.dataset.regionId); return ids.includes('region_total_energy') && ids.includes('region_hourly_trend'); })()"
+        },
+        {
+          "eval": "(() => { const g = document.querySelector('#preview-root [data-presentation=\"group\"]'); if (!g) return false; const ids = Array.from(g.querySelectorAll('[data-region-id]')).map(el => el.dataset.regionId); return !ids.includes('region_device_ranking'); })()"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_device_ranking\"]'); return !!el; })()"
+        },
+        {
+          "screenshot": "d-t04-02-接受后分组生效"
+        },
+        {
+          "eval": "(() => { location.reload(); return true; })()"
+        },
+        {
+          "wait": 5000
+        },
+        {
+          "eval": "(() => { const g = document.querySelector('#preview-root [data-presentation=\"group\"]'); return !!g && Number(g.getAttribute('data-arrangement-columns')) === 2; })()"
+        },
+        {
+          "eval": "(() => { const g = document.querySelector('#preview-root [data-presentation=\"group\"]'); if (!g) return false; const ids = Array.from(g.querySelectorAll('[data-region-id]')).map(el => el.dataset.regionId); return ids.includes('region_total_energy') && ids.includes('region_hourly_trend') && !ids.includes('region_device_ranking'); })()"
+        },
+        {
+          "screenshot": "d-t04-03-刷新后分组保持"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-wp-history]'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.value === 'undo'); if (!opt || opt.disabled) return false; sel.value = 'undo'; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "(() => { const g = document.querySelector('#preview-root [data-presentation=\"group\"]'); return !g; })()"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"]'); return !!el; })()"
+        },
+        {
+          "screenshot": "d-t04-04-撤销后分组回退"
+        }
+      ]
+    }
+  ]
+}

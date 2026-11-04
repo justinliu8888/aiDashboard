@@ -172,6 +172,65 @@ def _payload_is_simulated(payload: Any) -> bool:
     return False
 
 
+#: 「这一轮真的把修改落到草稿上了」的**服务端信号**。
+#:
+#: 撤销 / 重做要失效的正是这些轮次 —— 用它判，不按中文文案猜。
+APPLIED_UI_ACTION = "template_edit_applied"
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="microseconds")
+
+
+def _payload_belongs_to_step(payload: dict[str, Any], step_id: str) -> bool:
+    """这条消息是不是**属于某个步骤**的。
+
+    步骤归属有三个来源（消息 payload 的真实形状）：
+      1. 顶层 ``stepId``；
+      2. ``questions[].stepId`` —— 那一轮画出来的菜单 / 澄清卡各属一步；
+      3. ``domainObjects.pendingEditPlan.editPlan.stepId`` —— 待确认计划那一步。
+
+    只认**服务端自己写进去的**步骤 id，不猜、不按文本匹配。
+    """
+    if not step_id:
+        return False
+    if str(payload.get("stepId") or "") == step_id:
+        return True
+    questions = payload.get("questions")
+    if isinstance(questions, list):
+        for question in questions:
+            if isinstance(question, dict) and str(question.get("stepId") or "") == step_id:
+                return True
+    domain_objects = payload.get("domainObjects")
+    if isinstance(domain_objects, dict):
+        pending = domain_objects.get("pendingEditPlan")
+        if isinstance(pending, dict):
+            plan = pending.get("editPlan")
+            if isinstance(plan, dict) and str(plan.get("stepId") or "") == step_id:
+                return True
+    return False
+
+
+def _message_step_id(payload: dict[str, Any]) -> str:
+    """这条消息属于哪一步（取第一张卡的 stepId）。"""
+    questions = payload.get("questions")
+    if isinstance(questions, list):
+        for question in questions:
+            if isinstance(question, dict):
+                step_id = str(question.get("stepId") or "").strip()
+                if step_id:
+                    return step_id
+    return ""
+
+
+def _is_applied_message(payload: dict[str, Any]) -> bool:
+    """这一轮是不是**真的把修改落到草稿上了**。"""
+    actions = payload.get("uiActions")
+    if not isinstance(actions, list):
+        return False
+    return APPLIED_UI_ACTION in actions
+
+
 def _persisted_response_payload(response: AgentResponse) -> dict[str, Any]:
     """消息落库用的响应体：**不含模拟业务结果**。
 
@@ -584,6 +643,8 @@ class SessionService:
         self._migrate_legacy_pending_plan(session_id)
         current = self._repo.get_session(session_id) or current
         snapshot = dict(current.snapshot or {}) if current else {}
+        if (response.debug or {}).get("queryReturnedToDraft"):
+            snapshot.pop("editingTargetRegionId", None)
         if request is not None:
             collected = dict(getattr(request, "collectedInfo", None) or {})
             if collected:
@@ -1136,6 +1197,136 @@ class SessionService:
     def load_pending_choice(self, session_id: str) -> dict[str, Any] | None:
         record = self._repo.get_session(session_id)
         return record.pendingChoice if record else None
+
+    # ---------- 步骤失效标记 ----------
+
+    def mark_step_revoked(self, session_id: str, step_id: str) -> int:
+        """把某一步在**历史消息**上标成已撤销。
+
+        BUG-008：撤销只回滚右侧定义时，左侧历史里那一步在**刷新之后**
+        仍然是可操作的。这里在消息 payload 上落 ``revoked``，前端回放时
+        据此把那一步标成只读 / 已撤销 —— **消息文本与更早历史一个字不删**。
+
+        尽力而为：落不上标记不该掀翻整笔撤销（定义已经回滚了），
+        只记警告。
+        """
+        if not session_id or not step_id:
+            return 0
+        marked = 0
+        for message in self._list_messages_safe(session_id):
+            payload = message.payload
+            if not isinstance(payload, dict):
+                continue
+            if not _payload_belongs_to_step(payload, step_id):
+                continue
+            if payload.get("revoked") is True and payload.get("revokedStepId") == step_id:
+                marked += 1
+                continue
+            updated = dict(payload)
+            updated["revoked"] = True
+            updated["revokedStepId"] = step_id
+            if self._write_payload_safe(session_id, message.id, updated):
+                marked += 1
+        return marked
+
+    def revoke_latest_applied_step(self, session_id: str) -> str | None:
+        """撤销掉**最近一个已生效的修改**，把那一轮的历史标成已撤销。
+
+        「一次接受整批算一个撤销单位」（契约 §2.3）。所以连续撤销 B / A 时，
+        第二次撤销要失效的**不是**已经失效的那一步，而是**再往前一个**
+        已生效的修改 —— 否则 A 那轮留在历史里的「已完成：……」会继续显示成
+        生效的样子。
+
+        判据用的是**服务端自己写的** ``uiActions``（``template_edit_applied``），
+        不按文案猜。返回被失效的 stepId（没有可失效的返回 None）。
+        """
+        if not session_id:
+            return None
+        for message in reversed(self._list_messages_safe(session_id)):
+            payload = message.payload
+            if not isinstance(payload, dict):
+                continue
+            if not _is_applied_message(payload):
+                continue
+            if payload.get("revoked") is True:
+                continue  # 已经失效过了 —— 往前找
+            step_id = _message_step_id(payload)
+            if not step_id:
+                continue
+            updated = dict(payload)
+            updated["revoked"] = True
+            updated["revokedStepId"] = step_id
+            updated["revokedAt"] = _now_iso()
+            if not self._write_payload_safe(session_id, message.id, updated):
+                continue
+            self.mark_step_revoked(session_id, step_id)
+            return step_id
+        return None
+
+    def restore_last_revoked_applied_step(self, session_id: str) -> str | None:
+        """重做：把**最近被撤销的已生效修改**恢复回来。
+
+        撤销的顺序是 LIFO（B 先撤、再撤 A），所以重做要恢复的是
+        **最后撤掉的那一个** —— 用撤销时刻排序，不按历史顺序
+        （历史顺序里 A 在 B 前面，按历史找会恢复错）。
+
+        返回被恢复的 stepId（没有可恢复的返回 None）。
+        """
+        if not session_id:
+            return None
+        best: tuple[str, Any, dict[str, Any]] | None = None
+        for message in self._list_messages_safe(session_id):
+            payload = message.payload
+            if not isinstance(payload, dict):
+                continue
+            if not _is_applied_message(payload):
+                continue
+            if payload.get("revoked") is not True:
+                continue
+            revoked_at = str(payload.get("revokedAt") or "")
+            step_id = _message_step_id(payload)
+            if not step_id:
+                continue
+            if best is None or revoked_at >= best[0]:
+                best = (revoked_at, message, payload)
+        if best is None:
+            return None
+        _revoked_at, message, payload = best
+        updated = dict(payload)
+        updated.pop("revoked", None)
+        updated.pop("revokedStepId", None)
+        updated.pop("revokedAt", None)
+        if not self._write_payload_safe(session_id, message.id, updated):
+            return None
+        return _message_step_id(payload) or None
+
+    def _list_messages_safe(self, session_id: str) -> list[Any]:
+        try:
+            return list(self._repo.list_messages(session_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[session_service] 读取会话消息失败 sessionId=%s errorType=%s",
+                session_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
+            return []
+
+    def _write_payload_safe(
+        self, session_id: str, message_id: int, payload: dict[str, Any]
+    ) -> bool:
+        try:
+            return bool(
+                self._repo.update_message_payload(session_id, message_id, payload)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[session_service] 写回消息 payload 失败 sessionId=%s errorType=%s",
+                session_id,
+                type(exc).__name__,
+                exc_info=(type(exc), None, exc.__traceback__),
+            )
+            return False
 
     # ---------- 选择锁的「延迟写入」 ----------
 

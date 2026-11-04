@@ -16,6 +16,7 @@ import pytest
 from app.services.report_draft_service import build_definition_draft
 from app.services.session_service import session_service
 from app.services.validation_service import validate_definition
+from tests.support.step_contract import step_ref
 
 
 @pytest.fixture()
@@ -25,6 +26,20 @@ def definition():
 
 def _snap(definition):
     return {"reportDefinition": definition.model_dump(mode="json")}
+
+
+def _enter_edit_step(post_chat, draft, *, state="USER_EDITING_TEMPLATE"):
+    """点「修改」进入**受限修改输入**这一步，返回它的步骤关联。
+
+    这一步之后，提交必须带上步骤关联（权威步骤契约）：服务端拿它跟持久化
+    的权威记录核对，对不上就拒。
+    """
+    response = post_chat(
+        "修改",
+        state=state,
+        snapshots={"reportDefinition": draft},
+    ).json()
+    return step_ref(response)
 
 
 def _accept_options(payload):
@@ -302,18 +317,16 @@ def test_stale_plan_is_blocked_after_draft_changed(post_chat, definition):
     assert accepted["domainObjects"]["reportDefinitionDraft"]["metadata"]["revision"] == 1
 
     # 接受后有必选菜单，先明确选择继续修改，再生成第二个计划。
-    resumed = post_chat(
-        "修改",
-        state="USER_EDITING_TEMPLATE",
-        snapshots={"reportDefinition": accepted["domainObjects"]["reportDefinitionDraft"]},
-    ).json()
-    assert resumed["uiActions"] != ["selection_required"]
+    ref = _enter_edit_step(
+        post_chat, accepted["domainObjects"]["reportDefinitionDraft"],
+    )
     candidate = post_chat(
         "把设备耗电排名改成柱状图",
         state="USER_EDITING_TEMPLATE",
         snapshots={
             "reportDefinition": accepted["domainObjects"]["reportDefinitionDraft"]
         },
+        **ref,
     ).json()
     assert candidate["domainObjects"]["pendingEditPlan"] is not None
     # 拿旧草稿（revision 0）去接受，版本对不上，必须被拦住。
@@ -408,15 +421,12 @@ def test_new_requirement_after_apply_is_not_narrowed_to_the_old_card(
     applied = _apply_bar_chart_change(post_chat, definition)
     draft = applied["domainObjects"]["reportDefinitionDraft"]
 
-    post_chat(
-        "修改",
-        state="USER_EDITING_TEMPLATE",
-        snapshots={"reportDefinition": draft},
-    ).json()
+    ref = _enter_edit_step(post_chat, draft)
     fresh = post_chat(
         "把标题改成测试",
         state="USER_EDITING_TEMPLATE",
         snapshots={"reportDefinition": draft},
+        **ref,
     ).json()
 
     # 没有默认选第一张，也没有退回上一张卡片：直接问是哪一张。
@@ -431,15 +441,12 @@ def test_draft_level_requirement_is_not_truncated_by_the_old_card(
     applied = _apply_bar_chart_change(post_chat, definition)
     draft = applied["domainObjects"]["reportDefinitionDraft"]
 
-    post_chat(
-        "修改",
-        state="USER_EDITING_TEMPLATE",
-        snapshots={"reportDefinition": draft},
-    ).json()
+    ref = _enter_edit_step(post_chat, draft)
     renamed = post_chat(
         "报表名称改成新日报",
         state="USER_EDITING_TEMPLATE",
         snapshots={"reportDefinition": draft},
+        **ref,
     ).json()
 
     pending = renamed["domainObjects"]["pendingEditPlan"]
@@ -453,15 +460,12 @@ def test_recency_reference_points_at_the_last_applied_card(post_chat, definition
     applied = _apply_bar_chart_change(post_chat, definition)
     draft = applied["domainObjects"]["reportDefinitionDraft"]
 
-    post_chat(
-        "修改",
-        state="USER_EDITING_TEMPLATE",
-        snapshots={"reportDefinition": draft},
-    ).json()
+    ref = _enter_edit_step(post_chat, draft)
     recency = post_chat(
         "把刚才那张卡片的标题改为测试卡片",
         state="USER_EDITING_TEMPLATE",
         snapshots={"reportDefinition": draft},
+        **ref,
     ).json()
 
     pending = recency["domainObjects"]["pendingEditPlan"]
@@ -474,15 +478,12 @@ def test_ordinary_demonstrative_after_apply_still_asks(post_chat, definition):
     applied = _apply_bar_chart_change(post_chat, definition)
     draft = applied["domainObjects"]["reportDefinitionDraft"]
 
-    post_chat(
-        "修改",
-        state="USER_EDITING_TEMPLATE",
-        snapshots={"reportDefinition": draft},
-    ).json()
+    ref = _enter_edit_step(post_chat, draft)
     asked = post_chat(
         "把这个删掉",
         state="USER_EDITING_TEMPLATE",
         snapshots={"reportDefinition": draft},
+        **ref,
     ).json()
 
     assert asked["domainObjects"]["pendingEditPlan"] is None

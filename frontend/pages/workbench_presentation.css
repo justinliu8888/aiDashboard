@@ -89,6 +89,38 @@
   padding-inline: min(1.25rem, 8%);
 }
 
+/*
+ * 窄卡：文字**不竖排**、按钮**不越界**。
+ *
+ * 「竖排」其实是窄容器里逐字换行的观感：中文没有词间空格，容器一窄，
+ * 浏览器就把每个字放到单独一行（一个字一行 = 看着像竖排）。
+ * 这里给数字区一条 nowrap：数值永远在一行里，读起来就是横排。
+ *
+ * 按钮不越界：工具条允许换行（flex-wrap），按钮本身不缩到变形，
+ * 并且不超过卡片的宽度。
+ */
+.wp-card,
+.wp-leaf,
+.wp-group {
+  /* 明确横排：不让任何继承来的 writing-mode 把中文竖着排。 */
+  writing-mode: horizontal-tb;
+}
+
+.wp-card [data-region-metric] > div {
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: keep-all;
+}
+
+.wp-card .region-tools {
+  overflow: hidden;
+}
+
+.wp-card button,
+.wp-card select {
+  max-width: 100%;
+}
+
 .wp-card > .flex:first-child {
   flex-wrap: wrap;
 }

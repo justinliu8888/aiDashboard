@@ -29,6 +29,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import (
     ROUND_CEILING,
@@ -39,12 +40,15 @@ from decimal import (
 )
 from typing import Any, Iterable, Iterator
 
+from pydantic import ValidationError
+
 from app.schemas.change_set import ChangeSet, ChangeSetEntry
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.report_presentation import PresentationResult
 from app.services.report_theme_service import (
     THEME_MANAGED_STYLE_KEYS,
     clear_theme_managed_style_layers,
+    theme_service,
 )
 
 
@@ -847,6 +851,100 @@ def _root_regions(root: dict[str, Any]) -> list[dict[str, Any]]:
     return regions
 
 
+def _region_slots(
+    root: dict[str, Any], region_id: str
+) -> list[tuple[list[dict[str, Any]], int, dict[str, Any] | None, dict[str, Any]]]:
+    """列出某个 id 在树里的**所有**位置。
+
+    每项是 ``(所在列表, 下标, 父容器, 区域本身)`` —— 父容器为 ``None``
+    表示它在根层。
+
+    正常定义里 id 唯一；返回多项说明**同一个 id 出现了多次**：
+    那就是"目标不唯一"，要澄清（``ambiguous_target``），不能自己挑一个。
+    """
+    slots: list[
+        tuple[list[dict[str, Any]], int, dict[str, Any] | None, dict[str, Any]]
+    ] = []
+    target = str(region_id or "")
+    if not target:
+        return slots
+
+    def walk(regions: Any, parent: dict[str, Any] | None) -> None:
+        if not isinstance(regions, list):
+            return
+        for index, region in enumerate(regions):
+            if not isinstance(region, dict):
+                continue
+            if str(region.get("id") or "") == target:
+                slots.append((regions, index, parent, region))
+            if is_container(region):
+                walk(region.get("children"), region)
+
+    walk(_root_regions(root), None)
+    return slots
+
+
+def _resolve_relative_move(
+    root: dict[str, Any],
+    region_id: str,
+    after_region_id: Any,
+    before_region_id: Any,
+) -> tuple[str | None, int]:
+    """把「移到某张卡后面 / 前面」解析成 ``(目标容器 id 或 None, 插入下标)``。
+
+    **下标按"源卡已从树上摘出之后"算**（契约 N2）：
+    源卡与参照卡**同容器**、且源卡在参照卡**前面**时，摘掉源卡会让参照卡
+    前移一格 —— 所以参照卡的下标要减一。不减一就会插错位置
+    （"移到 X 后面"变成"移到 X 后面那张的后面"）。
+
+    参照卡在根层时目标容器为 ``None``（= 根层列表）。
+
+    这份计算**在源卡还在树上时**做一次即可：规范化层与执行器用的是**同一个**
+    函数，所以"候选里写的下标"与"真正执行的下标"必然一致。
+    """
+    after_id = str(after_region_id or "").strip()
+    before_id = str(before_region_id or "").strip()
+    if after_id and before_id:
+        raise PresentationError(
+            "invalid_operation",
+            "移动参数重复：不能同时指定「移到某张卡后面」和「移到某张卡前面」。",
+        )
+    target_id = after_id or before_id
+    if not target_id:
+        raise PresentationError("invalid_operation", "相对位置需要指明参照卡片。")
+    if target_id == region_id:
+        raise PresentationError("invalid_operation", "不能把卡片移到它自己后面。")
+
+    source_slots = _region_slots(root, region_id)
+    if not source_slots:
+        raise PresentationError("unknown_region", f"找不到这张卡片：{region_id}。")
+    _source_list, source_index, _source_parent, source_region = source_slots[0]
+
+    target_slots = _region_slots(root, target_id)
+    if not target_slots:
+        raise PresentationError("unknown_region", f"找不到要参照的卡片：{target_id}。")
+    if len(target_slots) > 1:
+        raise PresentationError(
+            "ambiguous_target",
+            f"有 {len(target_slots)} 张卡片用了同一个 id（{target_id}），"
+            "没法确定要移到哪一张后面，请说得更具体些。",
+        )
+    siblings, target_index, parent, _target_region = target_slots[0]
+    if parent is not None and not is_container(parent):
+        raise PresentationError(
+            "invalid_operation", "参照卡片所在的层级不是分组，无法按相对位置移动。"
+        )
+    # **循环挂接**：不能把容器挪到自己孩子后面。
+    if target_id in _region_subtree_ids(source_region):
+        raise PresentationError("cycle", "不能把分组移到它自己的子卡片后面。")
+    # 源卡与参照卡同容器、且源卡在它前面 → 摘出源卡后参照卡会前移一格。
+    if siblings is source_slots[0][0] and source_index < target_index:
+        target_index -= 1
+    index = target_index + 1 if after_id else target_index
+    target_group_id = str(parent.get("id") or "") if parent is not None else ""
+    return (target_group_id or None), index
+
+
 def _auto_placements(children: list[dict[str, Any]], arrangement: dict[str, Any]) -> None:
     """按容器排列**重算**子区域的定位。
 
@@ -1378,13 +1476,31 @@ def _op_set_group_arrangement(root, params, affected, issues, changes) -> None:
 
 
 def _op_move_region(root, params, affected, issues, changes) -> None:
-    _require_keys(params, ("regionId",), ("targetGroupId", "index"))
+    # ``afterRegionId`` / ``beforeRegionId``：**相对位置**（契约 N2 / §1.3）。
+    # 执行器**直接**认这两个参数 —— 即使有计划绕过规范化层，也不会再报
+    # "不支持的参数：'afterRegionId'"。下标语义与规范化层**完全一致**
+    # （同一个 ``_resolve_relative_move``）。
+    _require_keys(
+        params,
+        ("regionId",),
+        ("targetGroupId", "index", "afterRegionId", "beforeRegionId"),
+    )
     region_id = str(params["regionId"])
     region = find_region(root, region_id)
     if region is None:
         raise PresentationError("unknown_region", f"找不到这张卡片：{region_id}。")
+    after_id = str(params.get("afterRegionId") or "").strip()
+    before_id = str(params.get("beforeRegionId") or "").strip()
+    relative = bool(after_id or before_id)
+    if relative and (
+        params.get("targetGroupId") is not None or params.get("index") is not None
+    ):
+        raise PresentationError(
+            "invalid_operation",
+            "移动参数重复：不能同时给目标位置和「移到某张卡后面」。",
+        )
     target_group = params.get("targetGroupId")
-    if target_group is not None:
+    if not relative and target_group is not None:
         target_id = str(target_group)
         if target_id == region_id:
             raise PresentationError("cycle", "不能把分组移进它自己。")
@@ -1397,6 +1513,33 @@ def _op_move_region(root, params, affected, issues, changes) -> None:
         ancestors = region_ancestors(root, target_id)
         if any(str(item.get("id") or "") == region_id for item in ancestors):
             raise PresentationError("cycle", "不能把分组移进它自己的子分组。")
+
+    if relative:
+        # 相对位置：插入下标**在摘出之前**算好（摘出后列表会前移）。
+        relative_group_id, index = _resolve_relative_move(
+            root, region_id, after_id, before_id
+        )
+        moved = _detach(root, region_id)
+        if moved is None:
+            raise PresentationError("unknown_region", f"找不到这张卡片：{region_id}。")
+        siblings = (
+            _root_regions(root)
+            if relative_group_id is None
+            else _container_children(root, relative_group_id)
+        )
+        if siblings is None:
+            raise PresentationError(
+                "unknown_region", f"找不到目标分组：{relative_group_id}。"
+            )
+        position = _as_int(index, low=0, high=max(len(siblings), 0), field="index")
+        siblings.insert(position, moved)
+        affected.append(region_id)
+        _record_change(
+            changes, region_id, f"/regions/{region_id}", None, moved,
+            "移动卡片（id 与统计口径不变）",
+        )
+        return
+
     moved = _detach(root, region_id)
     if moved is None:
         raise PresentationError("unknown_region", f"找不到这张卡片：{region_id}。")
@@ -1434,7 +1577,57 @@ def _op_ungroup(root, params, affected, issues, changes) -> None:
     anchor = _locate(root, group_id)
     if anchor is None:
         raise PresentationError("unknown_region", f"找不到这个分组：{group_id}。")
-    insert_list, insert_at, _parent = anchor
+    insert_list, insert_at, parent = anchor
+    arrangement = (
+        (parent.get("component") or {}).get("arrangement") or {}
+        if parent is not None else (root.get("page") or {}).get("arrangement") or {}
+    )
+    outer = (container.get("layout") or {}).get("placement") or {}
+    # Group-local coordinates cannot be reused in the parent's grid.
+    if str(arrangement.get("mode") or "GRID").upper() == "GRID":
+        columns = int(arrangement.get("columns") or (1 if parent else 12))
+        column = min(int(outer.get("column") or 1), columns)
+        span = min(int(outer.get("columnSpan") or columns), columns - column + 1)
+        # An automatic parent row must stay automatic after promotion.
+        explicit_row = outer.get("row") is not None
+        row = int(outer.get("row") or 1)
+        old_end = row + int(outer.get("rowSpan") or 1)
+        next_row = row
+        for child in children:
+            layout = child.setdefault("layout", {})
+            before = copy.deepcopy(layout.get("placement"))
+            height = int((before or {}).get("rowSpan") or 1)
+            layout["placement"] = {
+                "type": "GRID", "column": column, "columnSpan": span,
+                "rowSpan": height,
+            }
+            if explicit_row:
+                layout["placement"]["row"] = next_row
+            next_row += height
+            _record_change(changes, str(child.get("id") or ""),
+                           f"/regions/{child.get('id')}/layout/placement", before,
+                           layout["placement"], "取消分组后转换到父层定位")
+        delta = max(0, next_row - old_end) if explicit_row else 0
+        for sibling in insert_list[insert_at + 1:]:
+            placement = (sibling.get("layout") or {}).get("placement") or {}
+            if delta and placement.get("type") == "GRID" and int(placement.get("row") or 0) >= old_end:
+                before = copy.deepcopy(placement)
+                placement["row"] += delta
+                sibling_id = str(sibling.get("id") or "")
+                affected.append(sibling_id)
+                _record_change(changes, sibling_id,
+                               f"/regions/{sibling_id}/layout/placement", before,
+                               placement, "取消分组后为子卡预留行")
+    else:
+        for child in children:
+            layout = child.setdefault("layout", {})
+            before = copy.deepcopy(layout.get("placement"))
+            layout["placement"] = {"type": "FLOW"}
+            if outer.get("type") == "FLOW" and outer.get("width"):
+                layout["placement"]["width"] = copy.deepcopy(outer["width"])
+            _record_change(changes, str(child.get("id") or ""),
+                           f"/regions/{child.get('id')}/layout/placement", before,
+                           layout["placement"], "取消分组后转换到父层定位")
     detached = _detach(root, group_id)
     if detached is None:
         raise PresentationError("unknown_region", f"找不到这个分组：{group_id}。")
@@ -1951,3 +2144,504 @@ _HANDLERS = {
     "SET_METADATA": _op_set_metadata,
     "SET_THEME": _op_set_theme,
 }
+
+
+# --------------------------------------------------------------------------
+# 规范计划（canonical plan）：把松散参数规范成执行器认得的形状
+# --------------------------------------------------------------------------
+#
+# 为什么要有这一层：模型 / 规则给出的参数是**松散**的（``fontSize: 28``、
+# ``gap: 16``、``afterRegionId: "region_x"``），而执行器只认**一种**写法。
+# 缺了这一层，非法参数会一路走到"用户点了接受修改"才炸
+# （BUG-001 字号 / BUG-002 移动 / BUG-004 间距 / BUG-006 层级）。
+#
+# 这一层只做**语义保持**的规范化：把等价的写法换成执行器要的那个形状。
+# 认不出来的语义**抛 PresentationError**，绝不静默丢弃字段。
+
+
+#: 长度类字段（契约 N1）：统一成 ``{"value": n, "unit": "PX"}``。
+_LENGTH_STYLE_FIELDS = ("fontSize", "lineHeight", "padding", "margin")
+
+#: 定位里的长度字段（契约 N1）：只有 GRID / FLOW 有（ABSOLUTE 的 width /
+#: height 是**整数像素**，那是执行器的口径，不能动）。
+_LENGTH_PLACEMENT_FIELDS = ("width", "minHeight")
+
+#: 长度只允许这两种单位；其它单位报错，不猜。
+_ALLOWED_LENGTH_UNITS = ("PX", "PERCENT")
+
+#: 排列参数里的键（契约 N4）。
+_ARRANGEMENT_KEYS = ("mode", "columns", "direction", "gap")
+
+#: 排列字段出现在 **placement** 里 = 层级错（契约 N3）。
+_ARRANGEMENT_MARKERS = ("columns", "mode", "direction", "gap")
+
+#: 主题同义词（契约 N5）：用户说的是「暗色」，内置主题名是「深色主题」。
+#:
+#: 这不是**另一份主题清单** —— 主题本身仍然只来自主题服务
+#: （``list_themes``）；这里只是"用户说法 → 内置 id"的对照表，
+#: 命中的 id 必须在 ``list_themes`` 里真的存在才用。
+_THEME_SYNONYMS = {
+    "暗色": "theme_dark",
+    "深色": "theme_dark",
+    "dark": "theme_dark",
+    "浅色": "theme_default",
+    "默认": "theme_default",
+    "light": "theme_default",
+    "default": "theme_default",
+    "柔和": "theme_soft",
+    "soft": "theme_soft",
+    "打印": "theme_print",
+    "print": "theme_print",
+}
+
+#: ``"28px"`` / ``"28"`` / ``"28%"`` 的解析：数值 + 可选单位。
+_LENGTH_PATTERN = re.compile(r"^(-?\d+(?:\.\d+)?)\s*([a-z%]*)$", re.IGNORECASE)
+
+
+def _normalize_length(value: Any, *, field: str) -> dict[str, Any]:
+    """把长度写法统一成 ``{"value": n, "unit": "PX"}``（契约 N1）。
+
+    接受：``28``（数字）/ ``"28px"`` / ``"28"`` / ``{"value": 28}``。
+    单位只允许 **PX / PERCENT** —— 其它单位报错，不猜。
+
+    长度对象里除 ``value`` / ``unit`` 外的键执行器本来就不读，规范化后按
+    规范形状输出（不引入新语义）。
+    """
+    if isinstance(value, dict):
+        if "value" not in value:
+            raise PresentationError("out_of_range", f"{field} 的取值格式不对。")
+        number = value["value"]
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            raise PresentationError("out_of_range", f"{field} 的取值格式不对。")
+        unit = str(value.get("unit") or "PX").upper()
+        if unit not in _ALLOWED_LENGTH_UNITS:
+            raise PresentationError(
+                "out_of_range", f"{field} 的单位只能是 PX 或 PERCENT。"
+            )
+        return {"value": number, "unit": unit}
+    if isinstance(value, bool):
+        raise PresentationError("out_of_range", f"{field} 的取值格式不对。")
+    if isinstance(value, (int, float)):
+        return {"value": value, "unit": "PX"}
+    if isinstance(value, str):
+        match = _LENGTH_PATTERN.match(value.strip())
+        if match is None:
+            raise PresentationError("out_of_range", f"{field} 的取值格式不对。")
+        number_text, unit_text = match.group(1), match.group(2).lower()
+        unit = {"": "PX", "px": "PX", "%": "PERCENT", "percent": "PERCENT"}.get(unit_text)
+        if unit is None:
+            raise PresentationError(
+                "out_of_range", f"{field} 的单位只能是 PX 或 PERCENT。"
+            )
+        number = int(number_text) if "." not in number_text else float(number_text)
+        return {"value": number, "unit": unit}
+    raise PresentationError("out_of_range", f"{field} 的取值格式不对。")
+
+
+def _normalize_arrangement(value: Any, *, field: str = "arrangement") -> dict[str, Any]:
+    """排列参数规范化（契约 N1 + N4）。
+
+    ``gap`` 走 N1；``columns`` 整数 1..12；未知键报错。
+
+    规范化结果与执行器 ``_validate_arrangement`` 的输出**逐字一致** ——
+    候选摘要与真正执行的是同一份参数（契约 §1.4）。
+    """
+    if not isinstance(value, dict):
+        raise PresentationError("out_of_range", "排列参数格式不对。")
+    for key in value:
+        if key not in _ARRANGEMENT_KEYS:
+            raise PresentationError("invalid_operation", f"排列参数不支持 {key!r}。")
+    normalized = dict(value)
+    if normalized.get("gap") is not None:
+        normalized["gap"] = _normalize_length(normalized["gap"], field="gap")
+    # 用执行器自己的校验收口：取值域（列数 1..12、模式、方向）与默认值
+    # 只有一处定义 —— 规范化与执行不会漂。
+    return _validate_arrangement(normalized)
+
+
+def _normalize_style(value: Any) -> dict[str, Any]:
+    """样式参数规范化（契约 N1 + N7）。
+
+    长度类字段统一成 ``{"value","unit"}``；**未知键照样报错** ——
+    白名单与执行器共用同一份（``THEME_MANAGED_STYLE_KEYS``），不会漂。
+    """
+    if not isinstance(value, dict):
+        raise PresentationError("out_of_range", "样式参数格式不对。")
+    for key in value:
+        if key not in THEME_MANAGED_STYLE_KEYS:
+            raise PresentationError(
+                "invalid_operation", f"样式不支持 {key!r}（只接受受控的外观属性）。"
+            )
+    normalized = dict(value)
+    for key in _LENGTH_STYLE_FIELDS:
+        if normalized.get(key) is not None:
+            normalized[key] = _normalize_length(normalized[key], field=key)
+    return normalized
+
+
+def _normalize_placement(value: Any) -> dict[str, Any]:
+    """定位参数规范化（契约 N1）。
+
+    只有 GRID / FLOW 的 ``width`` / ``minHeight`` 是**长度**；
+    ABSOLUTE 的 width / height 是**整数像素**（执行器口径），不动 ——
+    把它改成长度对象反而会让执行器报错。
+    """
+    if not isinstance(value, dict):
+        raise PresentationError("out_of_range", "定位参数格式不对。")
+    kind = str(value.get("type") or "").upper()
+    if kind not in ("GRID", "FLOW"):
+        return dict(value)
+    normalized = dict(value)
+    for key in _LENGTH_PLACEMENT_FIELDS:
+        if normalized.get(key) is not None:
+            normalized[key] = _normalize_length(normalized[key], field=key)
+    return normalized
+
+
+def _strip_theme_suffix(text: str) -> str:
+    """去掉主题名末尾的「主题 / theme」：「深色主题」→「深色」。"""
+    value = str(text or "").strip()
+    for suffix in ("主题", "theme"):
+        if value.lower().endswith(suffix) and len(value) > len(suffix):
+            return value[: -len(suffix)]
+    return value
+
+
+def _resolve_theme_id(value: Any) -> str:
+    """把主题**名字**解析成真实 themeId（契约 N5）。
+
+    唯一主题来源是主题服务（``list_themes``）—— 这里只额外加一张
+    **同义词表**（用户说「暗色」，内置主题名是「深色主题」）。
+    解析不到就抛 ``unknown_theme``（候选期澄清，不是执行期炸）。
+    """
+    theme_id = str(value or "").strip()
+    if not theme_id:
+        raise PresentationError("invalid_operation", "主题需要一个 id。")
+    themes = theme_service.list_themes()
+    known_ids = {str(item.get("themeId") or "") for item in themes}
+    # 1) 已经是真实 id → 原样用。
+    if theme_id in known_ids:
+        return theme_id
+    # 2) 按**主题名**匹配（「深色主题」）。
+    for item in themes:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        if theme_id == name or theme_id == _strip_theme_suffix(name):
+            return str(item.get("themeId") or "")
+    # 3) 同义词（「暗色」→ theme_dark）。命中的 id 必须**真的存在**。
+    synonym = _THEME_SYNONYMS.get(theme_id.lower())
+    if not synonym:
+        synonym = _THEME_SYNONYMS.get(_strip_theme_suffix(theme_id).lower())
+    if synonym and synonym in known_ids:
+        return synonym
+    names = "、".join(
+        str(item.get("name") or item.get("themeId") or "") for item in themes
+    )
+    raise PresentationError(
+        "unknown_theme", f"没有这个主题：{theme_id}。可选：{names}。"
+    )
+
+
+def _arrangement_from_placement(placement: dict[str, Any]) -> dict[str, Any]:
+    """从 placement 里取出**排列**部分（契约 N3）。
+
+    ``type`` 等价于 ``mode``（GRID / FLOW）；其余定位字段（column / row /
+    align / x / width …）与排列混在一起时**报错** —— 静默丢掉字段是不允许的
+    （契约 N7）。
+    """
+    arrangement: dict[str, Any] = {}
+    leftover: list[str] = []
+    for key, value in placement.items():
+        if key in ("columns", "direction", "gap"):
+            arrangement[key] = value
+        elif key == "mode":
+            arrangement["mode"] = value
+        elif key == "type":
+            mode = str(value or "").upper()
+            if mode not in ALLOWED_ARRANGEMENT_MODES:
+                raise PresentationError(
+                    "invalid_operation",
+                    "定位方式不能转成分组排列（只有 GRID / FLOW 可以）。",
+                )
+            if "mode" in arrangement and str(arrangement["mode"] or "").upper() != mode:
+                raise PresentationError(
+                    "invalid_operation", "定位方式与排列方式冲突，说清楚要哪一种。"
+                )
+            arrangement["mode"] = mode
+        else:
+            leftover.append(key)
+    if leftover:
+        raise PresentationError(
+            "invalid_operation",
+            f"定位参数与排列参数混在一起：{'、'.join(sorted(leftover))}。"
+            "请只说列数 / 间距 / 排列方式。",
+        )
+    return arrangement
+
+
+def _normalize_move_operation(
+    params: dict[str, Any], root: dict[str, Any]
+) -> dict[str, Any]:
+    """MOVE_REGION 的相对位置解析（契约 N2）。
+
+    ``afterRegionId`` / ``beforeRegionId`` → ``targetGroupId`` + ``index``；
+    **不允许把 afterRegionId 原样穿透给执行器**。
+    """
+    after_id = str(params.get("afterRegionId") or "").strip()
+    before_id = str(params.get("beforeRegionId") or "").strip()
+    new_params = {
+        key: value
+        for key, value in params.items()
+        if key not in ("afterRegionId", "beforeRegionId")
+    }
+    if not after_id and not before_id:
+        return {"op": "MOVE_REGION", "params": new_params}
+    if params.get("targetGroupId") is not None or params.get("index") is not None:
+        raise PresentationError(
+            "invalid_operation",
+            "移动参数重复：不能同时给目标位置和「移到某张卡后面」。",
+        )
+    region_id = str(params.get("regionId") or "").strip()
+    if not region_id:
+        raise PresentationError("invalid_operation", "移动需要指明要移动哪张卡片。")
+    target_group_id, index = _resolve_relative_move(root, region_id, after_id, before_id)
+    new_params["index"] = index
+    if target_group_id:
+        new_params["targetGroupId"] = target_group_id
+    return {"op": "MOVE_REGION", "params": new_params}
+
+
+def _normalize_placement_operation(
+    op: str, params: dict[str, Any], root: dict[str, Any]
+) -> dict[str, Any]:
+    """SET_PLACEMENT 的层级纠正（契约 N3）。
+
+    ``placement`` 里出现 ``columns`` / ``mode`` / ``direction`` / ``gap``
+    = 层级错：
+
+    - 目标是**容器** → 整条转成 ``SET_GROUP_ARRANGEMENT {groupId, arrangement}``；
+    - 目标是**叶子卡** → 抛 ``arrangement_not_placement``（**不许静默删字段**）。
+    """
+    placement = params.get("placement")
+    if not isinstance(placement, dict):
+        # 形状不对交给执行器报错（它的文案更贴上下文）。
+        return {"op": op, "params": dict(params)}
+    markers = [key for key in _ARRANGEMENT_MARKERS if key in placement]
+    if not markers:
+        return {
+            "op": op,
+            "params": {**params, "placement": _normalize_placement(placement)},
+        }
+    region_id = str(params.get("regionId") or "").strip()
+    region = find_region(root, region_id) if region_id else None
+    if region is None:
+        raise PresentationError("unknown_region", f"找不到这张卡片：{region_id}。")
+    if not is_container(region):
+        raise PresentationError(
+            "arrangement_not_placement",
+            f"「{region.get('name') or region_id}」是单张卡片，"
+            f"{'、'.join(markers)} 是**分组**的属性，不能设在这张卡上。"
+            "要改它的位置请说「移到…」，要改排列请先选一个分组。",
+        )
+    arrangement = _arrangement_from_placement(placement)
+    return {
+        "op": "SET_GROUP_ARRANGEMENT",
+        "params": {
+            "groupId": region_id,
+            "arrangement": _normalize_arrangement(arrangement),
+        },
+    }
+
+
+def _normalize_one_operation(raw: Any, root: dict[str, Any]) -> dict[str, Any]:
+    """规范化**一条**操作（契约 §1.2 的 N1–N7）。"""
+    if not isinstance(raw, dict):
+        raise PresentationError("invalid_operation", "展示操作格式不对。")
+    op = str(raw.get("op") or "")
+    if op not in ALLOWED_OPERATIONS:
+        raise PresentationError(
+            "invalid_operation", f"还不支持这个展示操作：{op or '(空)'}。"
+        )
+    params = raw.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        raise PresentationError("invalid_operation", "展示操作参数格式不对。")
+    # 安全值检查**不放松**：脚本 / 任意 CSS 文本照样拒。
+    _reject_unsafe(params)
+
+    if op == "MOVE_REGION":
+        return _normalize_move_operation(params, root)
+
+    if op == "SET_PLACEMENT":
+        return _normalize_placement_operation(op, params, root)
+
+    if op == "SET_STYLE":
+        new_params = dict(params)
+        if params.get("style") is not None:
+            new_params["style"] = _normalize_style(params["style"])
+        return {"op": op, "params": new_params}
+
+    if op in ("SET_GROUP_ARRANGEMENT", "CREATE_GROUP"):
+        new_params = dict(params)
+        if params.get("arrangement") is not None:
+            new_params["arrangement"] = _normalize_arrangement(params["arrangement"])
+        return {"op": op, "params": new_params}
+
+    if op == "SET_PAGE":
+        new_params = dict(params)
+        if params.get("webMaxWidth") is not None:
+            new_params["webMaxWidth"] = _normalize_length(
+                params["webMaxWidth"], field="webMaxWidth"
+            )
+        if params.get("arrangement") is not None:
+            new_params["arrangement"] = _normalize_arrangement(params["arrangement"])
+        return {"op": op, "params": new_params}
+
+    if op == "SET_THEME":
+        new_params = dict(params)
+        new_params["themeId"] = _resolve_theme_id(params.get("themeId"))
+        return {"op": op, "params": new_params}
+
+    if op == "SET_FORMAT":
+        new_params = dict(params)
+        fmt = params.get("format")
+        if isinstance(fmt, dict):
+            for key in fmt:
+                if key not in ALLOWED_FORMAT_KEYS:
+                    raise PresentationError(
+                        "invalid_operation", f"显示格式不支持 {key!r}。"
+                    )
+        return {"op": op, "params": new_params}
+
+    return {"op": op, "params": dict(params)}
+
+
+def normalize_presentation_operations(
+    operations: list[dict[str, Any]],
+    definition: ReportDefinitionDraft,
+) -> list[dict[str, Any]]:
+    """把模型 / 规则给出的松散参数规范成执行器认得的形状（契约 §1.2）。
+
+    **只做语义保持的规范化**：把等价的写法换成执行器要的那个形状。
+    认不出来的语义**抛 PresentationError**，绝不静默丢弃。
+
+    规则（契约 N1–N7）：
+
+    - **N1** 长度类字段统一成 ``{"value": n, "unit": "PX"}``；
+    - **N2** ``MOVE_REGION`` 的相对位置 → ``targetGroupId`` + ``index``；
+    - **N3** placement 里出现排列字段 = 层级错（容器则转 op，叶子卡则报错）；
+    - **N4** 排列参数：``gap`` 走 N1、``columns`` 1..12、未知键报错；
+    - **N5** ``SET_THEME`` 的主题**名字** → 真实 themeId；
+    - **N6** ``SET_FORMAT`` 只认 ``ALLOWED_FORMAT_KEYS``；
+    - **N7** 未知 op / 未知参数键**仍然报错** —— 规范化不放松校验。
+
+    **幂等**：对已经规范化的结果再跑一遍，结果不变 —— 所以调用方可以
+    「先规范化再预检」，预检里再规范化一次也不怕。
+
+    **无副作用**：不改传入的 definition（定位判断都在副本上做）。
+    """
+    if not isinstance(operations, list):
+        raise PresentationError("invalid_operation", "展示操作格式不对。")
+    # 在**副本**上定位：不许改调用方传进来的定义。
+    root = copy.deepcopy(_as_dict(definition))
+    return [_normalize_one_operation(raw, root) for raw in operations]
+
+
+@dataclass
+class PreflightResult:
+    """预检结果（契约 §1.1）。
+
+    - ``ok``：整批是否可执行；
+    - ``operations``：**规范化后**的那一批（= 将来真正执行的那一批）；
+    - ``failure``：面向用户的中文失败 / 澄清理由；
+    - ``reason``：机器可读码（``out_of_range`` / ``invalid_operation`` /
+      ``unknown_region`` / ``arrangement_not_placement`` / ``unknown_theme`` /
+      ``ambiguous_target`` …）；
+    - ``affectedRegionIds``：预检会影响的区域；
+    - ``changes``：ChangeSet.changed（摘要可用）。
+    """
+
+    ok: bool
+    operations: list[dict[str, Any]] = field(default_factory=list)
+    failure: str | None = None
+    reason: str | None = None
+    affectedRegionIds: list[str] = field(default_factory=list)
+    changes: list[dict[str, Any]] = field(default_factory=list)
+
+
+def preflight_presentation(
+    definition: ReportDefinitionDraft,
+    operations: list[dict[str, Any]],
+) -> PreflightResult:
+    """在**副本**上把整批跑一遍（契约 §1.1）。
+
+    **无副作用**：不落库、不产生撤销单位、不改传入的 definition。
+
+    失败时 ``ok=False`` 且 ``failure`` 给出可直接给用户看的中文理由；
+    成功时 ``operations`` 是**规范化后的那一份**（不是入参那一份）——
+    候选摘要与执行器真正跑的参数是同一份数据（契约 §1.4）。
+    """
+    try:
+        normalized = normalize_presentation_operations(operations, definition)
+    except PresentationError as exc:
+        return PreflightResult(ok=False, failure=exc.message, reason=exc.reason)
+    except Exception as exc:  # noqa: BLE001 —— 预检**绝不能**把异常甩给调用方
+        # 规范化会读主题服务（解析主题名），那一步可能碰到**存储层**的异常
+        # （数据库不可用等）。预检是候选期的**闸门**：它抛出去，整个请求就炸了 ——
+        # 而这一批本来只是"参数不合法"，应该变成一句澄清。
+        logger.warning("[report_presentation] 预检规范化异常：%s", type(exc).__name__)
+        return PreflightResult(
+            ok=False,
+            failure="这次修改的参数暂时没法校验，草稿没有变化，也没有生成待接受的修改计划。",
+            reason="invalid_operation",
+        )
+
+    try:
+        working = ReportDefinitionDraft.model_validate(
+            copy.deepcopy(_as_dict(definition))
+        )
+    except (PresentationError, ValidationError) as exc:
+        message = getattr(exc, "message", "") or "报表定义读不出来。"
+        reason = getattr(exc, "reason", "") or "invalid_definition"
+        return PreflightResult(ok=False, failure=message, reason=reason)
+    except Exception as exc:  # noqa: BLE001 —— 同上：预检不抛异常
+        logger.warning("[report_presentation] 预检读取定义异常：%s", type(exc).__name__)
+        return PreflightResult(
+            ok=False,
+            failure="报表定义暂时读不出来，草稿没有变化，也没有生成待接受的修改计划。",
+            reason="invalid_definition",
+        )
+
+    # 执行器本身是纯计算（内部深拷贝、失败不留半份）——
+    # 这里再传一份副本，保证"预检绝不碰调用方的定义"。
+    try:
+        result = apply_presentation(working, normalized)
+    except Exception as exc:  # noqa: BLE001 —— 预检是闸门，不抛异常
+        logger.warning("[report_presentation] 预检执行异常：%s", type(exc).__name__)
+        return PreflightResult(
+            ok=False,
+            operations=normalized,
+            failure="这次修改没法执行，草稿没有变化，也没有生成待接受的修改计划。",
+            reason="invalid_operation",
+        )
+    if not result.ok:
+        return PreflightResult(
+            ok=False,
+            operations=normalized,
+            failure=result.failure or "这次修改没有生效，草稿保持不变。",
+            reason=result.reason or "invalid_operation",
+        )
+    change_set = result.changeSet
+    changes = [
+        entry.model_dump() for entry in (change_set.changed if change_set else [])
+    ]
+    return PreflightResult(
+        ok=True,
+        operations=normalized,
+        failure=None,
+        reason=None,
+        affectedRegionIds=list(result.affectedRegionIds),
+        changes=changes,
+    )

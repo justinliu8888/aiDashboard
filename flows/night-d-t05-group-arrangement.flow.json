@@ -1,0 +1,173 @@
+{
+  "outDir": "../.selfcheck/night-d/flow",
+  "waitMs": 1500,
+  "timeout": 30000,
+  "ignore": [
+    "modao.cc",
+    "/health",
+    "api.simplesvg.com",
+    "simplesvg.com",
+    "api.iconify.design",
+    "iconify.design",
+    "api.unisvg.com",
+    "unisvg.com"
+  ],
+  "flows": [
+    {
+      "name": "T05a-组内排列-缺组样本明确未找到分组-不拿单卡冒充",
+      "url": "http://127.0.0.1:8004/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "restoreSession('sess_night_d_flow_t05')",
+          "save": "restoredA"
+        },
+        {
+          "wait": 6000
+        },
+        {
+          "assertText": "请选择下一步操作"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "assertText": "请选择下一步操作"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select')).filter(s => !s.disabled); for (const sel of sels.reverse()) { const opt = Array.from(sel.options).find(o => o.textContent.trim() === '修改'); if (!opt) continue; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; } return false; })()"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "assertVisible": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])"
+        },
+        {
+          "type": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])",
+          "text": "\"能耗概览\"改为两列，间距 20 像素"
+        },
+        {
+          "click": "#chat-scroll .question-other-submit:not([disabled]), #chat-scroll .question-text-submit:not([disabled])"
+        },
+        {
+          "wait": 2500
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('#chat-scroll').innerText; return t.includes('没有找到名为') && t.includes('能耗概览') && t.includes('分组'); })()"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('#chat-scroll').innerText; return !t.includes('待确认的修改'); })()",
+          "save": "noCandidateForMissingGroup"
+        },
+        {
+          "screenshot": "d-t05a-01-缺组只澄清不产出候选"
+        }
+      ]
+    },
+    {
+      "name": "T05b-组内排列-真实分组改为两列间距20",
+      "url": "http://127.0.0.1:8004/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "restoreSession('sess_night_d_flow_t05b')",
+          "save": "restoredB"
+        },
+        {
+          "wait": 2500
+        },
+        {
+          "assertText": "请选择下一步操作"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select')).filter(s => !s.disabled); for (const sel of sels.reverse()) { const opt = Array.from(sel.options).find(o => o.textContent.trim() === '修改'); if (!opt) continue; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; } return false; })()"
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "assertVisible": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])"
+        },
+        {
+          "type": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])",
+          "text": "把总耗电概览和能耗趋势分析放进能耗概览分组"
+        },
+        {
+          "click": "#chat-scroll .question-other-submit:not([disabled]), #chat-scroll .question-text-submit:not([disabled])"
+        },
+        {
+          "waitFor": "[data-pending-plan]",
+          "timeout": 20000
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const card = cards[cards.length - 1]; if (!card) return false; const sel = card.querySelector('select'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "assertText": "请选择下一步操作"
+        },
+        {
+          "eval": "(() => { const g = document.querySelector('#preview-root [data-presentation=\"group\"]'); return !!g && g.getAttribute('data-region-id') !== null; })()"
+        },
+        {
+          "screenshot": "d-t05b-01-分组已建立"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const card = cards[cards.length - 1]; return card ? (card.getAttribute('data-pending-plan') || '') : ''; })()",
+          "save": "planIdG"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select')).filter(s => !s.disabled); for (const sel of sels.reverse()) { const opt = Array.from(sel.options).find(o => o.textContent.trim() === '修改'); if (!opt) continue; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; } return false; })()"
+        },
+        {
+          "wait": 2500
+        },
+        {
+          "assertVisible": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])"
+        },
+        {
+          "type": "#chat-scroll .question-other-input:not([disabled]), #chat-scroll .question-text-input:not([disabled])",
+          "text": "\"能耗概览\"改为两列，间距 20 像素"
+        },
+        {
+          "click": "#chat-scroll .question-other-submit:not([disabled]), #chat-scroll .question-text-submit:not([disabled])"
+        },
+        {
+          "waitFor": "[data-pending-plan]:not([data-pending-plan=\"{{planIdG}}\"])",
+          "timeout": 20000
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const card = cards[cards.length - 1]; if (!card) return false; const t = card.innerText; return /\\d+\\s*列/.test(t) && t.includes('间距') && (t.includes('分组') || t.includes('排列')); })()"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const card = cards[cards.length - 1]; return card ? card.innerText : ''; })()",
+          "save": "arrangementCandidateText"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('[data-pending-plan]')); const card = cards[cards.length - 1]; if (!card) return false; const sel = card.querySelector('select'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "(() => { const g = document.querySelector('#preview-root [data-presentation=\"group\"]'); return !!g && Number(g.getAttribute('data-arrangement-columns')) === 2; })()"
+        },
+        {
+          "eval": "(() => { const g = document.querySelector('#preview-root [data-presentation=\"group\"]'); return !!g && Number(g.getAttribute('data-gap')) === 20; })()"
+        },
+        {
+          "eval": "(() => { const g = document.querySelector('#preview-root [data-presentation=\"group\"]'); if (!g) return false; const leaves = Array.from(g.querySelectorAll('[data-presentation=\"leaf\"]')); return leaves.length === 2 && leaves.every(el => el.getAttribute('data-placement-type') === 'GRID'); })()"
+        },
+        {
+          "screenshot": "d-t05b-02-组级两列排列生效"
+        }
+      ]
+    }
+  ]
+}

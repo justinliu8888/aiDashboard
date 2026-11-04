@@ -1,0 +1,66 @@
+{
+  "outDir": "../.selfcheck/night-b-frontend/render",
+  "waitMs": 1500,
+  "timeout": 60000,
+  "ignore": [
+    "modao.cc",
+    "/health"
+  ],
+  "flows": [
+    {
+      "name": "包B-渲染真实生效-数字格式-暗色主题-单列排布与阅读顺序",
+      "url": "http://127.0.0.1:8013/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "eval": "restoreSession('sess_night_b_frontend')", "save": "restored" },
+        { "wait": 3000 },
+        { "assertText": "请选择下一步操作" },
+
+        { "eval": "(async () => { for (let i = 0; i < 120; i += 1) { if (typeof isBusy === 'function' && isBusy()) { await new Promise((r) => setTimeout(r, 500)); continue; } const sel = Array.from(document.querySelectorAll('#chat-scroll .question-select[data-question-id=\"template_edit_confirm\"]')).filter((s) => !s.disabled).pop(); if (sel) { const opt = Array.from(sel.options).find((o) => o.textContent.trim() === '修改'); if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; } } await new Promise((r) => setTimeout(r, 500)); } return false; })()" },
+        { "wait": 1500 },
+        { "type": "#chat-scroll .question-other-input:not([disabled])", "text": "总耗电显示两位小数，加千分位，保留原单位 kWh" },
+        { "click": "#chat-scroll .question-other-submit:not([disabled])" },
+        { "waitFor": "[data-pending-plan]", "timeout": 150000 },
+        { "wait": 800 },
+        { "assertText": "待确认的修改" },
+        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "screenshot": "render-01-数字格式候选待选" },
+        { "eval": "(() => { const sels = Array.from(document.querySelectorAll('[data-pending-plan] select')).filter(s => !s.disabled); const sel = sels[sels.length - 1]; if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()" },
+        { "wait": 12000 },
+        { "eval": "/\\d+\\.\\d{2}\\s*kWh/.test(document.querySelector('#preview-root').innerText)" },
+        { "eval": "/\\d,\\d{3}\\.\\d{2}\\s*kWh/.test(document.querySelector('#preview-root').innerText)" },
+        { "screenshot": "render-02-数字格式生效" },
+
+        { "eval": "(async () => { for (let i = 0; i < 120; i += 1) { if (typeof isBusy === 'function' && isBusy()) { await new Promise((r) => setTimeout(r, 500)); continue; } const sel = Array.from(document.querySelectorAll('#chat-scroll .question-select[data-question-id=\"template_edit_confirm\"]')).filter((s) => !s.disabled).pop(); if (sel) { const opt = Array.from(sel.options).find((o) => o.textContent.trim() === '修改'); if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; } } await new Promise((r) => setTimeout(r, 500)); } return false; })()" },
+        { "waitFor": "#chat-scroll .question-text-input:not([disabled])", "timeout": 120000 },
+        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "screenshot": "render-03-受限步骤的专用输入" },
+        { "type": "#chat-scroll .question-text-input:not([disabled])", "text": "给这份报表应用暗色主题" },
+        { "click": "#chat-scroll .question-text-submit:not([disabled])" },
+        { "waitFor": "[data-pending-plan]", "timeout": 150000 },
+        { "wait": 800 },
+        { "screenshot": "render-04-暗色主题候选待选" },
+        { "eval": "(() => { const sels = Array.from(document.querySelectorAll('[data-pending-plan] select')).filter(s => !s.disabled); const sel = sels[sels.length - 1]; if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()" },
+        { "wait": 12000 },
+        { "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); if (!root) return false; return getComputedStyle(root).backgroundColor === 'rgb(20, 23, 28)'; })()" },
+        { "eval": "(() => { const els = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); if (!els.length) return false; return els.some(el => getComputedStyle(el).backgroundColor === 'rgb(29, 33, 39)' && getComputedStyle(el).color === 'rgb(232, 234, 237)'); })()" },
+        { "screenshot": "render-05-暗色主题生效" },
+
+        { "eval": "(async () => { for (let i = 0; i < 120; i += 1) { if (typeof isBusy === 'function' && isBusy()) { await new Promise((r) => setTimeout(r, 500)); continue; } const sel = Array.from(document.querySelectorAll('#chat-scroll .question-select[data-question-id=\"template_edit_confirm\"]')).filter((s) => !s.disabled).pop(); if (sel) { const opt = Array.from(sel.options).find((o) => o.textContent.trim() === '修改'); if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; } } await new Promise((r) => setTimeout(r, 500)); } return false; })()" },
+        { "waitFor": "#chat-scroll .question-text-input:not([disabled])", "timeout": 120000 },
+        { "type": "#chat-scroll .question-text-input:not([disabled])", "text": "页面紧凑一点，标题保留，其他内容按阅读顺序排列" },
+        { "click": "#chat-scroll .question-text-submit:not([disabled])" },
+        { "waitFor": "[data-pending-plan]", "timeout": 150000 },
+        { "wait": 800 },
+        { "screenshot": "render-06-单列排布候选待选" },
+        { "eval": "(() => { const sels = Array.from(document.querySelectorAll('[data-pending-plan] select')).filter(s => !s.disabled); const sel = sels[sels.length - 1]; if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()" },
+        { "wait": 12000 },
+        { "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return !!root && root.getAttribute('data-arrangement-mode') === 'FLOW' && root.getAttribute('data-arrangement-direction') === 'VERTICAL' && root.getAttribute('data-gap') === '8'; })()" },
+        { "eval": "(() => { const dom = Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(e => e.getAttribute('data-region-id')); const def = (session.definition?.regions || []).map(r => r.id); const common = dom.filter(id => def.includes(id)); const expected = def.filter(id => dom.includes(id)); return common.length >= 3 && JSON.stringify(common) === JSON.stringify(expected); })()" },
+        { "screenshot": "render-07-单列连续排布生效" },
+
+        { "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return root ? root.getAttribute('data-arrangement-mode') + ':' + root.getAttribute('data-arrangement-direction') + ':' + root.getAttribute('data-gap') : 'none'; })()", "save": "layout" }
+      ]
+    }
+  ]
+}

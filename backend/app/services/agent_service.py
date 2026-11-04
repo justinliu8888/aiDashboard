@@ -31,6 +31,11 @@ from app.schemas.agent import (
     LOCK_SCOPE_INPUT_AND_MENU,
     LOCK_SCOPE_MENU_ONLY,
     LOCK_SCOPE_NONE,
+    STEP_KIND_EDIT_REQUEST,
+    STEP_KIND_MENU,
+    STEP_REF_MISMATCH_CODE,
+    STEP_REF_REQUIRED_CODE,
+    STEP_SUBMISSION_EDIT_TEXT,
     AgentBlock,
     AgentError,
     AgentQuestion,
@@ -74,6 +79,7 @@ from app.services.report_design_service import (
     report_design_service,
 )
 from app.services.report_issue_analysis import IssueAnalysis, analyze_region
+from app.services.report_presentation_service import find_region
 # 判定与兜底策略放在 query_answer_service（回答文本策略的家）。
 from app.services.query_answer_service import (
     claims_live_progress,
@@ -408,7 +414,7 @@ class AgentService:
         self._agent = _build_agent()
 
     def _remember_choice(self, response: AgentResponse) -> AgentResponse:
-        if response.turnKind == TURN_KIND_QUERY_ANSWER:
+        if response.turnKind == TURN_KIND_QUERY_ANSWER and not (response.debug or {}).get("queryReturnedToDraft"):
             # 只读咨询轮：原菜单、pendingChoice、待确认修改计划、澄清轮次
             # 一律不动（ADR 0002 §6.1）。咨询不是决定，不能顺手「恢复」
             # 出一个选择锁。
@@ -416,11 +422,35 @@ class AgentService:
         if response.state == AgentState.WAITING_USER_CONFIRM:
             # 所有生成路径共用同一确认协议；旧 Agent 的 confirm_draft 不能绕过选项锁。
             response.questions = self._editing_confirm_questions()
+        questions = [q for q in (response.questions or []) if q]
+        # **受限修改输入步骤**优先于菜单：这一步在一步里要一直有效
+        # （说不清 / 技术失败之后还在），不能被同一轮里的澄清菜单顶掉 ——
+        # 顶掉就等于普通聊天被放开，而用户还没说完这一步的事。
         choice = next(
-            (q for q in response.questions if q.selectionOnly and q.options), None
+            (q for q in questions if q.stepKind == STEP_KIND_EDIT_REQUEST), None,
+        ) or next(
+            (q for q in questions if q.selectionOnly and q.options), None,
         )
         session_key = current_session_key() or response.conversationId
-        if choice:
+        if choice is not None:
+            # 步骤身份：这一轮菜单 / 步骤的**权威身份**。
+            #
+            # 同一个步骤在刷新 / 重连之后必须还是同一个 id：前端拿它关联
+            # 下一次提交，后端拿它核对。已经带身份的不改（受限步骤在澄清
+            # 之后要**沿用**同一个身份，不能每轮换一张）。
+            if not choice.stepId:
+                choice.stepId = f"step_{uuid.uuid4().hex}"
+            if choice.stepVersion is None:
+                choice.stepVersion = 1
+            if not choice.stepKind:
+                choice.stepKind = STEP_KIND_MENU
+            # 同一轮里的其它卡片（澄清菜单、粒度选项）也是**这一步**的一部分：
+            # 它们带同一个身份，用户答哪张卡都不会变成「另一个步骤的答案」。
+            for question in questions:
+                if question is choice or question.stepId:
+                    continue
+                question.stepId = choice.stepId
+                question.stepVersion = choice.stepVersion
             # 选择锁存库（不是进程内存）：后端重启后恢复历史会话仍能拿到锁，
             # 不会出现「前端放行自由输入、后端拒收」的前后端不一致。
             #
@@ -437,6 +467,173 @@ class AgentService:
                 },
             )
         return response
+
+    # ---------- 权威步骤契约（本次新增） ----------
+
+    @staticmethod
+    def _new_step_id() -> str:
+        """一个新的步骤身份。
+
+        步骤 id 的作用是「区分这一步和上一步」：旧卡片的答案不能被当成
+        新菜单的答案，靠的就是它对不上。
+        """
+        return f"step_{uuid.uuid4().hex}"
+
+    @staticmethod
+    def _step_ref_matches(request: AgentRequest, question: AgentQuestion) -> bool:
+        """请求带的步骤关联，是不是**这一步**的关联。"""
+        if not question.stepId:
+            # 权威记录里没有身份（老数据 / 库里没写过）→ 没有可比的东西。
+            return False
+        if str(request.context.stepId or "") != str(question.stepId):
+            return False
+        expected = question.stepVersion
+        actual = request.context.stepVersion
+        if expected is None or actual is None:
+            return True
+        return int(actual) == int(expected)
+
+    def _step_ref_rejected(
+        self, request: AgentRequest, question: AgentQuestion, *,
+        code: str, message: str,
+    ) -> AgentResponse:
+        """步骤关联对不上：**什么都不改**，只把当前的权威入口带回去。
+
+        定义、待确认计划、菜单、工作区 revision、已保存版、撤销游标
+        一个都不动 —— 拒绝不是「业务转换」，聊天里可以说一句，但不能
+        伪装成已经改了东西。
+        """
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=request.state,
+            reply=message,
+            designSessionId=request.context.designSessionId,
+            questions=[question],
+            uiActions=["template_editing"],
+            error=AgentError(code=code, message=message),
+        )
+
+    def _check_step_ref(
+        self, request: AgentRequest, question: AgentQuestion,
+    ) -> AgentResponse | None:
+        """核对「当前这一步」的权威记录与请求带的关联。
+
+        返回 ``None`` = 放行；返回响应 = 拒绝（**什么都不改**）。
+
+        两种拒绝：
+
+        - **缺关联**：受限步骤一律拒（老客户端 / 直接调接口绕过）；
+        - **对不上**：别的卡片、上一版步骤、伪造的关联，一律拒。
+        """
+        kind = question.stepKind
+        if kind == STEP_KIND_EDIT_REQUEST:
+            if not request.context.stepId:
+                return self._step_ref_rejected(
+                    request, question, code=STEP_REF_REQUIRED_CODE,
+                    message=(
+                        "这一步要在修改要求输入框里提交。"
+                        "页面可能已经刷新过，请从当前卡片重新提交。"
+                    ),
+                )
+            if not self._step_ref_matches(request, question):
+                return self._step_ref_rejected(
+                    request, question, code=STEP_REF_MISMATCH_CODE,
+                    message="这一步已经变了，请从当前卡片重新提交修改要求。",
+                )
+            return None
+        if kind == STEP_KIND_MENU and request.context.stepId:
+            # 菜单步骤：带了关联就必须对上（旧卡片 / 过期步骤不能当新菜单
+            # 的答案）。没带关联的旧客户端照旧放行 —— 菜单本身还有选项
+            # 与后续校验兜底，受限步骤那侧才是硬边界。
+            if not self._step_ref_matches(request, question):
+                return self._step_ref_rejected(
+                    request, question, code=STEP_REF_MISMATCH_CODE,
+                    message="这个菜单已经换了，请从当前卡片重新选择。",
+                )
+        return None
+
+    def _current_draft_id(self, session_key: str) -> str | None:
+        """当前会话的草稿 id（步骤归属用）。"""
+        try:
+            snapshot = session_service.load_snapshot(session_key)
+        except Exception:  # noqa: BLE001 - 归属信息读不到不该掀翻整轮
+            return None
+        draft_id = (snapshot or {}).get("draftId")
+        return str(draft_id) if draft_id else None
+
+    def _edit_request_step_question(self, draft_id: str | None = None) -> AgentQuestion:
+        """**受限修改输入**这一步的权威菜单对象。
+
+        这一步的语义：用户正在「专用输入」里写修改要求。普通聊天与新任务
+        在这一步**锁着**（``lockScope=input_and_menu``），只有这张卡里的
+        提交算数 —— 所以它必须带**步骤身份**，后端才认得出「这段文字确实
+        来自当前这一步的输入」。
+        """
+        return AgentQuestion(
+            id="template_edit_request",
+            prompt="请描述你想怎样修改当前草稿：",
+            expects="TEXT",
+            # 受限步骤：输入框与发送按钮一起锁住，只有这张卡的专用输入能提交。
+            lockScope=LOCK_SCOPE_INPUT_AND_MENU,
+            allowsOther=True,
+            otherLabel="修改要求",
+            otherPlaceholder="直接输入修改要求",
+            stepId=self._new_step_id(),
+            stepVersion=1,
+            stepKind=STEP_KIND_EDIT_REQUEST,
+            stepDraftId=draft_id,
+            allowedSubmissions=[STEP_SUBMISSION_EDIT_TEXT],
+        )
+
+    def _current_edit_step(self, session_key: str) -> AgentQuestion | None:
+        """当前这一步是不是**受限修改输入**步骤。
+
+        先看暂存（这一轮刚写的那份），再看库里持久的那份 —— 暂存优先：
+        「其他」那条路就是这一轮才把步骤建起来的。
+        """
+        staged, value = session_service.staged_pending_choice(session_key)
+        raw: Any = value if staged else session_service.load_pending_choice(session_key)
+        if not isinstance(raw, dict):
+            return None
+        question = raw.get("question")
+        if not isinstance(question, dict):
+            return None
+        if question.get("stepKind") != STEP_KIND_EDIT_REQUEST:
+            return None
+        try:
+            return AgentQuestion(**question)
+        except (TypeError, ValueError):
+            return None
+
+    def _edit_request_step_response(
+        self, request: AgentRequest, session_key: str, *, reply: str,
+    ) -> AgentResponse:
+        """进入**受限修改输入**这一步。
+
+        步骤身份（id / 版本 / 归属草稿 / 允许提交什么）随这一轮的菜单
+        一起**持久**记在 ``pending_choice`` 里 —— 它是这一步的权威记录。
+        前端下一次提交要带上这份关联，后端拿它核对，不靠前端的布尔来源标志。
+        """
+        step = self._edit_request_step_question(self._current_draft_id(session_key))
+        response = AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=reply,
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportPolicyDraft=request.snapshots.reportPolicy,
+                reportDefinitionDraft=request.snapshots.reportDefinition,
+            ),
+            questions=[step],
+            uiActions=["template_editing", "ask_template_edit_detail"],
+            debug={
+                "editingIntent": "UNKNOWN",
+                # 点「修改」= 开启**新一轮草稿级**编辑，上一轮的临时卡片
+                # 目标到此结束（与既有语义一致）。
+                "editingTargetRegionId": None,
+            },
+        )
+        return self._remember_choice(response)
 
     def _keep_choice_untouched(self, response: AgentResponse) -> AgentResponse:
         """只读查询轮：菜单照原样带回，但**不落库**。
@@ -592,6 +789,23 @@ class AgentService:
             "queryMode": True,
             "factStatus": facts.status.value,
         }
+        query_step = next((q for q in response.questions if q.stepKind == STEP_KIND_EDIT_REQUEST), None)
+        if (
+            request.state == AgentState.USER_EDITING_TEMPLATE
+            and query_step is not None
+            and response.domainObjects.reportDefinitionDraft is not None
+            and response.error is None
+            and not response.debug.get("needsClarification")
+            and response.debug.get("queryOutcome") not in {"clarification", "technical_failure"}
+            and re.search(r"位置|尺寸|样式|属性", request.message)
+            and session_service.load_pending_plan(current_session_key() or request.conversationId) is None
+        ):
+            # A completed property lookup is not an unfinished edit request.
+            response.questions = self._editing_confirm_questions()
+            response.debug.update(queryReturnedToDraft=True, editingTargetRegionId=None)
+            request.collectedInfo.pop("pendingEditRequest", None)
+            request.collectedInfo.pop("pendingEditTimeAnchor", None)
+            self._remember_choice(response)
         self._ensure_recorded_stage_disclosure(request, response, facts)
         return response
 
@@ -659,7 +873,10 @@ class AgentService:
         if isinstance(raw, dict):
             try:
                 AgentState(raw["state"])
-                return [_question_from_pending(raw["question"])]
+                question = _question_from_pending(raw["question"])
+                # 反序列化失败（字段变了 / 旧记录）时**不给**半张卡：
+                # ``[None]`` 会让前端拿到一个空壳，待决步骤等于凭空消失。
+                return [question] if question is not None else []
             except (KeyError, TypeError, ValueError):
                 # 待确认菜单的原文（题干 / 选项）可能带用户原话与模型文本，
                 # 整包不进日志（#61 AC#1）：只留容器类型这个派生信息。
@@ -802,12 +1019,32 @@ class AgentService:
         pending_plan = session_service.load_pending_plan(session_key)
         if pending_plan:
             # 待决计划比旧的其他选择锁更权威；确认不能被迟到的题目覆盖。
-            pending = (
-                AgentState.USER_EDITING_TEMPLATE,
-                self._pending_edit_question(
+            #
+            # 用**库里那一份**菜单（它带步骤身份），不要重新造一份：
+            # 重新造的那份没有 stepId，前端无从关联、后端无从核对，
+            # 「旧卡片的答案不能当新菜单的答案」这条就落空了。
+            pending_question = None
+            if pending is not None and pending[1].id == EDIT_CHOICE_ID:
+                pending_question = pending[1]
+            else:
+                pending_question = self._pending_edit_question(
                     placeholder=self._pending_plan_appends_metrics(pending_plan)
-                ),
-            )
+                )
+            pending = (AgentState.USER_EDITING_TEMPLATE, pending_question)
+
+        # ---------- 权威步骤核对（本次新增） ----------
+        #
+        # 「当前这一步」由服务端说了算（``pending_choice`` 里那一份）。
+        # 前端请求要带**步骤关联**，后端拿它核对 —— 不是相信前端的布尔来源
+        # 标志（``fromChoice`` / ``fromOther`` / ``fromInline`` 只是本地
+        # 参数，HTTP 请求里根本没有，校验不了）。
+        #
+        # 拒绝时**什么都不改**：定义、待确认计划、菜单、工作区 revision、
+        # 已保存版、撤销游标一个都不动。
+        if pending is not None:
+            refusal = self._check_step_ref(request, pending[1])
+            if refusal is not None:
+                return refusal
 
         # 待确认入口（工单 #14）：
         #
@@ -840,8 +1077,38 @@ class AgentService:
                 and not routing_rules.is_readonly_question(request.message)
             ):
                 # NEXT_ACTION 的「其他」进入编辑，不代表同意或保存草稿。
-                # 旧菜单作废 → **暂存**清锁，与这一轮一起提交。
-                session_service.stage_pending_choice(session_key, None)
+                #
+                # **先走规则**：用户在「其他」里写的是一句**完整的修改要求**
+                # （用户原话：「把『昨日能耗总览』的文字调大，右对齐，圆角调小一点」）。
+                # 规则能确定就直接出候选 —— 与「普通聊天里发同一句话」**同一条路**，
+                # 同一句话必须得到同一个候选，不能因为入口不同就退化成追问。
+                #
+                # 规则认不出来（「改一下」这种只说了意图、没说怎么改的），
+                # 才进入**受限修改输入**这一步：步骤身份持久记在
+                # ``pending_choice`` 里（这一轮的文字就是这一步的提交）。
+                # 说不清 / 技术失败时这一步原样留着，普通聊天继续锁着。
+                rule_edit = await self._try_handle_template_edit(request)
+                if rule_edit is not None:
+                    return self._remember_choice(
+                        self._finalize_template_edit(request, rule_edit)
+                    )
+                step = self._edit_request_step_question(
+                    self._current_draft_id(session_key)
+                )
+                session_service.stage_pending_choice(
+                    session_key,
+                    {
+                        "state": pending_state.value,
+                        "question": step.model_dump(mode="json"),
+                    },
+                )
+                pending = None
+            elif question.stepKind == STEP_KIND_EDIT_REQUEST:
+                # 受限修改输入：这一轮的文字就是**这一步**的提交
+                # （步骤关联已在上面对过）。
+                #
+                # 步骤**不消费**：候选产生后由候选菜单接管；说不清 / 技术
+                # 失败时步骤原样留着（同一张专用输入里还能补充）。
                 pending = None
         if pending:
             pending_state, question = pending
@@ -922,8 +1189,11 @@ class AgentService:
                             return report_design_service.restart_design(
                                 request, state=design_state
                             )
-                        return self._editing_prompt_response(
-                            request,
+                        # 「修改」进入**受限修改输入**这一步：步骤身份持久记在
+                        # ``pending_choice`` 里，普通聊天在这一步锁着，
+                        # 只有这张卡的专用输入能提交。
+                        return self._edit_request_step_response(
+                            request, session_key,
                             reply="好的，请描述你想怎样修改当前草稿。",
                         )
                     if question.id == "ready_action":
@@ -1686,6 +1956,39 @@ class AgentService:
         )
 
     @staticmethod
+    def _target_is_named_in_message(
+        target_region_id: str, draft: Any, text: str,
+    ) -> bool:
+        """候选的**动作目标**是不是在用户这句话里被点名了。
+
+        名字 / id / 组件标题 / 主指标名，任意一个出现在句子里就算点名。
+
+        为什么需要它：「把『设备耗电排名』移入『能耗概览』」这句话里
+        点了**两个**对象 —— 动作目标是「设备耗电排名」，参照对象是分组
+        「能耗概览」。按"解析出来的参照对象必须等于动作目标"去判，
+        这类操作会被整个堵死。
+
+        名字是**可靠锚点**：只要动作目标被点名，它就是用户真的指的那张，
+        不需要再和另一个被点名的对象比。
+        """
+        if not target_region_id or not text:
+            return False
+        region = find_region(draft, str(target_region_id))
+        if region is None:
+            return False
+        component = region.get("component") or {}
+        metric = component.get("metric") or {}
+        names = (
+            region.get("id"), region.get("name"),
+            component.get("title"), metric.get("label"),
+        )
+        haystack = str(text)
+        for name in names:
+            if name and len(str(name).strip()) >= 2 and str(name).strip() in haystack:
+                return True
+        return False
+
+    @staticmethod
     def _reference_is_reliable(reference, context) -> bool:
         """这次解析出来的目标是否可信到可以直接执行修改。
 
@@ -1782,6 +2085,38 @@ class AgentService:
             }
         return response
 
+    def _attach_edit_step(self, session_key: str, response: AgentResponse) -> None:
+        """这一步还在的话，把它**带回**响应。
+
+        说不清 / 技术失败之后，这一步**不能**悄悄结束：用户还没说完，
+        普通聊天也不能因此被放开。把这张卡带回响应 → 前端继续锁着、
+        还能在同一张输入里补充；``_remember_choice`` 也会把它重新落成
+        权威记录（刷新后仍然受限）。
+        """
+        step = self._current_edit_step(session_key)
+        if step is None:
+            return
+        if any(
+            question.stepId == step.stepId
+            for question in (response.questions or [])
+        ):
+            return
+        menu = next((q for q in (response.questions or []) if q.selectionOnly and q.options), None)
+        if menu is not None:
+            # Keep one answer surface and persist the same authoritative step.
+            combined = step.model_copy(update={
+                "prompt": menu.prompt,
+                "expects": menu.expects,
+                "options": menu.options,
+                "selectionOnly": True,
+                "allowRestart": menu.allowRestart,
+                "allowsOther": True,
+                "otherLabel": "其他",
+            })
+            response.questions = [combined if q is menu else q for q in response.questions]
+            return
+        response.questions = [*(response.questions or []), step]
+
     def _finalize_template_edit(
         self, request: AgentRequest, response: AgentResponse
     ) -> AgentResponse:
@@ -1827,12 +2162,28 @@ class AgentService:
                     reference.regionId != candidate.targetRegionId
                     or not self._reference_is_reliable(reference, request.context)
                 ):
-                    raise ValueError("可见卡片顺序或目标尚未确认")
+                    # **消息里点了名**的对象，和候选的**动作目标**可以不是同一个：
+                    # 「把『设备耗电排名』移入『能耗概览』」点了**两个**对象 ——
+                    # 动作目标是前者，参照对象是后者。按"名字对不上"就拒，
+                    # 等于把这类操作整个堵死（T06）。
+                    #
+                    # 所以：**候选的目标本身被点名**时，候选说了算
+                    # （名字是可靠锚点）；只有"序数 / 指代"这类
+                    # **顺序型**参照对不上才拒 —— 那才是"顺序变了、
+                    # 目标可能选错"的真实风险。
+                    if not self._target_is_named_in_message(
+                        candidate.targetRegionId, draft, reference_text
+                    ):
+                        raise ValueError("可见卡片顺序或目标尚未确认")
             except (KeyError, TypeError, ValueError) as exc:
                 reason = str(exc) if isinstance(exc, ValueError) else "计划字段不完整"
-                return self._edit_notice(
+                notice = self._edit_notice(
                     request, f"{reason}，草稿没有变化；请重新说明可执行的修改。"
                 )
+                # 候选没能落库 = 这一步**还没结束**：把这一步带回响应，
+                # 用户还能在同一张专用输入里补充（普通聊天继续锁着）。
+                self._attach_edit_step(session_key, notice)
+                return notice
             active = session_service.save_pending_plan_if_absent(
                 session_key, candidate
             )
@@ -1864,9 +2215,22 @@ class AgentService:
             # 换一件事才由键的变化重新计数，这里不再替它清零。
             request.collectedInfo.pop("pendingEditRequest", None)
             request.collectedInfo.pop("pendingEditTimeAnchor", None)
+            # 这一轮**只回答、没有候选** —— 但这一步**还没结束**：
+            # 用户在受限输入里提的是一句话，服务端查证后回了一段说明，
+            # 没有产生修改计划，也没有替用户接受任何东西。
+            #
+            # 所以要把这张卡带回响应（用户还在同一张专用输入里，
+            # 普通聊天继续锁着）。不带回的话，响应里就没有这张卡，
+            # 前端只好自己去问服务端要 —— 拿到后**再画一张**，
+            # 用户看到的就是「回答完了又跳出一张『请描述你想怎样修改
+            # 当前草稿』」（用户现场截图）。
+            self._attach_edit_step(session_key, response)
             return response
 
         if response.error is not None:
+            # 技术失败：这一步**不结束**。把受限输入那张卡带回响应，
+            # 用户还能在同一张输入里重试；普通聊天继续锁着。
+            self._attach_edit_step(session_key, response)
             return response
         is_clarification = (
             (response.debug or {}).get("editOutcome") == "clarification"
@@ -1939,12 +2303,17 @@ class AgentService:
                 key=resolved_key,
                 outcome=CLARIFICATION_KEY_UPDATED,
             )
+            # 额度用完 = 这一件事**结束**了：这一步不再是「同一步的补充」，
+            # 普通聊天可以重新开（步骤不带走）。
             return response
         session_service.record_clarification(
             session_key, key=key, question=response.reply
         )
         if not prior:
             request.collectedInfo["pendingEditRequest"] = request.message
+        # 说不清 = 这一步**还没结束**：把受限输入那张卡带回响应，
+        # 用户在同一张专用输入里补充，普通聊天继续锁着。
+        self._attach_edit_step(session_key, response)
         return response
 
     def _edit_notice(
@@ -3027,6 +3396,25 @@ class AgentService:
                 # 用户说了「别问了」：不再追问，改成可见假设 + 可选替代。
                 # **不猜目标、不造空计划**（规格第 16、18 条）。
                 return self._delegated_response(request, definition)
+            # **规则层已经给出了本步合法选择** → 规则层说了算。
+            #
+            # 「这张卡已经满宽，不能再调宽，请选：加高 / 换一张 / 取消」
+            # 「没有找到名为 X 的分组，请选：新建 / 重新指定 / 取消」——
+            # 这类问题规则层**知道合法选项**，交给模型只会得到一句
+            # "请重新说明"（或者更糟：把分组当成卡片，BUG-007）。
+            #
+            # 所以：规则层带选项时，**这一轮由规则层收口**，不再往下走模型。
+            rule_choices = [
+                item for item in (plan.operation.displayOptions or [])
+                if isinstance(item, dict) and item.get("value")
+            ]
+            if rule_choices:
+                result = template_edit_engine.apply(
+                    plan=plan, definition=definition, scope=scope
+                )
+                response = self._build_template_edit_response(request, result)
+                response.debug["editPlanSource"] = "rule_clarification"
+                return response
             if isinstance(self._agent, FakeReportAgent):
                 if plan.needsClarification or plan.intent == EditIntent.UNKNOWN:
                     result = template_edit_engine.apply(
@@ -3516,6 +3904,30 @@ class AgentService:
                     selectionOnly=True,
                 )
             ]
+        # **本步合法选择**：计划里带了选项就给选项卡。
+        #
+        # 选项卡 = 待选步骤 → 普通输入、发送、Enter 与快捷入口**全程锁住**
+        # （前端按 lockScope 判定；这里显式写 input_and_menu，不靠推导）。
+        # 那些选项挂在计划的 ``displayOptions`` 上，含义是"这一步可以选什么"。
+        choices = [
+            QuestionOption(
+                value=str(item.get("value")),
+                label=str(item.get("label") or item.get("value")),
+            )
+            for item in (result.plan.operation.displayOptions or [])
+            if isinstance(item, dict) and item.get("value")
+        ]
+        if choices:
+            return [
+                AgentQuestion(
+                    id="edit_clarification_choice",
+                    prompt=result.clarificationQuestion or "请选择下一步操作：",
+                    expects="SINGLE_CHOICE",
+                    options=choices,
+                    selectionOnly=True,
+                    lockScope=LOCK_SCOPE_INPUT_AND_MENU,
+                )
+            ]
         return AgentService._editing_prompt_questions()
 
     @staticmethod
@@ -3740,7 +4152,7 @@ class AgentService:
 
         # 面向用户：**业务语言**。定义 id / 版本号这类内部标识不出口 ——
         # 它们在下面的 ``toolRequests`` 里，前端要用得到。
-        reply = route.reply or "草稿已保存，接下来校验这份报表的指标口径。"
+        reply = "草稿已保存，后续流程待接入。"
         response = AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.SAVE_DEFINITION_DRAFT,
@@ -3760,17 +4172,8 @@ class AgentService:
                         "revision": saved.revision,
                     },
                 ),
-                ToolRequest(
-                    id="req_validate_after_save",
-                    type="VALIDATE_DEFINITION",
-                    target="JavaReportService",
-                    arguments={
-                        "definitionId": saved.definitionId,
-                        "revision": saved.revision,
-                    },
-                ),
             ],
-            uiActions=["save_definition_draft", "advance_to_validating"],
+            uiActions=["save_definition_draft"],
         )
         # 右侧那块画的是什么：与「确认方案」「接受修改」**同一个入口**生成示意
         # 载荷（report_design_service._attach_report_preview_payload → 内部走
@@ -3800,7 +4203,12 @@ class AgentService:
         """前端发来 __advance__ 时，根据当前 state 走对应 handler。"""
         state = request.state
         if state == AgentState.SAVE_DEFINITION_DRAFT:
-            return self._handle_save_to_validating(request)
+            return AgentResponse(
+                conversationId=request.conversationId,
+                state=AgentState.SAVE_DEFINITION_DRAFT,
+                reply="草稿已保存，后续流程待接入。",
+                designSessionId=request.context.designSessionId,
+            )
         if state == AgentState.VALIDATING:
             return self._handle_validating(request)
         if state == AgentState.PREVIEWING:

@@ -236,7 +236,43 @@ class EditOperation(BaseModel):
     #:
     #: 这批操作**不改**统计口径、不改时间范围、不改设备范围 ——
     #: 分组只管外观。
+    #:
+    #: **形状约束**：每项必须是 ``{"op": <操作名>, "params": {...}}`` ——
+    #: ``op`` 是非空字符串，``params`` 是对象（缺省算空对象）。
+    #: 只是**形状**上的约束：不改内容、不改顺序、不补默认值 ——
+    #: 规则引擎与模型路径现有的写法照旧通过；
+    #: 嵌套参数（字号 / 间距 / 主题名…）的取值域仍由
+    #: ``report_presentation_service`` 校验，不在这里另写一份。
     presentationOperations: list[dict[str, Any]] = Field(default_factory=list)
+
+    @field_validator("presentationOperations", mode="before")
+    @classmethod
+    def _check_presentation_operations(cls, value: Any) -> Any:
+        """展示操作必须是 ``{"op": str, "params": dict}``。
+
+        只卡**形状**（契约 §1.2 N7：未知 op / 未知参数键仍然报错），
+        不在这里重写取值域 —— 那是执行器与规范化层的职责，
+        两边各写一份必然漂。
+        """
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            # 类型不对就交给 pydantic 自己报错（文案更标准）。
+            return value
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ValueError(f"presentationOperations[{index}] 必须是对象。")
+            op = item.get("op")
+            if not isinstance(op, str) or not op.strip():
+                raise ValueError(f"presentationOperations[{index}] 缺少操作名 op。")
+            params = item.get("params")
+            if params is None:
+                continue
+            if not isinstance(params, dict):
+                raise ValueError(
+                    f"presentationOperations[{index}] 的 params 必须是对象。"
+                )
+        return value
 
     # SAVE_THEME
     #

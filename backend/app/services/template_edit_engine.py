@@ -1122,6 +1122,72 @@ class TemplateEditEngine:
         "十": 10,
     }
 
+    # ------------------------------------------------------------------
+    # 卡片尺寸（调宽 / 调窄 / 加高）—— BUG-003
+    # ------------------------------------------------------------------
+
+    #: 页面根栅格的默认列数（与前端默认 12 列同口径）。
+    _DEFAULT_PAGE_COLUMNS = 12
+
+    #: 「调宽一点」一次加几列。
+    _SIZE_WIDEN_STEP = 2
+
+    #: 「加高一点」一次加多少像素。
+    _SIZE_HEIGHT_STEP = 80
+
+    #: 卡片高度的默认值与上限（像素）。
+    _SIZE_DEFAULT_MIN_HEIGHT = 180
+    _SIZE_MAX_MIN_HEIGHT = 720
+
+    #: 「加高 / 调高」的说法（**高度**，不是"提高优先级"）。
+    _HEIGHT_COMMAND_PATTERN = re.compile(
+        r"(?:加高|调高|增高|加高一些|调高一点|高度\s*(?:调高|加高|增加|加大))"
+    )
+
+    #: 「移到 X 后面 / 前面」的相对位置说法。
+    _MOVE_RELATIVE_PATTERN = re.compile(
+        r"(?:移到|移动到|挪到|放到|排到|置于)\s*(?P<name>[^，,。；;！!？?]{1,20}?)\s*"
+        r"(?:后面|之后|下方|前面|之前|上方)"
+    )
+
+    #: 「移入 / 放进某个分组」。
+    #:
+    #: 组名后面的「分组 / 组」是**必需**的：不然非贪婪的名字会把
+    #: 「放进能耗概览分组」截成「能」—— 那不是组名，是半个字。
+    _MOVE_INTO_GROUP_PATTERN = re.compile(
+        r"(?:移入|放进|放入|归入|并入|加入)\s*"
+        r"(?P<name>[^，,。；;！!？?]{1,24}?)\s*(?:分组|组)"
+    )
+
+    #: 「移出某个分组」。
+    _MOVE_OUT_GROUP_PATTERN = re.compile(
+        r"(?:移出|移走|挪出|提出|撤出)\s*"
+        r"(?P<name>[^，,。；;！!？?]{1,24}?)\s*(?:分组|组)"
+    )
+
+    #: 组级排列的说法：「改为两列」「间距 20 像素」。
+    #:
+    #: 认的是**列数**（数字 / 中文数字 + 列）与**间距**，不是随便一个"列" ——
+    #: 「时间列显示格式设为日期」里的"列"是列名，不是列数。
+    _GROUP_ARRANGEMENT_PATTERN = re.compile(
+        r"(?:\d+|[一二两三四五六七八九十])\s*列|列数|间距|间隔|空隙"
+    )
+
+    #: 「应用主题」的说法。**报表级** —— 不针对某一张卡片。
+    _APPLY_THEME_PATTERN = re.compile(r"主题")
+
+    #: 主题**同义词** → 真实 themeId。
+    #:
+    #: 内置主题的名字是「深色主题」，用户说的是「暗色主题」—— 字面不一样，
+    #: 所以要带同义词表。同义词只指向**已存在的**主题（唯一出处是
+    #: ``theme_service.list_themes()``），不另造一份主题清单。
+    _THEME_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("theme_dark", ("暗色", "深色", "黑色", "dark")),
+        ("theme_default", ("浅色", "默认", "亮色", "light", "default")),
+        ("theme_soft", ("柔和", "素雅", "soft")),
+        ("theme_print", ("打印", "print")),
+    )
+
     def _parse_save_theme(
         self,
         text: str,
@@ -1250,6 +1316,20 @@ class TemplateEditEngine:
             operations.append(set_format)
             return operations
 
+        # --- 整页紧凑 / 按阅读顺序重排 ---
+        #
+        # 「页面紧凑一点，标题保留，其他内容按阅读顺序排列」说的是**整页**
+        # 排布：范围由句子本身决定，**不看** ``target_region`` —— 旧选中卡片
+        # 不该把一个整页请求缩成单张卡。
+        #
+        # 放在这里（_parse_set_style / _parse_set_format 之后）是必须的：
+        # 那两条认的是**单张卡**的外观诉求，整页请求不该被它们抢走；
+        # 而更靠后的分组 / 隐藏 / 复制规则又会把整页请求当成卡片级操作。
+        page_operations = self._parse_page_compact(text, definition)
+        if page_operations:
+            operations.extend(page_operations)
+            return operations
+
         # --- 取消分组 ---
         if (
             any(word in normalized for word in self._UNGROUP_WORDS)
@@ -1301,12 +1381,16 @@ class TemplateEditEngine:
 
         # --- 组成一组 ---
         if any(word in normalized for word in self._GROUP_WORDS):
-            # 只在**位置明确**的请求上走规则（「前两张」「这两张」）。
-            # 用户点名了卡片时，规则认不全就**不猜** —— 交给模型那条路，
-            # 别把「设备耗电排名和能耗趋势」组成了另外两张卡。
-            if not self._is_positional_group_request(text):
-                return operations
+            # 规则认得全就**不猜**：句子里**点名了至少两张**卡片时，
+            # 成员就是那几张（「把总览和趋势放进能耗概览分组」）。
+            # 只有位置说法（「前两张」）也能认。
+            #
+            # 认不全就**不猜** —— 交给模型那条路（它能读懂"总览和趋势"）。
             members = self._group_members(text, definition, target_region)
+            if not self._is_positional_group_request(text) and not self._named_members_are_explicit(
+                text, definition,
+            ):
+                return operations
             if len(members) >= 2:
                 columns = self._extract_columns(text) or len(members)
                 gap = self._extract_gap(text)
@@ -1330,6 +1414,673 @@ class TemplateEditEngine:
                 return operations
 
         return operations
+
+    # ------------------------------------------------------------------
+    # 卡片尺寸：调宽 / 调窄 / 加高（BUG-003）
+    # ------------------------------------------------------------------
+    #
+    # 「把昨日能耗趋势调宽一点，方便看时间轴」说的是**显示布局**，
+    # 不是数据口径 —— 用户给的是理由（「方便看时间轴」），不是改
+    # 时间窗 / 粒度 / 指标的授权。所以这里只动 ``layout.placement``：
+    # 时间范围、统计粒度、指标、设备范围、数据来源一个字节都不碰。
+    #
+    # **已占满宽度的卡不能"调宽"**：那种情况下说清楚限制，并给本步
+    # 合法选择（加高 / 换一张 / 取消），而不是硬凑一个没效果的增量。
+
+    def _grid_columns_for(
+        self, definition: ReportDefinitionDraft, region: dict[str, Any],
+    ) -> int:
+        """这张卡所在的那一层栅格有几列。
+
+        组里的子卡看**它自己那个组**的排列；根层的卡片看**页面**的排列。
+        """
+        from app.services.report_presentation_service import region_parent
+
+        parent = region_parent(definition, str(region.get("id") or ""))
+        if parent is not None:
+            component = parent.get("component") or {}
+            arrangement = component.get("arrangement") or {}
+            columns = arrangement.get("columns")
+            if isinstance(columns, int) and not isinstance(columns, bool):
+                return max(1, min(12, columns))
+        page = definition.page if isinstance(definition.page, dict) else {}
+        arrangement = page.get("arrangement") or {}
+        columns = arrangement.get("columns")
+        if isinstance(columns, int) and not isinstance(columns, bool):
+            return max(1, min(12, columns))
+        return self._DEFAULT_PAGE_COLUMNS
+
+    def _selectable_cards(
+        self, definition: ReportDefinitionDraft,
+    ) -> list[dict[str, Any]]:
+        """可以让用户挑的正文卡片（不含标题、不含容器）。"""
+        from app.services.report_presentation_service import is_container
+
+        cards: list[dict[str, Any]] = []
+        for region in self._flatten_regions(definition.regions or []):
+            if is_container(region):
+                continue
+            if str(region.get("role") or "").upper() == "REPORT_TITLE":
+                continue
+            cards.append(region)
+        return cards
+
+    def _parse_set_size(
+        self,
+        text: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """「把 X 调宽一点」→ 一条 ``SET_PLACEMENT``，或一句本步澄清。
+
+        返回 ``{"operations": [...]}`` 或 ``{"clarification": {...}}``；
+        都不是就返回 ``None``（这不是尺寸请求）。
+        """
+        from app.services import routing_rules
+
+        if not routing_rules.detect_size_command(text):
+            return None
+        if target_region is None:
+            return {
+                "clarification": {
+                    "question": "要给哪一张卡片调宽？请从下面选一张。",
+                    "options": [
+                        {"value": str(card.get("id")), "label": _region_label(card)}
+                        for card in self._selectable_cards(definition)
+                    ],
+                }
+            }
+
+        layout = target_region.get("layout")
+        layout = layout if isinstance(layout, dict) else {}
+        placement = layout.get("placement")
+        placement = placement if isinstance(placement, dict) else {}
+        kind = str(placement.get("type") or "").upper()
+        columns = self._grid_columns_for(definition, target_region)
+
+        if kind == "GRID":
+            column = placement.get("column")
+            column = int(column) if isinstance(column, int) and not isinstance(column, bool) else 1
+            span = placement.get("columnSpan")
+            span = int(span) if isinstance(span, int) and not isinstance(span, bool) else 1
+            # 这一层栅格里，从它当前位置往右**最多**能占几列。
+            max_span = max(1, columns - column + 1)
+            if span >= max_span:
+                return {"clarification": self._full_width_clarification(
+                    target_region, columns,
+                )}
+            new_span = min(span + self._SIZE_WIDEN_STEP, max_span)
+            new_placement: dict[str, Any] = {
+                "type": "GRID",
+                "column": column,
+                "columnSpan": new_span,
+            }
+            # 行 / 行高 / 最小高度原样保留 —— 只改宽度这一件事。
+            for key in ("row", "rowSpan", "minHeight"):
+                if placement.get(key) is not None:
+                    new_placement[key] = placement[key]
+            return {
+                "operations": [
+                    {
+                        "op": "SET_PLACEMENT",
+                        "params": {
+                            "regionId": str(target_region.get("id")),
+                            "placement": new_placement,
+                        },
+                    }
+                ]
+            }
+
+        if kind == "FLOW" and isinstance(placement.get("width"), dict):
+            width = placement["width"]
+            value = width.get("value")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                unit = str(width.get("unit") or "PX").upper()
+                if unit == "PX":
+                    new_value = min(2000, int(value) + self._SIZE_WIDEN_STEP * 40)
+                else:
+                    new_value = min(100, int(value) + 10)
+                new_placement = {
+                    "type": "FLOW",
+                    "width": {"value": new_value, "unit": unit},
+                }
+                if placement.get("align") is not None:
+                    new_placement["align"] = placement["align"]
+                return {
+                    "operations": [
+                        {
+                            "op": "SET_PLACEMENT",
+                            "params": {
+                                "regionId": str(target_region.get("id")),
+                                "placement": new_placement,
+                            },
+                        }
+                    ]
+                }
+
+        # 其余情况（固定定位 / 没有宽度可加）：当"已经占满"处理。
+        return {"clarification": self._full_width_clarification(target_region, columns)}
+
+    def _full_width_clarification(
+        self, region: dict[str, Any], columns: int,
+    ) -> dict[str, Any]:
+        """这张卡已经占满宽度 —— 说清限制，并给**本步合法选择**。
+
+        合法选择都是**只改显示**的：加高一张卡、换一张卡调宽、取消这次调整。
+        刻意**不**提供"改时间粒度 / 改时间窗"这类选项 —— 那会拿数据口径
+        去顶替显示层的问题（BUG-003 的原话正是这么被带偏的）。
+        """
+        name = _region_label(region)
+        return {
+            "question": (
+                f"「{name}」已经占满当前可用宽度（{columns} 列），"
+                "再调宽就没有空间了。下面几个做法都只改显示、不改数据口径，"
+                "请选一个："
+            ),
+            "options": [
+                {
+                    "value": f"把「{name}」加高一些",
+                    "label": f"把「{name}」加高一些，看得更清楚",
+                },
+                {"value": "换成别的卡片调宽", "label": "换成别的卡片调宽"},
+                {"value": "取消这次调整", "label": "取消这次调整"},
+            ],
+        }
+
+    def _parse_set_height(
+        self,
+        text: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """「把 X 加高一些」→ 一条 ``SET_PLACEMENT``（只加 ``minHeight``）。"""
+        if not self._HEIGHT_COMMAND_PATTERN.search(text):
+            return None
+        if target_region is None:
+            return None
+        layout = target_region.get("layout")
+        layout = layout if isinstance(layout, dict) else {}
+        placement = layout.get("placement")
+        placement = placement if isinstance(placement, dict) else {}
+        kind = str(placement.get("type") or "").upper()
+        current = placement.get("minHeight")
+        if not isinstance(current, dict):
+            current = {"value": self._SIZE_DEFAULT_MIN_HEIGHT, "unit": "PX"}
+        value = current.get("value")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            value = self._SIZE_DEFAULT_MIN_HEIGHT
+        new_value = max(0, min(self._SIZE_MAX_MIN_HEIGHT, int(value) + self._SIZE_HEIGHT_STEP))
+        new_placement: dict[str, Any] = {"type": kind or "GRID", "minHeight": {
+            "value": new_value, "unit": "PX",
+        }}
+        for key in ("column", "columnSpan", "row", "rowSpan"):
+            if placement.get(key) is not None:
+                new_placement[key] = placement[key]
+        return {
+            "operations": [
+                {
+                    "op": "SET_PLACEMENT",
+                    "params": {
+                        "regionId": str(target_region.get("id")),
+                        "placement": new_placement,
+                    },
+                }
+            ]
+        }
+
+    # ------------------------------------------------------------------
+    # 应用主题（报表级）—— BUG-009
+    # ------------------------------------------------------------------
+
+    def _resolve_theme_id(self, normalized: str) -> str | None:
+        """把用户说的主题名解析成真实 themeId；认不出就返回 ``None``。"""
+        from app.services.report_theme_service import theme_service
+
+        themes = theme_service.list_themes() or []
+        # 先按**真实主题名**匹配（「深色主题」）。
+        for theme in themes:
+            name = _normalize_text(str(theme.get("name") or ""))
+            if name and name in normalized:
+                return str(theme.get("themeId"))
+        # 再按同义词匹配（「暗色主题」→ 深色主题）。
+        for theme_id, keywords in self._THEME_ALIASES:
+            if not any(word in normalized for word in keywords):
+                continue
+            for theme in themes:
+                if str(theme.get("themeId")) == theme_id:
+                    return theme_id
+        return None
+
+    def _parse_apply_theme(
+        self, text: str, definition: ReportDefinitionDraft,
+    ) -> dict[str, Any] | None:
+        """"给这份报表应用暗色主题" → 一条**报表级** ``SET_THEME``。
+
+        这是**整份报表**的外观诉求，**不需要**用户再选一张卡片
+        （BUG-009：曾经被要求"选择目标卡片"，把报表级请求缩成了单卡请求）。
+
+        「保存 / 更新共享主题」是另一件事（``SAVE_THEME``），不归这里。
+        """
+        normalized = _normalize_text(text)
+        if not self._APPLY_THEME_PATTERN.search(normalized):
+            return None
+        if any(word in normalized for word in self._SAVE_THEME_VERBS):
+            return None
+        theme_id = self._resolve_theme_id(normalized)
+        if theme_id is None:
+            return None
+        return {"op": "SET_THEME", "params": {"themeId": theme_id}}
+
+    # ------------------------------------------------------------------
+    # 组级排列 / 移入移出 —— BUG-006 / BUG-007
+    # ------------------------------------------------------------------
+
+    def _find_region_by_name(
+        self, definition: ReportDefinitionDraft, name: str,
+    ) -> dict[str, Any] | None:
+        """按**确切名字**找一张卡 / 一个组；认不准就返回 ``None``。
+
+        名字相同时不猜（多个同名 → ``None``，交给追问）。
+        """
+        reference = _normalize_text(name).strip("「」『』\"' 　")
+        if not reference:
+            return None
+        hits: list[dict[str, Any]] = []
+        for region in self._flatten_regions(definition.regions or []):
+            component = region.get("component") or {}
+            metric = component.get("metric") or {}
+            names = (
+                region.get("id"), region.get("name"),
+                component.get("title"), metric.get("label"),
+            )
+            if reference in [str(item).strip() for item in names if item]:
+                hits.append(region)
+        if len(hits) == 1:
+            return hits[0]
+        return None
+
+    def _find_named_container(
+        self, definition: ReportDefinitionDraft, text: str,
+    ) -> dict[str, Any] | None:
+        """按**句子里出现的名字**找那个分组（严格）。
+
+        不像 :meth:`_find_container` 那样"树里只有一个组就当它" ——
+        那样会把一句跟组无关的话（「时间列显示格式设为日期」里也有"列"）
+        误当成组级排列。
+        """
+        from app.services.report_presentation_service import is_container
+
+        normalized = _normalize_text(text)
+        for region in self._flatten_regions(definition.regions or []):
+            if not is_container(region):
+                continue
+            name = _normalize_text(str(region.get("name") or ""))
+            if name and len(name) >= 2 and name in normalized:
+                return region
+        return None
+
+    def _parse_group_arrangement(
+        self,
+        text: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """「X 改为两列，间距 20 像素」→ **组级** ``SET_GROUP_ARRANGEMENT``。
+
+        找不到那个组就**说找不到**（BUG-007：曾经拿"总览卡"冒充分组），
+        并给本步合法选择：新建这个组 / 重新指定 / 取消。
+
+        只在**确实在谈一个组**时才生效：句子里要么出现"分组 / 这一组 /
+        组内"，要么点名的那个东西**就是一个容器**。
+        """
+        normalized = _normalize_text(text)
+        if not self._GROUP_ARRANGEMENT_PATTERN.search(normalized):
+            return None
+        mentions_group = bool(
+            re.search(r"分组|这一组|这个组|该组|这组|组内|组里|一组", normalized)
+        )
+        group = self._find_named_container(definition, text)
+        if group is not None:
+            columns = self._extract_columns(text) or 2
+            gap = self._extract_gap(text)
+            direction = (
+                "VERTICAL" if ("竖排" in normalized or "上下" in normalized) else "HORIZONTAL"
+            )
+            return {
+                "operations": [
+                    {
+                        "op": "SET_GROUP_ARRANGEMENT",
+                        "params": {
+                            "groupId": str(group.get("id")),
+                            "arrangement": {
+                                "mode": "GRID",
+                                "columns": columns,
+                                "direction": direction,
+                                "gap": {"value": gap, "unit": "PX"},
+                            },
+                        },
+                    }
+                ]
+            }
+        # 说了组名但树里没有这个组 → 明确"未找到分组"。
+        named = self._group_name_in_text(text)
+        if not named:
+            return None
+        from app.services.report_presentation_service import is_container
+
+        resolved = self._find_region_by_name(definition, named)
+        if resolved is not None and not is_container(resolved):
+            # 点名的是**一张卡片**，不是分组 —— 说清楚，别拿它冒充组。
+            return {
+                "clarification": {
+                    "question": (
+                        f"「{named}」是一张卡片，不是分组，"
+                        "不能改它的组内排列。请指定要改的分组名。"
+                    ),
+                    "options": [
+                        {"value": "重新指定要改的分组", "label": "重新指定要改的分组"},
+                        {"value": "取消这次调整", "label": "取消这次调整"},
+                    ],
+                }
+            }
+        return self._group_not_found_clarification(named)
+
+    def _group_not_found_clarification(self, name: str) -> dict[str, Any]:
+        """这个分组**不存在** —— 说清楚，并给本步合法选择。
+
+        刻意**不**提供"拿某张卡冒充这个组"这种选项（BUG-007）：
+        分组不存在时，唯一正确的做法是新建、重新指定或取消。
+        """
+        label = str(name or "").strip("「」『』\"' 　")
+        if not label:
+            label = "这个分组"
+        return {
+            "clarification": {
+                "question": (
+                    f"没有找到名为「{label}」的分组。"
+                    "下面这几个做法都可以，选一个："
+                ),
+                "options": [
+                    {
+                        "value": f"新建一个「{label}」分组",
+                        "label": f"新建一个「{label}」分组",
+                    },
+                    {"value": "重新指定要改的分组", "label": "重新指定要改的分组"},
+                    {"value": "取消这次调整", "label": "取消这次调整"},
+                ],
+            }
+        }
+
+    def _group_name_in_text(self, text: str) -> str:
+        """句子里那个"分组名"（「能耗概览」分组 / 分组「能耗概览」）。"""
+        match = re.search(r"[「『\"“]([^」』\"”]{1,20})[」』\"”]", text)
+        if match:
+            return match.group(1)
+        match = re.search(r"(?:叫做|命名为|叫)\s*([^\s，,。；;]{1,20})", text)
+        if match:
+            return match.group(1)
+        return "新分组"
+
+    def _parse_move_region(
+        self,
+        text: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """「把 A 移到 B 后面」/「把 A 移入 X 组」→ 一条 ``MOVE_REGION``。
+
+        相对位置（"移到 B 后面"）用 ``afterRegionId`` 表达 ——
+        真正的下标由**规范化那一层**按"摘出源卡之后"算（契约 N2）。
+        """
+        from app.services.report_presentation_service import is_container
+
+        normalized = _normalize_text(text)
+        # 「把 A 和 B 放进 X 分组」是**建组**，不是移动 ——
+        # 成员点名了 ≥2 张时，交给 CREATE_GROUP 那条规则（成员更准）。
+        many_named = self._named_members_are_explicit(text, definition)
+        # --- 移出分组 ---
+        out = self._MOVE_OUT_GROUP_PATTERN.search(text)
+        if out is not None and target_region is not None:
+            group = self._find_container(definition, text, target_region)
+            if group is not None and is_container(group):
+                return {
+                    "operations": [
+                        {
+                            "op": "MOVE_REGION",
+                            "params": {
+                                "regionId": str(target_region.get("id")),
+                                "targetGroupId": None,
+                            },
+                        }
+                    ]
+                }
+            # 说了组名但树里没有这个组 → 明确"未找到该分组"。
+            return self._group_not_found_clarification(out.group("name"))
+        # --- 移入分组 ---
+        into = self._MOVE_INTO_GROUP_PATTERN.search(text)
+        if into is not None and target_region is not None and not many_named:
+            group = self._find_region_by_name(definition, into.group("name"))
+            if group is not None and is_container(group):
+                return {
+                    "operations": [
+                        {
+                            "op": "MOVE_REGION",
+                            "params": {
+                                "regionId": str(target_region.get("id")),
+                                "targetGroupId": str(group.get("id")),
+                            },
+                        }
+                    ]
+                }
+            # 说了组名但树里没有这个组 → 明确"未找到该分组"，
+            # **不拿别的卡片冒充那个组**（BUG-007）。
+            named = into.group("name").strip()
+            if named:
+                return self._group_not_found_clarification(named)
+        # --- 相对移动（移到某张卡后面 / 前面）---
+        relative = self._MOVE_RELATIVE_PATTERN.search(text)
+        if relative is not None and target_region is not None:
+            anchor = self._find_region_by_name(definition, relative.group("name"))
+            if anchor is not None and str(anchor.get("id")) != str(target_region.get("id")):
+                params: dict[str, Any] = {"regionId": str(target_region.get("id"))}
+                if re.search(r"(?:前面|之前|上方)", relative.group(0)):
+                    params["beforeRegionId"] = str(anchor.get("id"))
+                else:
+                    params["afterRegionId"] = str(anchor.get("id"))
+                return {"operations": [{"op": "MOVE_REGION", "params": params}]}
+        return None
+
+    # ------------------------------------------------------------------
+    # 数字显示格式（两位小数 / 千分位）—— BUG-010
+    # ------------------------------------------------------------------
+
+    def _parse_number_format(
+        self, text: str, target_region: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """「两位小数，加千分位，保留原单位」→ 一条 ``SET_FORMAT``。
+
+        关键是**改格式**，不是改展示类型：BUG-010 里同一份候选写着
+        "两位小数 + 千分位"，执行时却退化成 ``METRIC_CARD → METRIC_CARD``
+        的展示类型切换 —— 需求根本没落到操作上。
+
+        **单位不动**：「保留原单位 kWh」说的就是"别动单位"，所以这里
+        **不写** ``unitLabel``（写了反而可能与当前单位冲突）。真正的
+        单位换算不在本批能力里，写了会被执行层按"只能保持当前单位"拒绝。
+        """
+        if target_region is None:
+            return None
+        normalized = _normalize_text(text)
+        fmt: dict[str, Any] = {}
+        match = re.search(r"(\d+|[一二两三四五六七八九十])\s*位?小数", normalized)
+        if match:
+            raw = match.group(1)
+            digits = int(raw) if raw.isdigit() else self._CN_NUMBERS.get(raw)
+            if digits is not None:
+                fmt["precision"] = max(0, min(6, digits))
+        if "千分位" in normalized:
+            fmt["thousandSeparator"] = True
+        if not fmt:
+            return None
+        return {
+            "op": "SET_FORMAT",
+            "params": {
+                "regionId": str(target_region.get("id")),
+                "format": fmt,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # 展示类请求的**统一出口**（契约 §2.1）
+    # ------------------------------------------------------------------
+
+    def _parse_presentation_outcome(
+        self,
+        text: str,
+        definition: ReportDefinitionDraft,
+        target_region: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """展示类请求的出口：**要么**一批操作，**要么**一句本步澄清。
+
+        返回 ``{"operations": [...]}`` / ``{"clarification": {...}}`` /
+        ``None``（不是展示类请求）。
+
+        顺序很重要：**更具体的规则在前**。外观（字号 / 对齐 / 圆角）
+        最具体；尺寸、主题、组级排列、移动各自成条；兜底才是既有那批
+        展示规则（分组 / 隐藏 / 复制 / 整页紧凑）。
+        """
+        # --- 外观（字号 / 对齐 / 圆角）：最具体 ---
+        set_style = self._parse_set_style(text, definition, target_region)
+        if set_style is not None:
+            return {"operations": [set_style]}
+        # --- 数字格式（两位小数 / 千分位）---
+        number_format = self._parse_number_format(text, target_region)
+        if number_format is not None:
+            return {"operations": [number_format]}
+        # --- 尺寸（调宽 / 调窄）：满宽时给本步澄清 ---
+        size = self._parse_set_size(text, definition, target_region)
+        if size is not None:
+            return size
+        # --- 加高 ---
+        height = self._parse_set_height(text, definition, target_region)
+        if height is not None:
+            return height
+        # --- 应用主题（报表级）---
+        theme = self._parse_apply_theme(text, definition)
+        if theme is not None:
+            return {"operations": [theme]}
+        # --- 既有展示规则（显示格式 / 整页紧凑 / 分组 / 隐藏 / 复制）---
+        #
+        # 放在组级排列 / 移动**之前**：「把前两张组成一组并排，间距 16」
+        # 是**建组**，不是"改某个已存在组的排列"；「时间列显示格式设为日期」
+        # 里的"列"更不是列数。既有规则更成熟，先让它认。
+        operations = self._parse_presentation(text, definition, target_region)
+        if operations:
+            return {"operations": operations}
+        # --- 组级排列 ---
+        arrangement = self._parse_group_arrangement(text, definition, target_region)
+        if arrangement is not None:
+            return arrangement
+        # --- 移动（相对位置 / 移入移出）---
+        move = self._parse_move_region(text, definition, target_region)
+        if move is not None:
+            return move
+        return None
+
+    # ------------------------------------------------------------------
+    # 整页紧凑 / 重排
+    # ------------------------------------------------------------------
+    #
+    #: 整页间距的**下限**（像素）。已经很小的间距不再往下压。
+    _PAGE_GAP_FLOOR = 4
+    #: 整页紧凑一次收紧多少（像素）。以**当前值**为基准，不是固定值。
+    _PAGE_GAP_STEP = 4
+    #: 页面根栅格的默认间距（与前端 ``DEFAULT_ROOT_GAP`` 同口径）。
+    _PAGE_DEFAULT_GAP = 16
+
+    def _parse_page_compact(
+        self,
+        text: str,
+        definition: ReportDefinitionDraft,
+    ) -> list[dict[str, Any]]:
+        """把「整页紧凑 / 按阅读顺序排列」翻译成一批**具体**的展示操作。
+
+        没有这一条，这类句子会掉进问题反馈那条路（只解释、不改版式），
+        用户要的整页排版什么也没发生 —— 拿到的只是「请告诉我是哪一张卡片」。
+
+        产出的操作只用既有的合法 op：
+
+        - ``SET_PAGE``：整页排列改成**单列连续排布**（FLOW / VERTICAL），
+          外部间距以**当前值**为基准收紧（16 → 12、12 → 8 …）；
+        - ``SET_PLACEMENT``：顶层卡片从 12 / 6 / 4 的**列跨度**换成流式定位。
+
+        为什么必须一起改定位：只缩页面列数、把 12/6/4 的跨度留在原地，
+        会造出「隐式列」—— 定义里还写着三列宽，正文却按一列排。
+
+        **最小变更**：只碰 ``page.arrangement`` 与顶层卡片的
+        ``layout.placement``；标题文字与样式、区域 id、阅读顺序、分组层级、
+        隐藏标记、时间窗、粒度、指标、设备范围、数据来源、主题都不动。
+        """
+        from app.services import routing_rules
+
+        if not routing_rules.detect_page_compact_request(text):
+            return []
+        page = definition.page if isinstance(definition.page, dict) else {}
+        arrangement = page.get("arrangement")
+        arrangement = arrangement if isinstance(arrangement, dict) else {}
+        current_gap = self._page_gap_value(arrangement)
+        # 以当前值为基准收紧；已经很小时**保持原值**，绝不反向增大。
+        new_gap = current_gap
+        if current_gap > self._PAGE_GAP_FLOOR:
+            new_gap = max(self._PAGE_GAP_FLOOR, current_gap - self._PAGE_GAP_STEP)
+        operations: list[dict[str, Any]] = [
+            {
+                "op": "SET_PAGE",
+                "params": {
+                    "arrangement": {
+                        "mode": "FLOW",
+                        "columns": 1,
+                        "direction": "VERTICAL",
+                        "gap": {"value": new_gap, "unit": "PX"},
+                    }
+                },
+            }
+        ]
+        for region in definition.regions or []:
+            if not isinstance(region, dict):
+                continue
+            layout = region.get("layout")
+            layout = layout if isinstance(layout, dict) else {}
+            placement = layout.get("placement")
+            placement = placement if isinstance(placement, dict) else {}
+            if str(placement.get("type") or "").upper() != "GRID":
+                # 本来就不是网格定位的（已经是流式 / 固定定位）→ 不动它。
+                continue
+            operations.append(
+                {
+                    "op": "SET_PLACEMENT",
+                    "params": {
+                        "regionId": str(region.get("id")),
+                        "placement": {"type": "FLOW", "align": "STRETCH"},
+                    },
+                }
+            )
+        return operations
+
+    @classmethod
+    def _page_gap_value(cls, arrangement: dict[str, Any]) -> int:
+        """当前整页间距（像素）。定义里没写就用页面根栅格的默认值。"""
+        gap = arrangement.get("gap") if isinstance(arrangement, dict) else None
+        if isinstance(gap, dict):
+            value = gap.get("value")
+            if isinstance(value, bool):
+                value = None
+            if isinstance(value, (int, float)):
+                return max(0, int(value))
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+        elif isinstance(gap, (int, float)) and not isinstance(gap, bool):
+            return max(0, int(gap))
+        return cls._PAGE_DEFAULT_GAP
 
     @staticmethod
     def _quoted_style_reference(text: str) -> re.Match[str] | None:
@@ -1540,6 +2291,42 @@ class TemplateEditEngine:
             return containers[0]
         return None
 
+    def _explicit_group_members(
+        self, text: str, definition: ReportDefinitionDraft,
+    ) -> list[str]:
+        from app.services.report_presentation_service import iter_leaves
+
+        leaves = [r for r in iter_leaves(definition)
+                  if str(r.get("role") or "").upper() != "REPORT_TITLE"]
+        # Resolve only the member clause, never a substring of the new group name.
+        clause = re.split(r"放进|放入|归入|组成|分成", text, maxsplit=1)[0]
+        normalized = _normalize_text(clause)
+        named = [str(r.get("id")) for r in leaves
+                 if len(_normalize_text(str(r.get("name") or ""))) >= 2
+                 and _normalize_text(str(r.get("name") or "")) in normalized]
+        if len(named) >= 2:
+            return named
+        tokens = re.split(r"和|与|及|、", re.sub(r"^\s*把", "", clause))
+        if len(tokens) < 2:
+            return named
+        resolved: list[str] = []
+        for token in tokens:
+            token = _normalize_text(token.strip(" \"'“”「」『』"))
+            matches = []
+            for region in leaves:
+                name = _normalize_text(str(region.get("name") or ""))
+                exact = token == name
+                overview = token in {"总览", "概览"} and any(
+                    word in name for word in ("总览", "概览", "总耗电")
+                )
+                trend = token == "趋势" and "趋势" in name
+                if exact or overview or trend:
+                    matches.append(str(region.get("id")))
+            if len(matches) != 1 or matches[0] in resolved:
+                return []
+            resolved.append(matches[0])
+        return resolved
+
     def _group_members(
         self,
         text: str,
@@ -1549,12 +2336,7 @@ class TemplateEditEngine:
         """要分组的卡片：消息里点名了的优先，否则取前 N 张。"""
         from app.services.report_presentation_service import iter_leaves
 
-        normalized = _normalize_text(text)
-        named: list[str] = []
-        for region in iter_leaves(definition):
-            name = _normalize_text(str(region.get("name") or ""))
-            if name and len(name) >= 2 and name in normalized:
-                named.append(str(region.get("id")))
+        named = self._explicit_group_members(text, definition)
         if len(named) >= 2:
             return named
 
@@ -1565,6 +2347,16 @@ class TemplateEditEngine:
             if str(region.get("role") or "").upper() != "REPORT_TITLE"
         ]
         return leaves[: max(count, 2)]
+
+    def _named_members_are_explicit(
+        self, text: str, definition: ReportDefinitionDraft,
+    ) -> bool:
+        """句子里是不是**明确点名了至少两张**卡片。
+
+        点名了 → 规则认得全，可以直接组；没点名 → 只能靠位置说法
+        （「前两张」），否则不猜。
+        """
+        return len(self._explicit_group_members(text, definition)) >= 2
 
     def _extract_count(self, text: str) -> int | None:
         """「前两张」「3 个」这类数量。"""
@@ -1594,10 +2386,23 @@ class TemplateEditEngine:
         return 12
 
     def _extract_group_name(self, text: str) -> str:
-        """「叫做 X」「命名为 X」「组名 X」。"""
+        """「叫做 X」「命名为 X」「组名 X」「放进 X 分组」。"""
         match = re.search(r"(?:叫做|命名为|叫|组名)\s*([^\s，,。；;]{1,20})", text)
         if match:
             return match.group(1)
+        # 「能耗概览」分组 / 分组「能耗概览」
+        match = re.search(r"[「『\"“]([^」』\"”]{1,20})[」』\"”]\s*(?:分组|组)", text)
+        if match:
+            return match.group(1)
+        # 放进 / 放入 / 组成 / 分成 …… 分组
+        match = re.search(
+            r"(?:放进|放入|归入|组成|分成)\s*([^\s，,。；;]{1,20}?)\s*(?:分组|组)", text
+        )
+        if match:
+            name = match.group(1)
+            # 「组成一组」里的"一"不是组名。
+            if name and name != "一":
+                return name
         return "分组"
 
     def _next_group_id(self, definition: ReportDefinitionDraft) -> str:
@@ -1610,7 +2415,38 @@ class TemplateEditEngine:
         return f"group_{index}"
 
     @staticmethod
-    def _presentation_summary(operations: list[dict[str, Any]]) -> str:
+    def _preflight_presentation(
+        definition: ReportDefinitionDraft, operations: list[dict[str, Any]],
+    ) -> tuple[bool, list[dict[str, Any]], str | None]:
+        """候选前预检：在**副本**上把这一批真跑一遍。
+
+        返回 ``(ok, operations, failure)``：
+
+        - ``ok=True``：``operations`` 是**规范化后**的那一批（就是将来
+          真正执行的那一批）；草稿一个字节都没动。
+        - ``ok=False``：``failure`` 是可以直接给用户看的中文理由。
+
+        **无副作用**：不落库、不产生撤销单位、不改传入的 definition。
+        """
+        from app.services import report_presentation_service as rps
+
+        preflight = getattr(rps, "preflight_presentation", None)
+        if preflight is not None:
+            result = preflight(definition, operations)
+            return bool(result.ok), list(result.operations), result.failure
+        # **兜底**：规范化 / 预检那一层还没就位时，**仍然**在副本上跑一遍
+        # 真实执行 —— 至少保证"不合法的一批不会进候选"。校验没有被放过，
+        # 只是少了参数规范化。
+        result = rps.apply_presentation(definition, operations)
+        if result.ok:
+            return True, list(operations), None
+        return False, list(operations), result.failure or "这次修改没有生效。"
+
+    def _presentation_summary(
+        self,
+        operations: list[dict[str, Any]],
+        definition: ReportDefinitionDraft | None = None,
+    ) -> str:
         """给用户看的这批修改摘要（确认菜单直接展示这句话）。"""
         labels = {
             "CREATE_GROUP": "把卡片组成一个分组",
@@ -1629,6 +2465,10 @@ class TemplateEditEngine:
             "SET_METADATA": "修改报表信息",
             "SET_THEME": "应用主题",
         }
+        # 整页紧凑：改的是**整页排布**，跟「调整某张卡外观」不是一回事，
+        # 摘要单独说 —— 新间距、排列方式、保留项，用户一眼要能看懂。
+        if any(str(op.get("op") or "") == "SET_PAGE" for op in operations):
+            return TemplateEditEngine._page_compact_summary(operations, definition)
         parts = []
         for op in operations:
             label = labels.get(str(op.get("op") or ""), "调整展示")
@@ -1644,7 +2484,124 @@ class TemplateEditEngine:
                     details.append(f"圆角 {style['borderRadius']} PX")
                 if details:
                     label += "：" + "、".join(details)
+            if op.get("op") == "SET_FORMAT":
+                # 数字格式：摘要要写清**到底改成什么格式** ——
+                # BUG-010 里候选摘要写"两位小数 + 千分位"，执行却是
+                # 展示类型切换，摘要与真实操作对不上，用户无从判断。
+                fmt = (op.get("params") or {}).get("format") or {}
+                details = []
+                if fmt.get("precision") is not None:
+                    details.append(f"小数位 {fmt.get('precision')} 位")
+                if fmt.get("thousandSeparator") is True:
+                    details.append("启用千分位")
+                elif fmt.get("thousandSeparator") is False:
+                    details.append("关闭千分位")
+                if fmt.get("unitLabel") is not None:
+                    details.append(
+                        f"单位保持「{fmt.get('unitLabel')}」"
+                        if str(fmt.get("unitLabel")) else "清空单位标签"
+                    )
+                if fmt.get("kind"):
+                    details.append(f"格式类型 {fmt.get('kind')}")
+                if details:
+                    label += "：" + "、".join(details)
+            if op.get("op") == "SET_PLACEMENT":
+                placement = (op.get("params") or {}).get("placement") or {}
+                details = []
+                if str(placement.get("type") or "").upper() == "GRID":
+                    if placement.get("columnSpan") is not None:
+                        details.append(f"占 {placement.get('columnSpan')} 列")
+                width = placement.get("width")
+                if isinstance(width, dict) and width.get("value") is not None:
+                    details.append(f"宽度 {width.get('value')} {width.get('unit', 'PX')}")
+                if placement.get("minHeight") is not None:
+                    height = placement.get("minHeight")
+                    if isinstance(height, dict):
+                        details.append(f"最小高度 {height.get('value')} {height.get('unit', 'PX')}")
+                if details:
+                    label += "：" + "、".join(details)
+            if op.get("op") == "CREATE_GROUP":
+                # 建组摘要要说清**组名 + 收哪几张 + 怎么排** ——
+                # 用户要确认的就是"哪两张进来了、排成什么样"。
+                params = op.get("params") or {}
+                group_name = str(params.get("name") or "")
+                members = params.get("memberRegionIds") or []
+                names: list[str] = []
+                if definition is not None:
+                    for region in self._flatten_regions(definition.regions or []):
+                        if str(region.get("id")) in [str(item) for item in members]:
+                            names.append(_region_label(region))
+                arrangement = params.get("arrangement") or {}
+                details = []
+                if names:
+                    details.append("收进 " + "、".join(names))
+                if arrangement.get("columns") is not None:
+                    details.append(f"{arrangement.get('columns')} 列")
+                gap = arrangement.get("gap")
+                if isinstance(gap, dict) and gap.get("value") is not None:
+                    details.append(f"间距 {gap.get('value')} {gap.get('unit', 'PX')}")
+                if details:
+                    label = f"新建分组「{group_name}」" + "：" + "、".join(details)
+            if op.get("op") == "SET_GROUP_ARRANGEMENT":
+                arrangement = (op.get("params") or {}).get("arrangement") or {}
+                details = []
+                if arrangement.get("columns") is not None:
+                    details.append(f"{arrangement.get('columns')} 列")
+                gap = arrangement.get("gap")
+                if isinstance(gap, dict) and gap.get("value") is not None:
+                    details.append(f"间距 {gap.get('value')} {gap.get('unit', 'PX')}")
+                if details:
+                    label += "：" + "、".join(details)
+            if op.get("op") == "SET_THEME":
+                theme_id = str((op.get("params") or {}).get("themeId") or "")
+                name = ""
+                try:
+                    from app.services.report_theme_service import theme_service
+
+                    theme = theme_service.get_theme(theme_id) or {}
+                    name = str(theme.get("name") or "")
+                except Exception:  # noqa: BLE001 - 主题服务不可用时不影响其它摘要
+                    name = ""
+                if name:
+                    label += f"：{name}"
             parts.append(label)
+        return "；".join(parts)
+
+    @staticmethod
+    def _page_compact_summary(
+        operations: list[dict[str, Any]],
+        definition: ReportDefinitionDraft | None = None,
+    ) -> str:
+        """整页紧凑这一批的摘要：**新值** + **排列方式** + **保留项**。
+
+        「间距收紧到 8 PX」这种话不写清楚，用户看到的只是「调整整页设置」，
+        不知道到底改了什么、也不知道标题和数据会不会被动。
+        """
+        page_op = next(
+            (op for op in operations if str(op.get("op") or "") == "SET_PAGE"), None,
+        )
+        arrangement = ((page_op or {}).get("params") or {}).get("arrangement")
+        arrangement = arrangement if isinstance(arrangement, dict) else {}
+        gap = arrangement.get("gap")
+        gap = gap if isinstance(gap, dict) else {}
+        new_gap = gap.get("value")
+        unit = str(gap.get("unit") or "PX")
+        old_gap: int | None = None
+        if definition is not None:
+            page = definition.page if isinstance(definition.page, dict) else {}
+            current = page.get("arrangement")
+            current = current if isinstance(current, dict) else {}
+            old_gap = TemplateEditEngine._page_gap_value(current)
+        gap_text = f"{new_gap} {unit}"
+        if old_gap is not None and old_gap != new_gap:
+            gap_text = f"{old_gap} → {new_gap} {unit}"
+        placement_count = sum(
+            1 for op in operations if str(op.get("op") or "") == "SET_PLACEMENT"
+        )
+        parts = [f"整页改为单列连续排布，外部间距收紧到 {gap_text}"]
+        if placement_count:
+            parts.append(f"{placement_count} 张顶层卡片改为占满可用宽度的连续排布")
+        parts.append("保留标题文字与样式、内容原有阅读顺序、分组层级与数据口径不变")
         return "；".join(parts)
 
     def _apply_presentation(
@@ -1663,6 +2620,18 @@ class TemplateEditEngine:
         """
         from app.services.report_presentation_service import apply_presentation
 
+        # 接受时**再**校验一次（候选期已经预检过，这里是兜底）：
+        # 候选生成之后草稿可能已经被别的窗口改过 —— 这时这批参数
+        # 可能已经打不上了（比如目标卡片被删了）。
+        #
+        # 失败 → **整批不生效**，草稿保持不变（不留下半份定义）。
+        ok, normalized, failure = self._preflight_presentation(
+            draft, plan.operation.presentationOperations,
+        )
+        if not ok:
+            return None, failure or "这次修改没有生效，草稿保持不变。"
+        plan.operation.presentationOperations = normalized
+
         result = apply_presentation(
             draft,
             plan.operation.presentationOperations,
@@ -1670,11 +2639,13 @@ class TemplateEditEngine:
         )
         if not result.ok:
             return None, result.failure or "这次修改没有生效，草稿保持不变。"
+        # 摘要**在写回之前**算：整页紧凑那批要报「间距 16 → 12」，
+        # 写回之后 draft 里已经是新值（12），旧值就丢了。
+        reply = self._presentation_summary(plan.operation.presentationOperations, draft)
         # 把新定义写回 draft（就地修改约定）。
         payload = result.definition.model_dump()
         for key, value in payload.items():
             setattr(draft, key, value)
-        reply = self._presentation_summary(plan.operation.presentationOperations)
         if result.affectedRegionIds:
             reply = f"已完成：{reply}。"
         return result.changeSet, reply
@@ -1926,12 +2897,52 @@ class TemplateEditEngine:
         #
         # 放在最前面：这些表达很具体（「组成一组」「并排」「取消分组」），
         # 不该被后面的删卡 / 改标题规则抢走。
-        presentation_operations = self._parse_presentation(text, definition, target_region)
-        if presentation_operations:
+        presentation = self._parse_presentation_outcome(text, definition, target_region)
+        if presentation:
+            # --- 本步澄清：这批操作做不成，说清楚并给合法选择 ---
+            #
+            # **不猜、不静默删操作**：要么这批参数本身不合法（预检拦下），
+            # 要么这步缺一个必要选择（比如目标已经是满宽）。两种都走
+            # 「本步澄清」，普通聊天**不因此开放**。
+            if "clarification" in presentation:
+                plan.intent = EditIntent.UNKNOWN
+                plan.needsClarification = True
+                plan.clarificationQuestion = str(
+                    presentation["clarification"].get("question") or ""
+                )
+                # 本步合法选择：挂在计划的 displayOptions 上（澄清时
+                # 它就是"这一步可以选什么"，不是展示方式建议）。
+                plan.operation.displayOptions = [
+                    dict(item)
+                    for item in (presentation["clarification"].get("options") or [])
+                    if isinstance(item, dict) and item.get("value")
+                ]
+                return plan
+
+            presentation_operations = presentation["operations"]
+            # --- 候选前预检（契约 §2.1）---
+            #
+            # 在**副本**上把这一批真跑一遍：参数不合法的话**不出候选**，
+            # 改成一句安全澄清 —— 用户不该在点「接受修改」之后才看到
+            # "[EDIT_VALIDATION_FAILED] fontSize 的取值格式不对"。
+            #
+            # 预检通过后，把**规范化后的**那一批写回计划：候选摘要与
+            # 执行器真正跑的参数是**同一份数据**。
+            preflight_ok, preflight_operations, preflight_failure = self._preflight_presentation(
+                definition, presentation_operations,
+            )
+            if not preflight_ok:
+                plan.intent = EditIntent.UNKNOWN
+                plan.needsClarification = True
+                plan.clarificationQuestion = preflight_failure or (
+                    "这次修改的参数还不合法，草稿没有变化，也没有生成待接受的修改计划。"
+                )
+                return plan
+            presentation_operations = preflight_operations
             plan.intent = EditIntent.APPLY_PRESENTATION
             plan.confidence = 0.85
             plan.operation = EditOperation(presentationOperations=presentation_operations)
-            plan.summary = self._presentation_summary(presentation_operations)
+            plan.summary = self._presentation_summary(presentation_operations, definition)
             return plan
 
         # ===== 1. 改报表名 =====

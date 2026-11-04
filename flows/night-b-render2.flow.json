@@ -1,0 +1,34 @@
+{
+  "outDir": "../.selfcheck/night-b-frontend/render2",
+  "waitMs": 1500,
+  "timeout": 60000,
+  "ignore": [
+    "modao.cc",
+    "/health",
+    "api.unisvg.com",
+    "cdn.tailwindcss.com"
+  ],
+  "flows": [
+    {
+      "name": "包B-渲染验证-暗色主题覆盖与可读性-单列排布与阅读顺序",
+      "url": "http://127.0.0.1:8013/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "eval": "restoreSession('sess_night_b_frontend')", "save": "restored" },
+        { "wait": 6000 },
+
+        { "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); if (!root) return false; return getComputedStyle(root).backgroundColor === 'rgb(20, 23, 28)'; })()" },
+        { "eval": "(() => { const els = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); if (!els.length) return false; return els.some(el => getComputedStyle(el).backgroundColor === 'rgb(29, 33, 39)' && getComputedStyle(el).color === 'rgb(232, 234, 237)'); })()" },
+        { "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return !!root && root.getAttribute('data-arrangement-mode') === 'FLOW' && root.getAttribute('data-arrangement-direction') === 'VERTICAL' && root.getAttribute('data-gap') === '8'; })()" },
+        { "eval": "(() => { const all = Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(e => e.getAttribute('data-region-id')); const dom = []; for (const id of all) if (!dom.includes(id)) dom.push(id); const def = (session.definition?.regions || []).map(r => r.id); const common = dom.filter(id => def.includes(id)); const expected = def.filter(id => dom.includes(id)); return common.length >= 3 && JSON.stringify(common) === JSON.stringify(expected); })()" },
+        { "eval": "JSON.stringify({ theme: (session.resolvedTheme || {}).themeId, textColor: ((session.resolvedTheme || {}).tokens || {}).colorText, mode: document.querySelector('#preview-root [data-presentation=\"root\"]').getAttribute('data-arrangement-mode'), gap: document.querySelector('#preview-root [data-presentation=\"root\"]').getAttribute('data-gap'), order: Array.from(new Set(Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(e => e.getAttribute('data-region-id')))) })", "save": "scene" },
+        { "screenshot": "render2-01-暗色主题与单列排布生效" },
+
+        { "eval": "(() => { const els = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); return els.every(el => el.scrollWidth <= el.clientWidth + 2); })()" },
+        { "eval": "(() => { const btns = Array.from(document.querySelectorAll('#preview-root button')); return btns.every(b => b.getBoundingClientRect().right <= window.innerWidth + 1); })()" },
+        { "eval": "(() => { const els = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); return els.every(el => !String(getComputedStyle(el).writingMode || '').includes('vertical')); })()" },
+        { "screenshot": "render2-02-窄卡不竖排按钮不越界" }
+      ]
+    }
+  ]
+}

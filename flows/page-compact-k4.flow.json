@@ -1,0 +1,168 @@
+{
+  "outDir": "../.selfcheck/page-compact-20261103/flow",
+  "waitMs": 1500,
+  "timeout": 30000,
+  "ignore": [
+    "modao.cc",
+    "/health"
+  ],
+  "flows": [
+    {
+      "name": "整页紧凑-原句闭环-接受-刷新-撤销",
+      "url": "http://127.0.0.1:8003/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "restoreSession('sess_page_compact_k4')",
+          "save": "restored"
+        },
+        {
+          "wait": 2000
+        },
+        {
+          "assertText": "请选择下一步操作"
+        },
+        {
+          "assertVisible": "#chat-scroll .question-select[data-question-id=\"template_edit_confirm\"]"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "eval": "document.getElementById('btn-send').disabled === true"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return root ? root.getAttribute('data-arrangement-mode') + ':' + root.getAttribute('data-gap') : 'none'; })()",
+          "save": "beforeLayout"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return Number(root.getAttribute('data-gap')); })()",
+          "save": "beforeGap"
+        },
+        {
+          "eval": "Number(session.baseDefinitionRevision)",
+          "save": "beforeRev"
+        },
+        {
+          "eval": "(() => { const sels = Array.from(document.querySelectorAll('#chat-scroll .question-select[data-question-id=\"template_edit_confirm\"]')).filter(s => !s.disabled); const sel = sels[sels.length - 1]; if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "assertVisible": "#chat-scroll .question-other-input:not([disabled])"
+        },
+        {
+          "eval": "(() => { const inputs = Array.from(document.querySelectorAll('#chat-scroll .question-other-input')).filter(x => !x.disabled); if (inputs.length !== 1) return false; const box = inputs[0].closest('.question-other'); return box.dataset.questionOther === 'template_edit_confirm' && box.dataset.answerMode === 'edit' && box.dataset.editAction === '修改'; })()"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "screenshot": "k4-01-修改后进入受限输入"
+        },
+        {
+          "type": "#chat-scroll .question-other-input:not([disabled])",
+          "text": "页面紧凑一点，标题保留，其他内容按阅读顺序排列"
+        },
+        {
+          "click": "#chat-scroll .question-other-submit:not([disabled])"
+        },
+        {
+          "waitFor": "[data-pending-plan]",
+          "timeout": 20000
+        },
+        {
+          "assertText": "待确认的修改"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan]').innerText; return t.includes('单列连续排布') && t.includes(' PX') && t.includes('保留标题') && t.includes('整页（全部正文卡片）'); })()"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-pending-plan]').innerText; return t; })()",
+          "save": "candidateText"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return !!root && root.getAttribute('data-arrangement-mode') === 'GRID'; })()"
+        },
+        {
+          "screenshot": "k4-02-整页紧凑候选"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-pending-plan] select'); const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "session.baseDefinitionRevision === beforeRev + 1"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return !!root && root.getAttribute('data-arrangement-mode') === 'FLOW' && root.getAttribute('data-arrangement-direction') === 'VERTICAL'; })()"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return Number(root.getAttribute('data-gap')) === beforeGap - 4; })()"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return root ? root.getAttribute('data-gap') : 'none'; })()",
+          "save": "afterGap"
+        },
+        {
+          "eval": "(() => { const els = Array.from(document.querySelectorAll('#preview-root [data-region-id][data-placement-type]')); return els.length === 6 && els.every(el => el.getAttribute('data-placement-type') === 'FLOW' && el.getAttribute('data-placement-align') === 'STRETCH'); })()"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"][data-placement-type]'); return !!el && el.getAttribute('data-placement-type') === 'FLOW' && el.getAttribute('data-placement-align') === 'STRETCH'; })()"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_report_title\"]'); return !!el && (el.innerText || '').includes('能耗'); })()"
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('#preview-root [data-region-id][data-placement-type]')).map(el => el.dataset.regionId).join(',') === 'region_report_title,region_total_energy,region_device_ranking,region_hourly_trend,region_data_quality,region_analysis'"
+        },
+        {
+          "screenshot": "k4-03-接受后整页紧凑生效"
+        },
+        {
+          "eval": "(() => { location.reload(); return true; })()"
+        },
+        {
+          "wait": 5000
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return !!root && root.getAttribute('data-arrangement-mode') === 'FLOW' && root.getAttribute('data-arrangement-direction') === 'VERTICAL' && Number(root.getAttribute('data-gap')) === beforeGap - 4; })()"
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return root ? root.getAttribute('data-gap') : 'none'; })()",
+          "save": "afterReloadGap"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"][data-placement-type]'); return !!el && el.getAttribute('data-placement-type') === 'FLOW'; })()"
+        },
+        {
+          "screenshot": "k4-04-刷新后仍然紧凑"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('[data-wp-history]'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.value === 'undo'); if (!opt || opt.disabled) return false; sel.value = 'undo'; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "(() => { const root = document.querySelector('#preview-root [data-presentation=\"root\"]'); return !!root && root.getAttribute('data-arrangement-mode') === 'GRID' && Number(root.getAttribute('data-gap')) === beforeGap; })()"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('#preview-root [data-region-id=\"region_total_energy\"][data-placement-type]'); return !!el && el.getAttribute('data-placement-type') === 'GRID'; })()"
+        },
+        {
+          "eval": "Number(session.baseDefinitionRevision) >= beforeRev"
+        },
+        {
+          "screenshot": "k4-05-撤销后回到原样"
+        }
+      ]
+    }
+  ]
+}

@@ -34,6 +34,7 @@ from tests.support.acceptance_harness import (
     acceptance_harness,
     plan_candidate,
 )
+from tests.support.step_contract import step_ref
 
 
 # --------------------------------------------------------------------------
@@ -377,19 +378,20 @@ def test_stale_draft_revision_is_rejected_and_old_draft_kept(post_chat):
     assert accepted["domainObjects"]["reportDefinitionDraft"]["metadata"]["revision"] == 1
 
     # 接受后有必选菜单：先明确选择继续修改，再提第二个计划。
-    post_chat(
+    ref = post_chat(
         "修改",
         state="USER_EDITING_TEMPLATE",
         snapshots={
             "reportDefinition": accepted["domainObjects"]["reportDefinitionDraft"]
         },
-    )
+    ).json()
     candidate = post_chat(
         "把设备耗电排名改成柱状图",
         state="USER_EDITING_TEMPLATE",
         snapshots={
             "reportDefinition": accepted["domainObjects"]["reportDefinitionDraft"]
         },
+        **step_ref(ref),
     ).json()
     assert candidate["domainObjects"]["pendingEditPlan"] is not None
 

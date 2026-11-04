@@ -28,6 +28,7 @@ from typing import Any
 from app.agents.fake_report_agent import FakeReportAgent
 from app.config import get_settings
 from app.schemas.agent import (
+    LOCK_SCOPE_INPUT_AND_MENU,
     AgentBlock,
     AgentRequest,
     AgentResponse,
@@ -1055,10 +1056,14 @@ class AgentScopeReportAgent:
         intent = plan.intent.value
         region_id = plan.target.regionId
         options = [option.model_dump(mode="json") for option in plan.options]
-        region = next(
-            (item for item in (definition.regions or []) if item.get("id") == region_id),
-            None,
-        ) if definition else None
+        # 目标区域要**递归**找：组里的子卡在 ``definition.regions`` 顶层
+        # 找不到（只有顶层那层是平铺的）。以前只查顶层 → 组内子卡的
+        # 目标被判成"没有找到要修改的卡片"（BUG-007）。
+        region = None
+        if definition is not None and region_id:
+            from app.services.report_presentation_service import find_region
+
+            region = find_region(definition, region_id)
 
         def ask(question: str, choices: list[dict] | None = None) -> AgentResponse:
             selected = [
@@ -1076,6 +1081,19 @@ class AgentScopeReportAgent:
                     expects="SINGLE_CHOICE" if selected else "TEXT",
                     options=selected,
                     selectionOnly=bool(selected),
+                    # **待决澄清期间锁住普通输入**（契约：状态白名单）。
+                    #
+                    # 以前这张卡没有 lockScope：没有选项时按 menu_only 推导，
+                    # 普通输入就**开着** —— 用户在澄清还没处理时就能发新消息
+                    # 逃离当前步骤（BUG-009）。
+                    #
+                    # 现在显式写 input_and_menu：普通输入、发送、Enter 与
+                    # 快捷入口全程锁住；要说的话走这张卡里的**专用输入**
+                    # （allowsOther），只接本步的补充说明。
+                    lockScope=LOCK_SCOPE_INPUT_AND_MENU,
+                    allowsOther=not selected,
+                    otherLabel="补充说明",
+                    otherPlaceholder="也可以直接在这里补充这一步需要的信息",
                 )],
                 uiActions=["ask_template_edit_detail"],
                 debug={
@@ -1166,6 +1184,39 @@ class AgentScopeReportAgent:
                 plan.clarificationQuestion or "我还不能确定这次修改的具体内容，请确认目标和修改值。",
                 options,
             )
+        # ===== 候选前预检（契约 §2.1）=====
+        #
+        # 模型给的展示操作**不保证**参数形状合法（``fontSize: 28`` 而不是
+        # ``{"value":28,"unit":"PX"}``、``afterRegionId`` 这种执行器不认的
+        # 字段、``columns`` 放错层级 …）。以前这些都要等用户点「接受修改」
+        # 才炸（BUG-001 / BUG-002 / BUG-004 / BUG-006）。
+        #
+        # 现在在**副本**上先跑一遍：不合法就**不出候选**，改成一句安全澄清；
+        # 通过就把**规范化后**的那一批写回候选 —— 候选摘要与执行器真正
+        # 跑的参数是**同一份数据**。
+        if intent == EditIntent.APPLY_PRESENTATION.value or any(
+            step.intent.value == EditIntent.APPLY_PRESENTATION.value
+            for step in steps
+        ):
+            from app.services.report_presentation_service import preflight_presentation
+
+            for step in steps:
+                if step.intent.value != EditIntent.APPLY_PRESENTATION.value:
+                    continue
+                operations = step.operation.presentationOperations or []
+                preflight = preflight_presentation(definition, operations)
+                if not preflight.ok:
+                    # **安全澄清**，不是把校验原文甩给用户。
+                    # 原文（"width 的取值格式不对"）是给开发看的；
+                    # 用户要看到的是"没改成功、为什么、接下来怎么办"。
+                    return ask(
+                        "这次修改的排版参数还不合法"
+                        f"（{preflight.failure}），"
+                        "草稿没有变化，也没有生成待接受的修改计划。"
+                        "请把要改的地方说得更具体一点（比如要几列、间距多少、"
+                        "改哪张卡片），我再出一次候选。"
+                    )
+                step.operation.presentationOperations = preflight.operations
         operation_steps = (
             [step.model_dump(mode="json") for step in plan.operations]
             if plan.operations else [{

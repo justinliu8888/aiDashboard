@@ -844,6 +844,92 @@ def is_clear_generation_request(message: str) -> bool:
 
 
 # --------------------------------------------------------------------------
+# 整页紧凑 / 重排
+# --------------------------------------------------------------------------
+#
+# 「页面紧凑一点，标题保留，其他内容按阅读顺序排列」说的是**整页**排布，
+# 不是某张卡片。以前它落进问题反馈：``_RE_ISSUE_POINT_COUNT`` 把
+# 「紧凑**一点**」里的「一点」当成了「只有一个数据点」，于是用户拿到的是
+# 「请告诉我是哪一张卡片」—— 整页请求被当成对某张卡的抱怨。
+#
+# 判定只看**句子形状**，不认任何卡片名：范围词 + 紧凑/重排词 + 请求特征，
+# 三者齐了才算命令。能力咨询（「支持紧凑排版吗？」）没有请求特征 → 不算。
+#
+# 词表**不包含**任何示例里的卡片名 —— 换一张报表、换一个说法同样要认得。
+
+#: 「整页 / 整份报表」这类范围词。
+_PAGE_SCOPE_WORDS: tuple[str, ...] = (
+    "整页", "全页", "整份", "整版面", "整张报表", "版面", "版式",
+    "页面", "整体布局", "整体排版", "布局", "排版",
+)
+
+#: 「更紧凑 / 按阅读顺序排」这类排布诉求词。
+_PAGE_COMPACT_WORDS: tuple[str, ...] = (
+    "紧凑", "压缩", "更密", "松散", "稀疏",
+    "收紧间距", "缩小间距", "减少间距", "间距小", "间隔小",
+    "重排", "阅读顺序", "依次排列", "按顺序排列", "顺序排列",
+)
+
+#: 指向**单张卡片**的说法：出现它们就不是整页范围（那是卡片级请求）。
+_CARD_SCOPE_WORDS: tuple[str, ...] = (
+    "这张", "那张", "卡片", "板块", "区域", "几张", "前两张", "后两张",
+    "第一张", "第二张",
+)
+
+#: 「第 N 张 / 前 N 张 / 这 N 张」这类**位置指代**。
+#:
+#: 词表里逐条登记的只有「第一张 / 第二张 / 前两张 / 后两张」，
+#: 但用户说「第三张」「前 3 张」时指的是同一种东西 —— 位置指代一律算单卡范围，
+#: 不能因为换了序号就当成整页请求。
+_CARD_SCOPE_PATTERN = re.compile(
+    r"(?:这|那|前|后|第|上|下)\s*(?:两|二|三|四|五|六|七|八|九|十|\d+)\s*(?:张|块)"
+)
+
+#: 「这句话在下指令」的形状特征。咨询句没有这些词。
+#:
+#: 「紧凑排版可以吗」是咨询（没有特征词）；「页面紧凑一点，可以吗？」是
+#: 命令（句尾客套问句不算咨询，特征词「一点」还在）。
+_PAGE_REQUEST_MARKERS: tuple[str, ...] = (
+    "一点", "一些", "一点点", "更", "稍微", "有点",
+    "收紧", "缩小", "减少", "压缩", "调整", "重排", "排列",
+    "改成", "改为", "设为", "设成", "调成", "变成", "换成",
+    "请", "帮我", "给我", "需要", "想要", "把", "将",
+)
+
+
+def detect_page_compact_request(message: str) -> bool:
+    """这句话是不是「把整页排得更紧凑（并按阅读顺序连续排列）」的**命令**。
+
+    判定口径（三个条件齐了才算）：
+
+        1. 有**范围词**（页面 / 整页 / 排版 / 布局 …）—— 说的是整页；
+        2. 有**紧凑或重排词**（紧凑 / 收紧间距 / 阅读顺序 …）；
+        3. 有**请求特征**（一点 / 一些 / 调整 / 请 / 把 …）—— 是命令不是咨询。
+
+    另外，出现**单卡范围词**（这张 / 卡片 / 前两张 …）时不算整页请求：
+    那是某张卡片的诉求，交给既有的卡片级链路。
+
+    与 :func:`detect_issue_feedback` 的分工：这里认的是**明确的排版命令**，
+    「趋势只有一个点」那种真实数据点数反馈不在这里（它没有范围词，
+    而且「紧凑」类诉求词也不匹配）。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if is_clear_generation_request(text):
+        return False
+    if not any(word in text for word in _PAGE_SCOPE_WORDS):
+        return False
+    if not any(word in text for word in _PAGE_COMPACT_WORDS):
+        return False
+    if any(word in text for word in _CARD_SCOPE_WORDS):
+        return False
+    if _CARD_SCOPE_PATTERN.search(text):
+        return False
+    return any(word in text for word in _PAGE_REQUEST_MARKERS)
+
+
+# --------------------------------------------------------------------------
 # 只读提问的判定（降级路径用）
 # --------------------------------------------------------------------------
 #
@@ -860,6 +946,29 @@ def is_clear_generation_request(message: str) -> bool:
 _QUESTION_MARKERS: tuple[str, ...] = (
     "吗", "呢", "？", "?", "什么", "怎么", "哪些", "是否", "有没有",
     "能不能", "可不可以", "能否", "多少", "几个", "为什么", "咋",
+)
+
+#: 「告诉我 X 的位置、尺寸和当前样式」这类**陈述式问句**的请求词。
+#:
+#: 这些句子**没有问号、也没有疑问词**（什么 / 怎么 / 吗 …），但语义是
+#: **要信息、不要修改**。以前它们过不了 :func:`is_readonly_question`
+#: 的「有疑问标记」这一条，于是掉进编辑快路 —— 用户只想知道一张卡的
+#: 位置 / 尺寸 / 样式，拿到的却是一条编辑步骤的追问（用户现场截图：
+#: 问完「昨日能耗趋势的位置、尺寸和当前样式」，紧接着就跳出一张
+#: 「请描述你想怎样修改当前草稿」的卡）。
+#:
+#: 判据与 :data:`_QUESTION_MARKERS` 那条**并列**，不是替代：
+#:     请求词 + 业务对象 + **没有改动动词** —— 三个都要。
+#:   - 「请告诉我叫什么」没有业务对象 → 不是在问报表，不算提问；
+#:   - 「告诉我把趋势改成柱状图」有改动动词 → 是指令，不算提问。
+#:
+#: **不收「给我看 / 给我讲」**：「给我」是既有的生成请求动词
+#: （:data:`_RE_GENERATION_VERBS`），「给我看看能耗日报」是要**产出**
+#: 一份报表，不是要信息 —— 收进来会把新建流程判成咨询。
+#: 这里只收**不会与生成请求混淆**的说法。
+_ASK_INFORMATION_PATTERN = re.compile(
+    r"(?:告诉我|我看下|我看一下|看一下|看下|讲讲|讲一下|说说|说一下|"
+    r"说明一下|介绍下|介绍一下|描述一下|列一下|展示一下|查一下|查下)"
 )
 
 #: 疑问必须指向的报表业务对象。没有它就是闲聊，不属于本产品的问答范围。
@@ -905,6 +1014,25 @@ _APPEARANCE_COMMAND_PATTERN = re.compile(
     r"|(?:^|[，,；;、])\s*(?:左对齐|右对齐|居中对齐)(?=$|[，,；;。.!！?？])"
 )
 
+#: 「把某张卡**调宽一点**」这类**尺寸命令**的表达（工单：BUG-003）。
+#:
+#: 之前没有这一条：「调宽一点」既没有改动动词（``_OPERATION_VERBS`` 不含
+#: 「调宽」），又被 :data:`_RE_ISSUE_POINT_COUNT` 认成「只有一个数据点」，
+#: 于是掉进问题反馈那条路 —— 用户要的是尺寸修改，拿到的却是趋势诊断。
+_SIZE_COMMAND_PATTERN = re.compile(
+    r"(?:调|加|改|变|弄|扩|收|缩|放)(?:整)?(?:宽|窄)"
+    r"|(?:宽|窄)(?:一点|一些|点儿|点|些)"
+)
+
+#: 「支持调宽吗」「能不能调宽」这类**咨询**。
+#:
+#: 咨询与命令用的是同一批词，靠**句子的问法**分开：咨询里出现
+#: 「支持 / 能不能 / 可以 … 吗」，说的不是"现在就改"。
+_SIZE_QUESTION_PATTERN = re.compile(
+    r"(?:支持|可否|能否|能不能|可以|是否|允许|有没有|能不能)"
+    r"[^，。；、！？]{0,10}(?:宽|窄)"
+)
+
 
 def looks_like_question(message: str) -> bool:
     """这句话有没有**疑问语气**。
@@ -935,12 +1063,46 @@ def has_operation_command(message: str) -> bool:
 
     用于把「操作」和「其它」分开：带明确改动动词的输入不能被当成提问，
     待确认期间也不允许它绕过菜单。
+
+    「整页紧凑 / 重排」也算命令（:func:`detect_page_compact_request`）：
+    那一类句子里没有改动动词（「紧凑一点」「按阅读顺序排列」都没有），
+    不单列的话它会被问题反馈那条路吞掉 —— 用户要的是整页排版，
+    拿到的却是「请告诉我是哪一张卡片」。
+
+    「调宽 / 调窄」也是命令（:func:`detect_size_command`）：同一个道理，
+    「调宽一点」里没有改动动词，不单列的话会被点数反馈那条路吞掉
+    （BUG-003）。
     """
     text = (message or "").strip()
     if not text:
         return False
+    if detect_page_compact_request(text):
+        return True
     return (any(word in text for word in _OPERATION_VERBS)
-            or bool(_APPEARANCE_COMMAND_PATTERN.search(text)))
+            or bool(_APPEARANCE_COMMAND_PATTERN.search(text))
+            or detect_size_command(text))
+
+
+def detect_size_command(message: str) -> bool:
+    """这句话是不是「把某张卡**调宽 / 调窄**」的**命令**。
+
+    与 :func:`detect_page_compact_request` 同一类问题：**范围词 + 动作词 +
+    请求特征**的句子不认改动动词，不单列就会被问题反馈那条路吞掉
+    （BUG-003：「把昨日能耗趋势调宽一点，方便看时间轴」曾经被当成
+    「趋势只有一个点」的数据抱怨）。
+
+    **咨询不是命令**：「支持调宽吗」「能不能把宽度调一下」说的是
+    "能不能"，不是"现在就改" —— 那类句子要留给能力问答那条路，
+    不能被当成立即执行的尺寸修改。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if _SIZE_QUESTION_PATTERN.search(text):
+        return False
+    if any(marker in text for marker in _QUESTION_MARKERS):
+        return False
+    return bool(_SIZE_COMMAND_PATTERN.search(text))
 
 
 def command_verbs_in(message: str) -> tuple[str, ...]:
@@ -962,6 +1124,12 @@ def command_verbs_in(message: str) -> tuple[str, ...]:
             start = text.find(verb, start + 1)
     for match in _APPEARANCE_COMMAND_PATTERN.finditer(text):
         hits.append((match.start(), match.end(), match.group().lstrip("，,；;、 ")))
+    if detect_size_command(text):
+        # 尺寸命令也要算一条"执行过的命令" —— 否则「这一轮没有执行」
+        # 那层实话会把尺寸修改报成"没有执行任何命令"，与实际不符。
+        match = _SIZE_COMMAND_PATTERN.search(text)
+        if match is not None:
+            hits.append((match.start(), match.end(), match.group()))
     # 同一处起点取最长的词；再按出现位置从前往后挑不重叠的。
     hits.sort(key=lambda item: (item[0], -item[1]))
     picked: list[tuple[int, int, str]] = []
@@ -998,6 +1166,14 @@ def is_readonly_question(message: str) -> bool:
 
     只用于降级路径和待确认入口的兜底判定。命中意味着：
     这句话在**问当前对话 / 当前产品**的事，不是在下指令。
+
+    两条并列的入口（缺一不可）：
+      1. **疑问语气**：有疑问标记（:data:`_QUESTION_MARKERS`）；
+      2. **陈述式要信息**：「告诉我 X 的位置、尺寸和当前样式」这种
+         没有问号的请求（:func:`looks_like_information_request`）。
+
+    两条都还要求：指向报表业务对象（:func:`mentions_report_object`）、
+    且**没有改动动词**（:func:`has_operation_command`）。
     """
     text = (message or "").strip()
     if not text:
@@ -1007,10 +1183,35 @@ def is_readonly_question(message: str) -> bool:
     if has_operation_command(text):
         return False
     if not any(marker in text for marker in _QUESTION_MARKERS):
-        return False
+        # 没有疑问标记的**陈述式问句**也是提问（「告诉我…」）。
+        return looks_like_information_request(text)
     # 业务对象表里 PUE 是小写，但用户在句首写大写 PUE 很常见。
     # 认不出一句提问，后果是「提问」被当成「修改」——
     # 设计流程里那会平白多出一版方案，所以这里按大小写不敏感匹配。
+    return mentions_report_object(text)
+
+
+def looks_like_information_request(message: str) -> bool:
+    """这句话是不是在**要信息**（陈述式问句）。
+
+    「告诉我『昨日能耗趋势』的位置、尺寸和当前样式」——没有问号，
+    但要的是**信息**，不是修改。它与 :func:`is_readonly_question`
+    的差别只在前半段（请求词 vs 疑问标记），后半段完全一样：
+    必须指向报表业务对象、必须没有改动动词。
+
+    放在本模块是为了让「什么算提问」只有**一处**判定口径 ——
+    意图门（:func:`context_engine.classify_message_intent`）、
+    只读快路、待确认入口都调这一份。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    if is_clear_generation_request(text):
+        return False
+    if has_operation_command(text):
+        return False
+    if not _ASK_INFORMATION_PATTERN.search(text):
+        return False
     return mentions_report_object(text)
 
 
@@ -1080,7 +1281,16 @@ _ISSUE_FEEDBACK_MARKERS: tuple[str, ...] = (
 #: 「就 2 个点」这类数量异常的说法。
 #:
 #: 「点级」「点位」不是数据点（那是粒度），排除掉。
+#:
+#: **程度补语不是点数**（BUG-003）：「调宽一点」「调大一点」里的「一点」
+#: 是"再多一点点"的意思，不是"只有一个数据点"。所以数词前面是
+#: 尺寸 / 程度形容词时**不算**点数异常。
+#:
+#: 「趋势只有一个点」必须仍然命中 —— 那里的数词前面是「有」，
+#: 不在排除集里（而且固定词表里本来就有「只有一个点」）。
 _RE_ISSUE_POINT_COUNT = re.compile(
+    r"(?<![宽窄大小长短高低厚薄深浅疏密])"
+    r"(?<![宽窄大小长短高低厚薄深浅疏密]\s)"
     r"(?:\d+|[一二三四五六七八九十两])\s*个?\s*(?:数据)?点(?!级|位)"
 )
 

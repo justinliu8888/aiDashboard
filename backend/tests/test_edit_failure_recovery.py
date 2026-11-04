@@ -87,6 +87,9 @@ def test_failed_acceptance_menu_survives_database_reconnect(
         assert "selection_required" not in resumed["uiActions"]
         assert resumed["domainObjects"]["reportDefinitionDraft"] == previous
         restored = client.get("/api/sessions/conv_test").json()
-        assert restored["pendingChoice"] is None
+        # 答掉菜单之后接管锁的是**受限修改输入**这一步（服务端持久记录）：
+        # 普通聊天继续锁着，刷新后仍然受限。
+        assert restored["pendingChoice"] is not None
+        assert restored["pendingChoice"]["question"]["stepKind"] == "edit_request"
     finally:
         reopened.close()
