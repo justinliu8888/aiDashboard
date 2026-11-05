@@ -714,6 +714,79 @@
       return box;
     }
 
+    if (region.componentType === "pie_chart" && typeof doc.createElementNS === "function") {
+      // 饼图兜底：**真的画扇区**。
+      //
+      // 以前 pie_chart 不是 line_chart → 落到下面那段 HTML 横条，
+      // 于是「饼图」画出来是一排横条。现在这里用 SVG 的圆弧画扇区。
+      const svgNode = (tag, attributes) => {
+        const node = doc.createElementNS("http://www.w3.org/2000/svg", tag);
+        for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+        return node;
+      };
+      const size = 180;
+      const radius = 70;
+      const center = size / 2;
+      const total = values.reduce((sum, value) => {
+        const num = Number(value);
+        return sum + (isFinite(num) && num > 0 ? num : 0);
+      }, 0);
+      const svg = svgNode("svg", {
+        viewBox: `0 0 ${size} ${size}`,
+        width: "100%",
+        role: "img",
+        "aria-label": region.title,
+      });
+      const colors = ["#2563eb", "#16a34a", "#d97706", "#9333ea", "#0891b2", "#db2777"];
+      if (total <= 0) {
+        svg.appendChild(svgNode("circle", {
+          cx: center, cy: center, r: radius, fill: "none", stroke: "#cbd5e1", "stroke-width": 2,
+        }));
+      } else {
+        let angle = -Math.PI / 2;
+        labels.forEach((label, index) => {
+          const num = Number(values[index]);
+          const share = isFinite(num) && num > 0 ? num / total : 0;
+          const sweep = share * Math.PI * 2;
+          const end = angle + sweep;
+          // 整圆用两段半圆画（单段弧画不出整圆）。
+          const path = sweep >= Math.PI * 2 - 1e-9
+            ? `M ${center} ${center - radius} A ${radius} ${radius} 0 1 1 ${center - 0.01} ${center - radius} Z`
+            : `M ${center} ${center} L ${center + radius * Math.cos(angle)} ${center + radius * Math.sin(angle)} `
+              + `A ${radius} ${radius} 0 ${sweep > Math.PI ? 1 : 0} 1 `
+              + `${center + radius * Math.cos(end)} ${center + radius * Math.sin(end)} Z`;
+          const sector = svgNode("path", {
+            d: path,
+            fill: colors[index % colors.length],
+            stroke: "#fff",
+            "stroke-width": 1,
+          });
+          const title = svgNode("title", {});
+          title.textContent = safeText(label) + ": " + safeText(values[index]) + " " + safeText(data.unit);
+          sector.appendChild(title);
+          svg.appendChild(sector);
+          angle = end;
+        });
+      }
+      box.appendChild(svg);
+      // 分类说明：标签与数值一一对应，模拟数据要标出来。
+      for (let index = 0; index < labels.length; index += 1) {
+        const row = makeBlock(doc, "div", STYLE.chartRow, "template-chart-row");
+        row.appendChild(makeText(doc, "span", STYLE.chartLabel, safeText(labels[index]) || "—"));
+        row.appendChild(makeText(doc, "span", STYLE.chartValue, safeText(values[index]) || "—"));
+        box.appendChild(row);
+      }
+      box.appendChild(makeText(
+        doc,
+        "div",
+        STYLE.sourceNote,
+        data.simulated
+          ? "单位：" + safeText(data.unit) + "，共 " + labels.length + " 个分类（模拟数据）"
+          : "单位：" + safeText(data.unit) + "，共 " + labels.length + " 个分类",
+      ));
+      return box;
+    }
+
     const limit = 12;
     for (let index = 0; index < labels.length && index < limit; index += 1) {
       const row = makeBlock(doc, "div", STYLE.chartRow, "template-chart-row");

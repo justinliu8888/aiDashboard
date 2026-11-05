@@ -1,0 +1,149 @@
+{
+  "outDir": "../.selfcheck/20261104-pie/flow",
+  "waitMs": 1500,
+  "timeout": 60000,
+  "ignore": [
+    "modao.cc",
+    "/health"
+  ],
+  "flows": [
+    {
+      "name": "1104-已接受现场：两张告警饼图扇区 + 分类数值 + 模拟标记 + 旧列表已消失",
+      "url": "http://127.0.0.1:8005/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "restoreSession('sess_night_1104_t01')",
+          "save": "restored"
+        },
+        {
+          "wait": 4000
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); const names = cards.map(c => (c.querySelector('.region-name')?.textContent || '').trim()); return names.includes('告警等级分布') && names.includes('告警区域分布') && !names.includes('告警列表'); })()"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); const names = cards.map(c => (c.querySelector('.region-name')?.textContent || '').trim()); return names.includes('能耗趋势分析') && names.includes('总耗电概览'); })()"
+        },
+        {
+          "eval": "(() => { const pick = (n) => Array.from(document.querySelectorAll('#preview-root [data-region-id]')).find(el => (el.querySelector('.region-name')?.textContent || '').trim() === n); const sectors = (card) => { if (window.echarts && typeof window.echarts.getInstanceByDom === 'function') { for (const d of Array.from(card.querySelectorAll('div')).filter(x => x.querySelector('canvas'))) { const inst = window.echarts.getInstanceByDom(d); const opt = inst && inst.getOption && inst.getOption(); const s = opt && opt.series && opt.series[0]; if (s && String(s.type) === 'pie') return true; } } return Array.from(card.querySelectorAll('svg path')).some(p => /A\\s/.test(p.getAttribute('d') || '')); }; const l = pick('告警等级分布'), a = pick('告警区域分布'); return !!l && !!a && sectors(l) && sectors(a); })()"
+        },
+        {
+          "eval": "(() => { if (!(window.echarts && typeof window.echarts.getInstanceByDom === 'function')) return 'svg-fallback'; const pick = (n) => Array.from(document.querySelectorAll('#preview-root [data-region-id]')).find(el => (el.querySelector('.region-name')?.textContent || '').trim() === n); for (const n of ['告警等级分布','告警区域分布']) { const card = pick(n); for (const d of Array.from(card.querySelectorAll('div')).filter(x => x.querySelector('canvas'))) { const inst = window.echarts.getInstanceByDom(d); const opt = inst && inst.getOption && inst.getOption(); const s = opt && opt.series && opt.series[0]; if (s && String(s.type) === 'pie') return 'echarts-pie'; } } return 'none'; })()",
+          "save": "renderPath"
+        },
+        {
+          "eval": "(() => { if (!(window.echarts && typeof window.echarts.getInstanceByDom === 'function')) return false; const pick = (n) => Array.from(document.querySelectorAll('#preview-root [data-region-id]')).find(el => (el.querySelector('.region-name')?.textContent || '').trim() === n); const dataOf = (card) => { for (const d of Array.from(card.querySelectorAll('div')).filter(x => x.querySelector('canvas'))) { const inst = window.echarts.getInstanceByDom(d); const opt = inst && inst.getOption && inst.getOption(); const s = opt && opt.series && opt.series[0]; if (s && String(s.type) === 'pie') return s.data || []; } return null; }; const l = dataOf(pick('告警等级分布')); const a = dataOf(pick('告警区域分布')); if (!l || !a) return false; const names = (d) => d.map(x => String(x.name)); const values = (d) => d.map(x => Number(x.value)); if (names(l).join(',') !== '严重,重要,一般,提示') return false; if (names(a).join(',') !== '华北机房,华东机房,华南机房,西部机房') return false; if (names(l).length !== values(l).length || names(a).length !== values(a).length) return false; if (values(l).some(v => !Number.isFinite(v) || v <= 0)) return false; if (values(a).some(v => !Number.isFinite(v) || v <= 0)) return false; return true; })()"
+        },
+        {
+          "eval": "(() => { const notes = Array.from(document.querySelectorAll('#preview-root [data-chart-simulated=\"true\"]')); if (notes.length < 2) return false; return notes.every(n => (n.textContent || '').includes('模拟')); })()"
+        },
+        {
+          "eval": "(() => { const notes = Array.from(document.querySelectorAll('#preview-root [data-chart-unit=\"条\"]')); return notes.length >= 2; })()"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); const names = Array.from(new Set(cards.map(c => (c.querySelector('.region-name')?.textContent || '').trim()))); return names.filter(n => n === '告警等级分布' || n === '告警区域分布').length === 2 && names.includes('能耗趋势分析') && names.includes('总耗电概览') && !names.includes('告警列表'); })()"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); return Array.from(new Set(cards.map(c => (c.querySelector('.region-name')?.textContent || '').trim()))).join('|'); })()",
+          "save": "regionNames"
+        },
+        {
+          "eval": "(() => { const pane = document.getElementById('draft-pane'); if (!pane) return false; const cards = Array.from(pane.querySelectorAll('[data-region-id]')).filter(el => el.getBoundingClientRect().height > 0 && el.offsetParent !== null); const card = cards.find(el => (el.querySelector('.region-name')?.textContent || '').trim() === '告警等级分布'); if (!card) return false; pane.scrollTop = pane.scrollTop + card.getBoundingClientRect().top - pane.getBoundingClientRect().top - 24; return pane.scrollTop > 0; })()"
+        },
+        {
+          "wait": 900
+        },
+        {
+          "eval": "(() => { const pane = document.getElementById('draft-pane'); if (!pane) return false; const cards = Array.from(pane.querySelectorAll('[data-region-id]'))   .filter(el => el.getBoundingClientRect().height > 0 && el.offsetParent !== null); const keep = new Set(['告警等级分布', '告警区域分布']); let hidden = 0; for (const el of cards) { const n = (el.querySelector('.region-name')?.textContent || '').trim();   if (!keep.has(n)) { el.style.display = 'none'; hidden += 1; } } return hidden >= 1; })()"
+        },
+        {
+          "wait": 900
+        },
+        {
+          "screenshot": "1104-01-已接受-两张告警饼图"
+        }
+      ]
+    },
+    {
+      "name": "1104-待确认现场：只给文字确认、接受前右侧不变、接受后变两张饼图",
+      "url": "http://127.0.0.1:8005/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "eval": "restoreSession('sess_night_1104_t04ui')",
+          "save": "restored"
+        },
+        {
+          "wait": 4000
+        },
+        {
+          "assertText": "待确认的修改"
+        },
+        {
+          "assertText": "告警等级分布"
+        },
+        {
+          "assertText": "告警区域分布"
+        },
+        {
+          "eval": "!!document.querySelector('#chat-scroll [data-pending-plan]')"
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); const names = cards.map(c => (c.querySelector('.region-name')?.textContent || '').trim()); return names.includes('告警列表') && !names.includes('告警等级分布') && !names.includes('告警区域分布'); })()"
+        },
+        {
+          "eval": "document.getElementById('chat-input').disabled === true"
+        },
+        {
+          "eval": "document.getElementById('btn-send').disabled === true"
+        },
+        {
+          "eval": "(() => { const pane = document.getElementById('draft-pane'); if (!pane) return false; const cards = Array.from(pane.querySelectorAll('[data-region-id]')).filter(el => el.getBoundingClientRect().height > 0 && el.offsetParent !== null); const card = cards.find(el => (el.querySelector('.region-name')?.textContent || '').trim() === '告警列表'); if (!card) return false; pane.scrollTop = pane.scrollTop + card.getBoundingClientRect().top - pane.getBoundingClientRect().top - 24; return pane.scrollTop > 0; })()"
+        },
+        {
+          "wait": 900
+        },
+        {
+          "eval": "(() => { const pane = document.getElementById('draft-pane'); if (!pane) return false; const cards = Array.from(pane.querySelectorAll('[data-region-id]'))   .filter(el => el.getBoundingClientRect().height > 0 && el.offsetParent !== null); const keep = new Set(['告警列表']); let hidden = 0; for (const el of cards) { const n = (el.querySelector('.region-name')?.textContent || '').trim();   if (!keep.has(n)) { el.style.display = 'none'; hidden += 1; } } return hidden >= 1; })()"
+        },
+        {
+          "wait": 900
+        },
+        {
+          "screenshot": "1104-02-待确认-只有文字确认右侧未变"
+        },
+        {
+          "eval": "(() => { const sel = document.querySelector('#chat-scroll [data-pending-plan] select'); if (!sel) return false; const opt = Array.from(sel.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 9000
+        },
+        {
+          "eval": "(() => { const cards = Array.from(document.querySelectorAll('#preview-root [data-region-id]')); const names = cards.map(c => (c.querySelector('.region-name')?.textContent || '').trim()); return names.includes('告警等级分布') && names.includes('告警区域分布') && !names.includes('告警列表'); })()"
+        },
+        {
+          "eval": "(() => { const pick = (n) => Array.from(document.querySelectorAll('#preview-root [data-region-id]')).find(el => (el.querySelector('.region-name')?.textContent || '').trim() === n); const sectors = (card) => { if (window.echarts && typeof window.echarts.getInstanceByDom === 'function') { for (const d of Array.from(card.querySelectorAll('div')).filter(x => x.querySelector('canvas'))) { const inst = window.echarts.getInstanceByDom(d); const opt = inst && inst.getOption && inst.getOption(); const s = opt && opt.series && opt.series[0]; if (s && String(s.type) === 'pie') return true; } } return Array.from(card.querySelectorAll('svg path')).some(p => /A\\s/.test(p.getAttribute('d') || '')); }; const l = pick('告警等级分布'), a = pick('告警区域分布'); return !!l && !!a && sectors(l) && sectors(a); })()"
+        },
+        {
+          "eval": "document.querySelectorAll('#preview-root [data-chart-simulated=\"true\"]').length >= 2"
+        },
+        {
+          "eval": "(() => { const pane = document.getElementById('draft-pane'); if (!pane) return false; const cards = Array.from(pane.querySelectorAll('[data-region-id]')).filter(el => el.getBoundingClientRect().height > 0 && el.offsetParent !== null); const card = cards.find(el => (el.querySelector('.region-name')?.textContent || '').trim() === '告警等级分布'); if (!card) return false; pane.scrollTop = pane.scrollTop + card.getBoundingClientRect().top - pane.getBoundingClientRect().top - 24; return pane.scrollTop > 0; })()"
+        },
+        {
+          "wait": 900
+        },
+        {
+          "eval": "(() => { const pane = document.getElementById('draft-pane'); if (!pane) return false; const cards = Array.from(pane.querySelectorAll('[data-region-id]'))   .filter(el => el.getBoundingClientRect().height > 0 && el.offsetParent !== null); const keep = new Set(['告警等级分布', '告警区域分布']); let hidden = 0; for (const el of cards) { const n = (el.querySelector('.region-name')?.textContent || '').trim();   if (!keep.has(n)) { el.style.display = 'none'; hidden += 1; } } return hidden >= 1; })()"
+        },
+        {
+          "wait": 900
+        },
+        {
+          "screenshot": "1104-03-接受后-两张告警饼图"
+        }
+      ]
+    }
+  ]
+}

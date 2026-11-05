@@ -66,6 +66,9 @@ EDIT_STATE_KEYS = (
     CLARIFICATION_COUNT_KEY,
     CLARIFICATION_KEY_KEY,
     CLARIFICATION_QUESTION_KEY,
+    #: 修改事项（同一件事跨轮的现场：原要求、操作清单、候选状态）。
+    #: 不带回去的话，一轮对话就把上一轮攒下的操作清单冲掉了。
+    "editItem",
 )
 
 #: 会话快照里的「最近一次**已应用**的卡片级修改所在卡片」。

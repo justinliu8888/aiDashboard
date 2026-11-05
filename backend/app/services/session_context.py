@@ -24,6 +24,15 @@ def bind_session_key(request: AgentRequest) -> str:
     return key
 
 
+def set_session_key(key: str | None) -> str | None:
+    """直接绑定一个**已解析好的**会话 key。
+
+    内部服务与测试用：会话 key 已经算出来了，不需要再走一遍请求对象。
+    """
+    _session_key.set(key or None)
+    return key
+
+
 def current_session_key() -> str | None:
     return _session_key.get()
 

@@ -232,6 +232,14 @@ class AgentScopeReportAgent:
         settings = self._settings
         if state == AgentState.USER_EDITING_TEMPLATE:
             max_iters = settings.react_max_iters_edit
+            # 能力格式（动态操作清单 + 整批试做 + 同一轮修正）需要**更多**轮次：
+            # 读草稿 → 查维度 → 提交（试做失败）→ 改正后再提交。
+            #
+            # 预算仍然是**有上限的**：只是把上限从「够单步计划」放宽到
+            # 「够一条操作清单 + 一次修正」。用完仍未通过就安全结束，
+            # 原草稿不变。
+            if self._capability_budget_active():
+                max_iters = settings.react_max_iters_edit_capability
         elif state == AgentState.VALIDATION_FAILED:
             max_iters = settings.react_max_iters_fix
         else:
@@ -241,6 +249,23 @@ class AgentScopeReportAgent:
             max_iters=max_iters,
             structured_output_grace_iters=settings.react_structured_output_grace_iters,
         )
+
+    @staticmethod
+    def _capability_budget_active() -> bool:
+        """这一轮要不要用**能力格式**的预算。
+
+        判据：会话里**已经有修改事项**（上一轮攒下的操作清单），或者
+        这条消息明显是在做「多区块 / 组合」的修改（删一块、加两块那种）。
+        判不准就按普通预算走 —— 能力格式本身是**可选**的出口。
+        """
+        try:
+            from app.services.edit_item_service import load_edit_item
+
+            if load_edit_item() is not None:
+                return True
+        except Exception:  # noqa: BLE001 — 判不准就按普通预算走
+            return False
+        return False
 
     # ---------- 入口 ----------
 
@@ -1041,6 +1066,75 @@ class AgentScopeReportAgent:
             },
         )
 
+    def _assemble_capability_candidate(
+        self, request: AgentRequest, plan: Any
+    ) -> AgentResponse:
+        """能力格式计划的候选。
+
+        这条路上的计划**已经整批试做通过**了（试做在 ``submit_edit_plan``
+        工具里做，失败就不写提交槽）。所以这里不再重复试做，只把
+        **试做核验出来的事实**变成一份待确认候选：
+
+        * 确认文字**只依据实际差异**（``editFacts``），不抄模型「打算做什么」；
+        * 摘要、图表类型、分类口径、位置说明都来自事实；
+        * 接受前**不渲染任何候选图表**（只有文字确认）。
+        """
+        from app.services.edit_trial_service import summarize_facts
+
+        facts = dict(plan.editFacts or {})
+        summary = str(facts.get("summary") or "").strip()
+        if not summary:
+            summary = summarize_facts(facts) if facts else str(plan.summary or "")
+        summary = sanitize_internal_ids(summary)
+        definition = request.snapshots.reportDefinition
+        revision = (
+            int((definition.metadata or {}).get("revision") or 0)
+            if definition is not None
+            else int(facts.get("baseRevision") or 0)
+        )
+        primary = str(facts.get("primaryTargetRegionId") or plan.target.regionId or "")
+        operation_steps = [step.model_dump(mode="json") for step in plan.operations]
+        candidate = {
+            "planId": f"plan_{uuid.uuid4().hex}",
+            "draftRevision": revision,
+            "targetRegionId": primary,
+            "operations": operation_steps,
+            "summary": summary,
+            "editPlan": plan.model_dump(mode="json"),
+            "editFacts": facts,
+            #: 这份候选**已经过整批试做**：接受时直接整批生效，不再重新规划。
+            "checked": True,
+        }
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=f"待确认的修改：\n{summary}\n接受后才会修改草稿。",
+            designSessionId=request.context.designSessionId,
+            domainObjects=self._edit_domain_objects(request),
+            questions=[AgentQuestion(
+                id="pending_edit_plan_confirm",
+                prompt="确认这次修改：",
+                expects="SINGLE_CHOICE",
+                selectionOnly=True,
+                # 「其他」：用户在**这张卡片里**写的自由文本 = 对当前修改
+                # 事项的**纠正 / 补充**（比如「两张都使用饼图」），不是另一条
+                # 无关消息 —— 服务端会把它关联回当前事项并重建候选。
+                allowsOther=True,
+                otherLabel="其他",
+                otherPlaceholder="也可以直接在这里写要怎么改",
+                options=[
+                    QuestionOption(value=value, label=value)
+                    for value in ("接受修改", "继续调整", "取消")
+                ],
+            )],
+            uiActions=["pending_edit_plan"],
+            debug={
+                "pendingEditPlan": candidate,
+                "editPlanSource": "react_capability",
+                "editOutcome": "candidate",
+            },
+        )
+
     def _assemble_edit_response(
         self, request: AgentRequest, payload: dict[str, Any]
     ) -> AgentResponse:
@@ -1052,6 +1146,9 @@ class AgentScopeReportAgent:
             plan = EditPlanPayload.model_validate(payload)
         except Exception:
             return self._unavailable_edit_response(request)
+        # 能力格式：已经整批试做通过，直接按**实际差异**组候选。
+        if getattr(plan, "is_capability_plan", False):
+            return self._assemble_capability_candidate(request, plan)
         definition = request.snapshots.reportDefinition
         intent = plan.intent.value
         region_id = plan.target.regionId

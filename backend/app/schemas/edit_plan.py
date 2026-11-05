@@ -289,15 +289,74 @@ class EditOperation(BaseModel):
     themeOperations: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class EditOperationTarget(BaseModel):
+    """一步操作的**目标**。
+
+    两种写法，指向的都是**这一次修改现场**里的区块：
+
+    - ``regionId``：权威草稿里**已有**的区块；
+    - ``ref``：本次修改里**新建**的区块的稳定引用名（ADD_SECTION 时给出，
+      后续步骤用它指这一块）。
+
+    不按标题猜目标：解析不出来就是错。
+    """
+
+    regionId: str = ""
+    ref: str = ""
+
+    @field_validator("regionId", "ref", mode="before")
+    @classmethod
+    def _text(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+
+class EditOperationSpec(BaseModel):
+    """能力格式的操作项：``op`` + ``target`` + ``params``。
+
+    与旧的 :class:`EditOperationStep`（intent + operation）**并存**：
+    旧格式走既有编辑引擎的组合执行，新格式走能力目录的隔离试做。
+    ``op`` 非空即视为新格式。
+    """
+
+    op: str = ""
+    target: EditOperationTarget = Field(default_factory=EditOperationTarget)
+    params: dict[str, Any] = Field(default_factory=dict)
+    summary: str = ""
+
+    @field_validator("op", mode="before")
+    @classmethod
+    def _op_text(cls, value: Any) -> str:
+        return str(value or "").strip().upper()
+
+
 class EditOperationStep(BaseModel):
     """组合修改中的一步：一次原子修改里的一个确定性动作。
 
     单项编辑不需要它；只有「换源 + 改粒度」这类组合计划才用到。
+
+    两种形态：
+
+    - **旧形态**（``intent`` + ``operation``）：既有编辑引擎的组合步骤，
+      所有步骤共用**同一个**顶层 target。
+    - **新形态**（``op`` + ``target`` + ``params``）：能力目录的操作项，
+      **每一步有自己的目标**（既有区块或本次新建的稳定引用）。
     """
 
-    intent: EditIntent
+    intent: EditIntent = EditIntent.UNKNOWN
     operation: EditOperation = Field(default_factory=EditOperation)
     summary: str = ""
+    #: 新形态：能力 id（ADD_SECTION / DELETE_SECTION / SET_DISPLAY …）。
+    op: str = ""
+    #: 新形态：这一步自己的目标。
+    target: EditOperationTarget = Field(default_factory=EditOperationTarget)
+    #: 新形态：这一步的参数（按能力契约校验）。
+    params: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("op", mode="before")
+    @classmethod
+    def _op_text(cls, value: Any) -> str:
+        return str(value or "").strip().upper()
+
 
 
 class EditPlan(BaseModel):
@@ -322,5 +381,27 @@ class EditPlan(BaseModel):
     #: 直接拒绝，旧生效组合原样保留（契约表 §4.2）。
     baseCombination: dict[str, Any] | None = None
 
+    #: **试做核验出来的事实**（能力格式计划专用）。
+    #:
+    #: 只有整批试做通过才会写进来：实际新增 / 删除 / 修改了哪些区块、"
+    #: 每个区块的图表类型与分类、引用表、以及位置是否真的换到了原位。
+    #: 文字确认**只依据这份事实**生成，不抄模型「打算做什么」。
+    editFacts: dict[str, Any] | None = None
+
+    #: 用户**最初**那句要求（这一件事的原话）。
+    #:
+    #: 后续那句「两张都使用饼图」是**同一件事**的补充，不是新任务 ——
+    #: 服务端靠这句话把补充关联回同一件事。
+    originalRequest: str = ""
+
     # 面向用户的修改摘要；确认菜单直接展示这句话。
     summary: str = ""
+
+    @property
+    def is_capability_plan(self) -> bool:
+        """这份计划是不是**能力格式**（每一步有自己的目标）。
+
+        能力格式 = 任意一步带 ``op``。能力格式走隔离试做 + 能力目录执行；
+        旧格式走既有编辑引擎的组合执行。
+        """
+        return any(str(step.op or "").strip() for step in self.operations)

@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -1130,6 +1131,17 @@ class AgentService:
                 and not routing_rules.is_readonly_question(request.message)
                 and question.id == EDIT_CHOICE_ID
             ):
+                # **同一修改事项**的补充 / 纠正（能力格式的已检查候选）。
+                #
+                # 「两张都使用饼图」「第二张换成柱状图」说的是**前面那件事**，
+                # 不是另起一件事，更不是回到旧列表改标题。
+                #
+                # 服务端把当前操作清单与这句话一起交给**同一个** ReAct Agent，
+                # 让它在清单上改，再整批试做：新候选顶上来，旧候选立即失效。
+                if self._pending_capability_item(session_key):
+                    return await self._continue_capability_item(
+                        request, session_key, request.message,
+                    )
                 corrected_plan = self._resolve_pending_edit_correction(
                     request, session_key, request.message,
                 )
@@ -2135,6 +2147,9 @@ class AgentService:
                 })
                 draft = request.snapshots.reportDefinition
                 plan = EditPlan.model_validate(raw["editPlan"])
+                # 能力格式的计划：intent 是 UNKNOWN（它不是某一种旧意图），
+                # 目标由「这一件事的主目标」给出 —— 按能力格式的口径校验。
+                capability_plan = getattr(plan, "is_capability_plan", False)
                 record = session_service.repository.get_session(session_key)
                 stored = (record.snapshot or {}).get("definition") if record else None
                 if (
@@ -2148,7 +2163,7 @@ class AgentService:
                     )
                     or candidate.targetRegionId != plan.target.regionId
                     or plan.needsClarification
-                    or plan.intent == EditIntent.UNKNOWN
+                    or (plan.intent == EditIntent.UNKNOWN and not capability_plan)
                 ):
                     raise ValueError("候选计划与当前草稿不一致")
                 reference_text = request.collectedInfo.get("pendingEditRequest") or request.message
@@ -2184,9 +2199,20 @@ class AgentService:
                 # 用户还能在同一张专用输入里补充（普通聊天继续锁着）。
                 self._attach_edit_step(session_key, notice)
                 return notice
-            active = session_service.save_pending_plan_if_absent(
-                session_key, candidate
+            # **纠正 / 补充**同一件事：旧候选**立即失效**，新候选顶上来。
+            #
+            # 这里用「保存并替换」而不是「保留首份」：纠正后的候选是
+            # 这一件事的**新**结论，旧 planId 不再存在 → 旧候选不可再接受
+            # （接受时按 planId 比对，对不上直接拒绝）。
+            is_continuation = bool(
+                request.collectedInfo.get("editItemContinuation")
             )
+            if is_continuation:
+                active = session_service.save_pending_plan(session_key, candidate)
+            else:
+                active = session_service.save_pending_plan_if_absent(
+                    session_key, candidate
+                )
             if active.planId != candidate.planId:
                 response.reply = "上一份修改计划仍待确认，请先处理该计划。"
                 response.debug["editingTargetRegionId"] = active.targetRegionId or None
@@ -2195,6 +2221,7 @@ class AgentService:
             # 换一件事（额度键变了）才由 record_clarification 自然重开。
             request.collectedInfo.pop("pendingEditRequest", None)
             request.collectedInfo.pop("pendingEditTimeAnchor", None)
+            request.collectedInfo.pop("editItemContinuation", None)
             response.domainObjects.pendingEditPlan = PendingEditPlan(
                 planId=active.planId,
                 draftRevision=active.draftRevision,
@@ -2381,6 +2408,139 @@ class AgentService:
             plan, correction, definition=definition, scope=scope,
         )
 
+    def _pending_capability_item(self, session_key: str) -> bool:
+        """当前待确认的是不是**能力格式**的候选。
+
+        是 → 用户那句自由文本按「同一事项的补充 / 纠正」处理；
+        不是 → 照旧走既有的纠正通路（``correct_plan``）。
+        """
+        from app.services.edit_item_service import is_capability_item, load_edit_item
+
+        pending = session_service.load_pending_plan(session_key)
+        if pending is None:
+            return False
+        raw = (pending.model_extra or {}).get("editPlan")
+        if not isinstance(raw, dict):
+            return False
+        try:
+            plan = EditPlan.model_validate(raw)
+        except (TypeError, ValueError):
+            return False
+        if not getattr(plan, "is_capability_plan", False):
+            return False
+        return is_capability_item(load_edit_item(session_key))
+
+    def _apply_capability_candidate(
+        self, plan: EditPlan, definition: ReportDefinitionDraft, scope: Any,
+    ) -> EditResult:
+        """整批执行**服务端保存的已检查操作清单**（能力格式）。
+
+        不重新让模型规划：执行的就是用户看到并确认的那份清单。
+        整批成功才生效；任一步失败 → 整批不生效，原草稿原样。
+        """
+        from app.services.edit_item_service import load_preview_context
+        from app.services.edit_trial_service import run_trial, summarize_facts
+        from app.services.template_edit_engine import EditResult
+
+        operations = [
+            {
+                "op": step.op,
+                "target": step.target.model_dump(mode="json"),
+                "params": dict(step.params or {}),
+                "summary": step.summary,
+            }
+            for step in plan.operations
+            if str(step.op or "").strip()
+        ]
+        trial = run_trial(
+            definition=definition,
+            operations=operations,
+            scope=scope,
+            preview_context=load_preview_context(definition),
+        )
+        if not trial.ok:
+            return EditResult(
+                plan=plan,
+                draftBeforeEdit=definition,
+                draftAfterEdit=definition,
+                needsClarification=True,
+                clarificationQuestion=(
+                    trial.error_message + "\n本次没有修改草稿，原草稿保持不变。"
+                ),
+                reply="修改没有生效，原草稿保持不变。",
+                debug={
+                    "reason": "capability_trial_failed",
+                    "errors": trial.errors,
+                },
+            )
+        facts = trial.facts
+        return EditResult(
+            plan=plan,
+            draftBeforeEdit=definition,
+            draftAfterEdit=trial.definition,
+            changeSet=trial.change_set,
+            reply=f"已按你的确认生效。\n{summarize_facts(facts)}",
+            editingTargetRegionId=plan.target.regionId or None,
+            debug={"editFacts": facts, "reason": "capability_applied"},
+        )
+
+    async def _continue_capability_item(
+        self, request: AgentRequest, session_key: str, message: str,
+    ) -> AgentResponse:
+        """**同一修改事项**的补充 / 纠正（例如「两张都使用饼图」）。
+
+        走同一个 ReAct Agent：把当前操作清单与这句话一起交给模型，
+        让它在**这份清单**上改，再整批试做。通过 → 新候选顶上来，
+        **旧候选立即失效**；不通过 → 留在同一张卡片里继续追问，
+        原草稿与旧候选都不变。
+        """
+        from app.services.edit_item_service import load_edit_item
+
+        item = load_edit_item(session_key)
+        if item is None:
+            return self._edit_notice(
+                request, "这份修改的现场已经不在了，请重新提出修改。",
+                code="EDIT_ITEM_MISSING",
+            )
+        operations = item.get("operations") or []
+        original = str(item.get("originalRequest") or "")
+        context_lines = [
+            "【当前修改事项】这是**同一件事**的补充或纠正，请在下面这份操作清单上改，"
+            "不要另起一件事，也不要回到旧目标重新解释。",
+            f"原始要求：{original}",
+            "当前操作清单（JSON）：",
+            json.dumps(operations, ensure_ascii=False),
+            "已建新区块的引用（ref → 区块 id）：",
+            json.dumps(item.get("refs") or {}, ensure_ascii=False),
+            f"用户这次的补充 / 纠正：{message}",
+            "请把修改后的**完整**操作清单用 submit_edit_plan 提交（operations）；"
+            "服务端会先整批试做，通过才会更新候选。",
+        ]
+        continuation_request = request.model_copy(deep=True)
+        continuation_request.message = "\n".join(context_lines)
+        continuation_request.collectedInfo = dict(request.collectedInfo or {})
+        # 参考锚点仍然是**用户最初点名的那块**（不是这句补充里的措辞）。
+        if original:
+            continuation_request.collectedInfo["pendingEditRequest"] = original
+        continuation_request.collectedInfo["editItemContinuation"] = True
+        handler = getattr(self._agent, "ahandle", None)
+        if handler is not None:
+            response = await handler(continuation_request)
+        else:
+            response = self._agent.handle(continuation_request)
+        if (response.debug or {}).get("pendingEditPlan") is None:
+            # 这一轮没能形成新候选：旧候选**照旧留着**（不吞掉），
+            # 用户可以在同一张卡片里继续补充。
+            return self._edit_notice(
+                request,
+                "这次补充没能形成可执行的修改；原来的待确认修改仍在，"
+                "草稿没有变化。请说得再具体一点（比如「两张都用饼图」）。",
+                questions=[self._pending_edit_question()],
+                ui_actions=["pending_edit_plan"],
+            )
+        # 落库候选（新候选顶上来，旧候选 planId 不再存在 → 旧候选不可接受）。
+        return self._finalize_template_edit(continuation_request, response)
+
     def _handle_pending_edit_choice(
         self, request: AgentRequest, session_key: str, *,
         correction: str = "", corrected_plan: EditPlan | None = None,
@@ -2552,9 +2712,15 @@ class AgentService:
                 plan.needsClarification = False
                 plan.clarificationQuestion = ""
         try:
-            result = template_edit_engine.apply(
-                plan=plan, definition=definition, scope=scope
-            )
+            if getattr(plan, "is_capability_plan", False):
+                # 能力格式：执行**服务端保存的已检查操作清单**，
+                # 不重新让模型规划（预执行不保证后续提交绝不会失败，
+                # 所以这里照样整批执行 + 校验，失败就整批不生效）。
+                result = self._apply_capability_candidate(plan, definition, scope)
+            else:
+                result = template_edit_engine.apply(
+                    plan=plan, definition=definition, scope=scope
+                )
         except Exception as exc:  # noqa: BLE001
             # 异常原文不进日志（#61）：留栈不留原文。
             logger.exception(

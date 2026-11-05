@@ -5892,6 +5892,104 @@ const CHART_SERIES_COLORS = ["#2563eb", "#16a34a", "#d97706", "#9333ea", "#0891b
  *     （需求稿 §3.3 保护的那段代码），照样把曲线 / 柱条画出来。
  * 两条都不通 → 把点列出来，数据仍然可见，不留空壳。
  */
+// 饼图渲染：**扇区**，不是折线也不是柱条。
+//
+// 两条渲染后端，同一套数据：
+//   - ECharts 可用 → 真饼图（type:"pie"，每个分类一个扇区，标签带分类名与数值）；
+//   - ECharts 不可用 → SVG 兜底**也画扇区**（<path> 的圆弧），不是横条。
+//
+// 数值是**模拟**时，图下要标出来（载荷里的 simulated 标记）。
+function renderPiePayload(container, region, p, labels, values, axisLabel, unit) {
+  const simulated = p.simulated === true;
+  const name = String(p.metrics?.[0]?.label || p.categoryLabel || region.name || "数值");
+
+  if (hasEcharts()) {
+    const div = document.createElement("div");
+    div.style.height = "260px";
+    container.appendChild(div);
+    try {
+      const chart = window.echarts.init(div);
+      _chartInstances.push(chart);
+      const data = labels.map((label, index) => ({
+        name: String(label),
+        value: Number(values[index] ?? 0),
+      }));
+      chart.setOption({
+        tooltip: {
+          trigger: "item",
+          formatter: (params) => {
+            const value = params && params.value != null ? params.value : 0;
+            const suffix = unit ? ` ${unit}` : "";
+            return `${params.name}<br/>${value}${suffix}`;
+          },
+        },
+        // 饼图没有坐标轴 —— 不给 xAxis / yAxis，分类就是扇区。
+        series: [
+          {
+            name,
+            type: "pie",
+            radius: ["38%", "68%"],
+            center: ["50%", "52%"],
+            avoidLabelOverlap: true,
+            itemStyle: { borderColor: "#fff", borderWidth: 2 },
+            label: {
+              formatter: (params) => `${params.name}\n${params.value}${unit ? " " + unit : ""}`,
+              fontSize: 11,
+              color: axisLabel.color,
+            },
+            labelLine: { show: true },
+            data,
+          },
+        ],
+      });
+      appendChartNote(container, p, unit, labels.length, simulated);
+      return;
+    } catch (err) {
+      console.error("[AI Report] 饼图初始化失败", err);
+      container.innerHTML = "";
+    }
+  }
+
+  // ECharts 不可用：SVG 兜底**也画扇区**（不是横条）。
+  const api = window.WorkbenchPlan;
+  if (api && typeof api.renderChart === "function") {
+    try {
+      const node = api.renderChart(document, {
+        componentType: "pie_chart",
+        title: region.name || "",
+        data: { xLabels: labels, yValues: values, unit, simulated },
+      });
+      container.appendChild(node);
+      appendChartNote(container, p, unit, labels.length, simulated);
+      return;
+    } catch (err) {
+      console.error("[AI Report] 饼图渲染失败", err);
+    }
+  }
+
+  // 兜底：至少把点列出来，数据不丢。
+  container.innerHTML = `
+    <div class="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+      <div class="text-[11px] text-slate-500 mb-1">${esc(unit || "数值")}</div>
+      ${labels.map((label, index) => `<div class="text-xs text-slate-700 mono">${esc(label)}: ${esc(values[index] ?? "")}</div>`).join("")}
+    </div>`;
+}
+
+// 图下的说明行：单位 + 数据点个数 + **模拟标记**。
+// 两条渲染后端产出**同一种**可断言标记（data-chart-unit / data-chart-simulated）。
+function appendChartNote(container, p, unit, count, simulated) {
+  const note = document.createElement("div");
+  note.className = "text-[11px] text-slate-400 mt-1";
+  if (unit) note.dataset.chartUnit = unit;
+  if (simulated) {
+    note.dataset.chartSimulated = "true";
+    note.textContent = `单位：${unit || "数值"}，共 ${count} 个分类（模拟数据）`;
+  } else {
+    note.textContent = `单位：${unit || "数值"}，共 ${count} 个分类`;
+  }
+  container.appendChild(note);
+}
+
 function renderChartPayload(container, region, p, unit) {
   const kind = String(p.chartKind || "LINE").toUpperCase();
   // 横轴标签：优先用服务端按权威格式算好的 displayXLabels
@@ -5913,6 +6011,16 @@ function renderChartPayload(container, region, p, unit) {
 
   if (!labels.length || (!values.length && !(series && series[0]?.yValues?.length))) {
     container.innerHTML = `<div class="rounded-lg bg-slate-50 border border-slate-200 px-4 py-3 text-xs text-slate-500">这个图表还没有数据点。</div>`;
+    return;
+  }
+
+  // 饼图：**真的画扇区**。
+  //
+  // 以前 PIE 落到 ``kind === "BAR" ? "bar" : "line"`` 的 else 分支 ——
+  // 卡片标题写着「饼图」，画出来却是折线。饼图有自己的一套 option
+  // （没有坐标轴，分类是扇区，标签跟着扇区走）。
+  if (kind === "PIE") {
+    renderPiePayload(container, region, p, labels, values, axisLabel, unit);
     return;
   }
 
@@ -5985,7 +6093,13 @@ function renderChartPayload(container, region, p, unit) {
       const node = api.renderChart(document, {
         componentType: CHART_KIND_TO_COMPONENT_TYPE[kind] || "line_chart",
         title: region.name || "",
-        data: { xLabels: labels, yValues: values, unit },
+        data: {
+          xLabels: labels,
+          yValues: values,
+          unit,
+          // 模拟标记透传：SVG 兜底也要能标出「这是模拟数据」。
+          simulated: p.simulated === true,
+        },
       });
       container.appendChild(node);
       // 折线渲染器自带「单位：…」说明；柱条那条没有 —— 这里补上，

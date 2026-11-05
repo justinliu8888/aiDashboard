@@ -140,6 +140,13 @@ class Settings:
     # ReAct 预算：AgentScope 默认 max_iters=50，报表场景用不了那么多步
     react_max_iters: int = int(os.getenv("REACT_MAX_ITERS", "6"))
     react_max_iters_edit: int = int(os.getenv("REACT_MAX_ITERS_EDIT", "4"))
+    #: 能力格式（动态操作清单 + 整批试做 + 同一轮修正）的预算。
+    #:
+    #: 这条路要够：读草稿 → 查维度 → 提交（试做失败）→ 改正后再提交。
+    #: 仍然**有上限**：用完仍未通过就安全结束，原草稿不变。
+    react_max_iters_edit_capability: int = int(
+        os.getenv("REACT_MAX_ITERS_EDIT_CAPABILITY", "8")
+    )
     react_max_iters_fix: int = int(os.getenv("REACT_MAX_ITERS_FIX", "5"))
     react_structured_output_grace_iters: int = int(
         os.getenv("REACT_STRUCTURED_OUTPUT_GRACE_ITERS", "2")

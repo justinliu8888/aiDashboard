@@ -31,6 +31,7 @@ from app.tools import (
     get_current_session_status_tool,
     get_recorded_progress_tool,
     get_validation_result_tool,
+    list_simulated_dimensions_tool,
     search_catalog_tool,
     search_metric_tool,
     submit_edit_answer_tool,
@@ -68,6 +69,8 @@ _TOOLS: list[Any] = [
     # 只读查询的领域事实工具（工单 #15 已记录进度 / #16 实际产品能力）
     get_recorded_progress_tool,
     check_product_capability_tool,
+    list_simulated_dimensions_tool,
+    # 编辑能力：把操作清单写进服务端现场（不终结本轮）
     # 确定性组装
     build_definition_draft_tool,
     # 终结工具

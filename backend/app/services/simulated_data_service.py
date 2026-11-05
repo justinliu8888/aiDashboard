@@ -2019,7 +2019,57 @@ def _chart_payload(
                 }
             )
         payload["series"] = series
+    # **分类统计口径**（饼图 / 分类图）：区块上挂了分类绑定就按它出数。
+    #
+    # 这一支的横轴是**分类**（告警等级、告警区域…），不是时间，也不是设备 ——
+    # 分类标签与数值一一对应，并标注「模拟」。
+    categorical = _categorical_binding(region)
+    if categorical:
+        categories = [
+            item
+            for item in (categorical.get("categories") or [])
+            if isinstance(item, dict)
+        ]
+        labels = [str(item.get("label") or "") for item in categories]
+        values = [item.get("value") for item in categories]
+        payload.update(
+            {
+                "chartKind": str(component.get("chartKind") or "PIE"),
+                "grain": categorical.get("grain") or grain,
+                "xField": str(categorical.get("categoryField") or x_field),
+                "yField": str(categorical.get("valueField") or y_field),
+                "unit": str(categorical.get("unit") or unit or ""),
+                "xLabels": labels,
+                "yValues": values,
+                "points": [
+                    {
+                        str(categorical.get("categoryField") or "category"): label,
+                        str(categorical.get("valueField") or "count"): value,
+                    }
+                    for label, value in zip(labels, values)
+                ],
+                "simulated": True,
+                "categoryLabel": str(categorical.get("categoryLabel") or ""),
+                "statistic": str(categorical.get("statistic") or ""),
+                "dataSource": "simulated",
+            }
+        )
+        payload.pop("series", None)
     return payload
+
+
+def _categorical_binding(region: dict[str, Any]) -> dict[str, Any] | None:
+    """区块上的**分类统计口径**绑定（``previewSpec.categoricalBinding``）。
+
+    绑定是「分类 + 计数」的权威来源：标签与数值一一对应，
+    数值是**模拟**的（``simulated`` 标记随载荷带出去）。
+    """
+    binding = region.get("templateBinding") or {}
+    spec = binding.get("previewSpec") if isinstance(binding, dict) else None
+    if not isinstance(spec, dict):
+        return None
+    categorical = spec.get("categoricalBinding")
+    return categorical if isinstance(categorical, dict) else None
 
 
 def _window_hours(buckets: list[_Bucket]) -> float:
