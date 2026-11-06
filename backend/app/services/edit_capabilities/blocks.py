@@ -26,6 +26,7 @@ from app.services.edit_capabilities.chart_data import (
     DEFAULT_CATEGORY_FIELD,
     DEFAULT_VALUE_FIELD,
     PREVIEW_SPEC_KEY,
+    SIMULATED_DIMENSIONS,
     SIMULATED_KEY,
     normalize_categories,
     resolve_dimension,
@@ -39,6 +40,15 @@ CHART_KIND_LABELS = {
     "LINE": "折线图",
     "AREA": "面积图",
 }
+
+#: 图表类型 / 组件类型的取值域 —— 能力总目录与错误反馈都读这一份。
+#:
+#: 写在这里（参数的**真实定义**里）而不是目录里另抄一份：
+#: 改了这一份，取值域说明自动跟着变。
+_CHART_KIND_VALUES = sorted(SUPPORTED_CHART_KINDS)
+_COMPONENT_TYPE_VALUES = sorted(SUPPORTED_COMPONENT_TYPES)
+#: 模拟分类维度的 key 目录（别名也能用，见 ``resolve_dimension``）。
+_DIMENSION_VALUES = sorted(SIMULATED_DIMENSIONS)
 
 
 def _chart_kind_label(chart_kind: Any) -> str:
@@ -78,10 +88,22 @@ class AddSectionParams(BaseModel):
     """
 
     title: str = Field(min_length=1)
-    componentType: str = "CHART"
-    chartKind: str = ""
+    componentType: str = Field(
+        default="CHART",
+        description="组件类型（TEXT / METRIC_CARD / TABLE / CHART）",
+        json_schema_extra={"x-allowedValues": _COMPONENT_TYPE_VALUES},
+    )
+    chartKind: str = Field(
+        default="",
+        description="图表类型（componentType=CHART 时必填）",
+        json_schema_extra={"x-allowedValues": _CHART_KIND_VALUES},
+    )
     role: str = "DETAIL"
-    dimension: str = ""
+    dimension: str = Field(
+        default="",
+        description="模拟分类维度（key 或业务别名）",
+        json_schema_extra={"x-allowedValues": _DIMENSION_VALUES},
+    )
     categories: list[CategoryItem] = Field(default_factory=list)
     unit: str = ""
     replaceRegionId: str = ""
@@ -117,8 +139,16 @@ class DeleteSectionParams(BaseModel):
 class SetDisplayParams(BaseModel):
     """改展示类型。"""
 
-    componentType: str = ""
-    chartKind: str = ""
+    componentType: str = Field(
+        default="",
+        description="组件类型（TEXT / METRIC_CARD / TABLE / CHART）",
+        json_schema_extra={"x-allowedValues": _COMPONENT_TYPE_VALUES},
+    )
+    chartKind: str = Field(
+        default="",
+        description="图表类型（componentType=CHART 时必填）",
+        json_schema_extra={"x-allowedValues": _CHART_KIND_VALUES},
+    )
 
     @field_validator("componentType", mode="before")
     @classmethod
@@ -134,7 +164,11 @@ class SetDisplayParams(BaseModel):
 class SetCategoryDataParams(BaseModel):
     """设置分类统计口径。"""
 
-    dimension: str = ""
+    dimension: str = Field(
+        default="",
+        description="模拟分类维度（key 或业务别名）",
+        json_schema_extra={"x-allowedValues": _DIMENSION_VALUES},
+    )
     categories: list[CategoryItem] = Field(default_factory=list)
     unit: str = ""
 
@@ -150,9 +184,22 @@ class SetPresentationParams(BaseModel):
     复用既有展示服务：``{"op": "<操作名>", "params": {...}}``。
     校验与执行都走**同一份实现**（``report_presentation_service``），
     不在这里另写一套。
+
+    ``operations`` 是**非空列表**：每一项形如
+    ``{"op": "<展示操作名>", "params": {...}}``。``op`` 只能取展示服务的
+    白名单（能力总目录里逐条列出）—— **它不是顶层能力**，只能放在
+    ``SET_PRESENTATION`` 的这个列表里，不能直接出现在
+    ``submit_edit_plan.operations`` 的顶层。
     """
 
-    operations: list[dict[str, Any]] = Field(default_factory=list)
+    operations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        min_length=1,
+        description=(
+            "外观修改包里的操作名单：非空列表，"
+            '每一项形如 {"op": "<展示操作名>", "params": {...}}'
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -485,6 +532,15 @@ def _add_section(
             "unit": str((dimension or {}).get("unit") or params.unit or "条"),
             "dimension": (dimension or {}).get("key", ""),
             "position": insert_at,
+            **_business_facts(
+                message=f"新增区块「{params.title}」（{_chart_kind_label(chart_kind)}）。",
+                detail={
+                    "regionId": region_id,
+                    "ref": params.ref,
+                    "title": params.title,
+                    "chartKind": chart_kind,
+                },
+            ),
         },
     )
 
@@ -512,7 +568,14 @@ def _delete_section(
         message=f"删除区块「{title}」。",
         region_id=region_id,
         title=title,
-        detail={"regionId": region_id, "title": title},
+        detail={
+            "regionId": region_id,
+            "title": title,
+            **_business_facts(
+                message=f"删除区块「{title}」。",
+                detail={"regionId": region_id, "title": title},
+            ),
+        },
     )
 
 
@@ -598,6 +661,24 @@ def _set_display(
             "beforeChartKind": before_kind,
             "componentType": component_type,
             "chartKind": chart_kind,
+            **_business_facts(
+                message=(
+                    f"「{str(region.get('name') or region_id)}」的展示方式改为"
+                    + (
+                        _chart_kind_label(chart_kind)
+                        if component_type == "CHART"
+                        else str(component_type)
+                    )
+                    + "。"
+                ),
+                detail={
+                    "regionId": region_id,
+                    "beforeComponentType": before_type,
+                    "beforeChartKind": before_kind,
+                    "componentType": component_type,
+                    "chartKind": chart_kind,
+                },
+            ),
         },
     )
 
@@ -696,6 +777,479 @@ def _set_category_data(
             "unit": unit,
             "dimension": (dimension or {}).get("key", ""),
             "statistic": binding["statistic"],
+            **_business_facts(
+                message=(
+                    f"「{str(region.get('name') or region_id)}」的统计口径设为"
+                    f"{binding['statistic'] or '分类计数'}"
+                    f"（{len(categories)} 个分类，模拟数据）。"
+                ),
+                detail={
+                    "regionId": region_id,
+                    "statistic": binding["statistic"],
+                    "categoryCount": len(categories),
+                    "unit": unit,
+                },
+            ),
+        },
+    )
+
+
+def _business_facts(
+    *,
+    message: str,
+    detail: dict[str, Any] | None = None,
+    issues: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """能力执行结果里的**业务事实**（追踪层按这五个字段读真实业务结论）。
+
+    ``businessOk`` 是三态：``True`` / ``False`` / ``None``（**未取得**）。
+    这里写的是**执行器真的做了什么** —— 不是「没抛异常」。
+    """
+    return {
+        "businessOk": True,
+        "businessMessage": message,
+        "businessReason": "",
+        "businessIssues": [item for item in (issues or []) if isinstance(item, dict)],
+        "businessDetail": dict(detail or {}),
+    }
+
+
+# --------------------------------------------------------------------------
+# 精确前后变化 + 有界结构投影（追踪层的事实来源）
+# --------------------------------------------------------------------------
+#
+# 展示服务是**只读**的：精确的 changeSet 从它那里来；**结构投影在这里
+# 自实现**（只用它公开的只读导出：``iter_regions`` / ``find_region`` /
+# ``region_parent`` / ``region_ancestors`` / ``is_container``）。
+#
+# 落进追踪的每个值都**有界**：只留排障需要的结构（容器排列 / 放置 /
+# 样式 / 格式 / 成员顺序 / 标题），**不落盘**整份区块定义、数据行与
+# 模拟数值；裁剪过就**标出来**（``truncation`` 说清裁了哪个字段）。
+
+#: 追踪里单个值的字符上限。
+MAX_TRACE_VALUE_CHARS = 600
+#: 追踪里单个列表的项数上限。
+MAX_TRACE_LIST_ITEMS = 20
+#: 追踪里单个字典的键数上限。
+MAX_TRACE_DICT_KEYS = 24
+#: 追踪里变化条目的条数上限。
+MAX_TRACE_CHANGE_ENTRIES = 50
+
+#: 只保留这些键（排障需要的结构）。
+_TRACE_KEEP_KEYS = frozenset(
+    {
+        "arrangement",
+        "backgroundColor",
+        "border",
+        "borderRadius",
+        "chartKind",
+        "children",
+        "color",
+        "column",
+        "columnSpan",
+        "columns",
+        "component",
+        "dateTimePattern",
+        "direction",
+        "fontFamily",
+        "fontSize",
+        "fontWeight",
+        "format",
+        "gap",
+        "height",
+        "hidden",
+        "id",
+        "kind",
+        "layout",
+        "lineHeight",
+        "margin",
+        "memberIds",
+        "memberOrder",
+        "memberRegionIds",
+        "members",
+        "mode",
+        "name",
+        "nullText",
+        "opacity",
+        "padding",
+        "pattern",
+        "placement",
+        "precision",
+        "row",
+        "rowSpan",
+        "rounding",
+        "roundingMode",
+        "style",
+        "textAlign",
+        "textColor",
+        "thousandSeparator",
+        "title",
+        "type",
+        "unit",
+        "unitLabel",
+        "value",
+        "verticalAlign",
+        "width",
+    }
+)
+#: 这些键的值是「成员列表」：**只记 id**（不落盘整棵子树）。
+_TRACE_MEMBER_KEYS = frozenset(
+    {"children", "members", "memberIds", "memberOrder", "memberRegionIds"}
+)
+
+
+def _as_dict_like(definition: Any) -> dict[str, Any]:
+    """定义 → 普通的 dict（只读投影用；读不到就空字典）。"""
+    if isinstance(definition, dict):
+        return definition
+    dump = getattr(definition, "model_dump", None)
+    if callable(dump):
+        try:
+            data = dump()
+        except Exception:  # noqa: BLE001 — 投影失败不该掀翻主流程
+            return {}
+        return data if isinstance(data, dict) else {}
+    return {}
+
+
+def _member_ids(value: Any) -> list[str]:
+    """成员列表 → 只留 id（不落盘整棵子树）。"""
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in list(value)[:MAX_TRACE_LIST_ITEMS]:
+        if isinstance(item, dict):
+            out.append(str(item.get("id") or ""))
+        else:
+            out.append(str(item or ""))
+    return out
+
+
+def _all_member_ids(value: Any) -> list[str]:
+    """成员列表 → 全部 id（**不裁剪**，只用于比较）。"""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [
+        str(item.get("id") or "") if isinstance(item, dict) else str(item or "")
+        for item in value
+    ]
+
+
+def _bounded_trace_value(
+    value: Any, *, path: str, notes: list[dict[str, Any]], depth: int = 0
+) -> tuple[Any, bool]:
+    """把一个值变成**有界**的、可进追踪的形状。
+
+    返回 ``(值, 是否裁剪过)``；裁剪痕迹追加到 ``notes``（字段级）。
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, False
+    if isinstance(value, str):
+        if len(value) > MAX_TRACE_VALUE_CHARS:
+            notes.append(
+                {
+                    "field": path,
+                    "reason": "value_too_long",
+                    "limit": MAX_TRACE_VALUE_CHARS,
+                    "length": len(value),
+                }
+            )
+            return value[:MAX_TRACE_VALUE_CHARS] + "[truncated]", True
+        return value, False
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        out: list[Any] = []
+        cut = False
+        for index, item in enumerate(items[:MAX_TRACE_LIST_ITEMS]):
+            cleaned, item_cut = _bounded_trace_value(
+                item, path=f"{path}[{index}]", notes=notes, depth=depth + 1
+            )
+            out.append(cleaned)
+            cut = cut or item_cut
+        if len(items) > MAX_TRACE_LIST_ITEMS:
+            notes.append(
+                {
+                    "field": path,
+                    "reason": "too_many_items",
+                    "limit": MAX_TRACE_LIST_ITEMS,
+                    "count": len(items),
+                }
+            )
+            cut = True
+        return out, cut
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        cut = False
+        kept = 0
+        for key, item in value.items():
+            name = str(key)
+            if name not in _TRACE_KEEP_KEYS:
+                notes.append({"field": f"{path}.{name}", "reason": "key_dropped"})
+                cut = True
+                continue
+            if kept >= MAX_TRACE_DICT_KEYS:
+                notes.append(
+                    {
+                        "field": f"{path}.{name}",
+                        "reason": "too_many_keys",
+                        "limit": MAX_TRACE_DICT_KEYS,
+                    }
+                )
+                cut = True
+                break
+            kept += 1
+            if name in _TRACE_MEMBER_KEYS:
+                out[name] = _member_ids(item)
+                continue
+            cleaned, item_cut = _bounded_trace_value(
+                item, path=f"{path}.{name}", notes=notes, depth=depth + 1
+            )
+            out[name] = cleaned
+            cut = cut or item_cut
+        return out, cut
+    text = str(value)
+    if len(text) > MAX_TRACE_VALUE_CHARS:
+        notes.append(
+            {
+                "field": path,
+                "reason": "value_too_long",
+                "limit": MAX_TRACE_VALUE_CHARS,
+                "length": len(text),
+            }
+        )
+        return text[:MAX_TRACE_VALUE_CHARS] + "[truncated]", True
+    return text, False
+
+
+def bounded_changes(entries: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """展示服务的 changeSet → **有界**的精确前后变化。
+
+    每一项保持展示服务 changeSet 的口径（``path`` / ``regionId`` /
+    ``before`` / ``after`` / ``summary``）；``before`` / ``after`` 被裁剪过，
+    裁剪痕迹放在 ``truncation`` 里（**不塞进变化项本身**）。
+
+    返回 ``(changes, truncation)``。
+    """
+    raw_entries = list(entries or [])
+    changes: list[dict[str, Any]] = []
+    notes: list[dict[str, Any]] = []
+    for entry in raw_entries[:MAX_TRACE_CHANGE_ENTRIES]:
+        if isinstance(entry, dict):
+            path = str(entry.get("path") or "")
+            region_id = str(entry.get("regionId") or "")
+            summary = str(entry.get("summary") or "")
+            before_raw = entry.get("before")
+            after_raw = entry.get("after")
+        else:
+            path = str(getattr(entry, "path", "") or "")
+            region_id = str(getattr(entry, "regionId", "") or "")
+            summary = str(getattr(entry, "summary", "") or "")
+            before_raw = getattr(entry, "before", None)
+            after_raw = getattr(entry, "after", None)
+        before, _ = _bounded_trace_value(
+            before_raw, path=f"{path}/before", notes=notes
+        )
+        after, _ = _bounded_trace_value(after_raw, path=f"{path}/after", notes=notes)
+        changes.append(
+            {
+                "path": path,
+                "regionId": region_id,
+                "before": before,
+                "after": after,
+                "summary": summary,
+            }
+        )
+    if len(raw_entries) > MAX_TRACE_CHANGE_ENTRIES:
+        notes.append(
+            {
+                "field": "changes",
+                "reason": "too_many_entries",
+                "limit": MAX_TRACE_CHANGE_ENTRIES,
+                "count": len(raw_entries),
+            }
+        )
+    truncation = {"changes": notes[:MAX_TRACE_LIST_ITEMS]} if notes else {}
+    return changes, truncation
+
+
+def _parent_signature(parent: Any) -> dict[str, Any] | None:
+    """父容器的**结构签名**（只用于比较父级有没有变化）。"""
+    if not isinstance(parent, dict):
+        return None
+    component = parent.get("component")
+    arrangement = component.get("arrangement") if isinstance(component, dict) else None
+    return {
+        "arrangement": arrangement if isinstance(arrangement, dict) else {},
+        "memberIds": _all_member_ids(parent.get("children")),
+    }
+
+
+def project_structure(
+    definition: Any, region_ids: Any, *, before: Any = None
+) -> dict[str, Any]:
+    """有界结构投影：受影响的区域 + 它们所在的容器。
+
+    只记排障需要的结构：标题 / 父子关系 / 成员顺序 / 放置 / 分组排列 /
+    父级有没有变化。**不落盘**整份区块定义、数据行与模拟数值。
+
+    ``before`` 给的是**改动前**的定义：拿得到时 ``parentChanged`` 才有
+    真值（true / false）；拿不到就是 ``None``（**未取得**，不猜）。
+    """
+    from app.services.report_presentation_service import (
+        is_container,
+        iter_regions,
+        region_parent,
+    )
+
+    root = _as_dict_like(definition)
+    root_before = _as_dict_like(before) if before is not None else None
+
+    index: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
+    for region, ancestors in iter_regions(root):
+        index[str(region.get("id") or "")] = (region, list(ancestors))
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in region_ids or []:
+        rid = str(item or "")
+        if rid and rid not in seen:
+            seen.add(rid)
+            ordered.append(rid)
+
+    affected: list[dict[str, Any]] = []
+    containers: dict[str, dict[str, Any]] = {}
+
+    for rid in ordered:
+        found = index.get(rid)
+        region = found[0] if found else None
+        ancestors = found[1] if found else []
+        parent = ancestors[-1] if ancestors else None
+
+        if parent is not None:
+            members = _all_member_ids(parent.get("children"))
+        else:
+            members = [
+                str(item.get("id") or "")
+                for item in (root.get("regions") or [])
+                if isinstance(item, dict)
+            ]
+        member_index = members.index(rid) if rid in members else None
+
+        layout = region.get("layout") if isinstance(region, dict) else None
+        placement_raw = layout.get("placement") if isinstance(layout, dict) else None
+        placement: dict[str, Any] = {}
+        if isinstance(placement_raw, dict):
+            for key in ("column", "row", "columnSpan", "rowSpan"):
+                if key in placement_raw:
+                    placement[key] = placement_raw.get(key)
+
+        arrangement: dict[str, Any] = {}
+        if parent is not None:
+            component = parent.get("component")
+            raw = component.get("arrangement") if isinstance(component, dict) else None
+            arrangement = raw if isinstance(raw, dict) else {}
+        gap = arrangement.get("gap")
+        gap = gap if isinstance(gap, dict) else {}
+
+        parent_changed: bool | None = None
+        if root_before is not None:
+            before_signature = _parent_signature(region_parent(root_before, rid))
+            after_signature = _parent_signature(parent)
+            if before_signature is not None and after_signature is not None:
+                parent_changed = before_signature != after_signature
+
+        affected.append(
+            {
+                "regionId": rid,
+                "title": str((region or {}).get("name") or ""),
+                "parentId": str((parent or {}).get("id") or ""),
+                "parentTitle": str((parent or {}).get("name") or ""),
+                "parentPath": [
+                    str(item.get("name") or item.get("id") or "")
+                    for item in ancestors
+                ],
+                "memberOrder": members[:MAX_TRACE_LIST_ITEMS],
+                "memberIndex": member_index,
+                "placement": placement,
+                "groupColumns": arrangement.get("columns"),
+                "groupArrangement": {
+                    "columns": arrangement.get("columns"),
+                    "gap": {"value": gap.get("value"), "unit": str(gap.get("unit") or "")},
+                    "mode": str(arrangement.get("mode") or ""),
+                },
+                "parentChanged": parent_changed,
+            }
+        )
+
+        # 容器：受影响区域所在的**祖先容器** + 它自己（是容器时）。
+        chain = list(ancestors)
+        if region is not None and is_container(region):
+            chain = chain + [region]
+        for position, container in enumerate(chain):
+            cid = str(container.get("id") or "")
+            if not cid or cid in containers:
+                continue
+            component = container.get("component")
+            raw = component.get("arrangement") if isinstance(component, dict) else None
+            container_arrangement = raw if isinstance(raw, dict) else {}
+            container_gap = container_arrangement.get("gap")
+            container_gap = container_gap if isinstance(container_gap, dict) else {}
+            parent_container = chain[position - 1] if position > 0 else None
+            containers[cid] = {
+                "regionId": cid,
+                "title": str(container.get("name") or ""),
+                "columns": container_arrangement.get("columns"),
+                "gap": {
+                    "value": container_gap.get("value"),
+                    "unit": str(container_gap.get("unit") or ""),
+                },
+                "memberIds": _member_ids(container.get("children")),
+                "parentId": str((parent_container or {}).get("id") or ""),
+            }
+
+    return {"affected": affected, "containers": list(containers.values())}
+
+
+def _presentation_failure(ctx: OperationContext, result: Any) -> CapabilityError:
+    """展示批次**业务上没成** —— 真实原因 / 失败说明 / 结构化问题原样带走。
+
+    ``apply_presentation`` 是纯计算：失败时它**不抛异常**，只把
+    ``ok=False`` 和真实原因带回来。**没抛异常不等于成功**。
+    """
+    reason = str(getattr(result, "reason", "") or "presentation_failed")
+    failure = str(getattr(result, "failure", "") or "")
+    issues = [
+        item
+        for item in (getattr(result, "issues", None) or [])
+        if isinstance(item, dict)
+    ]
+    message = (
+        f"展示操作没有执行成功（{reason}）：{failure}"
+        if failure
+        else f"展示操作没有执行成功（{reason}）。"
+    )
+    return CapabilityError(
+        message,
+        step=ctx.step,
+        op="SET_PRESENTATION",
+        target="",
+        constraint="展示操作必须能在当前草稿上真正执行",
+        reason=reason,
+        business={
+            "businessOk": False,
+            "businessMessage": failure or message,
+            "businessReason": reason,
+            "businessIssues": issues,
+            "businessDetail": {
+                "failure": failure,
+                "reason": reason,
+                "affectedRegionIds": list(
+                    getattr(result, "affectedRegionIds", None) or []
+                ),
+                # 结构化问题原样带走（失败时**没有**前后变化可报 ——
+                # 整批没执行成功，不伪造 changes）。
+                "issues": issues,
+            },
         },
     )
 
@@ -703,7 +1257,14 @@ def _set_category_data(
 def _set_presentation(
     ctx: OperationContext, params: SetPresentationParams
 ) -> CapabilityOutcome:
-    """一批展示操作：复用既有展示服务的**同一份**校验与执行实现。"""
+    """一批展示操作：复用既有展示服务的**同一份**校验与执行实现。
+
+    **业务结果先看，再落盘**：``apply_presentation`` 是纯计算 ——
+    失败时它**不抛异常**，只把 ``ok=False`` 与真实原因带回来，并把
+    **原定义原样带回**。所以这里必须先看 ``result.ok``：
+    没抛异常**不等于**分组成功；业务上没成就把真实原因 / 失败说明 /
+    结构化问题原样往上带，整批放弃。
+    """
     from app.services.report_presentation_service import (
         apply_presentation,
         normalize_presentation_operations,
@@ -716,9 +1277,18 @@ def _set_presentation(
             constraint="至少一项展示操作",
             reason="missing_operations",
         )
+
+    # **引用先解析**：本次修改现场里临时起的引用名（ADD_SECTION 的 ref）
+    # 在这里换成真实区块 id —— 展示服务只认真实 id。引用表是**本次执行
+    # 现场**的：试做与用户确认各自跑一遍、各自用自己的表。
+    resolved_params = params.model_copy(
+        update={
+            "operations": ctx.resolve_presentation_references(params.operations)
+        }
+    )
     try:
         normalized = normalize_presentation_operations(
-            params.operations, ctx.definition
+            resolved_params.operations, ctx.definition
         )
     except Exception as exc:  # noqa: BLE001 — 展示服务的校验错误原样带回
         raise CapabilityError(
@@ -736,13 +1306,48 @@ def _set_presentation(
             constraint="展示操作必须在草稿上可执行",
             reason="presentation_failed",
         ) from exc
+
+    # **业务上到底成没成**：先看这个，再决定要不要落盘。
+    if not result.ok:
+        raise _presentation_failure(ctx, result)
+
     payload = result.definition.model_dump()
+    # **先算事实再落盘**：结构投影要比对改动前后，``ctx.definition``
+    # 必须还是**改动前**的样子。
+    changed_entries = list(result.changeSet.changed) if result.changeSet else []
+    changes, truncation = bounded_changes(changed_entries)
+    affected_ids = [
+        str(item) for item in (result.affectedRegionIds or []) if str(item)
+    ]
+    structure = project_structure(result.definition, affected_ids, before=ctx.definition)
     for key, value in payload.items():
         setattr(ctx.definition, key, value)
+    issues = [item for item in (result.issues or []) if isinstance(item, dict)]
     return CapabilityOutcome(
         ok=True,
         message="已应用一批展示操作。",
-        detail={"operations": normalized},
+        detail={
+            # 既有键：保留原样（不删、不改名）。
+            "operations": normalized,
+            # 新增键：精确前后变化 + 有界结构投影（追踪层的事实来源）。
+            "changes": changes,
+            "structure": structure,
+            "truncation": truncation,
+            # 包装能力里的子操作（只记操作名与下标，不抄参数）。
+            "subOperations": [
+                {"op": str(item.get("op") or ""), "index": position}
+                for position, item in enumerate(normalized)
+                if isinstance(item, dict)
+            ],
+            **_business_facts(
+                message=f"已应用 {len(normalized)} 项展示操作。",
+                detail={
+                    "affectedRegionIds": list(result.affectedRegionIds or []),
+                    "changedCount": len(result.changeSet.changed) if result.changeSet else 0,
+                },
+                issues=issues,
+            ),
+        },
     )
 
 
@@ -815,10 +1420,11 @@ register(
         title="设置样式与布局",
         description=(
             "一批受约束的展示操作（分组 / 排版 / 样式 / 格式 / 页面）。"
-            "operations 形如 [{\"op\": \"SET_STYLE\", \"params\": {...}}]，"
-            "允许的 op：CREATE_GROUP、SET_GROUP_ARRANGEMENT、MOVE_REGION、UNGROUP、"
-            "DELETE_GROUP、COPY_REGION、DELETE_REGION、HIDE_REGION、SHOW_REGION、"
-            "SET_PLACEMENT、SET_STYLE、SET_FORMAT、SET_PAGE、SET_METADATA、SET_THEME。"
+            "**这是一个包装能力**：展示操作名不是顶层能力，只能放在它的 "
+            'params.operations 里，每一项形如 {"op": "<展示操作名>", "params": {...}}；'
+            "operations 是**非空列表**。"
+            "允许的 op、每个 op 的必填 / 可选键与取值域见能力总目录的"
+            "「展示操作白名单」一节（由展示服务的白名单自动生成）。"
         ),
         params_schema=SetPresentationParams,
         executor=_set_presentation,

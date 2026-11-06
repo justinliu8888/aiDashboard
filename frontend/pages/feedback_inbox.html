@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>反馈收件箱 · AI 报表</title>
+<title>管理员入口 · AI 报表</title>
 <script src="./vendor/tailwindcss.js?v=20261103-vendor1"></script>
 <script src="./vendor/iconify-icon.min.js?v=20261103-vendor1"></script>
 <link rel="stylesheet" href="./workbench_feedback.css?v=20261104-feedback1" />
-<link rel="stylesheet" href="./feedback_inbox.css?v=20261104-feedback1" />
+<link rel="stylesheet" href="./feedback_inbox.css?v=20261105-admin1" />
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
@@ -26,7 +26,7 @@
     <div class="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center">
       <iconify-icon class="text-white text-lg" icon="mdi:inbox"></iconify-icon>
     </div>
-    <span class="text-white font-semibold tracking-wide">反馈收件箱</span>
+    <span class="text-white font-semibold tracking-wide">管理员入口</span>
   </div>
   <div class="ml-auto flex items-center gap-2">
     <span id="feedback-admin-who" class="hidden text-[11px] text-slate-300"></span>
@@ -44,7 +44,7 @@
   <div class="max-w-sm mx-auto mt-16 bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
     <h2 class="text-sm font-semibold text-slate-900">维护者登录</h2>
     <p class="mt-1 text-[11px] text-slate-500 leading-relaxed">
-      反馈正文、署名、截图与定位详情仅维护者可读。这里用单独的用户名密码，<span class="font-medium">与站点访问口令不是一回事</span>。
+      这是<b class="font-medium text-slate-700">管理员入口</b>，含两个区域：<b class="font-medium text-slate-700">用户反馈</b>（反馈正文、署名、截图与定位详情）与<b class="font-medium text-slate-700">编辑经验</b>（执行记录审核与可信经验整理）。这些内容仅维护者可读。这里用单独的用户名密码，<span class="font-medium">与站点访问口令不是一回事</span>。
     </p>
     <form id="feedback-admin-login-form" class="mt-4 space-y-3">
       <div>
@@ -62,48 +62,117 @@
   </div>
 </section>
 
-<!-- ===== 收件箱主体 ===== -->
+<!-- ===== 管理员主体 ===== -->
 <main id="feedback-admin-app" class="flex-1 min-h-0 hidden flex-col">
-  <div class="shrink-0 bg-white border-b border-slate-200 px-5 py-3">
-    <div class="flex items-center gap-3 flex-wrap">
-      <h1 class="text-sm font-semibold text-slate-900">全部反馈</h1>
-      <span id="feedback-inbox-total" class="text-[11px] text-slate-500"></span>
-      <div class="ml-auto flex items-center gap-2 flex-wrap">
-        <select id="feedback-filter-rating" class="rounded-lg border border-slate-200 bg-white text-xs text-slate-700 px-2.5 py-1.5 outline-none focus:border-blue-400">
-          <option value="">全部满意度</option>
-          <option value="satisfied">满意</option>
-          <option value="neutral">一般</option>
-          <option value="dissatisfied">不满意</option>
-        </select>
-        <select id="feedback-filter-status" class="rounded-lg border border-slate-200 bg-white text-xs text-slate-700 px-2.5 py-1.5 outline-none focus:border-blue-400">
-          <option value="">全部处理状态</option>
-          <option value="pending">待处理</option>
-          <option value="in_progress">处理中</option>
-          <option value="resolved">已解决</option>
-        </select>
-        <button id="feedback-filter-refresh" type="button" class="rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-3 py-1.5">刷新</button>
+  <!-- 区域切换 -->
+  <div id="admin-tabs" class="shrink-0 bg-white border-b border-slate-200 px-5 py-2 flex items-center gap-2">
+    <button id="btn-tab-feedback" type="button" class="fb-tab is-active" aria-selected="true" aria-controls="feedback-panel">
+      <iconify-icon class="text-sm" icon="mdi:inbox"></iconify-icon>用户反馈
+    </button>
+    <button id="btn-tab-experience" type="button" class="fb-tab" aria-selected="false" aria-controls="experience-panel">
+      <iconify-icon class="text-sm" icon="mdi:school-outline"></iconify-icon>编辑经验
+    </button>
+    <span class="ml-auto text-[11px] text-slate-400">管理员入口 · 数据全部来自服务端，不在前端缓存</span>
+  </div>
+
+  <!-- ===== 区域一：用户反馈（原有功能原样保留） ===== -->
+  <section id="feedback-panel" class="flex-1 min-h-0 flex flex-col">
+    <div class="shrink-0 bg-white border-b border-slate-200 px-5 py-3">
+      <div class="flex items-center gap-3 flex-wrap">
+        <h1 class="text-sm font-semibold text-slate-900">全部反馈</h1>
+        <span id="feedback-inbox-total" class="text-[11px] text-slate-500"></span>
+        <div class="ml-auto flex items-center gap-2 flex-wrap">
+          <select id="feedback-filter-rating" class="rounded-lg border border-slate-200 bg-white text-xs text-slate-700 px-2.5 py-1.5 outline-none focus:border-blue-400">
+            <option value="">全部满意度</option>
+            <option value="satisfied">满意</option>
+            <option value="neutral">一般</option>
+            <option value="dissatisfied">不满意</option>
+          </select>
+          <select id="feedback-filter-status" class="rounded-lg border border-slate-200 bg-white text-xs text-slate-700 px-2.5 py-1.5 outline-none focus:border-blue-400">
+            <option value="">全部处理状态</option>
+            <option value="pending">待处理</option>
+            <option value="in_progress">处理中</option>
+            <option value="resolved">已解决</option>
+          </select>
+          <button id="feedback-filter-refresh" type="button" class="rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-3 py-1.5">刷新</button>
+        </div>
       </div>
+      <p id="feedback-inbox-notice" class="fb-notice hidden"></p>
     </div>
-    <p id="feedback-inbox-notice" class="fb-notice hidden"></p>
-  </div>
 
-  <div class="flex-1 min-h-0 flex flex-col lg:flex-row overflow-hidden">
-    <!-- 列表 -->
-    <section class="lg:w-[420px] shrink-0 border-b lg:border-b-0 lg:border-r border-slate-200 bg-white flex flex-col min-h-0">
-      <div id="feedback-inbox-list" class="flex-1 min-h-0 overflow-y-auto no-bar p-3 space-y-2">
-        <div class="text-[11px] text-slate-400 px-2 py-3">登录后加载…</div>
-      </div>
-    </section>
+    <div class="flex-1 min-h-0 flex flex-col lg:flex-row overflow-hidden">
+      <!-- 列表 -->
+      <section class="lg:w-[420px] shrink-0 border-b lg:border-b-0 lg:border-r border-slate-200 bg-white flex flex-col min-h-0">
+        <div id="feedback-inbox-list" class="flex-1 min-h-0 overflow-y-auto no-bar p-3 space-y-2">
+          <div class="text-[11px] text-slate-400 px-2 py-3">登录后加载…</div>
+        </div>
+      </section>
 
-    <!-- 详情 -->
-    <section class="flex-1 min-h-0 overflow-y-auto no-bar bg-slate-100">
-      <div id="feedback-detail" class="p-5">
-        <div class="text-[11px] text-slate-400 px-2 py-3">从左边选一条反馈看详情。</div>
-      </div>
-    </section>
-  </div>
+      <!-- 详情 -->
+      <section class="flex-1 min-h-0 overflow-y-auto no-bar bg-slate-100">
+        <div id="feedback-detail" class="p-5">
+          <div class="text-[11px] text-slate-400 px-2 py-3">从左边选一条反馈看详情。</div>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ===== 区域二：编辑经验（新增） ===== -->
+  <section id="experience-panel" class="flex-1 min-h-0 hidden overflow-y-auto no-bar bg-slate-100">
+    <div class="p-4 sm:p-5 space-y-4">
+
+      <!-- 执行记录 -->
+      <section class="fb-detail-card">
+        <div class="flex items-center gap-3 flex-wrap">
+          <h2 class="text-sm font-semibold text-slate-900">执行记录</h2>
+          <span id="experience-record-total" class="text-[11px] text-slate-500"></span>
+          <div class="ml-auto flex items-center gap-2 flex-wrap">
+            <select id="experience-filter-status" class="rounded-lg border border-slate-200 bg-white text-xs text-slate-700 px-2.5 py-1.5 outline-none focus:border-blue-400">
+              <option value="">全部状态</option>
+              <option value="pending">待审</option>
+              <option value="approved">已批准</option>
+              <option value="rejected">已拒绝</option>
+            </select>
+            <button id="experience-records-refresh" type="button" class="rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-3 py-1.5">刷新</button>
+          </div>
+        </div>
+        <p id="experience-notice" class="fb-notice hidden"></p>
+        <div class="grid gap-4 lg:grid-cols-[minmax(300px,380px)_1fr]">
+          <div id="experience-record-list" class="space-y-2">
+            <div class="text-[11px] text-slate-400 px-2 py-3">登录后加载…</div>
+          </div>
+          <div id="experience-record-detail">
+            <div class="text-[11px] text-slate-400 px-2 py-3">从左边选一条执行记录看详情与审核。</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 可信经验 -->
+      <section class="fb-detail-card">
+        <div class="flex items-center gap-3 flex-wrap">
+          <h2 class="text-sm font-semibold text-slate-900">可信经验</h2>
+          <span id="experience-list-total" class="text-[11px] text-slate-500"></span>
+          <div class="ml-auto flex items-center gap-3 flex-wrap">
+            <label class="inline-flex items-center gap-1.5 text-[11px] text-slate-600">
+              <input id="experience-include-disabled" type="checkbox" />含已禁用
+            </label>
+            <button id="experience-list-refresh" type="button" class="rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium px-3 py-1.5">刷新</button>
+          </div>
+        </div>
+        <div class="grid gap-4 lg:grid-cols-[minmax(300px,380px)_1fr]">
+          <div id="experience-list" class="space-y-2">
+            <div class="text-[11px] text-slate-400 px-2 py-3">登录后加载…</div>
+          </div>
+          <div id="experience-edit">
+            <div class="text-[11px] text-slate-400 px-2 py-3">选一条经验做「整理 / 禁用 / 恢复」。</div>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </section>
 </main>
 
-<script src="./feedback_inbox.js?v=20261104-feedback1"></script>
+<script src="./feedback_inbox.js?v=20261105-admin1"></script>
 </body>
 </html>

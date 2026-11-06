@@ -27,24 +27,74 @@ from app.tools.submission import record_submission
 
 
 NAME = "submit_edit_plan"
-DESCRIPTION = (
+#: 说明的**静态**部分（流程与两种提交方式）。
+_DESCRIPTION_BASE = (
     "提交对当前草稿的编辑计划，这是本轮的最终结论。两种提交方式："
     "（1）**能力格式**（推荐）：operations 里每一项形如 "
-    '{"op": "<能力名>", "target": {"regionId" 或 "ref"}, "params": {...}}，'
-    "服务端会先在草稿副本上**整批试做**："
-    "能力名见 list_simulated_dimensions 之外的能力目录"
-    "（ADD_SECTION 新增区块 / DELETE_SECTION 删除区块 / SET_DISPLAY 改展示类型 / "
-    "SET_CATEGORY_DATA 设分类统计口径 / SET_PRESENTATION 样式与布局）；"
+    '{"op": "<能力名>", "target": {"regionId" 或 "ref"}, "params": {...}},'
+    "服务端会先在草稿副本上**整批试做**；"
     "新增区块时在 params.ref 里起一个引用名，后续步骤用 target.ref 指它；"
-    "试做失败会返回**具体错误**（哪一步、哪个目标、哪条约束、为什么），"
+    "试做失败会返回**具体错误**（哪一步、哪个目标、哪条约束、为什么，"
+    "外加字段路径、收到的类型、要求的类型、该填在哪、最小结构示例），"
     "请按反馈改好 operations 后**再次调用本工具**，不要换别的出口；"
     "试做通过才形成待确认候选。"
     "（2）单步格式：target 指明改哪个区块（regionId），operation 指明怎么改。"
+    "**能力名、参数、支持范围、分类维度与源码位置见本轮下发的能力总目录**"
+    "（编辑说明末尾），不要凭记忆猜能力名或参数。"
     "needsClarification 为 true 时说明还缺参数并给出 clarificationQuestion。"
     "用户表达含糊（比如'改好看点'）时，把候选解释放进 options 让用户选，"
     "不要自己替用户决定。"
 )
+
+
+def _contract_description() -> str:
+    """包装能力的那一段说明 —— **从共享契约生成**。
+
+    包装能力（它的载荷里装的是别的操作）不是这里手写的名单：
+    契约认出来的每一个包装能力都会在这里说明「子操作填在哪」，
+    能力总目录里也是同一份。
+    """
+    try:
+        from app.services.edit_capabilities.contract import build_contract
+
+        contract = build_contract()
+    except Exception:  # noqa: BLE001 — 说明文本不该让工具不可用
+        return ""
+    lines: list[str] = []
+    for package in contract.packages:
+        members = "、".join(item.op for item in package.members)
+        lines.append(
+            f"**包装能力 {package.op}**：它的 params.{package.payload_field} 是**非空列表**，"
+            f'{{"op": "<操作名>", "params": {{...}}}}；'
+            f"允许的 op：{members}。"
+            "这些 op **不能**直接作为 operations 的顶层项 —— "
+            f"顶层项是 {package.op} 自己，"
+            f"它的子操作写在 params.{package.payload_field} 里。"
+        )
+    if not lines:
+        return ""
+    return "包装能力（子操作要放在它的 params 里，不要放在顶层）：" + "".join(lines)
+
+
+def __getattr__(name: str) -> str:
+    """``DESCRIPTION`` 按需生成（能力名 / 操作名不手写）。"""
+    if name == "DESCRIPTION":
+        return f"{_DESCRIPTION_BASE}{_contract_description()}"
+    raise AttributeError(name)
+
+
 PARAMETERS = EditPlanPayload.model_json_schema()
+#: ``operations`` 这一项的说明：**顶层能力**与**包装能力内部的操作**不是一回事。
+_PARAM_OPERATIONS_DESCRIPTION = (
+    "能力格式的操作清单：每一项形如 "
+    '{"op": "<能力名>", "target": {"regionId" 或 "ref"}, "params": {...}}。'
+    "**包装能力**（子操作要放在它 params 里的列表字段中）不能把子操作直接写成本列表的顶层项 —— "
+    "见本轮能力总目录里每项能力的「提交位置」。"
+)
+if isinstance(PARAMETERS.get("properties"), dict):
+    operations_spec = PARAMETERS["properties"].get("operations")
+    if isinstance(operations_spec, dict):
+        operations_spec["description"] = _PARAM_OPERATIONS_DESCRIPTION
 CATEGORY = ToolCategory.TERMINAL
 IS_READ_ONLY = False
 # 交编辑计划的节点：待确认和编辑中。
@@ -103,6 +153,98 @@ def _fill_step_summaries(
             step["summary"] = message
 
 
+def _trace_submit(
+    *,
+    stage: str,
+    name: str,
+    params: dict,
+    result: dict,
+    status: str = "ok",
+    error_category: str = "",
+    phase: str = "",
+    batch_id: str = "",
+    checks: dict[str, str] | None = None,
+    candidate_registered: bool | None = None,
+    applied: bool | None = None,
+    changes: list[dict[str, Any]] | None = None,
+    structure: dict[str, Any] | None = None,
+    truncation: dict[str, Any] | None = None,
+    step_index: int | None = None,
+    business_reason: str = "",
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """写一条追踪事件（**失败不影响主流程**）。
+
+    既有参数形态**不变**；新增的都是**关键字**参数（透传冻结契约里的
+    一等字段：批次 / 三类检查 / 候选登记 / 前后变化 / 结构投影）。
+    """
+    try:
+        from app.services import edit_trace_service
+
+        edit_trace_service.record(
+            stage,
+            name=name,
+            params=params,
+            result=result,
+            status=status,
+            errorCategory=error_category,
+            phase=phase,
+            batchId=batch_id,
+            checks=dict(checks or {}),
+            candidateRegistered=candidate_registered,
+            applied=applied,
+            changes=list(changes or []),
+            structure=dict(structure or {}),
+            truncation=dict(truncation or {}),
+            stepIndex=step_index,
+            businessReason=business_reason,
+            # 裁剪过就**标出来**（不把「截断了」写成「完整内容」）。
+            truncated=bool((truncation or {}).get("changes")),
+            extra=dict(extra or {}),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _bind_real_ids(item: dict[str, Any]) -> tuple[str, str]:
+    """把**真实存在**的修改事项 / 候选计划标识绑到本轮追踪上。
+
+    * ``itemId``：来自 ``new_item()`` / ``load_edit_item()`` —— 真实存在；
+    * ``planId``：事项里**真有**候选计划标识时才绑（没有就空着 ——
+      **不提前造候选 id**，也不从别的请求借）。
+
+    返回 ``(item_id, plan_id)``。
+    """
+    item_id = str((item or {}).get("itemId") or "")
+    plan_id = str((item or {}).get("candidatePlanId") or "")
+    try:
+        from app.services import edit_trace_service
+
+        edit_trace_service.set_ids(item_id=item_id, plan_id=plan_id)
+    except Exception:  # noqa: BLE001 — 绑定失败不该掀翻提交
+        pass
+    return item_id, plan_id
+
+
+def _checks(business: str) -> dict[str, str]:
+    """三类检查状态（分开记，不混成一句「已生效」）。
+
+    * 业务：试做通过 = ``pass``，失败 = ``fail``，没跑 = ``not_run``；
+    * 持久化：事务在**请求层**，工具层**没跑** → ``not_run``；
+    * 效果核对：本轮**没有**效果核对行为 → ``not_run``（不推断）。
+    """
+    try:
+        from app.services import edit_trace_service
+
+        return {
+            "business": business,
+            "persistence": edit_trace_service.PERSIST_NOT_RUN,
+            "effect": edit_trace_service.EFFECT_NOT_RUN,
+        }
+    except Exception:  # noqa: BLE001
+        return {"business": business, "persistence": "not_run", "effect": "not_run"}
+
+
 def run(
     isTemplateEdit: bool = True,
     intent: str = "UNKNOWN",
@@ -140,14 +282,42 @@ def run(
             f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
             for err in exc.errors()
         )
+        # 参数不合法：**结构就不合法**，没到试做那一步。
+        _trace_submit(
+            stage="submit",
+            name=NAME,
+            params={"format": "capability", "intent": str(intent or "")},
+            result={"accepted": False, "reason": "params_invalid"},
+            status="error",
+            error_category="params_invalid",
+            phase="plan",
+            checks=_checks("not_run"),
+        )
         return {"accepted": False, "error": f"载荷不合法：{details}"}
     except Exception as exc:  # noqa: BLE001
+        _trace_submit(
+            stage="submit",
+            name=NAME,
+            params={"format": "capability", "intent": str(intent or "")},
+            result={"accepted": False, "reason": "params_invalid"},
+            status="error",
+            error_category="params_invalid",
+            phase="plan",
+            checks=_checks("not_run"),
+        )
         return {"accepted": False, "error": f"载荷不合法：{exc}"}
 
     capability_steps = _capability_steps(validated)
     if not capability_steps:
         # 旧格式：单步 / 既有组合计划，行为不变。
         record_submission(NAME, validated.model_dump(mode="json"))
+        _trace_submit(
+            stage="submit",
+            name=NAME,
+            params={"format": "legacy", "intent": str(validated.intent or "")},
+            result={"accepted": True, "trial": False},
+            phase="plan",
+        )
         return {"accepted": True, "tool": NAME}
 
     # ---- 能力格式：先整批试做 ----
@@ -174,22 +344,45 @@ def run(
     else:
         definition, source = load_authoritative_definition()
     if definition is None:
+        _trace_submit(
+            stage="submit",
+            name=NAME,
+            params={"format": "capability", "steps": len(capability_steps)},
+            result={"accepted": False},
+            status="error",
+            error_category="tool_error",
+            phase="plan",
+            checks=_checks("not_run"),
+        )
         return {
             "accepted": False,
             "error": "服务端没有读到当前草稿，无法试做；草稿没有变化。",
         }
 
     item = load_edit_item()
+    # 原要求优先用模型传的 ``originalRequest``；模型没传时用**用户这一轮
+    # 的原话**兜底 —— 服务端在工具上下文里带着它，不能让归档记录丢掉
+    # 最关键的那句话。
+    user_message = ""
+    ctx_now = current_tool_context()
+    if ctx_now is not None:
+        user_message = str((ctx_now.extra or {}).get("userMessage") or "")
+    original_text = originalRequest or user_message
     if item is None:
         item = new_item(
-            original_request=originalRequest or "",
+            original_request=original_text,
             base_revision=int((definition.metadata or {}).get("revision") or 0),
         )
-    elif originalRequest and not item.get("originalRequest"):
-        item["originalRequest"] = originalRequest
+    elif original_text and not item.get("originalRequest"):
+        # 事项已存在但**原话还空着** → 补上。
+        # 只在空值时补：补充同一事项时不得覆盖原要求。
+        item["originalRequest"] = original_text
     # 这一件事的操作清单：**每次提交都以本次为准**（追加 / 更正 / 撤销
     # 都是「给一份新的完整清单」）。
     item["operations"] = capability_steps
+    # **真实存在的 id 立刻绑定**（``new_item`` / ``load_edit_item`` 给的）：
+    # 不提前造候选 id，也不从别的请求借。
+    item_id, plan_id = _bind_real_ids(item)
 
     trial = run_trial(
         definition=definition,
@@ -203,6 +396,35 @@ def run(
         item["status"] = "drafting"
         item["lastErrors"] = trial.errors
         save_edit_item(item)
+        _trace_submit(
+            stage="trial",
+            name=NAME,
+            params={"format": "capability", "steps": len(capability_steps)},
+            result={
+                "ok": False,
+                "errorCount": len(trial.errors or []),
+                "firstError": (trial.errors or [{}])[0] if trial.errors else {},
+            },
+            status="error",
+            error_category="trial_failed",
+            phase="trial",
+            batch_id=trial.batch_id,
+            checks=_checks("fail"),
+            # 试做没过 → 候选**没有**登记（不是「提交槽写成功了」）。
+            candidate_registered=False,
+            applied=False,
+            changes=list(trial.facts.get("presentationChanges") or []),
+            structure=dict(trial.structure or {}),
+            truncation=dict(trial.facts.get("truncation") or {}),
+            extra={
+                "batchOutcome": "failed",
+                "copyOnly": True,
+                "appliedToDraft": False,
+                "itemId": item_id,
+                "planId": plan_id,
+                "note": "副本上的局部变化，整批未通过、未正式生效",
+            },
+        )
         return {
             "accepted": False,
             "error": trial.error_message,
@@ -231,7 +453,33 @@ def run(
     item["resolvedOperations"] = trial.resolved_operations
     item["refs"] = trial.refs
     item["facts"] = facts
-    save_edit_item(item)
+    # 候选**真的登记成功**才算登记成功：``save_edit_item`` 抛了就记 False
+    # （工具提交槽写成功**不能**代替持久化成功）。异常照旧往上抛 ——
+    # 返回语义不变。
+    try:
+        save_edit_item(item)
+    except Exception as exc:  # noqa: BLE001 — 记事实，异常照旧往上抛
+        _trace_submit(
+            stage="candidate",
+            name=NAME,
+            params={"format": "capability"},
+            result={
+                "registered": False,
+                "reason": "candidate_save_failed",
+                "errorType": type(exc).__name__,
+            },
+            status="error",
+            error_category="tool_error",
+            phase="candidate",
+            batch_id=trial.batch_id,
+            checks=_checks("pass"),
+            candidate_registered=False,
+            applied=False,
+            business_reason="candidate_save_failed",
+            extra={"itemId": item_id, "planId": plan_id},
+        )
+        raise
+    candidate_registered = True
 
     payload = validated.model_dump(mode="json")
     payload["editFacts"] = facts
@@ -242,6 +490,49 @@ def run(
         payload["target"] = {**(payload.get("target") or {}), "regionId": primary}
     _fill_step_summaries(payload.get("operations") or [], trial.resolved_operations)
     record_submission(NAME, payload)
+    # 提交**结构合法**（过了载荷校验 + 试做校验），这一轮真的写进了提交槽。
+    _trace_submit(
+        stage="submit",
+        name=NAME,
+        params={"format": "capability", "steps": len(capability_steps)},
+        result={"accepted": True, "checked": True, "trial": True},
+        phase="plan",
+        batch_id=trial.batch_id,
+        checks=_checks("pass"),
+    )
+    _trace_submit(
+        stage="trial",
+        name=NAME,
+        params={"format": "capability", "steps": len(capability_steps)},
+        result={"ok": True, "resolved": len(trial.resolved_operations or [])},
+        phase="trial",
+        batch_id=trial.batch_id,
+        checks=_checks("pass"),
+        applied=False,
+        changes=list(facts.get("presentationChanges") or []),
+        structure=dict(trial.structure or {}),
+        truncation=dict(facts.get("truncation") or {}),
+    )
+    _trace_submit(
+        stage="candidate",
+        name=NAME,
+        params={"format": "capability"},
+        result={
+            "registered": True,
+            "primaryTargetRegionId": primary,
+            "summary": facts["summary"],
+        },
+        phase="candidate",
+        batch_id=trial.batch_id,
+        checks=_checks("pass"),
+        # 候选**真的登记了**（``save_edit_item`` 成功）。
+        candidate_registered=candidate_registered,
+        applied=False,
+        changes=list(facts.get("presentationChanges") or []),
+        structure=dict(trial.structure or {}),
+        truncation=dict(facts.get("truncation") or {}),
+        extra={"itemId": item_id, "planId": plan_id},
+    )
     return {
         "accepted": True,
         "tool": NAME,

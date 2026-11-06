@@ -14,6 +14,7 @@ from app.access import DemoAccessMiddleware
 from app.config import get_settings
 from app.routers import agent as agent_router
 from app.routers import drafts as drafts_router
+from app.routers import edit_experiences as edit_experiences_router
 from app.routers import feedback as feedback_router
 from app.routers import mock_capability
 from app.routers import report as report_router
@@ -60,13 +61,18 @@ class _FeedbackSchemaMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope.get("path", "").startswith("/api/"):
             try:
+                from app.services.edit_experience_service import (
+                    init_edit_experience_storage,
+                )
                 from app.services.feedback_service import init_feedback_storage
                 from app.services.session_service import session_service
 
                 init_feedback_storage(session_service.repository)
+                # 编辑经验表（20261105）：与反馈表同一套迁移入口。
+                init_edit_experience_storage(session_service.repository)
             except Exception:  # noqa: BLE001 — 建表失败不该把服务搞挂
                 logging.getLogger(__name__).warning(
-                    "[feedback] 反馈表初始化失败，反馈功能暂不可用"
+                    "[feedback] 反馈/经验表初始化失败，反馈与经验功能暂不可用"
                 )
         await self.app(scope, receive, send)
 
@@ -90,6 +96,33 @@ app.include_router(drafts_router.router)
 # 反馈收件箱（20261104）：提交反馈 / 客户端事件 / 维护者管理。
 # 它**不改变**任何报表业务状态，只是往反馈自己的表里写。
 app.include_router(feedback_router.router)
+# 编辑经验（20261105）：待审核执行记录 + 可信经验审核。
+# 同样**不改变**报表业务状态 —— 归档由接受路径在同一事务里写。
+app.include_router(edit_experiences_router.router)
+
+
+# 能力总目录（20261105）：启动时核对并生成。
+#
+# 生成失败 → **启动报错**，不静默用旧的手写说明：
+# 目录过期时模型会按一份已经不认识的参数去调工具。
+def _sync_capability_catalog() -> None:
+    from app.services.capability_catalog_service import ensure_catalog_fresh
+
+    version = ensure_catalog_fresh(force=True)
+    logging.getLogger(__name__).info(
+        "[capability_catalog] 能力总目录已就绪 version=%s", version
+    )
+
+
+try:
+    _sync_capability_catalog()
+except Exception as exc:  # noqa: BLE001
+    logging.getLogger(__name__).error(
+        "[capability_catalog] 能力总目录生成失败，服务不启动：%s",
+        type(exc).__name__,
+        exc_info=(type(exc), None, exc.__traceback__),
+    )
+    raise
 
 
 # 挂载前端静态目录：backend/../frontend

@@ -118,6 +118,110 @@ ALLOWED_FORMAT_KEYS = (
 #: metadata 只开放这三个；ID / 版本 / 状态**不供用户直接改**。
 ALLOWED_METADATA_KEYS = ("name", "description", "tags")
 
+
+# --------------------------------------------------------------------------
+# 契约事实：参数契约层与能力总目录**读这一份**
+# --------------------------------------------------------------------------
+#
+# 下面这些常量是「真实约束」的可导入形态：校验函数用它们判合法性，
+# 能力总目录（``capability_catalog_service``）与共享契约
+# （``edit_capabilities/contract.py``）也读它们写参数说明 ——
+# **同一份数字、同一份取值域**，不允许目录里另抄一份。
+
+#: 长度类字段的单位（像素 / 百分比）。
+LENGTH_UNITS = ("PX", "PERCENT")
+
+#: 长度类字段的默认取值范围（各字段另有更严的范围时用自己的）。
+LENGTH_MIN = 0
+LENGTH_MAX = 400
+
+#: 排列参数（``arrangement``）的键。
+ARRANGEMENT_KEYS = ("mode", "columns", "direction", "gap")
+
+#: 排列参数的列数范围。
+ARRANGEMENT_COLUMNS_MIN = 1
+ARRANGEMENT_COLUMNS_MAX = 12
+
+#: 排列参数的间距（``gap``）范围。
+ARRANGEMENT_GAP_MIN = 0
+ARRANGEMENT_GAP_MAX = 96
+
+#: 页面最大宽度（``webMaxWidth``）范围。
+PAGE_WIDTH_MIN = 640
+PAGE_WIDTH_MAX = 2560
+
+#: 定位（``placement``）的网格列范围。
+PLACEMENT_COLUMN_MIN = 1
+PLACEMENT_COLUMN_MAX = 12
+
+#: 定位的网格行范围。
+PLACEMENT_ROW_MIN = 1
+PLACEMENT_ROW_MAX = 999
+
+#: 定位的网格行跨度范围。
+PLACEMENT_ROW_SPAN_MIN = 1
+PLACEMENT_ROW_SPAN_MAX = 12
+
+#: 固定定位（ABSOLUTE）的坐标范围。
+PLACEMENT_ABSOLUTE_MIN = 0
+PLACEMENT_ABSOLUTE_MAX = 100000
+
+#: 固定定位的层级（``zIndex``）范围。
+PLACEMENT_ZINDEX_MIN = 0
+PLACEMENT_ZINDEX_MAX = 9999
+
+#: 流式定位的对齐方式。
+PLACEMENT_ALIGNMENTS = ("START", "CENTER", "END", "STRETCH")
+
+#: 样式字号范围（像素）。
+STYLE_FONT_SIZE_MIN = 1
+STYLE_FONT_SIZE_MAX = 200
+
+#: 样式字重范围（百分数）。
+STYLE_FONT_WEIGHT_MIN = 100
+STYLE_FONT_WEIGHT_MAX = 900
+
+#: 样式行高范围。
+STYLE_LINE_HEIGHT_MIN = 0
+STYLE_LINE_HEIGHT_MAX = 400
+
+#: 样式外边距范围（可负）。
+STYLE_MARGIN_MIN = -200
+STYLE_MARGIN_MAX = 400
+
+#: 样式边框宽度范围。
+STYLE_BORDER_WIDTH_MIN = 0
+STYLE_BORDER_WIDTH_MAX = 20
+
+#: 样式圆角范围。
+STYLE_BORDER_RADIUS_MIN = 0
+STYLE_BORDER_RADIUS_MAX = 200
+
+#: 样式透明度范围。
+STYLE_OPACITY_MIN = 0
+STYLE_OPACITY_MAX = 1
+
+#: 显示格式的小数位范围。
+FORMAT_PRECISION_MIN = 0
+FORMAT_PRECISION_MAX = 6
+
+#: 展示操作里承载「区块 / 分组引用」的字段：字段 → 取值来源。
+#:
+#: 这些字段的取值**必须来自当前草稿**，不许编 —— 目录里的「引用规则」
+#: 与错误反馈里的「引用说明」都读这一份。
+PRESENTATION_REFERENCE_FIELDS: dict[str, str] = {
+    "regionId": "当前草稿里的区块 id（get_current_draft 返回的正文卡片 id 清单）",
+    "newRegionId": "新卡片使用的 id（不能与现有区块 id 重复）",
+    "groupId": "当前草稿里的分组 id（CREATE_GROUP 建出来的分组）",
+    "memberRegionIds": "当前草稿里的区块 id 列表（至少一张卡片）",
+    "targetGroupId": "当前草稿里的分组 id",
+    "afterRegionId": "当前草稿里的区块 id（相对位置锚点：放到这张卡后面）",
+    "beforeRegionId": "当前草稿里的区块 id（相对位置锚点：放到这张卡前面）",
+}
+
+#: 引用字段里哪些是**id 列表**（其余是单个 id）。
+PRESENTATION_REFERENCE_LIST_FIELDS = ("memberRegionIds",)
+
 #: 明显不是样式值的东西：脚本、任意 CSS 文本、外链。
 #:
 #: ``<`` / ``>`` 一起拒（标签注入）；``{`` 与 ``}`` 同时出现也拒 ——
@@ -337,11 +441,11 @@ def _as_int(value: Any, *, low: int, high: int, field: str) -> int:
     return number
 
 
-def _length(value: Any, *, field: str, low: int = 0, high: int = 400) -> dict[str, Any]:
+def _length(value: Any, *, field: str, low: int = LENGTH_MIN, high: int = LENGTH_MAX) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise PresentationError("out_of_range", f"{field} 的取值格式不对。")
     unit = str(value.get("unit") or "PX").upper()
-    if unit not in ("PX", "PERCENT"):
+    if unit not in LENGTH_UNITS:
         raise PresentationError("out_of_range", f"{field} 的单位只能是 PX 或 PERCENT。")
     number = _as_int(value.get("value"), low=low, high=high, field=f"{field}.value")
     return {"value": number, "unit": unit}
@@ -351,17 +455,22 @@ def _validate_arrangement(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise PresentationError("out_of_range", "排列参数格式不对。")
     for key in value:
-        if key not in ("mode", "columns", "direction", "gap"):
+        if key not in ARRANGEMENT_KEYS:
             raise PresentationError("invalid_operation", f"排列参数不支持 {key!r}。")
     mode = str(value.get("mode") or "GRID").upper()
     if mode not in ALLOWED_ARRANGEMENT_MODES:
         raise PresentationError("out_of_range", "排列模式只能是 GRID 或 FLOW。")
-    columns = _as_int(value.get("columns", 2), low=1, high=12, field="columns")
+    columns = _as_int(
+        value.get("columns", 2),
+        low=ARRANGEMENT_COLUMNS_MIN,
+        high=ARRANGEMENT_COLUMNS_MAX,
+        field="columns",
+    )
     direction = str(value.get("direction") or "HORIZONTAL").upper()
     if direction not in ALLOWED_DIRECTIONS:
         raise PresentationError("out_of_range", "方向只能是 HORIZONTAL 或 VERTICAL。")
     gap_value = value.get("gap", {"value": 12, "unit": "PX"})
-    gap = _length(gap_value, field="gap", high=96)
+    gap = _length(gap_value, field="gap", high=ARRANGEMENT_GAP_MAX)
     return {
         "mode": mode,
         "columns": columns,
@@ -383,13 +492,33 @@ def _validate_placement(value: Any) -> dict[str, Any]:
                 raise PresentationError("invalid_operation", f"网格定位不支持 {key!r}。")
         placement: dict[str, Any] = {
             "type": "GRID",
-            "column": _as_int(value.get("column", 1), low=1, high=12, field="column"),
-            "columnSpan": _as_int(value.get("columnSpan", 1), low=1, high=12, field="columnSpan"),
+            "column": _as_int(
+                value.get("column", 1),
+                low=PLACEMENT_COLUMN_MIN,
+                high=PLACEMENT_COLUMN_MAX,
+                field="column",
+            ),
+            "columnSpan": _as_int(
+                value.get("columnSpan", 1),
+                low=PLACEMENT_COLUMN_MIN,
+                high=PLACEMENT_COLUMN_MAX,
+                field="columnSpan",
+            ),
         }
         if value.get("row") is not None:
-            placement["row"] = _as_int(value.get("row"), low=1, high=999, field="row")
+            placement["row"] = _as_int(
+                value.get("row"),
+                low=PLACEMENT_ROW_MIN,
+                high=PLACEMENT_ROW_MAX,
+                field="row",
+            )
         if value.get("rowSpan") is not None:
-            placement["rowSpan"] = _as_int(value.get("rowSpan"), low=1, high=12, field="rowSpan")
+            placement["rowSpan"] = _as_int(
+                value.get("rowSpan"),
+                low=PLACEMENT_ROW_SPAN_MIN,
+                high=PLACEMENT_ROW_SPAN_MAX,
+                field="rowSpan",
+            )
         if value.get("minHeight") is not None:
             placement["minHeight"] = _length(value["minHeight"], field="minHeight")
         return placement
@@ -401,7 +530,7 @@ def _validate_placement(value: Any) -> dict[str, Any]:
         placement = {"type": "FLOW"}
         if value.get("align") is not None:
             align = str(value.get("align")).upper()
-            if align not in ("START", "CENTER", "END", "STRETCH"):
+            if align not in PLACEMENT_ALIGNMENTS:
                 raise PresentationError("out_of_range", "对齐方式取值不对。")
             placement["align"] = align
         if value.get("width") is not None:
@@ -415,11 +544,36 @@ def _validate_placement(value: Any) -> dict[str, Any]:
             raise PresentationError("invalid_operation", f"固定定位不支持 {key!r}。")
     return {
         "type": "ABSOLUTE",
-        "x": _as_int(value.get("x", 0), low=0, high=100000, field="x"),
-        "y": _as_int(value.get("y", 0), low=0, high=100000, field="y"),
-        "width": _as_int(value.get("width", 100), low=1, high=100000, field="width"),
-        "height": _as_int(value.get("height", 100), low=1, high=100000, field="height"),
-        "zIndex": _as_int(value.get("zIndex", 0), low=0, high=9999, field="zIndex"),
+        "x": _as_int(
+            value.get("x", 0),
+            low=PLACEMENT_ABSOLUTE_MIN,
+            high=PLACEMENT_ABSOLUTE_MAX,
+            field="x",
+        ),
+        "y": _as_int(
+            value.get("y", 0),
+            low=PLACEMENT_ABSOLUTE_MIN,
+            high=PLACEMENT_ABSOLUTE_MAX,
+            field="y",
+        ),
+        "width": _as_int(
+            value.get("width", 100),
+            low=PLACEMENT_COLUMN_MIN,
+            high=PLACEMENT_ABSOLUTE_MAX,
+            field="width",
+        ),
+        "height": _as_int(
+            value.get("height", 100),
+            low=PLACEMENT_COLUMN_MIN,
+            high=PLACEMENT_ABSOLUTE_MAX,
+            field="height",
+        ),
+        "zIndex": _as_int(
+            value.get("zIndex", 0),
+            low=PLACEMENT_ZINDEX_MIN,
+            high=PLACEMENT_ZINDEX_MAX,
+            field="zIndex",
+        ),
     }
 
 
@@ -436,9 +590,19 @@ def _validate_style(value: Any) -> dict[str, Any]:
     if value.get("fontFamily") is not None:
         style["fontFamily"] = str(value["fontFamily"])[:200]
     if value.get("fontSize") is not None:
-        style["fontSize"] = _length(value["fontSize"], field="fontSize", low=1, high=200)
+        style["fontSize"] = _length(
+            value["fontSize"],
+            field="fontSize",
+            low=STYLE_FONT_SIZE_MIN,
+            high=STYLE_FONT_SIZE_MAX,
+        )
     if value.get("fontWeight") is not None:
-        style["fontWeight"] = _as_int(value["fontWeight"], low=100, high=900, field="fontWeight")
+        style["fontWeight"] = _as_int(
+            value["fontWeight"],
+            low=STYLE_FONT_WEIGHT_MIN,
+            high=STYLE_FONT_WEIGHT_MAX,
+            field="fontWeight",
+        )
     if value.get("textColor") is not None:
         style["textColor"] = str(value["textColor"])[:64]
     if value.get("backgroundColor") is not None:
@@ -454,11 +618,21 @@ def _validate_style(value: Any) -> dict[str, Any]:
             raise PresentationError("out_of_range", "垂直对齐取值不对。")
         style["verticalAlign"] = align
     if value.get("lineHeight") is not None:
-        style["lineHeight"] = _length(value["lineHeight"], field="lineHeight", high=400)
+        style["lineHeight"] = _length(
+            value["lineHeight"],
+            field="lineHeight",
+            low=STYLE_LINE_HEIGHT_MIN,
+            high=STYLE_LINE_HEIGHT_MAX,
+        )
     if value.get("padding") is not None:
         style["padding"] = _length(value["padding"], field="padding")
     if value.get("margin") is not None:
-        style["margin"] = _length(value["margin"], field="margin", low=-200)
+        style["margin"] = _length(
+            value["margin"],
+            field="margin",
+            low=STYLE_MARGIN_MIN,
+            high=STYLE_MARGIN_MAX,
+        )
     if value.get("border") is not None:
         border = value["border"]
         if not isinstance(border, dict):
@@ -467,19 +641,29 @@ def _validate_style(value: Any) -> dict[str, Any]:
             if key not in ("width", "style", "color"):
                 raise PresentationError("invalid_operation", f"边框不支持 {key!r}。")
         style["border"] = {
-            "width": _as_int(border.get("width", 1), low=0, high=20, field="border.width"),
+            "width": _as_int(
+                border.get("width", 1),
+                low=STYLE_BORDER_WIDTH_MIN,
+                high=STYLE_BORDER_WIDTH_MAX,
+                field="border.width",
+            ),
             "style": str(border.get("style") or "SOLID").upper(),
             "color": str(border.get("color") or "#e2e8f0")[:64],
         }
         if style["border"]["style"] not in ALLOWED_BORDER_STYLE:
             raise PresentationError("out_of_range", "边框线型取值不对。")
     if value.get("borderRadius") is not None:
-        style["borderRadius"] = _as_int(value["borderRadius"], low=0, high=200, field="borderRadius")
+        style["borderRadius"] = _as_int(
+            value["borderRadius"],
+            low=STYLE_BORDER_RADIUS_MIN,
+            high=STYLE_BORDER_RADIUS_MAX,
+            field="borderRadius",
+        )
     if value.get("opacity") is not None:
         opacity = value["opacity"]
         if isinstance(opacity, bool) or not isinstance(opacity, (int, float)):
             raise PresentationError("out_of_range", "透明度必须是数字。")
-        if opacity < 0 or opacity > 1:
+        if opacity < STYLE_OPACITY_MIN or opacity > STYLE_OPACITY_MAX:
             raise PresentationError("out_of_range", "透明度必须在 0 到 1 之间。")
         style["opacity"] = float(opacity)
     return style
@@ -579,7 +763,12 @@ def _validate_format(
             raise PresentationError("out_of_range", "显示格式类型取值不对。")
         fmt["kind"] = kind
     if value.get("precision") is not None:
-        fmt["precision"] = _as_int(value["precision"], low=0, high=6, field="precision")
+        fmt["precision"] = _as_int(
+            value["precision"],
+            low=FORMAT_PRECISION_MIN,
+            high=FORMAT_PRECISION_MAX,
+            field="precision",
+        )
     if value.get("unitLabel") is not None:
         label = str(value["unitLabel"]).strip()
         if not label:
@@ -1381,6 +1570,7 @@ def _apply_one(
 
 
 def _op_create_group(root, params, affected, issues, changes) -> None:
+    """把若干张卡片放进一个**新的分组**（容器）里：给 groupId、memberRegionIds，可选 name / arrangement。"""
     _require_keys(params, ("groupId", "memberRegionIds"), ("name", "description", "role", "arrangement"))
     group_id = str(params["groupId"]).strip()
     if not group_id:
@@ -1457,6 +1647,7 @@ def _op_create_group(root, params, affected, issues, changes) -> None:
 
 
 def _op_set_group_arrangement(root, params, affected, issues, changes) -> None:
+    """改一个**分组**里卡片的排列：给 groupId 与 arrangement（列数 / 方向 / 间距）。"""
     _require_keys(params, ("groupId", "arrangement"), ())
     group_id = str(params["groupId"])
     container = find_region(root, group_id)
@@ -1476,6 +1667,7 @@ def _op_set_group_arrangement(root, params, affected, issues, changes) -> None:
 
 
 def _op_move_region(root, params, affected, issues, changes) -> None:
+    """**移动**一张卡片：给 regionId，可选 targetGroupId + index，或 afterRegionId / beforeRegionId。"""
     # ``afterRegionId`` / ``beforeRegionId``：**相对位置**（契约 N2 / §1.3）。
     # 执行器**直接**认这两个参数 —— 即使有计划绕过规范化层，也不会再报
     # "不支持的参数：'afterRegionId'"。下标语义与规范化层**完全一致**
@@ -1565,6 +1757,7 @@ def _op_move_region(root, params, affected, issues, changes) -> None:
 
 
 def _op_ungroup(root, params, affected, issues, changes) -> None:
+    """**解散分组**：给 groupId，里面的卡片回到原来的层级。"""
     _require_keys(params, ("groupId",), ())
     group_id = str(params["groupId"])
     container = find_region(root, group_id)
@@ -1663,6 +1856,7 @@ def _referenced_region_ids(root: dict[str, Any]) -> set[str]:
 
 
 def _op_delete_group(root, params, affected, issues, changes) -> None:
+    """**删除分组**：给 groupId；组里还有卡片时默认整批失败（force=true 才强制）。"""
     _require_keys(params, ("groupId",), ("force",))
     group_id = str(params["groupId"])
     container = find_region(root, group_id)
@@ -1856,6 +2050,7 @@ def _mark_copied_regions(
 
 
 def _op_copy_region(root, params, affected, issues, changes) -> None:
+    """**复制**一张卡片：给 regionId 与 newRegionId（不能与现有 id 重复）。"""
     _require_keys(params, ("regionId", "newRegionId"), ())
     region_id = str(params["regionId"])
     new_id = str(params["newRegionId"]).strip()
@@ -1911,6 +2106,7 @@ def _op_copy_region(root, params, affected, issues, changes) -> None:
 
 
 def _op_delete_region(root, params, affected, issues, changes) -> None:
+    """**删除**一张卡片：给 regionId；有引用方时默认整批失败（force=true 才强制）。"""
     _require_keys(params, ("regionId",), ("force",))
     region_id = str(params["regionId"])
     region = find_region(root, region_id)
@@ -1945,6 +2141,7 @@ def _op_delete_region(root, params, affected, issues, changes) -> None:
 
 
 def _op_hide_region(root, params, affected, issues, changes) -> None:
+    """**隐藏**一张卡片（不删）：给 regionId。"""
     _require_keys(params, ("regionId",), ())
     region_id = str(params["regionId"])
     region = find_region(root, region_id)
@@ -1959,6 +2156,7 @@ def _op_hide_region(root, params, affected, issues, changes) -> None:
 
 
 def _op_show_region(root, params, affected, issues, changes) -> None:
+    """**恢复显示**一张隐藏的卡片：给 regionId。"""
     _require_keys(params, ("regionId",), ())
     region_id = str(params["regionId"])
     region = find_region(root, region_id)
@@ -1973,6 +2171,7 @@ def _op_show_region(root, params, affected, issues, changes) -> None:
 
 
 def _op_set_placement(root, params, affected, issues, changes) -> None:
+    """改**定位**：给 regionId 与 placement（GRID / FLOW / ABSOLUTE）。"""
     _require_keys(params, ("regionId", "placement"), ())
     region_id = str(params["regionId"])
     region = find_region(root, region_id)
@@ -1993,6 +2192,7 @@ def _op_set_placement(root, params, affected, issues, changes) -> None:
 
 
 def _op_set_style(root, params, affected, issues, changes) -> None:
+    """改**外观**：给 regionId 与 style（字体 / 字号 / 字重 / 颜色 / 对齐 / 行高 / 内外边距 / 边框 / 圆角 / 透明度）。"""
     _require_keys(params, ("regionId", "style"), ())
     region_id = str(params["regionId"])
     region = find_region(root, region_id)
@@ -2010,6 +2210,7 @@ def _op_set_style(root, params, affected, issues, changes) -> None:
 
 
 def _op_set_format(root, params, affected, issues, changes) -> None:
+    """改**数字显示格式**：给 regionId 与 format（kind / precision / unitLabel / thousandSeparator / dateTimePattern / nullText / roundingMode）。"""
     _require_keys(params, ("regionId", "format"), ())
     region_id = str(params["regionId"])
     region = find_region(root, region_id)
@@ -2027,13 +2228,19 @@ def _op_set_format(root, params, affected, issues, changes) -> None:
 
 
 def _op_set_page(root, params, affected, issues, changes) -> None:
+    """改**整页设置**：给 webMaxWidth 与 / 或 arrangement。"""
     _require_keys(params, (), ("webMaxWidth", "arrangement"))
     page = root.get("page")
     if not isinstance(page, dict):
         page = {}
         root["page"] = page
     if params.get("webMaxWidth") is not None:
-        width = _length(params["webMaxWidth"], field="webMaxWidth", low=640, high=2560)
+        width = _length(
+            params["webMaxWidth"],
+            field="webMaxWidth",
+            low=PAGE_WIDTH_MIN,
+            high=PAGE_WIDTH_MAX,
+        )
         before = copy.deepcopy(page.get("webMaxWidth"))
         page["webMaxWidth"] = width
         _record_change(
@@ -2050,6 +2257,7 @@ def _op_set_page(root, params, affected, issues, changes) -> None:
 
 
 def _op_set_metadata(root, params, affected, issues, changes) -> None:
+    """改**报表元数据**：给 name / description / tags。"""
     _require_keys(params, (), ALLOWED_METADATA_KEYS)
     metadata = root.get("metadata")
     if not isinstance(metadata, dict):
@@ -2112,6 +2320,7 @@ def _clear_theme_managed_overrides(
 
 
 def _op_set_theme(root, params, affected, issues, changes) -> None:
+    """把一个**共享主题**应用到这份报表：给 themeId（取自 availableThemes）。"""
     _require_keys(params, ("themeId",), ())
     theme_id = str(params["themeId"]).strip()
     if not theme_id:
@@ -2167,10 +2376,10 @@ _LENGTH_STYLE_FIELDS = ("fontSize", "lineHeight", "padding", "margin")
 _LENGTH_PLACEMENT_FIELDS = ("width", "minHeight")
 
 #: 长度只允许这两种单位；其它单位报错，不猜。
-_ALLOWED_LENGTH_UNITS = ("PX", "PERCENT")
+_ALLOWED_LENGTH_UNITS = LENGTH_UNITS
 
 #: 排列参数里的键（契约 N4）。
-_ARRANGEMENT_KEYS = ("mode", "columns", "direction", "gap")
+_ARRANGEMENT_KEYS = ARRANGEMENT_KEYS
 
 #: 排列字段出现在 **placement** 里 = 层级错（契约 N3）。
 _ARRANGEMENT_MARKERS = ("columns", "mode", "direction", "gap")

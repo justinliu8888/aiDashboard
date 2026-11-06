@@ -33,6 +33,7 @@ from app.tools import (
     get_validation_result_tool,
     list_simulated_dimensions_tool,
     search_catalog_tool,
+    search_edit_experience_tool,
     search_metric_tool,
     submit_edit_answer_tool,
     submit_blocked_tool,
@@ -70,6 +71,9 @@ _TOOLS: list[Any] = [
     get_recorded_progress_tool,
     check_product_capability_tool,
     list_simulated_dimensions_tool,
+    # 只读经验检索（20261105 编辑经验库）：检索**已批准且未禁用**的可信经验。
+    # 只在编辑态可用 —— 生成态没有「修改经验」这回事。
+    search_edit_experience_tool,
     # 编辑能力：把操作清单写进服务端现场（不终结本轮）
     # 确定性组装
     build_definition_draft_tool,

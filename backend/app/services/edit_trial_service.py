@@ -33,10 +33,18 @@ from app.services.edit_capabilities import (
     get_capability,
     validate_params,
 )
+from app.services.edit_capabilities.base import (
+    BUSINESS_DETAIL_FIELD,
+    BUSINESS_ISSUES_FIELD,
+    BUSINESS_MESSAGE_FIELD,
+    BUSINESS_OK_FIELD,
+    BUSINESS_REASON_FIELD,
+)
 from app.services.edit_capabilities.chart_data import (
     PREVIEW_SPEC_KEY,
     SIMULATED_KEY,
 )
+from app.services.edit_capabilities.blocks import project_structure
 from app.services.validation_service import SUPPORTED_CHART_KINDS
 
 logger = logging.getLogger(__name__)
@@ -46,6 +54,169 @@ logger = logging.getLogger(__name__)
 # 结果
 # --------------------------------------------------------------------------
 
+def _business_facts(raw: Any) -> dict[str, Any]:
+    """把执行实现报上来的**业务事实**整理成固定形状。
+
+    ``businessOk`` 是**三态**：
+
+    * ``True``  —— 业务上确实做成了；
+    * ``False`` —— 业务上确实没做成（带着真实的 reason / issues）；
+    * ``None``  —— **未取得**（框架没给业务结论，比如参数校验就没过）。
+
+    **绝不拿「执行器没抛异常」当业务成功**。
+    """
+    data = raw if isinstance(raw, dict) else {}
+    ok = data.get(BUSINESS_OK_FIELD)
+    if ok is not None and not isinstance(ok, bool):
+        ok = None
+    issues = data.get(BUSINESS_ISSUES_FIELD)
+    detail = data.get(BUSINESS_DETAIL_FIELD)
+    return {
+        BUSINESS_OK_FIELD: ok,
+        BUSINESS_MESSAGE_FIELD: str(data.get(BUSINESS_MESSAGE_FIELD) or ""),
+        BUSINESS_REASON_FIELD: str(data.get(BUSINESS_REASON_FIELD) or ""),
+        BUSINESS_ISSUES_FIELD: [
+            item
+            for item in (issues if isinstance(issues, list) else [])
+            if isinstance(item, dict)
+        ],
+        BUSINESS_DETAIL_FIELD: detail if isinstance(detail, dict) else {},
+    }
+
+
+def _attach_business(error: dict[str, Any], raw: Any) -> None:
+    """把**业务事实**补进错误形状（增量字段，既有字段语义不动）。"""
+    facts = _business_facts(raw)
+    for field in (
+        BUSINESS_OK_FIELD,
+        BUSINESS_MESSAGE_FIELD,
+        BUSINESS_REASON_FIELD,
+        BUSINESS_ISSUES_FIELD,
+        BUSINESS_DETAIL_FIELD,
+    ):
+        value = facts[field]
+        if value in (None, "", [], {}):
+            continue
+        error[field] = value
+
+
+def _new_batch_id() -> str:
+    """一次试做的**批次 id**（同一个事实只有一个落点：由追踪服务生成）。"""
+    try:
+        from app.services import edit_trace_service
+
+        return str(edit_trace_service.new_batch_id() or "")
+    except Exception:  # noqa: BLE001 — 取不到批次号不该掀翻试做
+        return ""
+
+
+def _checks_of_step(ok: bool | None) -> dict[str, str]:
+    """一步的三类检查状态。
+
+    * 业务：这一步**确实**做成了 / 确实没做成 / **没执行**（未取得）；
+    * 持久化：试做只跑在副本上，**没有**事务 → ``not_run``；
+    * 效果核对：本轮**没有**效果核对行为 → ``not_run``（不推断）。
+    """
+    try:
+        from app.services import edit_trace_service
+
+        business = (
+            edit_trace_service.CHECK_NOT_RUN
+            if ok is None
+            else (edit_trace_service.CHECK_PASS if ok else edit_trace_service.CHECK_FAIL)
+        )
+        return {
+            "business": business,
+            "persistence": edit_trace_service.PERSIST_NOT_RUN,
+            "effect": edit_trace_service.EFFECT_NOT_RUN,
+        }
+    except Exception:  # noqa: BLE001
+        return {"business": "unknown", "persistence": "not_run", "effect": "not_run"}
+
+
+def _trace_step(
+    *,
+    index: int | None,
+    op: str,
+    target: dict,
+    ok: bool | None,
+    region_id: str = "",
+    title: str = "",
+    error: dict | None = None,
+    business: Any = None,
+    draft_changed: bool | None = False,
+    phase: str = "trial",
+    batch_id: str = "",
+    changes: list[dict[str, Any]] | None = None,
+    structure: dict[str, Any] | None = None,
+    wrapper_path: list[str] | None = None,
+    sub_step_index: int | None = None,
+    not_executed: bool = False,
+    truncation: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """把一步的执行结果写进追踪（**失败不影响主流程**）。
+
+    记的是**实际发生的事**：这一步是什么能力、落在哪个目标、
+    **业务上到底成没成**（``businessOk`` 三态）、失败时的真实业务原因与
+    结构化问题、**正式草稿有没有变**，以及这一步的**精确前后变化**与
+    **有界结构投影**。
+
+    ``ok=None`` 表示这一步**没有执行**（前面的步骤失败导致整批放弃）：
+    它既不是成功，也不是「没有变化」—— ``result`` 里带
+    ``notExecuted=True`` 说清这一点。
+
+    试做阶段一律 ``phase="trial"``、``draftChanged=False`` ——
+    试做只在副本上跑，正式草稿**确实**没变（这是事实，不是推测）。
+    """
+    try:
+        from app.services import edit_trace_service
+
+        facts = _business_facts(business)
+        result: dict = {"ok": ok, "index": index}
+        if region_id:
+            result["regionId"] = region_id
+        if title:
+            result["title"] = title
+        if error:
+            result["reason"] = str(error.get("reason") or "")
+            result["constraint"] = str(error.get("constraint") or "")
+        if not_executed:
+            # **未执行**要说得出口：不是成功，也不是「没有变化」。
+            result["notExecuted"] = True
+        # 业务事实也进 result：这一步**实际**发生了什么。
+        result.update(facts)
+        record_extra: dict[str, Any] = {
+            "phase": phase,
+            "draftChanged": draft_changed,
+            **facts,
+        }
+        if extra:
+            record_extra.update(extra)
+        edit_trace_service.record(
+            edit_trace_service.STAGE_TRIAL,
+            name=op or "unknown_op",
+            params={"target": target},
+            result=result,
+            status="ok" if ok is True else ("error" if ok is False else "skipped"),
+            errorCategory="" if ok is not False else "trial_failed",
+            batchId=batch_id,
+            stepIndex=index,
+            changes=list(changes or []),
+            structure=dict(structure or {}),
+            wrapperPath=list(wrapper_path or []),
+            subStepIndex=sub_step_index,
+            truncation=dict(truncation or {}),
+            checks=_checks_of_step(ok),
+            applied=False,
+            # 裁剪过就**标出来**（不把「截断了」写成「完整内容」）。
+            truncated=bool((truncation or {}).get("changes")),
+            extra=record_extra,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @dataclass
 class TrialResult:
     """一次试做的结果。
@@ -53,6 +224,11 @@ class TrialResult:
     ``ok`` 为真时：``definition`` 是**改好的副本**（可作为正式生效的目标），
     ``facts`` 是**依据实际差异**生成的确认事实（文字确认从这里来，
     不抄模型「打算做什么」）。
+
+    新增字段（**增量**：既有字段语义不变）：
+
+    * ``batch_id``：这次试做的**批次 id**（同一次调用里的多次试做靠它分开）；
+    * ``structure``：整批的**有界结构投影**（受影响的区域 + 所在容器）。
     """
 
     ok: bool
@@ -62,6 +238,10 @@ class TrialResult:
     facts: dict[str, Any] = field(default_factory=dict)
     refs: dict[str, str] = field(default_factory=dict)
     resolved_operations: list[dict[str, Any]] = field(default_factory=list)
+    #: 试做批次 id。
+    batch_id: str = ""
+    #: 整批的有界结构投影（``{"affected": [...], "containers": [...]}``）。
+    structure: dict[str, Any] = field(default_factory=dict)
 
     @property
     def error_message(self) -> str:
@@ -468,6 +648,179 @@ def _collect_facts(
     }
 
 
+def _outcome_facts(detail: Any) -> dict[str, Any]:
+    """能力执行器的 ``detail`` → 这一步的**前后事实**。
+
+    ``changes`` / ``structure`` 来自能力执行器透传上来的那份（展示服务的
+    精确 changeSet + 有界结构投影）；**没有**就如实说没有 —— 不自己编。
+    """
+    data = detail if isinstance(detail, dict) else {}
+    changes = data.get("changes")
+    structure = data.get("structure")
+    truncation = data.get("truncation")
+    sub_operations = data.get("subOperations")
+    return {
+        "changes": (
+            [item for item in changes if isinstance(item, dict)]
+            if isinstance(changes, list)
+            else []
+        ),
+        "structure": dict(structure) if isinstance(structure, dict) else {},
+        "truncation": dict(truncation) if isinstance(truncation, dict) else {},
+        "subOperations": (
+            [item for item in sub_operations if isinstance(item, dict)]
+            if isinstance(sub_operations, list)
+            else []
+        ),
+        # 这一步**报没报过**前后变化（没报 ≠ 没有变化）。
+        "changeReported": "changes" in data,
+    }
+
+
+def _pending_step_facts(raw: Any) -> tuple[str, dict[str, Any]]:
+    """没执行的那一步：能说清是什么能力、什么目标就说清。"""
+    op = ""
+    target: dict[str, Any] = {}
+    if isinstance(raw, dict):
+        op = str(raw.get("op") or "").strip().upper()
+        raw_target = raw.get("target")
+        if isinstance(raw_target, dict):
+            target = {
+                key: value
+                for key, value in raw_target.items()
+                if isinstance(value, str) and value
+            }
+        elif isinstance(raw_target, str) and raw_target:
+            target = {"regionId": raw_target}
+    return op, target
+
+
+def _unchanged_operations(resolved: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """**没有变化**的操作与依据。
+
+    只有「报过前后变化」的能力才谈得上「没有变化」：别的能力**没报**
+    变化集 —— 那是「没取得」，不是「没有变化」。
+    """
+    out: list[dict[str, Any]] = []
+    for item in resolved:
+        if not item.get("changeReported"):
+            continue
+        if item.get("changes"):
+            continue
+        out.append(
+            {
+                "index": item.get("index"),
+                "op": str(item.get("op") or ""),
+                "regionId": str(item.get("regionId") or ""),
+                "title": str(item.get("title") or ""),
+                "basis": "执行器报出的前后变化为空",
+            }
+        )
+    return out
+
+
+def _check_report(
+    preview_context: dict[str, Any] | None, *, reached: bool
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """这次试做**实际做了哪些检查**、**哪些没做**（缺失写明缺失）。
+
+    ``reached=False``：整批在执行阶段就放弃了，核验**根本没跑到**。
+    """
+    if not reached:
+        return [], [
+            {
+                "check": "batch_verification",
+                "scope": "整批",
+                "performed": False,
+                "reason": "not_reached",
+                "missing": [],
+            }
+        ]
+    performed: list[dict[str, Any]] = [
+        {
+            "check": "categorical_binding",
+            "scope": "每个图表区块",
+            "performed": True,
+        },
+        {
+            "check": "chart_encoding",
+            "scope": "每个图表区块",
+            "performed": True,
+        },
+    ]
+    skipped: list[dict[str, Any]] = []
+    if preview_context:
+        performed.append(
+            {"check": "preview_payload", "scope": "最终定义", "performed": True}
+        )
+    else:
+        # 没取到上下文 → **如实说没做**，不猜它会通过。
+        skipped.append(
+            {
+                "check": "preview_payload",
+                "scope": "最终定义",
+                "performed": False,
+                "reason": "missing_context",
+                "missing": ["previewContext"],
+            }
+        )
+    return performed, skipped
+
+
+def _truncation_of(notes: list[dict[str, Any]]) -> dict[str, Any]:
+    """字段级裁剪痕迹（没裁过就是空字典 —— 不写空的假痕迹）。"""
+    return {"changes": list(notes)} if notes else {}
+
+
+def _batch_facts(
+    *,
+    batch_id: str,
+    structure: dict[str, Any],
+    changes: list[dict[str, Any]],
+    truncation: dict[str, Any],
+    scope: str,
+    unchanged_operations: list[dict[str, Any]],
+    checks_performed: list[dict[str, Any]],
+    checks_skipped: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """这一批的**事实**（只新增键；既有键的语义不动）。"""
+    return {
+        "batchId": batch_id,
+        "structure": dict(structure or {}),
+        # ``copy_only``：副本上的局部变化，整批没通过、没正式生效；
+        # ``batch_result``：这一批跑完的结构。
+        "structureScope": scope,
+        "presentationChanges": list(changes or []),
+        "truncation": dict(truncation or {}),
+        "unchangedOperations": list(unchanged_operations or []),
+        "checksPerformed": list(checks_performed or []),
+        "checksSkipped": list(checks_skipped or []),
+    }
+
+
+def _record_not_executed(
+    *, batch_id: str, operations: list[Any], start_index: int
+) -> list[int]:
+    """为失败步之后的步骤补记「**未执行**」。
+
+    后续步骤**根本没跑**：既不是成功，也不是「没有变化」。
+    """
+    recorded: list[int] = []
+    for index in range(max(start_index, 0), len(operations)):
+        op, target = _pending_step_facts(operations[index])
+        _trace_step(
+            index=index,
+            op=op,
+            target=target,
+            ok=None,
+            batch_id=batch_id,
+            not_executed=True,
+            extra={"notExecutedReason": "previous_step_failed"},
+        )
+        recorded.append(index)
+    return recorded
+
+
 def run_trial(
     *,
     definition: ReportDefinitionDraft,
@@ -479,12 +832,22 @@ def run_trial(
 
     返回的 ``TrialResult.definition`` 是改好的副本；``ok`` 为假时
     ``definition`` 为 ``None``（原草稿原样，调用方不需要清理）。
+
+    这次试做有**自己的批次 id**（``TrialResult.batch_id``）：同一次调用里
+    的多次试做靠它分开，第 1 步不会和上一次试做的第 1 步混成一步。
     """
     before = definition.model_copy(deep=True)
     working = definition.model_copy(deep=True)
     base_revision = _revision(definition)
     errors: list[dict[str, Any]] = []
     resolved: list[dict[str, Any]] = []
+    batch_id = _new_batch_id()
+    #: 这一批里**逐步**的前后变化（汇总用）。
+    step_changes: list[dict[str, Any]] = []
+    #: 这一批里受影响的区域 id（结构投影用）。
+    affected_ids: list[str] = []
+    #: 字段级裁剪痕迹。
+    truncation_notes: list[dict[str, Any]] = []
 
     ctx = OperationContext(
         definition=working,
@@ -505,7 +868,35 @@ def run_trial(
                 "message": "这次修改没有任何操作。",
             }
         )
-        return TrialResult(ok=False, errors=errors)
+        _trace_step(
+            index=0,
+            op="",
+            target={},
+            ok=False,
+            error=errors[-1],
+            batch_id=batch_id,
+            extra={
+                "batchOutcome": "failed",
+                "copyOnly": True,
+                "appliedToDraft": False,
+                "note": "副本上的局部变化，整批未通过、未正式生效",
+            },
+        )
+        return TrialResult(
+            ok=False,
+            errors=errors,
+            batch_id=batch_id,
+            facts=_batch_facts(
+                batch_id=batch_id,
+                structure={},
+                changes=[],
+                truncation={},
+                scope="copy_only",
+                unchanged_operations=[],
+                checks_performed=[],
+                checks_skipped=[],
+            ),
+        )
 
     for index, raw in enumerate(operations):
         ctx.step = index
@@ -539,7 +930,11 @@ def run_trial(
         except CapabilityError as exc:
             exc.step = index
             exc.op = exc.op or spec.op
-            errors.append(exc.to_dict())
+            error = exc.to_dict()
+            # 业务事实是**增量字段**：不改动 step / op / target / constraint /
+            # reason / message 的既有语义，只是把真实的业务结论补上去。
+            _attach_business(error, getattr(exc, "business", None))
+            errors.append(error)
             break
         except Exception as exc:  # noqa: BLE001 — 执行异常也要变成可修正的反馈
             errors.append(
@@ -561,8 +956,11 @@ def run_trial(
                 reason="operation_failed",
             )
             error.step = index
-            errors.append(error.to_dict())
+            error_dict = error.to_dict()
+            _attach_business(error_dict, getattr(error, "business", None))
+            errors.append(error_dict)
             break
+        facts_of_step = _outcome_facts(outcome.detail)
         resolved.append(
             {
                 "index": index,
@@ -574,12 +972,103 @@ def run_trial(
                 "chartKind": outcome.chart_kind,
                 "message": outcome.message,
                 "detail": outcome.detail,
+                # 这一步的**精确前后变化**与**结构投影**（追踪与事实用）。
+                "changes": facts_of_step["changes"],
+                "structure": facts_of_step["structure"],
+                "changeReported": facts_of_step["changeReported"],
             }
         )
+        step_changes.extend(facts_of_step["changes"])
+        truncation_notes.extend(facts_of_step["truncation"].get("changes") or [])
+        for item in facts_of_step["structure"].get("affected") or []:
+            region_id = str((item or {}).get("regionId") or "")
+            if region_id and region_id not in affected_ids:
+                affected_ids.append(region_id)
+        _trace_step(
+            index=index,
+            op=spec.op,
+            target=spec.target if isinstance(spec.target, dict) else {},
+            ok=True,
+            region_id=outcome.region_id,
+            title=outcome.title,
+            business=outcome.detail,
+            batch_id=batch_id,
+            changes=facts_of_step["changes"],
+            structure=facts_of_step["structure"],
+            truncation=facts_of_step["truncation"],
+        )
+        # 包装能力（展示操作包）里的**子操作**：只记操作名与下标 ——
+        # 展示服务给的是**整批** changeSet，没法诚实地拆到子操作，
+        # 所以这里不伪造子操作的前后变化。
+        for position, sub in enumerate(facts_of_step["subOperations"]):
+            _trace_step(
+                index=index,
+                op=spec.op,
+                target=spec.target if isinstance(spec.target, dict) else {},
+                ok=True,
+                business=None,
+                batch_id=batch_id,
+                structure=facts_of_step["structure"],
+                wrapper_path=[spec.op],
+                sub_step_index=position,
+                extra={
+                    "subOp": str(sub.get("op") or ""),
+                    "changesAttributed": False,
+                },
+            )
 
     if errors:
         # 整批放弃：原草稿不动（副本直接丢掉）。
-        return TrialResult(ok=False, errors=errors, refs=dict(ctx.refs))
+        failed_index = errors[-1].get("step")
+        failed_index = (
+            int(failed_index) if isinstance(failed_index, int) else len(resolved)
+        )
+        structure = project_structure(working, affected_ids, before=before)
+        _trace_step(
+            index=failed_index,
+            op=str(errors[-1].get("op") or ""),
+            target={"target": str(errors[-1].get("target") or "")},
+            ok=False,
+            error=errors[-1],
+            business=errors[-1],
+            draft_changed=False,
+            batch_id=batch_id,
+            changes=step_changes,
+            structure=structure,
+            truncation=_truncation_of(truncation_notes),
+            extra={
+                "batchOutcome": "failed",
+                "copyOnly": True,
+                "appliedToDraft": False,
+                "partialStepCount": len(resolved),
+                "partialChanges": step_changes,
+                "note": "副本上的局部变化，整批未通过、未正式生效",
+            },
+        )
+        # 失败步之后的步骤**根本没跑** —— 明确标「未执行」。
+        _record_not_executed(
+            batch_id=batch_id, operations=operations, start_index=failed_index + 1
+        )
+        checks_performed, checks_skipped = _check_report(
+            preview_context, reached=False
+        )
+        return TrialResult(
+            ok=False,
+            errors=errors,
+            refs=dict(ctx.refs),
+            batch_id=batch_id,
+            structure=structure,
+            facts=_batch_facts(
+                batch_id=batch_id,
+                structure=structure,
+                changes=step_changes,
+                truncation=_truncation_of(truncation_notes),
+                scope="copy_only",
+                unchanged_operations=_unchanged_operations(resolved),
+                checks_performed=checks_performed,
+                checks_skipped=checks_skipped,
+            ),
+        )
 
     # ---- 核验最终定义 ----
     for region in working.regions or []:
@@ -587,10 +1076,80 @@ def run_trial(
         _validate_chart_encoding(region, errors)
     payload = _validate_preview_payload(working, preview_context, errors)
     if errors:
-        return TrialResult(ok=False, errors=errors, refs=dict(ctx.refs))
+        # 核验阶段失败：也是**业务事实**（确实没通过检查），不是框架状态。
+        for item in errors:
+            _attach_business(
+                item,
+                {
+                    BUSINESS_OK_FIELD: False,
+                    BUSINESS_REASON_FIELD: str(item.get("reason") or ""),
+                    BUSINESS_MESSAGE_FIELD: str(item.get("message") or ""),
+                },
+            )
+        # 也要进追踪（否则「预执行没通过」查不到是哪一步）。
+        #
+        # 这是**批次级**的失败（每一步都跑完了，是核验没过）：
+        # 不对应某一步 → 步骤下标留空，**别把某一步说成失败**。
+        structure = project_structure(working, affected_ids, before=before)
+        _trace_step(
+            index=None,
+            op=str(errors[-1].get("op") or ""),
+            target={"target": str(errors[-1].get("target") or "")},
+            ok=False,
+            error=errors[-1],
+            business=errors[-1],
+            draft_changed=False,
+            batch_id=batch_id,
+            changes=step_changes,
+            structure=structure,
+            truncation=_truncation_of(truncation_notes),
+            extra={
+                "batchOutcome": "failed",
+                "failureScope": "batch_verification",
+                "copyOnly": True,
+                "appliedToDraft": False,
+                "partialStepCount": len(resolved),
+                "partialChanges": step_changes,
+                "note": "副本上的局部变化，整批未通过、未正式生效",
+            },
+        )
+        checks_performed, checks_skipped = _check_report(
+            preview_context, reached=True
+        )
+        return TrialResult(
+            ok=False,
+            errors=errors,
+            refs=dict(ctx.refs),
+            batch_id=batch_id,
+            structure=structure,
+            facts=_batch_facts(
+                batch_id=batch_id,
+                structure=structure,
+                changes=step_changes,
+                truncation=_truncation_of(truncation_notes),
+                scope="copy_only",
+                unchanged_operations=_unchanged_operations(resolved),
+                checks_performed=checks_performed,
+                checks_skipped=checks_skipped,
+            ),
+        )
 
     _bump_revision(working)
     facts = _collect_facts(before, working, resolved, ctx.refs)
+    structure = project_structure(working, affected_ids, before=before)
+    checks_performed, checks_skipped = _check_report(preview_context, reached=True)
+    facts.update(
+        _batch_facts(
+            batch_id=batch_id,
+            structure=structure,
+            changes=step_changes,
+            truncation=_truncation_of(truncation_notes),
+            scope="batch_result",
+            unchanged_operations=_unchanged_operations(resolved),
+            checks_performed=checks_performed,
+            checks_skipped=checks_skipped,
+        )
+    )
 
     change_set = ChangeSet(
         baseDefinitionRevision=base_revision,
@@ -645,6 +1204,8 @@ def run_trial(
         facts=facts,
         refs=dict(ctx.refs),
         resolved_operations=resolved,
+        batch_id=batch_id,
+        structure=structure,
     )
 
 

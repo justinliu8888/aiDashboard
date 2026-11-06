@@ -1,11 +1,18 @@
 /**
- * 反馈收件箱页面（20261104）。
+ * 管理员入口页面（20261105-admin1）。
+ *
+ * 两个区域：
+ *   - **用户反馈**：原有反馈功能（列表 / 详情 / 状态 / 备注 / 删除 / 导出 / 附件）原样保留；
+ *   - **编辑经验**：按契约 0003 §3.3 对接 `/api/edit-experiences`（执行记录审核 + 可信经验整理）。
  *
  * 纪律：
  *   - **先登录再加载数据**：静态壳可以公开，管理数据必须服务端鉴权；
  *   - 未登录时任何管理接口都返回 401 / 503 —— 这里如实显示，不假装有数据；
  *   - 列表 / 详情 / 改状态 / 备注 / 导出 / 删除都走后端鉴权接口，
- *     不在前端缓存任何管理数据。
+ *     不在前端缓存任何管理数据；
+ *   - 经验接口的错误**如实显示后端 detail**（401 / 403 / 404 / 409 / 422 / 503），
+ *     不统一说「操作失败」；
+ *   - 状态以**服务端为准**：每次写操作后重新拉列表/详情，不靠前端内存。
  */
 (function () {
   "use strict";
@@ -87,7 +94,8 @@
     $("feedback-admin-login").classList.toggle("hidden", loggedIn);
     $("feedback-admin-app").classList.toggle("hidden", !loggedIn);
     $("feedback-admin-app").classList.toggle("flex", loggedIn);
-    $("feedback-admin-export").classList.toggle("hidden", !loggedIn);
+    // 「导出 CSV」属于反馈区域；切到编辑经验时不该露出它。
+    $("feedback-admin-export").classList.toggle("hidden", !loggedIn || activeTab !== "feedback");
     $("feedback-admin-logout").classList.toggle("hidden", !loggedIn);
     const who = $("feedback-admin-who");
     who.classList.toggle("hidden", !loggedIn);
@@ -133,6 +141,7 @@
     $("feedback-admin-password").value = "";
     setLoggedIn(true, (result.payload && result.payload.username) || username);
     await loadList();
+    if (activeTab === "experience") await loadExperienceAll();
   }
 
   async function logout() {
@@ -142,6 +151,7 @@
     currentDetail = null;
     renderDetail(null);
     renderList([], 0);
+    resetExperienceUi();
   }
 
   // ---------- 列表 ----------
@@ -515,6 +525,601 @@
     URL.revokeObjectURL(url);
   }
 
+  // =========================================================
+  // 区域二：编辑经验（契约 0003 §3.3）
+  //
+  // 前缀 `/api/edit-experiences`：
+  //   GET   /admin/records?status=&limit=&offset=
+  //   GET   /admin/records/{record_id}
+  //   GET   /admin/experiences?includeDisabled=&limit=&offset=
+  //   POST  /admin/records/{record_id}/approve  {method, conditions, expectedVersion}
+  //   POST  /admin/records/{record_id}/reject   {reason?, expectedVersion}
+  //   PATCH /admin/experiences/{experience_id}   {method?, conditions?, disabled?, expectedVersion}
+  //
+  // 鉴权**复用**反馈那边的登录 cookie（fb_admin），不另造体系。
+  // 写操作带 expectedVersion（乐观锁）：版本不符 → 409，**数据不变**，如实显示。
+  // =========================================================
+
+  const EXP_PREFIX = "/api/edit-experiences";
+  const RECORD_STATUS_LABELS = { pending: "待审", approved: "已批准", rejected: "已拒绝" };
+  const EXPERIENCE_STATUS_LABELS = { approved: "已批准", disabled: "已禁用" };
+
+  let activeTab = "feedback";
+  let currentRecordId = null;
+  let currentRecord = null;
+  let currentExperience = null;
+
+  // ---------- 区域切换 ----------
+
+  function switchTab(tab) {
+    activeTab = tab === "experience" ? "experience" : "feedback";
+    const isFeedback = activeTab === "feedback";
+    $("btn-tab-feedback").classList.toggle("is-active", isFeedback);
+    $("btn-tab-experience").classList.toggle("is-active", !isFeedback);
+    $("btn-tab-feedback").setAttribute("aria-selected", isFeedback ? "true" : "false");
+    $("btn-tab-experience").setAttribute("aria-selected", isFeedback ? "false" : "true");
+    $("feedback-panel").classList.toggle("hidden", !isFeedback);
+    $("experience-panel").classList.toggle("hidden", isFeedback);
+    // 「导出 CSV」只属于反馈区域。
+    $("feedback-admin-export").classList.toggle("hidden", !isFeedback);
+    if (!isFeedback) loadExperienceAll();
+  }
+
+  async function loadExperienceAll() {
+    // 没登录时管理数据一律不取。
+    if ($("feedback-admin-app").classList.contains("hidden")) return;
+    await loadExperienceRecords();
+    await loadExperienceList();
+  }
+
+  function resetExperienceUi() {
+    currentRecordId = null;
+    currentRecord = null;
+    currentExperience = null;
+    const list = $("experience-record-list");
+    if (list) list.innerHTML = "";
+    const detail = $("experience-record-detail");
+    if (detail) detail.innerHTML = "";
+    const expList = $("experience-list");
+    if (expList) expList.innerHTML = "";
+    const edit = $("experience-edit");
+    if (edit) edit.innerHTML = "";
+    const total = $("experience-record-total");
+    if (total) total.textContent = "";
+    const expTotal = $("experience-list-total");
+    if (expTotal) expTotal.textContent = "";
+    clearExpNotice();
+  }
+
+  // ---------- 错误语义 ----------
+
+  function expFailure(result, fallback) {
+    const detail = detailText(result.payload);
+    if (result.status === 401) return `未登录（401）：${detail}`;
+    if (result.status === 403) return `跨源写请求被拒绝（403）：${detail}`;
+    if (result.status === 404) return `对象不存在（404）：${detail}`;
+    if (result.status === 409) return `版本冲突，数据未改动（409）：${detail}`;
+    if (result.status === 422) return `请求不合法（422）：${detail}`;
+    if (result.status === 503) return `管理员未配置，管理入口关闭（503）：${detail}`;
+    return `${fallback}（${result.status}）：${detail}`;
+  }
+
+  // 401 / 503 会让整个管理入口失效 —— 如实回到登录页，不假装有数据。
+  // 后端返回的 detail 也**如实显示**（不换成笼统说法）。
+  function expAuthFailure(result) {
+    if (result.status === 401) {
+      setLoggedIn(false, "");
+      showLoginError(`未登录（401）：${detailText(result.payload)}`);
+      return true;
+    }
+    if (result.status === 503) {
+      setLoggedIn(false, "");
+      showNotConfigured((result.payload && result.payload.host) || "");
+      showLoginError(`管理员未配置，管理入口关闭（503）：${detailText(result.payload)}`);
+      return true;
+    }
+    return false;
+  }
+
+  function showExpNotice(message, tone) {
+    const node = $("experience-notice");
+    if (!node) return;
+    node.textContent = message;
+    node.className = `fb-notice ${tone === "err" ? "fb-notice-err" : "fb-notice-ok"}`;
+  }
+
+  function clearExpNotice() {
+    const node = $("experience-notice");
+    if (!node) return;
+    node.textContent = "";
+    node.classList.add("hidden");
+  }
+
+  function setExpEditMessage(message, isError) {
+    const node = $("experience-edit-message");
+    if (!node) return;
+    node.textContent = message;
+    node.className = isError ? "fb-hint fb-warn" : "fb-hint";
+  }
+
+  // 提交期间禁用按钮，防重复提交。
+  async function withBusy(button, task) {
+    if (button) button.disabled = true;
+    try {
+      return await task();
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function truncateText(text, max) {
+    const value = String(text || "");
+    return value.length > max ? `${value.slice(0, max)}…` : value;
+  }
+
+  function prettyJson(value) {
+    if (value === undefined || value === null) return "";
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch (error) {
+      return String(value);
+    }
+  }
+
+  function recordStatusTone(status) {
+    if (status === "approved") return "bg-emerald-50 text-emerald-700 border-emerald-200";
+    if (status === "pending") return "bg-amber-50 text-amber-700 border-amber-200";
+    return "bg-rose-50 text-rose-700 border-rose-200";
+  }
+
+  function experienceStatusTone(status) {
+    if (status === "disabled") return "bg-slate-100 text-slate-600 border-slate-200";
+    return "bg-emerald-50 text-emerald-700 border-emerald-200";
+  }
+
+  // ---------- 执行记录 ----------
+
+  async function loadExperienceRecords() {
+    const status = $("experience-filter-status").value || "";
+    const query = new URLSearchParams({ limit: "50", offset: "0" });
+    if (status) query.set("status", status);
+    const result = await api(`${EXP_PREFIX}/admin/records?${query.toString()}`);
+    if (expAuthFailure(result)) return;
+    if (!result.ok) {
+      renderExperienceRecords([], 0, expFailure(result, "记录列表加载失败"));
+      return;
+    }
+    const items = (result.payload && result.payload.items) || [];
+    renderExperienceRecords(items, (result.payload && result.payload.total) || items.length);
+  }
+
+  function renderExperienceRecords(items, total, errorMessage) {
+    const list = $("experience-record-list");
+    list.innerHTML = "";
+    $("experience-record-total").textContent = errorMessage ? "" : `共 ${total} 条`;
+    if (errorMessage) {
+      list.appendChild(el("div", "text-[11px] text-rose-600 px-2 py-3", errorMessage));
+      return;
+    }
+    if (!items.length) {
+      list.appendChild(el("div", "text-[11px] text-slate-400 px-2 py-3", "没有符合条件的执行记录。"));
+      return;
+    }
+    items.forEach((item) => {
+      const card = el("button", "fb-item");
+      card.type = "button";
+      card.dataset.recordId = item.recordId;
+      if (item.recordId === currentRecordId) card.classList.add("is-active");
+
+      const top = el("div", "fb-item-top");
+      top.appendChild(el("span", `fb-tag ${recordStatusTone(item.status)}`, RECORD_STATUS_LABELS[item.status] || item.status));
+      top.appendChild(el("span", "fb-item-time mono", (item.createdAt || "").replace("T", " ")));
+      card.appendChild(top);
+
+      card.appendChild(
+        el("div", "fb-item-excerpt", item.originalRequest ? truncateText(item.originalRequest, 120) : "（原要求不可得）")
+      );
+      if (item.supplement) {
+        card.appendChild(el("div", "fb-item-excerpt fb-muted", `补充：${truncateText(item.supplement, 80)}`));
+      }
+
+      const foot = el("div", "fb-item-foot");
+      foot.appendChild(el("span", "mono", item.recordId));
+      if (item.planId) foot.appendChild(el("span", "mono", `plan ${item.planId}`));
+      if (item.capabilityVersion) foot.appendChild(el("span", "mono", `能力 ${item.capabilityVersion}`));
+      card.appendChild(foot);
+
+      card.addEventListener("click", () => {
+        clearExpNotice();
+        openExperienceRecord(item.recordId);
+      });
+      list.appendChild(card);
+    });
+  }
+
+  async function openExperienceRecord(recordId) {
+    currentRecordId = recordId;
+    currentRecord = null;
+    document.querySelectorAll("#experience-record-list .fb-item").forEach((node) => {
+      node.classList.toggle("is-active", node.dataset.recordId === recordId);
+    });
+    const result = await api(`${EXP_PREFIX}/admin/records/${encodeURIComponent(recordId)}`);
+    if (expAuthFailure(result)) return;
+    if (!result.ok) {
+      renderExperienceRecord(null, expFailure(result, "记录详情加载失败"));
+      return;
+    }
+    currentRecord = result.payload || null;
+    renderExperienceRecord(currentRecord);
+  }
+
+  function renderExperienceRecord(record, errorMessage) {
+    const host = $("experience-record-detail");
+    host.innerHTML = "";
+    if (errorMessage) {
+      host.appendChild(el("div", "text-[11px] text-rose-600 px-2 py-3", errorMessage));
+      return;
+    }
+    if (!record) {
+      host.appendChild(el("div", "text-[11px] text-slate-400 px-2 py-3", "从左边选一条执行记录看详情与审核。"));
+      return;
+    }
+
+    const card = el("div", "fb-detail-card");
+
+    const head = el("div", "fb-detail-head");
+    head.appendChild(el("span", `fb-tag ${recordStatusTone(record.status)}`, RECORD_STATUS_LABELS[record.status] || record.status));
+    head.appendChild(el("span", "fb-tag bg-slate-100 text-slate-600 border-slate-200", `版本 v${record.version}`));
+    head.appendChild(el("span", "fb-item-time mono", (record.createdAt || "").replace("T", " ")));
+    card.appendChild(head);
+
+    card.appendChild(el("div", "fb-detail-id mono", `记录 ${record.recordId}`));
+
+    const section = (title, contentNode) => {
+      const block = el("div", "fb-detail-section");
+      block.appendChild(el("div", "fb-detail-label", title));
+      block.appendChild(contentNode);
+      card.appendChild(block);
+    };
+
+    const metaBox = el("div");
+    const metaTable = el("table", "fb-locator");
+    const metaBody = el("tbody");
+    [
+      ["计划", record.planId],
+      ["会话", record.sessionId],
+      ["草稿", record.draftId],
+      ["事项", record.itemId],
+      ["能力版本", record.capabilityVersion],
+      ["审核人", record.reviewer],
+      ["审核时间", record.reviewedAt],
+      ["拒绝理由", record.reason],
+    ].forEach(([label, value]) => {
+      if (value === undefined || value === null || value === "") return;
+      const tr = el("tr");
+      tr.appendChild(el("th", "", label));
+      tr.appendChild(el("td", "mono", String(value)));
+      metaBody.appendChild(tr);
+    });
+    metaTable.appendChild(metaBody);
+    metaBox.appendChild(metaTable);
+    section("来源与审核信息", metaBox);
+
+    section("原要求", el("div", "fb-detail-text", record.originalRequest || "（原要求不可得）"));
+    if (record.supplement) {
+      section("补充要求", el("div", "fb-detail-text", record.supplement));
+    }
+    // 后端已经脱敏，这里**只展示**，不自己再猜哪些字段敏感。
+    section("操作清单（服务端已脱敏）", el("pre", "fb-json", prettyJson(record.operations)));
+    section("结果摘要（服务端已脱敏）", el("pre", "fb-json", prettyJson(record.result)));
+
+    if (record.status === "pending") {
+      section("审核", buildReviewForm(record));
+    } else {
+      const done = el("div");
+      done.appendChild(
+        el("div", "fb-detail-text", `这条记录已经审核过（${RECORD_STATUS_LABELS[record.status] || record.status}），不能重复批准。`)
+      );
+      if (record.reason) done.appendChild(el("div", "fb-detail-text fb-muted", `理由：${record.reason}`));
+      section("审核", done);
+    }
+
+    host.appendChild(card);
+  }
+
+  function buildReviewForm(record) {
+    const box = el("div", "fb-detail-actions");
+
+    const methodInput = document.createElement("textarea");
+    methodInput.id = "experience-method";
+    methodInput.className = "fb-input fb-textarea";
+    methodInput.rows = 3;
+    methodInput.placeholder = "可复用的方法描述（写可移植的步骤，别写具体区块 ID）";
+
+    const conditionsInput = document.createElement("textarea");
+    conditionsInput.id = "experience-conditions";
+    conditionsInput.className = "fb-input fb-textarea";
+    conditionsInput.rows = 2;
+    conditionsInput.placeholder = "在什么情况下可以复用这个方法";
+
+    const reasonInput = document.createElement("input");
+    reasonInput.id = "experience-reason";
+    reasonInput.type = "text";
+    reasonInput.className = "fb-input";
+    reasonInput.placeholder = "拒绝理由（只在拒绝时使用，可留空）";
+
+    box.appendChild(el("label", "fb-field-label", "可复用方法（必填）"));
+    box.appendChild(methodInput);
+    box.appendChild(el("label", "fb-field-label", "适用条件"));
+    box.appendChild(conditionsInput);
+    box.appendChild(el("label", "fb-field-label", "拒绝理由"));
+    box.appendChild(reasonInput);
+
+    const row = el("div", "fb-detail-buttons");
+    const approveBtn = el("button", "fb-btn fb-btn-primary", "批准并生成经验");
+    approveBtn.type = "button";
+    approveBtn.id = "experience-approve";
+    approveBtn.addEventListener("click", () => approveExperienceRecord());
+
+    const rejectBtn = el("button", "fb-btn fb-btn-danger", "拒绝");
+    rejectBtn.type = "button";
+    rejectBtn.id = "experience-reject";
+    rejectBtn.addEventListener("click", () => rejectExperienceRecord());
+
+    row.appendChild(approveBtn);
+    row.appendChild(rejectBtn);
+    box.appendChild(row);
+
+    const hint = el("p", "fb-hint", `提交会带上当前版本 v${record.version}。记录被别人改动过 → 409，数据不变，请刷新后重试。`);
+    box.appendChild(hint);
+    return box;
+  }
+
+  async function approveExperienceRecord() {
+    const record = currentRecord;
+    if (!record) return;
+    const method = ($("experience-method").value || "").trim();
+    if (!method) {
+      showExpNotice("请先填写「可复用方法」再批准。", "err");
+      return;
+    }
+    const conditions = ($("experience-conditions").value || "").trim();
+    await withBusy($("experience-approve"), async () => {
+      const result = await api(`${EXP_PREFIX}/admin/records/${encodeURIComponent(record.recordId)}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ method, conditions, expectedVersion: Number(record.version) }),
+      });
+      if (expAuthFailure(result)) return;
+      if (!result.ok) {
+        showExpNotice(expFailure(result, "批准失败"), "err");
+        return;
+      }
+      const created = (result.payload && result.payload.experience) || null;
+      const experienceId = (created && created.experienceId) || "";
+      showExpNotice(`已批准，生成可信经验 ${experienceId}。`, "ok");
+      await loadExperienceRecords();
+      await loadExperienceList();
+      await openExperienceRecord(record.recordId);
+    });
+  }
+
+  async function rejectExperienceRecord() {
+    const record = currentRecord;
+    if (!record) return;
+    const reason = ($("experience-reason").value || "").trim();
+    await withBusy($("experience-reject"), async () => {
+      const result = await api(`${EXP_PREFIX}/admin/records/${encodeURIComponent(record.recordId)}/reject`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason, expectedVersion: Number(record.version) }),
+      });
+      if (expAuthFailure(result)) return;
+      if (!result.ok) {
+        showExpNotice(expFailure(result, "拒绝失败"), "err");
+        return;
+      }
+      showExpNotice("已拒绝这条记录，没有产生可复用经验。", "ok");
+      await loadExperienceRecords();
+      await openExperienceRecord(record.recordId);
+    });
+  }
+
+  // ---------- 可信经验 ----------
+
+  async function loadExperienceList() {
+    const includeDisabled = $("experience-include-disabled").checked;
+    const query = new URLSearchParams({ limit: "50", offset: "0" });
+    if (includeDisabled) query.set("includeDisabled", "true");
+    const result = await api(`${EXP_PREFIX}/admin/experiences?${query.toString()}`);
+    if (expAuthFailure(result)) return;
+    if (!result.ok) {
+      renderExperienceList([], 0, expFailure(result, "经验列表加载失败"));
+      return;
+    }
+    const items = (result.payload && result.payload.items) || [];
+    renderExperienceList(items, (result.payload && result.payload.total) || items.length);
+  }
+
+  function renderExperienceList(items, total, errorMessage) {
+    const list = $("experience-list");
+    list.innerHTML = "";
+    $("experience-list-total").textContent = errorMessage ? "" : `共 ${total} 条`;
+    if (errorMessage) {
+      list.appendChild(el("div", "text-[11px] text-rose-600 px-2 py-3", errorMessage));
+      return;
+    }
+    if (!items.length) {
+      list.appendChild(el("div", "text-[11px] text-slate-400 px-2 py-3", "还没有已批准的经验。"));
+      return;
+    }
+    items.forEach((item) => {
+      const card = el("div", "fb-item fb-item-static");
+      card.dataset.experienceId = item.experienceId;
+
+      const top = el("div", "fb-item-top");
+      top.appendChild(el("span", `fb-tag ${experienceStatusTone(item.status)}`, EXPERIENCE_STATUS_LABELS[item.status] || item.status));
+      top.appendChild(el("span", "fb-item-time mono", `v${item.version}`));
+      card.appendChild(top);
+
+      card.appendChild(el("div", "fb-detail-text", item.method || "（方法为空）"));
+      if (item.conditions) {
+        card.appendChild(el("div", "fb-item-excerpt fb-muted", `适用条件：${item.conditions}`));
+      }
+
+      const foot = el("div", "fb-item-foot");
+      foot.appendChild(el("span", "mono", item.experienceId));
+      if (item.recordId) foot.appendChild(el("span", "mono", `来源 ${item.recordId}`));
+      if (item.capabilityVersion) foot.appendChild(el("span", "mono", `能力 ${item.capabilityVersion}`));
+      card.appendChild(foot);
+
+      const row = el("div", "fb-detail-buttons");
+      const editBtn = el("button", "fb-btn fb-btn-ghost", "整理");
+      editBtn.type = "button";
+      editBtn.id = "experience-item-edit";
+      editBtn.addEventListener("click", () => {
+        clearExpNotice();
+        openExperienceEditor(item);
+      });
+      row.appendChild(editBtn);
+
+      const toggleBtn = el("button", "fb-btn fb-btn-ghost", item.status === "disabled" ? "恢复" : "禁用");
+      toggleBtn.type = "button";
+      toggleBtn.id = "experience-item-toggle";
+      toggleBtn.addEventListener("click", () => toggleExperience(item, item.status !== "disabled"));
+      row.appendChild(toggleBtn);
+
+      card.appendChild(row);
+      list.appendChild(card);
+    });
+  }
+
+  async function toggleExperience(item, disabled) {
+    const result = await api(`${EXP_PREFIX}/admin/experiences/${encodeURIComponent(item.experienceId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ disabled: !!disabled, expectedVersion: Number(item.version) }),
+    });
+    if (expAuthFailure(result)) return;
+    if (!result.ok) {
+      showExpNotice(expFailure(result, disabled ? "禁用失败" : "恢复失败"), "err");
+      return;
+    }
+    showExpNotice(disabled ? "已禁用这条经验（检索时不再返回）。" : "已恢复这条经验。", "ok");
+    await loadExperienceList();
+  }
+
+  function openExperienceEditor(item) {
+    currentExperience = item;
+    const host = $("experience-edit");
+    host.innerHTML = "";
+    const card = el("div", "fb-detail-card");
+
+    const head = el("div", "fb-detail-head");
+    head.appendChild(el("span", `fb-tag ${experienceStatusTone(item.status)}`, EXPERIENCE_STATUS_LABELS[item.status] || item.status));
+    head.appendChild(el("span", "fb-tag bg-slate-100 text-slate-600 border-slate-200", `版本 v${item.version}`));
+    card.appendChild(head);
+    card.appendChild(el("div", "fb-detail-id mono", `经验 ${item.experienceId}`));
+
+    const section = (title, contentNode) => {
+      const block = el("div", "fb-detail-section");
+      block.appendChild(el("div", "fb-detail-label", title));
+      block.appendChild(contentNode);
+      card.appendChild(block);
+    };
+
+    const metaBox = el("div");
+    const metaTable = el("table", "fb-locator");
+    const metaBody = el("tbody");
+    [
+      ["来源记录", item.recordId],
+      ["能力版本", item.capabilityVersion],
+      ["审核人", item.reviewer],
+      ["创建时间", item.createdAt],
+      ["更新时间", item.updatedAt],
+    ].forEach(([label, value]) => {
+      if (value === undefined || value === null || value === "") return;
+      const tr = el("tr");
+      tr.appendChild(el("th", "", label));
+      tr.appendChild(el("td", "mono", String(value)));
+      metaBody.appendChild(tr);
+    });
+    metaTable.appendChild(metaBody);
+    metaBox.appendChild(metaTable);
+    section("来源信息", metaBox);
+
+    const methodInput = document.createElement("textarea");
+    methodInput.id = "experience-edit-method";
+    methodInput.className = "fb-input fb-textarea";
+    methodInput.rows = 3;
+    methodInput.value = item.method || "";
+    methodInput.placeholder = "可复用的方法描述";
+
+    const conditionsInput = document.createElement("textarea");
+    conditionsInput.id = "experience-edit-conditions";
+    conditionsInput.className = "fb-input fb-textarea";
+    conditionsInput.rows = 2;
+    conditionsInput.value = item.conditions || "";
+    conditionsInput.placeholder = "在什么情况下可以复用这个方法";
+
+    const form = el("div", "fb-detail-actions");
+    form.appendChild(el("label", "fb-field-label", "可复用方法（必填）"));
+    form.appendChild(methodInput);
+    form.appendChild(el("label", "fb-field-label", "适用条件"));
+    form.appendChild(conditionsInput);
+
+    const row = el("div", "fb-detail-buttons");
+    const saveBtn = el("button", "fb-btn fb-btn-primary", "保存");
+    saveBtn.type = "button";
+    saveBtn.id = "experience-edit-save";
+    saveBtn.addEventListener("click", () => saveExperience());
+    const cancelBtn = el("button", "fb-btn fb-btn-ghost", "关闭");
+    cancelBtn.type = "button";
+    cancelBtn.id = "experience-edit-cancel";
+    cancelBtn.addEventListener("click", () => {
+      currentExperience = null;
+      host.innerHTML = "";
+      host.appendChild(el("div", "text-[11px] text-slate-400 px-2 py-3", "选一条经验做「整理 / 禁用 / 恢复」。"));
+    });
+    row.appendChild(saveBtn);
+    row.appendChild(cancelBtn);
+    form.appendChild(row);
+
+    const msg = el("p", "fb-hint", `保存会带上当前版本 v${item.version}。经验被别人改动过 → 409，数据不变，请刷新后重试。`);
+    msg.id = "experience-edit-message";
+    form.appendChild(msg);
+    section("整理", form);
+
+    host.appendChild(card);
+  }
+
+  async function saveExperience() {
+    const item = currentExperience;
+    if (!item) return;
+    const method = ($("experience-edit-method").value || "").trim();
+    if (!method) {
+      setExpEditMessage("请填写「可复用方法」。", true);
+      return;
+    }
+    const conditions = ($("experience-edit-conditions").value || "").trim();
+    await withBusy($("experience-edit-save"), async () => {
+      const result = await api(`${EXP_PREFIX}/admin/experiences/${encodeURIComponent(item.experienceId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ method, conditions, expectedVersion: Number(item.version) }),
+      });
+      if (expAuthFailure(result)) return;
+      if (!result.ok) {
+        setExpEditMessage(expFailure(result, "保存失败"), true);
+        return;
+      }
+      await loadExperienceList();
+      const updated = (result.payload && result.payload.experience) || null;
+      if (updated) openExperienceEditor(updated);
+      setExpEditMessage("已保存。", false);
+    });
+  }
+
   // ---------- 启动 ----------
 
   function bind() {
@@ -524,6 +1129,13 @@
     $("feedback-filter-refresh").addEventListener("click", loadList);
     $("feedback-filter-rating").addEventListener("change", loadList);
     $("feedback-filter-status").addEventListener("change", loadList);
+
+    $("btn-tab-feedback").addEventListener("click", () => switchTab("feedback"));
+    $("btn-tab-experience").addEventListener("click", () => switchTab("experience"));
+    $("experience-records-refresh").addEventListener("click", loadExperienceRecords);
+    $("experience-filter-status").addEventListener("change", loadExperienceRecords);
+    $("experience-list-refresh").addEventListener("click", loadExperienceList);
+    $("experience-include-disabled").addEventListener("change", loadExperienceList);
   }
 
   async function boot() {
@@ -538,6 +1150,7 @@
     if (result.ok && payload.authenticated) {
       setLoggedIn(true, payload.username || "");
       await loadList();
+      if (activeTab === "experience") await loadExperienceAll();
       return;
     }
     setLoggedIn(false, "");

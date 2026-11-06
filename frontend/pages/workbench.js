@@ -1409,6 +1409,7 @@ const DEBUG_STAGE_LABELS = {
   fallback_no_client: "ContextEngine 兜底：无模型客户端",
   deep_route_failed: "Deep Router 失败",
   concierge_failed: "Concierge 失败",
+  trace_round: "ReAct 逐轮",
 };
 
 // -------- 滚动跟随 --------
@@ -1670,15 +1671,22 @@ async function registerFeedbackClientEvent(kind, options = {}) {
   }
 }
 
-function appendDebugTrace({ text, state, isAdvance }) {
-  const title = isAdvance ? "自动推进 Debug Trace" : "请求 Debug Trace";
+function appendDebugTrace({ text, state, isAdvance, history = false }) {
+  const title = history
+    ? "历史 Debug Trace"
+    : (isAdvance ? "自动推进 Debug Trace" : "请求 Debug Trace");
+  // 历史卡片是**回放**出来的，已经结束了 —— 不挂「running」。
+  const statusClass = history
+    ? "debug-status shrink-0 rounded-full bg-slate-100 text-slate-600 border border-slate-200 text-[10px] px-2 py-0.5"
+    : "debug-status shrink-0 rounded-full bg-blue-50 text-blue-700 border border-blue-100 text-[10px] px-2 py-0.5";
+  const statusText = history ? "历史" : "running";
   const wrap = aiBubble(`
     <div class="debug-card is-collapsed rounded-xl rounded-tl-sm border border-slate-200 bg-white overflow-hidden">
       <button type="button" data-debug-toggle class="debug-header flex w-full items-center justify-between gap-2 px-3.5 py-2.5 bg-slate-50 border-b border-slate-200 text-left cursor-pointer select-none hover:bg-slate-100 transition-colors" aria-expanded="false">
         <div class="flex items-center gap-2 min-w-0">
           <iconify-icon class="text-slate-500 shrink-0" icon="mdi:timeline-clock-outline"></iconify-icon>
           <span class="text-xs font-semibold text-slate-700 truncate">${esc(title)}</span>
-          <span class="debug-status shrink-0 rounded-full bg-blue-50 text-blue-700 border border-blue-100 text-[10px] px-2 py-0.5">running</span>
+          <span class="${statusClass}">${statusText}</span>
           <span class="debug-unread hidden shrink-0 rounded-full bg-blue-100 text-blue-700 border border-blue-100 text-[10px] px-1.5 py-0.5"></span>
         </div>
         <div class="flex items-center gap-2 shrink-0">
@@ -1819,6 +1827,9 @@ function addDebugEvent(card, event, data = {}) {
   const elapsed = data.elapsedMs ?? 0;
   card.querySelector(".debug-elapsed").textContent = `${elapsed}ms`;
   if (data.state) card.querySelector(".debug-state").textContent = data.state;
+  // 最终结果里带着逐轮摘要（与流式事件**同一份数据**）：一并渲染，
+  // 这样非流式路径也看得见逐轮过程。
+  renderTraceRoundsFromSummary(card, data.traceSummary);
 
   if (event === "model_chunk") {
     const key = stage;
@@ -1880,6 +1891,548 @@ function finishDebugTrace(card, status) {
     : status === "cancelled"
       ? "debug-status rounded-full bg-amber-50 text-amber-700 border border-amber-100 text-[10px] px-2 py-0.5"
       : "debug-status rounded-full bg-rose-50 text-rose-700 border border-rose-100 text-[10px] px-2 py-0.5";
+}
+
+// --------------------------------------------------------------------------
+// Debug Trace：ReAct 逐轮人话摘要
+// --------------------------------------------------------------------------
+//
+// 「ReAct 第 N 轮」= **一次真实的框架循环**（想 → 调工具 → 收结果）。
+// 同一轮里的多个工具调用属于同一轮，并排列出，不编造先后。
+//
+// 这一块只做**渲染**：正文与数据都来自服务端同一份事件数据
+// （流式事件与最终摘要用的是同一份），前端不自己编内容。
+
+// ===== TRACE RENDER PURE BEGIN =====
+// 纯函数区：**只拼 HTML 字符串**，不碰 DOM。
+//
+// 自检脚本按这两个标记把本段截出来，在 node 里直接跑 ——
+// 不开浏览器、不起服务、不装依赖。渲染逻辑与浏览器里跑的是同一份代码。
+//
+// 本段只依赖外层唯一的 `esc`（HTML 转义），其余都是本段内定义。
+
+/** 逐轮行的去重键：同一个 traceId + 同一轮 = 同一行（后来的覆盖先来的）。 */
+function traceRoundKey(data) {
+  const round = data?.roundKey ?? data?.key ?? data?.round ?? "unknown";
+  return `${data?.traceId || ""}::${round}`;
+}
+
+// 缺失事实的名字 → 人话（缺什么就说什么，不静悄悄省略）。
+// 口径与服务端 MISSING_LABELS 一份。
+const TRACE_MISSING_LABELS = {
+  itemId: "修改事项标识",
+  planId: "候选计划标识",
+  iteration: "轮次",
+  replyIndex: "回复序号",
+  callContext: "调用归属",
+  batchId: "试做批次",
+  toolCallId: "工具调用 id",
+  thinkingSummary: "思考摘要",
+  businessResult: "后台结果",
+  detailTruncated: "部分内容",
+  changes: "前后变化",
+  structure: "结构投影",
+  effectCheck: "效果核对",
+  persistenceCheck: "持久化结果",
+};
+
+function traceMissingText(missing) {
+  return (missing || [])
+    .map((item) => TRACE_MISSING_LABELS[item] || item)
+    .join("、");
+}
+
+// 历史记录里**根本没有**的字段（旧消息早于这些字段）：明说没记，不补造。
+const TRACE_HISTORY_DETAIL_MISSING = "历史 Trace 未记录该详情";
+// 服务端自己的「变化细节未取得」口径 —— 空变化用它，不写「已应用一批操作」这种缩略句。
+const TRACE_CHANGES_MISSING = "变化细节未取得";
+
+/** 「实际变化」这一层的正文。 */
+function traceChangesText(data) {
+  const text = data?.changesText;
+  if (text === undefined || text === null) return TRACE_HISTORY_DETAIL_MISSING;
+  const flat = String(text).trim();
+  if (!flat) return TRACE_CHANGES_MISSING;
+  return flat;
+}
+
+/** 「是否生效」这一层的正文（禁止用 done / 「操作正常返回」代替）。 */
+function traceEffectText(data) {
+  const text = data?.effectText;
+  if (text === undefined || text === null) return TRACE_HISTORY_DETAIL_MISSING;
+  const flat = String(text).trim();
+  if (!flat) return "是否生效结果未取得";
+  return flat;
+}
+
+/** 这一轮有没有修订号（没有修订号 ≠ 拒绝更新，只是不知道新旧）。 */
+function traceHasRevision(data) {
+  const raw = data?.revision;
+  if (raw === undefined || raw === null || raw === "") return false;
+  return Number.isFinite(Number(raw));
+}
+
+/** 这一轮里有没有「归属来源有冲突」的调用。 */
+function traceHasAttributionConflict(data) {
+  const calls = Array.isArray(data?.calls) ? data.calls : [];
+  return calls.some((call) => call?.attribution?.conflict === true);
+}
+
+/** 技术细节里的值：对象转成可读 JSON，没拿到就明说没拿到。 */
+function traceFormatValue(value) {
+  if (value === undefined) return "未取得";
+  if (value === null) return "（空）";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch (err) {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+/**
+ * 一步的状态：人话 + 配色。
+ *
+ * `notExecuted` 优先 —— 未执行就是未执行，不能显示成成功，也不能显示成「无变化」。
+ */
+function traceStepStatus(step) {
+  if (step?.notExecuted === true) return { kind: "skip", text: "未执行" };
+  const text = String(step?.statusText || "").trim();
+  if (text) {
+    if (text === "通过") return { kind: "ok", text };
+    if (text === "未通过") return { kind: "fail", text };
+    if (text === "未执行") return { kind: "skip", text };
+    return { kind: "unknown", text };
+  }
+  if (step?.ok === true) return { kind: "ok", text: "通过" };
+  if (step?.ok === false) return { kind: "fail", text: "未通过" };
+  return { kind: "unknown", text: "结果未取得" };
+}
+
+/**
+ * 把一次调用的步骤按**试做批次**分组。
+ *
+ * 批次 id 是技术信息 → 正文只说「第 1 次试做 / 第 2 次试做」；
+ * 两次试做各自的「第 1 步」绝不混成一步。
+ */
+function traceStepGroups(call) {
+  const steps = Array.isArray(call?.steps) ? call.steps : [];
+  const order = [];
+  const byBatch = new Map();
+  const addBatch = (batchId) => {
+    if (byBatch.has(batchId)) return byBatch.get(batchId);
+    const group = { batchId, label: "", steps: [] };
+    byBatch.set(batchId, group);
+    order.push(group);
+    return group;
+  };
+  (Array.isArray(call?.batchIds) ? call.batchIds : []).forEach((raw) => addBatch(String(raw || "")));
+  steps.forEach((step) => {
+    const batchId = String(step?.batchId || "");
+    if (batchId) addBatch(batchId);
+  });
+  const loose = { batchId: "", label: "", steps: [] };
+  steps.forEach((step) => {
+    const batchId = String(step?.batchId || "");
+    const group = batchId ? byBatch.get(batchId) : null;
+    if (group) group.steps.push(step);
+    else loose.steps.push(step);
+  });
+  order.forEach((group, i) => { group.label = `第 ${i + 1} 次试做`; });
+  const filled = order.filter((group) => group.steps.length);
+  if (loose.steps.length) {
+    loose.label = filled.length ? "未标批次的试做" : "第 1 次试做";
+    filled.push(loose);
+  }
+  return filled;
+}
+
+/** 一个试做批次里的步骤。 */
+function renderTraceStepGroup(group) {
+  return `
+    <div class="debug-round-batch">
+      <div class="debug-round-batch-title">${esc(group.label)}</div>
+      ${group.steps.map(renderTraceStep).join("")}
+    </div>`;
+}
+
+/** 一步：序号 + 可见名称 + 状态 + 这一步的实际变化。 */
+function renderTraceStep(step) {
+  const rawIndex = Number(step?.index);
+  const index = Number.isFinite(rawIndex) && rawIndex > 0 ? rawIndex : null;
+  const name = String(step?.name || "").trim() || "名称未取得";
+  const status = traceStepStatus(step);
+  const change = String(step?.changeText || "").trim();
+  const reason = String(step?.reason || "").trim();
+  const constraint = String(step?.constraint || "").trim();
+  // 包装能力里的**子操作**：与它的父步骤不是同一件事 ——
+  // 标出来，别让人以为重复执行了一遍。
+  const isSub = step?.kind === "substep";
+  const subIndex = Number.isFinite(step?.subStepIndex) ? Number(step.subStepIndex) + 1 : null;
+  const stepLabel = isSub
+    ? `子步骤${subIndex ? ` ${subIndex}` : ""}`
+    : (index ? `第 ${index} 步` : "步骤");
+  return `
+    <div class="debug-round-step${isSub ? " is-substep" : ""}">
+      <div class="debug-round-step-head">
+        <span class="debug-round-step-index">${esc(stepLabel)}</span>
+        <span class="debug-round-step-name">${esc(name)}</span>
+        <span class="debug-round-step-status is-${status.kind}">${esc(status.text)}</span>
+      </div>
+      <div class="debug-round-step-change${change ? "" : " is-empty"}">${esc(change || "该步变化未取得")}</div>
+      ${reason ? `<div class="debug-round-step-reason">原因：${esc(reason)}</div>` : ""}
+      ${constraint ? `<div class="debug-round-step-reason">约束：${esc(constraint)}</div>` : ""}
+    </div>`;
+}
+
+/**
+ * 一个调用块：标题用**可见说法**（toolCallId 只进技术细节）。
+ *
+ * 服务端给了 ``label``（人话说法，如「第 1 次调用（提交了修改计划）」）就用它；
+ * 没有就退回原始工具名 —— 但原始工具名只当**兜底**，不是首选。
+ */
+function renderTraceCallBlock(call) {
+  const label = String(call?.label || "").trim();
+  const name = String(call?.name || "").trim();
+  const title = label || name || "工具名称未取得";
+  const hasSteps = Array.isArray(call?.steps);
+  let body;
+  if (!hasSteps) {
+    body = `<div class="debug-round-step-change is-empty">${esc(TRACE_HISTORY_DETAIL_MISSING)}</div>`;
+  } else {
+    const groups = traceStepGroups(call);
+    body = groups.length
+      ? groups.map(renderTraceStepGroup).join("")
+      : `<div class="debug-round-step-change is-empty">该调用没有步骤记录</div>`;
+  }
+  return `
+    <div class="debug-round-call">
+      <div class="debug-round-call-name">${esc(title)}</div>
+      ${body}
+    </div>`;
+}
+
+/**
+ * 一轮里的**并列**调用块。
+ *
+ * 同一轮的多次调用并排摆出来 —— **不编先后**（不写「先…后…」）。
+ */
+function renderTraceRoundCalls(data) {
+  const calls = data?.calls;
+  if (!Array.isArray(calls)) {
+    return `
+    <div class="debug-round-calls mt-1">
+      <div class="debug-round-calls-title">本轮调用（并列）</div>
+      <div class="debug-round-calls-note">${esc(TRACE_HISTORY_DETAIL_MISSING)}</div>
+    </div>`;
+  }
+  if (!calls.length) {
+    return `
+    <div class="debug-round-calls mt-1">
+      <div class="debug-round-calls-title">本轮调用（并列）</div>
+      <div class="debug-round-calls-note">本轮没有并列调用记录</div>
+    </div>`;
+  }
+  return `
+    <div class="debug-round-calls mt-1">
+      <div class="debug-round-calls-title">本轮调用（并列）</div>
+      <div class="debug-round-call-grid">${calls.map(renderTraceCallBlock).join("")}</div>
+    </div>`;
+}
+
+/**
+ * 一轮的五层正文：
+ * 公开决策摘要 / 实际调用及提交计划 / 后台逐步结果 / 实际变化 / 是否生效。
+ */
+function renderTraceRoundLayers(data) {
+  const thinking = data?.thinking || "思考摘要未提供";
+  const action = data?.action || "实际行动未取得";
+  const backend = data?.backend || "后台结果未取得";
+  // 「根据实际调用/提交计划整理」这层标签**只在真的整理出来时**出现 ——
+  // 没整理出来就说没整理出来，不挂一个空标签。
+  const actionLabel = data?.actionSource === "missing"
+    ? "实际调用及提交计划"
+    : "实际调用及提交计划（根据实际调用/提交计划整理）";
+  const layers = [
+    ["公开决策摘要", thinking, ""],
+    [actionLabel, action, ""],
+    ["后台逐步结果", backend, ""],
+    ["实际变化", traceChangesText(data), " is-changes"],
+    ["是否生效", traceEffectText(data), " is-effect"],
+  ];
+  const missing = Array.isArray(data?.missing) ? data.missing : [];
+  const missingNote = missing.length
+    ? `<div class="mt-0.5 text-amber-600">未取得：${esc(traceMissingText(missing))}</div>`
+    : "";
+  return `
+    ${layers.map(([label, value, cls]) => `
+      <div class="debug-round-layer mt-1${cls}">
+        <span class="debug-round-label">${esc(label)}</span>
+        <span class="debug-round-value">${esc(value)}</span>
+      </div>`).join("")}
+    ${renderTraceRoundCalls(data)}
+    ${data?.draftChangedText ? `<div class="mt-0.5 text-slate-500">${esc(data.draftChangedText)}</div>` : ""}
+    ${missingNote}`;
+}
+
+/** 一轮的标题条：轮次 + 阶段说明 + 是否被截断。 */
+function renderTraceRoundHeader(data) {
+  const label = data?.roundLabel || "ReAct 轮次未取得";
+  const phase = data?.phaseLabel || "";
+  const badge = phase
+    ? `<span class="debug-round-phase">${esc(phase)}</span>`
+    : "";
+  const truncated = data?.truncated === true
+    ? `<span class="debug-round-truncated">内容被截断</span>`
+    : "";
+  return `
+    <div class="flex items-start justify-between gap-2">
+      <span class="font-semibold text-slate-700">${esc(label)}</span>
+      <div class="flex items-center gap-1.5 shrink-0">${badge}${truncated}</div>
+    </div>`;
+}
+
+/** 技术细节：「逐调用前后变化」—— 每条按调用分组，前后值折叠（可能很大）。 */
+function renderTraceTechnicalChanges(items) {
+  if (!Array.isArray(items) || !items.length) return "";
+  const blocks = items.map((item) => {
+    const changes = Array.isArray(item?.changes) ? item.changes : [];
+    const callId = String(item?.toolCallId || item?.callKey || "");
+    const rows = changes.map((change) => {
+      const path = String(change?.path || "");
+      const summary = String(change?.summary || "");
+      return `
+        <details class="debug-round-tech-item">
+          <summary class="cursor-pointer select-none text-blue-600">${esc(path || "路径未取得")}${summary ? ` · ${esc(summary)}` : ""}</summary>
+          <div class="debug-round-tech-item-body">
+            <div class="debug-round-tech-kv">
+              <span class="debug-round-tech-key">before</span>
+              <pre class="debug-round-tech-pre">${esc(traceFormatValue(change?.before))}</pre>
+            </div>
+            <div class="debug-round-tech-kv">
+              <span class="debug-round-tech-key">after</span>
+              <pre class="debug-round-tech-pre">${esc(traceFormatValue(change?.after))}</pre>
+            </div>
+          </div>
+        </details>`;
+    }).join("");
+    return `
+      <details class="debug-round-tech-item">
+        <summary class="cursor-pointer select-none text-blue-600">调用 ${esc(callId || "未取得")} · ${changes.length} 处变化</summary>
+        <div class="debug-round-tech-item-body">${rows || "该调用没有记录前后变化"}</div>
+      </details>`;
+  }).join("");
+  return `
+    <div class="debug-round-tech-group">
+      <div class="debug-round-tech-group-title">逐调用前后变化</div>
+      ${blocks}
+    </div>`;
+}
+
+/** 技术细节：「结构投影」（affected / containers）。 */
+function renderTraceTechnicalStructure(items) {
+  if (!Array.isArray(items) || !items.length) return "";
+  const blocks = items.map((item) => {
+    const structure = item?.structure && typeof item.structure === "object" ? item.structure : {};
+    const affected = Array.isArray(structure.affected) ? structure.affected : [];
+    const containers = Array.isArray(structure.containers) ? structure.containers : [];
+    const callKey = String(item?.callKey || "");
+    return `
+      <details class="debug-round-tech-item">
+        <summary class="cursor-pointer select-none text-blue-600">调用 ${esc(callKey || "未取得")} · 受影响 ${affected.length} · 容器 ${containers.length}</summary>
+        <div class="debug-round-tech-item-body">
+          <div class="debug-round-tech-kv">
+            <span class="debug-round-tech-key">affected</span>
+            <pre class="debug-round-tech-pre">${esc(traceFormatValue(affected))}</pre>
+          </div>
+          <div class="debug-round-tech-kv">
+            <span class="debug-round-tech-key">containers</span>
+            <pre class="debug-round-tech-pre">${esc(traceFormatValue(containers))}</pre>
+          </div>
+        </div>
+      </details>`;
+  }).join("");
+  return `
+    <div class="debug-round-tech-group">
+      <div class="debug-round-tech-group-title">结构投影</div>
+      ${blocks}
+    </div>`;
+}
+
+/** 技术细节：调用归属明细（含「归属来源有冲突」标记）。 */
+function renderTraceTechnicalAttribution(data) {
+  const calls = Array.isArray(data?.calls) ? data.calls : [];
+  if (!calls.length) return "";
+  const rows = calls.map((call) => {
+    const attribution = call?.attribution && typeof call.attribution === "object" ? call.attribution : {};
+    const parts = [
+      `toolCallId=${String(call?.toolCallId || "") || "未取得"}`,
+      `replyIndex=${attribution.replyIndex ?? "未取得"}`,
+      `iteration=${attribution.iteration ?? "未取得"}`,
+    ];
+    if (attribution.conflict === true) parts.push("归属来源有冲突");
+    return `<div class="debug-round-tech-line">${esc(parts.join(" · "))}</div>`;
+  }).join("");
+  return `
+    <div class="debug-round-tech-group">
+      <div class="debug-round-tech-group-title">调用归属明细</div>
+      ${rows}
+    </div>`;
+}
+
+/**
+ * 一轮的技术细节（可展开）。
+ *
+ * 能力名、参数名、id、错误码都在这里 —— 正文只给人话。
+ */
+function renderTraceRoundTechnical(data, options = {}) {
+  const technical = data?.technical && typeof data.technical === "object" ? data.technical : null;
+  const notes = [];
+  if (!traceHasRevision(data)) notes.push("修订号未取得");
+  if (traceHasAttributionConflict(data)) notes.push("归属来源有冲突");
+  const lines = [];
+  if (technical) {
+    Object.entries(technical)
+      .filter(([key, value]) => key !== "逐调用前后变化" && key !== "结构投影")
+      .filter(([, value]) => value !== undefined && value !== null && value !== "")
+      .forEach(([key, value]) => {
+        const display = typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
+        lines.push(`${key}:\n${display}`);
+      });
+  }
+  const changesBlock = renderTraceTechnicalChanges(technical?.["逐调用前后变化"]);
+  const structureBlock = renderTraceTechnicalStructure(technical?.["结构投影"]);
+  const attributionBlock = renderTraceTechnicalAttribution(data);
+  if (!notes.length && !lines.length && !changesBlock && !structureBlock && !attributionBlock) return "";
+  return `
+    <details class="debug-round-tech mt-1 text-slate-500"${options.open ? " open" : ""}>
+      <summary class="cursor-pointer select-none text-blue-600">技术细节</summary>
+      <div class="mt-1 space-y-2">
+        ${notes.length ? `<div class="debug-round-tech-note">${esc(notes.join("；"))}</div>` : ""}
+        ${lines.length ? `<pre class="debug-round-tech-pre mt-1 whitespace-pre-wrap break-all text-slate-600">${esc(lines.join("\n"))}</pre>` : ""}
+        ${changesBlock}
+        ${structureBlock}
+        ${attributionBlock}
+      </div>
+    </details>`;
+}
+
+/**
+ * 一轮的完整正文（标题 + 五层 + 并列调用 + 技术细节）—— 纯函数。
+ *
+ * 自检脚本直接调它；DOM 更新（addTraceRoundRow）也调它 —— 同一份渲染。
+ */
+function renderTraceRoundBody(data, options = {}) {
+  return `
+    ${renderTraceRoundHeader(data)}
+    ${renderTraceRoundLayers(data)}
+    ${renderTraceRoundTechnical(data, { open: options.techOpen === true })}
+  `;
+}
+
+// 自检出口：把这几个纯函数挂出去，node 自检脚本按同一份实现跑。
+if (typeof window !== "undefined") {
+  window.WorkbenchTraceRender = {
+    traceRoundKey,
+    traceMissingText,
+    traceChangesText,
+    traceEffectText,
+    traceStepStatus,
+    traceStepGroups,
+    renderTraceRoundBody,
+    renderTraceRoundLayers,
+    renderTraceRoundCalls,
+    renderTraceRoundTechnical,
+  };
+}
+
+// ===== TRACE RENDER PURE END =====
+
+/**
+ * 渲染（或更新）一行「ReAct 第 N 轮」。
+ *
+ * 同一轮会随着事件到达被**多次**推送 → 这里按 key **更新**同一行，
+ * 不追加重复行。
+ *
+ * 两道保护：
+ *   - **请求隔离**：traceId / messageId 与本卡片不一致 → 整条忽略
+ *     （别的事件流 / 别的消息的轮次不串进这张卡）。
+ *   - **旧修订保护**：同一轮的修订号比已存的**旧**修订号小 → 忽略这次更新，
+ *     不让旧内容盖掉新内容。修订号缺失按「无修订信息」处理 ——
+ *     **不**因为缺修订号就拒绝更新（旧数据没有这个字段）。
+ */
+function addTraceRoundRow(card, data) {
+  if (!card || !data) return;
+  if (!card._roundRows) card._roundRows = new Map();
+  if (!card._roundRevisions) card._roundRevisions = new Map();
+  // 请求隔离：这条事件是不是**本卡片**那条 trace 的？
+  const traceId = String(data.traceId || "");
+  if (traceId && card._traceId && card._traceId !== traceId) return;
+  if (traceId) card._traceId = traceId;
+  // 请求隔离：这条轮次是不是**本卡片**那条消息的？
+  const messageId = String(data.messageId || "");
+  if (messageId && card._messageId && card._messageId !== messageId) return;
+  if (messageId) card._messageId = messageId;
+
+  const key = traceRoundKey(data);
+  // 旧修订保护：更小的修订号 = 更旧的内容 → 忽略，不覆盖。
+  const hasRevision = traceHasRevision(data);
+  const incoming = hasRevision ? Number(data.revision) : null;
+  const stored = card._roundRevisions.get(key);
+  if (stored !== undefined && hasRevision && incoming < stored) return;
+
+  let row = card._roundRows.get(key);
+  if (!row) {
+    row = document.createElement("div");
+    row.className = "debug-round px-3.5 py-2 text-[11px] leading-relaxed";
+    card.querySelector(".debug-rows").appendChild(row);
+    if (card._rowObserver) card._rowObserver.observe(row);
+    card._roundRows.set(key, row);
+  }
+  const wasOpen = row.querySelector("details")?.open ?? false;
+  row.innerHTML = renderTraceRoundBody(data, { techOpen: wasOpen });
+  if (hasRevision) {
+    card._roundRevisions.set(key, stored === undefined ? incoming : Math.max(stored, incoming));
+  }
+  refreshDebugCard(card);
+  scrollDebugRows(card);
+  scrollChatBottom();
+}
+
+/** 把最终摘要里的逐轮数据也渲染出来（非流式路径 / final 事件 / 历史回放）。 */
+function renderTraceRoundsFromSummary(card, summary) {
+  const rounds = summary?.rounds;
+  if (!Array.isArray(rounds)) return;
+  rounds.forEach((round) => {
+    addTraceRoundRow(card, {
+      ...round,
+      traceId: round.traceId || summary.traceId || "",
+      messageId: round.messageId || summary.messageId || "",
+    });
+  });
+}
+
+/**
+ * 历史回放：把这一轮**存下来的**逐轮摘要画成一张 Debug Trace 卡片。
+ *
+ * 走的是**同一套**渲染（renderTraceRoundsFromSummary → addTraceRoundRow）——
+ * 历史与流式看到的是同一种正文。旧消息没有的字段由渲染函数自己说
+ * 「历史 Trace 未记录该详情」，**不**补造轮次或结构。
+ */
+function appendTraceHistoryCard(payload) {
+  const summary = payload?.debug?.traceSummary;
+  const rounds = summary?.rounds;
+  if (!Array.isArray(rounds) || !rounds.length) return null;
+  const card = appendDebugTrace({
+    text: payload?.reply || "",
+    state: payload?.state || "",
+    isAdvance: false,
+    history: true,
+  });
+  renderTraceRoundsFromSummary(card, summary);
+  return card;
 }
 
 // --------------------------------------------------------------------------
@@ -3004,6 +3557,9 @@ async function postAgentStream(body, debugCard, signal) {
       throw new Error(payload.message || "stream error");
     } else if (event === "reply_delta") {
       // 最终回复仍由现有渲染逻辑统一展示，避免同一句话重复出现。
+    } else if (event === "trace_round") {
+      // 「ReAct 第 N 轮」：同一轮会被多次推送 → 卡片里**更新**同一行。
+      addTraceRoundRow(debugCard, payload);
     } else {
       addDebugEvent(debugCard, event, payload);
     }
@@ -6369,6 +6925,13 @@ async function restoreSession(sessionId, { silent = false, token = null, detail:
       // 老消息没有目标 → 明确不支持，不按最新回复补绑。
       const historyTarget = message.feedbackTarget || message.payload?.feedbackTarget || null;
       if (typeof mountFeedbackTarget === "function") mountFeedbackTarget(historyTarget, bubbleMark);
+      // 历史 Debug Trace：这一轮**存下来的**逐轮摘要，走与流式**同一套**渲染
+      // （renderTraceRoundsFromSummary → addTraceRoundRow）。
+      //
+      // 画在**这一轮回答之后**：反馈入口按「第几条 AI 气泡」定位，先挂好再追加
+      // 气泡，它的落点不会被这张新卡挪走。旧消息没有的字段由渲染函数自己说
+      // 「历史 Trace 未记录该详情」，**不**补造轮次或结构。
+      appendTraceHistoryCard(message.payload);
     } else {
       appendAiText(message.content);
     }

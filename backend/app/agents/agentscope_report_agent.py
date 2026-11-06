@@ -18,9 +18,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,7 @@ from app.services.report_log_safety import (
     safe_reason,
 )
 from app.services import routing_rules
+from app.services import edit_trace_service
 from app.tools.context import (
     ToolContext,
     bind_tool_context,
@@ -84,6 +87,72 @@ logger = logging.getLogger(__name__)
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "report_generation.md"
 _EDIT_PROMPT_PATH = Path(__file__).parent / "prompts" / "template_edit.md"
 _QUERY_PROMPT_PATH = Path(__file__).parent / "prompts" / "query_answer.md"
+
+
+# --------------------------------------------------------------------------
+# 追踪用中间件：把「这次调用是谁」固定下来
+# --------------------------------------------------------------------------
+#
+# 为什么需要它：
+#
+# * AgentScope **并行**执行同一批工具调用（``asyncio.gather``）——
+#   每个调用跑在**各自的任务**里，彼此看不到对方写入的状态；
+# * 框架的 ``TOOL_CALL_START`` 事件与真正的执行器**不在同一个协程**：
+#   事件是消费者侧读到的，执行发生在框架自己的任务里；
+# * 工具函数本身**拿不到** ``tool_call_id``。
+#
+# 所以「这次调用是哪一次调用」只能在**工具执行的那一刻**、在**执行任务
+# 自己**的上下文里固定下来，再通过不可变对象传给提交 / 试做事件。
+#
+# 这个中间件就是那个接缝：``on_acting`` 在框架调用工具函数**之前**触发，
+# 且与工具函数跑在**同一个任务**里 —— ContextVar 的写入对工具可见。
+
+
+class _TraceCallMiddleware:
+    """在**工具执行的那一刻**绑定这次调用的归属。
+
+    只做观察：绑定一个不可变的 ``CallContext``，不改工具参数、
+    不改返回值、不改执行顺序。
+
+    **不继承框架的 ``MiddlewareBase``**：框架只用到两个成员
+    （``is_implemented`` 与 ``on_acting``），鸭子类型即可 ——
+    这样本模块不必 import 框架的中间件包（那条 import 链在本环境里
+    会连带拉起可选依赖，不值得为一次观察点冒险）。
+    """
+
+    def is_implemented(self, hook_name: str) -> bool:
+        """只实现 ``on_acting`` 这一个钩子。"""
+        return hook_name == "on_acting"
+
+    async def on_acting(self, agent, input_kwargs, next_handler):
+        """把这次调用的 reply / 轮次 / 调用 id 固定成任务局部上下文。"""
+        tool_call = (input_kwargs or {}).get("tool_call")
+        call_id = str(getattr(tool_call, "id", "") or "")
+        tool_name = str(getattr(tool_call, "name", "") or "")
+        iteration = AgentScopeReportAgent._iteration_of(agent)
+        reply_index = 0
+        trace = edit_trace_service.current_trace()
+        if trace is not None:
+            try:
+                reply_index = int(trace.get("replyIndex", 0) or 0)
+            except (TypeError, ValueError):
+                reply_index = 0
+        edit_trace_service.bind_call_context(
+            edit_trace_service.CallContext(
+                reply_index=reply_index,
+                iteration=iteration,
+                tool_call_id=call_id,
+                tool_name=tool_name,
+            )
+        )
+        try:
+            async for item in next_handler():
+                yield item
+        finally:
+            # 这一次调用结束 → 清掉任务局部的归属。
+            # 不清的话，同一任务里后续的调用会带着上一次的 id。
+            edit_trace_service.clear_call_context()
+
 
 
 #: 句子里出现「样式/版式/标题/柱状图…」这类词时，才去纠正它的「已生效」说法。
@@ -200,6 +269,11 @@ class AgentScopeReportAgent:
 
         只读查询轮换一套工具：只注册事实工具和查询答案终结工具，
         执行类工具结构上就调不到。
+
+        **能力说明来自总目录**（契约 0003 §1）：编辑态的说明 =
+        ``template_edit.md``（只保留流程）+ **当前版本**的能力总目录。
+        目录在**每次构造 Agent 时**核对并按需重新生成 ——
+        不在 ``__init__`` 缓存，所以改了能力之后下一次构造就能拿到新版本。
         """
         from agentscope.agent import Agent
 
@@ -210,7 +284,7 @@ class AgentScopeReportAgent:
         if query_mode:
             system_prompt = self._query_prompt
         elif request.state == AgentState.USER_EDITING_TEMPLATE:
-            system_prompt = self._edit_prompt
+            system_prompt = self._edit_system_prompt()
         else:
             system_prompt = self._system_prompt
         return Agent(
@@ -219,27 +293,43 @@ class AgentScopeReportAgent:
             model=self._model,
             toolkit=toolkit,
             react_config=self._build_react_config(request.state),
+            # 追踪接缝：在**工具执行的那一刻**把这次调用的归属固定下来。
+            # 只观察，不改行为。
+            middlewares=[_TraceCallMiddleware()],
         )
+
+    def _edit_system_prompt(self) -> str:
+        """编辑态的说明：流程规则 + **当前版本**的能力总目录。
+
+        目录生成失败 → **明确报错**（抛出去），不静默回退到旧手写说明：
+        回退会让模型按一份已经不认识的参数去调工具。
+        """
+        from app.services.capability_catalog_service import (
+            catalog_text,
+            ensure_catalog_fresh,
+        )
+
+        # 核对已加载契约与目录文件；不一致就重新生成（原子替换）。
+        ensure_catalog_fresh()
+        body = catalog_text(AgentState.USER_EDITING_TEMPLATE.value)
+        return f"{self._edit_prompt}\n\n{body}"
 
     def _build_react_config(self, state: AgentState):
         """按节点构造 ReAct 预算。
 
         AgentScope 默认 max_iters=50，报表场景根本用不到；这里按节点收紧，
         避免模型在错误的分支上空转。
+
+        **编辑态只有一个预算**（``react_max_iters_edit``，默认 8 圈）：
+        新的编辑要求与同一事项的后续调整用同一个上限，不再因为
+        「会话里还没有 editItem」退回 4 圈 —— 那正是首次请求在提交前
+        就耗尽预算的原因。
         """
         from agentscope.agent import ReActConfig
 
         settings = self._settings
         if state == AgentState.USER_EDITING_TEMPLATE:
             max_iters = settings.react_max_iters_edit
-            # 能力格式（动态操作清单 + 整批试做 + 同一轮修正）需要**更多**轮次：
-            # 读草稿 → 查维度 → 提交（试做失败）→ 改正后再提交。
-            #
-            # 预算仍然是**有上限的**：只是把上限从「够单步计划」放宽到
-            # 「够一条操作清单 + 一次修正」。用完仍未通过就安全结束，
-            # 原草稿不变。
-            if self._capability_budget_active():
-                max_iters = settings.react_max_iters_edit_capability
         elif state == AgentState.VALIDATION_FAILED:
             max_iters = settings.react_max_iters_fix
         else:
@@ -251,21 +341,29 @@ class AgentScopeReportAgent:
         )
 
     @staticmethod
-    def _capability_budget_active() -> bool:
-        """这一轮要不要用**能力格式**的预算。
+    def _grace_iters_config(settings) -> int:
+        """框架结构化输出宽限轮数。
 
-        判据：会话里**已经有修改事项**（上一轮攒下的操作清单），或者
-        这条消息明显是在做「多区块 / 组合」的修改（删一块、加两块那种）。
-        判不准就按普通预算走 —— 能力格式本身是**可选**的出口。
+        这是框架为了把结构化输出落地而给的**额外**圈数，与编辑预算
+        **分开计数** —— 它不是「第二次完整催交」，也不是预算的一部分。
         """
         try:
-            from app.services.edit_item_service import load_edit_item
+            return int(
+                getattr(settings, "react_structured_output_grace_iters", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return 0
 
-            if load_edit_item() is not None:
-                return True
-        except Exception:  # noqa: BLE001 — 判不准就按普通预算走
-            return False
-        return False
+    @staticmethod
+    def _budget_source(settings) -> str:
+        """本轮预算**实际**来自哪个环境变量（用于日志如实说明）。"""
+        import os
+
+        if os.getenv("REACT_MAX_ITERS_EDIT"):
+            return "REACT_MAX_ITERS_EDIT"
+        if os.getenv("REACT_MAX_ITERS_EDIT_CAPABILITY"):
+            return "REACT_MAX_ITERS_EDIT_CAPABILITY（旧名，兼容回退）"
+        return "默认值 8（环境变量未配置）"
 
     # ---------- 入口 ----------
 
@@ -273,12 +371,14 @@ class AgentScopeReportAgent:
         """降级响应。
 
         查询轮降级到 Fake 的查询路径（同一套事实工具、同一套事实口径）；
-        编辑态降级到「查证不可用」；其余降级到 FakeAgent。
+        编辑态降级到**按真实原因分类**的失败；其余降级到 FakeAgent。
         """
         if getattr(request, "queryMode", False):
             return self._fallback.handle(request)
         if request.state == AgentState.USER_EDITING_TEMPLATE:
-            return self._unavailable_edit_response(request)
+            return self._unavailable_edit_response(
+                request, edit_trace_service.ERR_MODEL_UNAVAILABLE
+            )
         return self._fallback.handle(request)
 
     def handle(self, request: AgentRequest) -> AgentResponse:
@@ -293,12 +393,22 @@ class AgentScopeReportAgent:
                 self._init_err,
             )
             return self._model_unavailable_response(request)
+        self._start_request_trace(request)
         try:
             plan, reason = asyncio.run(self._run_agent(request))
         except Exception as exc:  # noqa: BLE001
             log_failure(logger, "AgentScope 运行异常，降级 FakeAgent", exc)
+            edit_trace_service.record(
+                edit_trace_service.STAGE_ERROR,
+                name="agent_exception",
+                errorCategory=self._classify_exception(exc),
+                status="error",
+                extra={"errorType": type(exc).__name__},
+            )
             return self._degraded_response(request)
-        return self._dispatch(request, plan, reason)
+        finally:
+            pass
+        return self._attach_trace_debug(self._dispatch(request, plan, reason))
 
     async def ahandle(self, request: AgentRequest) -> AgentResponse:
         """async 入口：复用 FastAPI 的事件循环，避免 httpx 连接池跨 loop 失效。"""
@@ -310,12 +420,85 @@ class AgentScopeReportAgent:
                 self._init_err,
             )
             return self._model_unavailable_response(request)
+        self._start_request_trace(request)
         try:
             plan, reason = await self._run_agent(request)
         except Exception as exc:  # noqa: BLE001
             log_failure(logger, "AgentScope 运行异常，降级 FakeAgent", exc)
+            edit_trace_service.record(
+                edit_trace_service.STAGE_ERROR,
+                name="agent_exception",
+                errorCategory=self._classify_exception(exc),
+                status="error",
+                extra={"errorType": type(exc).__name__},
+            )
             return self._degraded_response(request)
-        return self._dispatch(request, plan, reason)
+        return self._attach_trace_debug(self._dispatch(request, plan, reason))
+
+    @staticmethod
+    def _attach_trace_debug(response: AgentResponse) -> AgentResponse:
+        """给响应挂上本轮追踪标识与摘要。
+
+        **成功轮与失败轮都挂**：排查「这次到底跑了几圈、调了哪些工具」
+        时，成功与失败要能在同一处对照。
+        """
+        summary = edit_trace_service.trace_summary()
+        trace_id = str(summary.get("traceId") or "")
+        if not trace_id:
+            return response
+        debug = dict(response.debug or {})
+        debug.setdefault("traceId", trace_id)
+        debug.setdefault("traceSummary", summary)
+        response.debug = debug
+        return response
+
+    def _start_request_trace(self, request: AgentRequest) -> None:
+        """开一条**请求作用域**的追踪（成功轮与失败轮都记）。
+
+        目录版本取**本轮固定**的值：构造 Agent 时用的是哪个版本，
+        这里就记哪个版本 —— 便于把日志与当时人打开的目录对上。
+        """
+        catalog_version = ""
+        try:
+            from app.services.capability_catalog_service import catalog_version as _version
+
+            catalog_version = _version()
+        except Exception:  # noqa: BLE001 — 取不到就留空，不影响主流程
+            catalog_version = ""
+        edit_trace_service.ensure_trace(
+            session_id=request.sessionId or request.conversationId or "",
+            draft_id=(
+                request.context.reportDefinitionId
+                or request.context.subjectId
+                or ""
+            ),
+            catalog_version=catalog_version,
+            # 本轮请求的消息标识：迟到的事件靠它判断「是不是本请求的」。
+            message_id=str(request.messageId or ""),
+        )
+
+    @staticmethod
+    def _classify_exception(exc: Exception) -> str:
+        """把异常分成「模型接口」与「其它」两类。
+
+        只有**确实**是模型接口不可用/超时才算那两类；其余一律归
+        ``unknown``（原因尚未确定），不假装已经查明。
+        """
+        name = type(exc).__name__.lower()
+        text = str(exc).lower()
+        if "timeout" in name or "timeout" in text or "timed out" in text:
+            return edit_trace_service.ERR_MODEL_TIMEOUT
+        if any(
+            token in name or token in text
+            for token in ("authentication", "apikey", "unauthorized", "permission")
+        ):
+            return edit_trace_service.ERR_MODEL_UNAVAILABLE
+        if any(
+            token in name or token in text
+            for token in ("connection", "apiconnection", "serviceunavailable", "internalserver")
+        ):
+            return edit_trace_service.ERR_MODEL_UNAVAILABLE
+        return edit_trace_service.ERR_UNKNOWN
 
     @staticmethod
     def _model_unavailable_response(request: AgentRequest) -> AgentResponse:
@@ -354,7 +537,9 @@ class AgentScopeReportAgent:
             )
             if getattr(request, "queryMode", False):
                 return self._query_failure_response(request)
-            return self._unavailable_edit_response(request) if request.state == AgentState.USER_EDITING_TEMPLATE else self._fallback.handle(request)
+            if request.state == AgentState.USER_EDITING_TEMPLATE:
+                return self._unavailable_edit_response(request, reason)
+            return self._fallback.handle(request)
 
         submission = plan.get("submission")
         query_mode = bool(getattr(request, "queryMode", False))
@@ -371,7 +556,9 @@ class AgentScopeReportAgent:
             or submission.get("tool") not in {"submit_edit_answer", "submit_edit_plan"}
         ):
             log_warning(logger, "编辑态拒绝非编辑终结工具或旧式文本计划")
-            return self._unavailable_edit_response(request)
+            return self._unavailable_edit_response(
+                request, edit_trace_service.ERR_PARAMS_INVALID
+            )
         elif isinstance(submission, dict) and submission.get("tool") == "submit_query_answer":
             # 普通业务轮不接受只读答案提交：这个出口只在查询模式注册。
             log_warning(logger, "非查询轮拒绝只读答案提交")
@@ -416,8 +603,102 @@ class AgentScopeReportAgent:
         )
 
     @staticmethod
-    def _unavailable_edit_response(request: AgentRequest) -> AgentResponse:
-        message = "本轮查证遇到技术问题，草稿没有修改。请稍后重试。"
+    def _unavailable_edit_response(
+        request: AgentRequest, reason: str = ""
+    ) -> AgentResponse:
+        """编辑态失败：**按真实原因分类**，不再一律说「技术问题」。
+
+        失败阶段 / 已知原因 / 修改是否生效 / 可用的下一步 —— 四件事都
+        写清楚。通用兜底只用于「原因尚未确定」。
+        """
+        category = str(reason or "") or edit_trace_service.ERR_UNKNOWN
+        # 认不出来的类别一律按「原因尚未确定」表述 —— 不把裸码抛给用户。
+        known = edit_trace_service.ERROR_MESSAGES.get(
+            category
+        ) or edit_trace_service.ERROR_MESSAGES[edit_trace_service.ERR_UNKNOWN]
+        if category == edit_trace_service.ERR_UNKNOWN:
+            # 通用兜底：**逐字保留**既有文案。
+            #
+            # 这一句前端与既有测试都认（``EDIT_VERIFICATION_UNAVAILABLE``
+            # 的失败渲染），改了就是破坏既有行为。分类信息放在
+            # ``debug.errorCategory`` / ``debug.failureReason`` 里 ——
+            # 「原因尚未确定」写在那里（契约 §2.4：摘要里写明原因尚未确定）。
+            message = "本轮查证遇到技术问题，草稿没有修改。请稍后重试。"
+        # 预算耗尽要说清「未形成可执行计划」，不能暗示接口或数据查询坏了。
+        elif category == edit_trace_service.ERR_BUDGET_EXHAUSTED:
+            message = (
+                "本次编辑没有完成：本轮推理用完了预算，仍然没有提交可执行的修改计划。"
+                "草稿和待确认操作都没有变化。"
+                "可以再说一次要改什么，或者把要求说得更具体一点。"
+            )
+        elif category == edit_trace_service.ERR_MODEL_UNAVAILABLE:
+            message = (
+                "本次编辑没有完成：模型接口当前不可用，本轮没有生成修改计划。"
+                "草稿和待确认操作都没有变化。请稍后重试。"
+            )
+        elif category == edit_trace_service.ERR_MODEL_TIMEOUT:
+            message = (
+                "本次编辑没有完成：模型请求超时，本轮没有生成修改计划。"
+                "草稿和待确认操作都没有变化。请稍后重试。"
+            )
+        elif category == edit_trace_service.ERR_TOOL_ERROR:
+            message = (
+                "本次编辑没有完成：查询工具执行报错，没有形成可执行的修改计划。"
+                "草稿和待确认操作都没有变化。可以稍后重试。"
+            )
+        elif category == edit_trace_service.ERR_TOOL_LOOKUP_FAILED:
+            message = (
+                "本次编辑没有完成：没有查到要修改的目标，或该能力当前不支持，"
+                "因此没有形成可执行的修改计划。草稿和待确认操作都没有变化。"
+                "可以换一种说法，或直接说明要改哪张卡片。"
+            )
+        elif category == edit_trace_service.ERR_PARAMS_INVALID:
+            message = (
+                "本次编辑没有完成：提交的修改参数不合法，没有形成可执行的修改计划。"
+                "草稿和待确认操作都没有变化。请把要求说得再具体一点。"
+            )
+        elif category == edit_trace_service.ERR_TRIAL_FAILED:
+            message = (
+                "本次编辑没有完成：修改计划在预执行校验时没有通过，原草稿保持不变。"
+                "可以调整要求后重试。"
+            )
+        elif category == edit_trace_service.ERR_ACCEPT_FAILED:
+            message = (
+                "本次编辑没有完成：接受修改时正式提交失败（草稿版本或权限已变化），"
+                "草稿没有被修改。请重新核对目标后再试。"
+            )
+        elif category == edit_trace_service.ERR_NOT_SUBMITTED:
+            message = (
+                "本次编辑没有完成：本轮结束，但没有提交可执行的修改计划。"
+                "草稿和待确认操作都没有变化。可以把要求说得更具体一点。"
+            )
+        else:
+            message = (
+                "本次编辑没有完成：原因尚未确定，草稿和待确认操作都没有变化。"
+                "请稍后重试。"
+            )
+        # 把这一轮的**失败类别**写进追踪：摘要里要写明「原因尚未确定」
+        # 或具体原因（契约 §2.4 / §2.5）。只做一次，没有 trace 就跳过。
+        if edit_trace_service.current_trace() is not None:
+            edit_trace_service.record(
+                edit_trace_service.STAGE_ERROR,
+                name="edit_failed",
+                replyIndex=1,
+                params={},
+                result={"submitted": False, "applied": False},
+                status="error",
+                errorCategory=category,
+            )
+        summary = edit_trace_service.trace_summary()
+        debug: dict[str, Any] = {
+            # ``technical_failure`` 是**既有**的失败标记（前端与既有测试都认），
+            # 分类信息另放在 ``errorCategory`` / ``failureReason`` 里。
+            "editOutcome": "technical_failure",
+            "errorCategory": category,
+            "failureReason": known,
+            "traceId": summary.get("traceId", ""),
+            "traceSummary": summary,
+        }
         return AgentResponse(
             conversationId=request.conversationId,
             state=AgentState.USER_EDITING_TEMPLATE,
@@ -427,9 +708,32 @@ class AgentScopeReportAgent:
                 reportPolicyDraft=request.snapshots.reportPolicy,
                 reportDefinitionDraft=request.snapshots.reportDefinition,
             ),
-            error=AgentError(code="EDIT_VERIFICATION_UNAVAILABLE", message=message),
-            debug={"editOutcome": "technical_failure"},
+            error=AgentError(
+                code=AgentScopeReportAgent._edit_error_code(category),
+                message=message,
+            ),
+            debug=debug,
         )
+
+    @staticmethod
+    def _edit_error_code(category: str) -> str:
+        """失败类别 → 协议错误码。
+
+        ``EDIT_VERIFICATION_UNAVAILABLE`` 保留为「原因尚未确定」的兜底 ——
+        前端已有按这个码渲染失败的逻辑，不能破坏。
+        """
+        return {
+            edit_trace_service.ERR_BUDGET_EXHAUSTED: "EDIT_BUDGET_EXHAUSTED",
+            edit_trace_service.ERR_MODEL_UNAVAILABLE: "EDIT_MODEL_UNAVAILABLE",
+            edit_trace_service.ERR_MODEL_TIMEOUT: "EDIT_MODEL_TIMEOUT",
+            edit_trace_service.ERR_MODEL_ERROR: "EDIT_MODEL_UNAVAILABLE",
+            edit_trace_service.ERR_TOOL_ERROR: "EDIT_TOOL_FAILED",
+            edit_trace_service.ERR_TOOL_LOOKUP_FAILED: "EDIT_TOOL_FAILED",
+            edit_trace_service.ERR_PARAMS_INVALID: "EDIT_PARAMS_INVALID",
+            edit_trace_service.ERR_TRIAL_FAILED: "EDIT_TRIAL_FAILED",
+            edit_trace_service.ERR_ACCEPT_FAILED: "EDIT_ACCEPT_FAILED",
+            edit_trace_service.ERR_NOT_SUBMITTED: "EDIT_VERIFICATION_UNAVAILABLE",
+        }.get(category, "EDIT_VERIFICATION_UNAVAILABLE")
 
     def _dispatch_submission(
         self, request: AgentRequest, submission: dict[str, Any]
@@ -486,6 +790,51 @@ class AgentScopeReportAgent:
         bind_tool_context(self._build_tool_context(request))
         bind_submission()
         bind_lookup_failure()
+        edit_state = request.state in {
+            AgentState.USER_EDITING_TEMPLATE,
+            AgentState.WAITING_USER_CONFIRM,
+        }
+        # 预算在**启动 ReAct 前**定下来并记录：实际值 + 来源 + 理由。
+        budget = self._build_react_config(request.state).max_iters
+        grace_iters = self._grace_iters_config(self._settings)
+        edit_trace_service.set_budget(budget)
+        edit_trace_service.record(
+            edit_trace_service.STAGE_AGENT_REPLY,
+            name="react_budget",
+            replyIndex=1,
+            params={
+                "maxIters": budget,
+                "source": self._budget_source(self._settings),
+                "reason": "新旧编辑统一预算，不依赖是否已有修改事项",
+                # 框架结构化输出宽限：独立于编辑预算另计，**不是**一次额外催交。
+                "structuredOutputGraceIters": grace_iters,
+            },
+            result={"configured": True},
+        )
+        log_info(
+            logger,
+            "[agent] 本轮编辑预算 maxIters=%d source=%s reason=新旧编辑统一预算 "
+            "graceIters=%d（框架结构化输出宽限，单独计数）",
+            budget,
+            self._budget_source(self._settings),
+            grace_iters,
+        )
+        # 草稿版本：这一轮是在**哪个版本**上做的（没有草稿就记「未取得」）。
+        definition = request.snapshots.reportDefinition
+        draft_revision = (
+            int((definition.metadata or {}).get("revision") or 0)
+            if definition is not None
+            else None
+        )
+        edit_trace_service.record(
+            edit_trace_service.STAGE_AGENT_REPLY,
+            name="draft_snapshot",
+            replyIndex=1,
+            result={
+                "draftId": request.context.reportDefinitionId or "",
+                "draftRevision": draft_revision,
+            },
+        )
         try:
             user_msg = Msg(
                 name="user",
@@ -496,11 +845,58 @@ class AgentScopeReportAgent:
             )
 
             # 第一次调用：由 AgentScope 跑完整 ReAct 循环（Reason → Tool → Observation → ...）
-            reply_msg = await agent.reply(user_msg)
+            reply_msg, reply_info = await self._reply_with_trace(
+                agent, user_msg, reply_index=1
+            )
+            # **真实**迭代数与停止原因：来自框架状态，不是 HTTP 次数。
+            iterations = self._real_iterations(agent)
+            finished_reason = reply_info.get("finishedReason") or self._finished_reason(
+                reply_msg
+            )
+            edit_trace_service.record(
+                edit_trace_service.STAGE_AGENT_REPLY,
+                name="react_reply",
+                replyIndex=1,
+                iteration=iterations,
+                params={},
+                result={
+                    "finishedReason": finished_reason,
+                    "replyLength": len(_extract_text(reply_msg)),
+                },
+                # ``completed`` 不等于「没有提交」：按**真实**提交事实说。
+                stopReason=self._stop_reason_of(
+                    finished_reason,
+                    submitted=edit_trace_service.has_accepted_submission(),
+                ),
+                status="ok",
+            )
+            # 框架结构化输出宽限：超出 max_iters 的部分**单独**记录。
+            #
+            # 这是框架为了让结构化输出落地而给的额外圈数，**不是**一次
+            # 「第二次完整催交」—— 名字与口径都不能那样叫。
+            grace_used = None
+            if iterations is not None:
+                grace_used = max(0, iterations - budget)
+            edit_trace_service.record(
+                edit_trace_service.STAGE_AGENT_REPLY,
+                name="react_grace_iters",
+                replyIndex=1,
+                iteration=iterations,
+                params={
+                    "maxIters": budget,
+                    "graceItersConfigured": grace_iters,
+                    "graceItersUsed": grace_used,
+                    "note": "框架结构化输出宽限，单独计数，不是一次额外的完整推理轮次",
+                },
+                result={
+                    "iterations": iterations,
+                    "exceededMaxIters": bool(grace_used),
+                },
+            )
             if getattr(request, "queryMode", False) and take_lookup_failure():
                 log_warning(logger, "查询态事实工具查证失败，不接受本轮答案")
                 return None, "事实工具查证失败"
-            if request.state in {AgentState.USER_EDITING_TEMPLATE, AgentState.WAITING_USER_CONFIRM} and take_lookup_failure():
+            if edit_state and take_lookup_failure():
                 # 编辑态：事实工具查证失败**不废掉**本轮候选。
                 #
                 # 事实工具是帮模型**定位**目标卡片用的，不是「准不准加这个
@@ -522,6 +918,45 @@ class AgentScopeReportAgent:
             if plan is not None:
                 return plan, ""
 
+            # 编辑态：**不再**跑第二轮完整 ReAct 催交（需求第 5 节）。
+            #
+            # 循环内的错误反馈（参数不合法 / 引用错 / 试做失败）本来就在
+            # 同一个 Agent 的同一个循环里发生 —— 那条路径没有动。
+            # 循环**结束**仍没有有效提交时，如实记录停止原因并结束：
+            # 不把预算耗尽、未提交、参数非法混成同一个技术错误。
+            if edit_state:
+                first_reply = _extract_text(reply_msg)
+                log_warning(
+                    logger,
+                    "AgentScope 编辑态未提交终结工具 state=%s iterations=%s "
+                    "finishedReason=%s replyLength=%d replyShape=%s",
+                    request.state.value,
+                    iterations,
+                    finished_reason,
+                    len(first_reply),
+                    model_text_shape(first_reply),
+                )
+                category = self._classify_no_submission(
+                    finished_reason=finished_reason,
+                    iterations=iterations,
+                    budget=budget,
+                    tool_category=edit_trace_service.latest_error_category(),
+                )
+                edit_trace_service.record(
+                    edit_trace_service.STAGE_ERROR,
+                    name="react_no_submission",
+                    replyIndex=1,
+                    iteration=iterations,
+                    params={},
+                    result={"submitted": False, "tried": False},
+                    status="error",
+                    errorCategory=category,
+                    stopReason=self._stop_reason_of(finished_reason),
+                )
+                return None, category
+
+            # 其它状态（查询等）：保留既有的修复重试策略，不顺带删。
+            #
             # 修复重试 1 次（Q5）
             # 模型返回原文不进日志：只留长度与形状级摘要（#61）。
             first_reply = _extract_text(reply_msg)
@@ -543,12 +978,12 @@ class AgentScopeReportAgent:
                     )
                 ],
             )
-            reply_msg2 = await agent.reply(repair_msg)
+            reply_msg2, reply_info2 = await self._reply_with_trace(
+                agent, repair_msg, reply_index=2
+            )
             if getattr(request, "queryMode", False) and take_lookup_failure():
                 log_warning(logger, "查询态修复轮事实工具查证失败")
                 return None, "修复轮事实工具查证失败"
-            if request.state in {AgentState.USER_EDITING_TEMPLATE, AgentState.WAITING_USER_CONFIRM} and take_lookup_failure():
-                log_warning(logger, "编辑态修复轮事实工具查证失败，候选仍交用户确认")
             plan = self._plan_from_submission()
             if plan is not None:
                 return plan, ""
@@ -568,6 +1003,343 @@ class AgentScopeReportAgent:
             clear_tool_context()
             clear_submission()
             clear_lookup_failure()
+
+    async def _reply_with_trace(
+        self,
+        agent,
+        message,
+        *,
+        reply_index: int,
+    ) -> tuple[Any, dict[str, Any]]:
+        """跑一轮 ReAct，并把**逐圈**的工具事件写进追踪。
+
+        优先用 ``reply_stream``：它给出真实的 ``tool_call_id``、工具名与
+        工具结果状态 —— 这是「逐圈追踪」里最有定位价值的三样东西。
+        Agent 没有流式接口时（老替身 / 旧框架）退回 ``reply()``：
+        迭代编号仍取**框架真实计数**，``toolCallId`` 记为未取得（空串）。
+
+        返回 ``(最终消息, 本轮信息)``；本轮信息里有停止原因与工具调用统计。
+        """
+        from agentscope.message import Msg
+
+        # 本轮是第几次 reply：工具侧事件靠它继承 replyIndex。
+        edit_trace_service.set_reply_index(reply_index)
+
+        stream = getattr(agent, "reply_stream", None)
+        if stream is None:
+            reply_msg = await agent.reply(message)
+            error = getattr(reply_msg, "error", None)
+            return reply_msg, {
+                "finishedReason": self._finished_reason(reply_msg),
+                "errorType": str(getattr(error, "type", "") or "") if error else "",
+                "toolCalls": 0,
+                "toolErrors": 0,
+            }
+
+        final_msg: Any = None
+        finished_reason = ""
+        error_type = ""
+        tool_calls = 0
+        tool_errors = 0
+        pending: dict[str, dict[str, Any]] = {}
+        # 工具的**真实返回**（TOOL_RESULT_TEXT_DELTA）：后台结果的来源。
+        tool_payloads: dict[str, list[str]] = {}
+        # 模型的**公开**文本（TEXT_BLOCK_DELTA）：思考摘要的**唯一**来源。
+        #
+        # 隐藏的 THINKING_BLOCK_* 是模型的内部思维链 —— 这里**不订阅、
+        # 不读取、不转发**。要写「思考摘要」只能用公开文本。
+        public_texts: dict[str, list[str]] = {}
+        public_recorded: set[str] = set()
+
+        async for chunk in stream(message, yield_final_msg=True):
+            # 框架只会产出「事件」或「最终消息」两类；事件一定有 ``type``。
+            # 没有 ``type`` 的就当最终消息（老替身返回的是普通对象）。
+            if isinstance(chunk, Msg) or not hasattr(chunk, "type"):
+                final_msg = chunk
+                continue
+            kind = str(getattr(chunk, "type", "") or "")
+            if kind == "TEXT_BLOCK_DELTA":
+                # 公开文本：模型说给人听的那部分。思考摘要只认这里。
+                delta = str(getattr(chunk, "delta", "") or "")
+                if delta:
+                    iteration = self._iteration_of(agent)
+                    public_texts.setdefault(
+                        _round_bucket(iteration), []
+                    ).append(delta)
+                    # 工具自己记的事件靠它归到正确的轮次。
+                    edit_trace_service.set_current_iteration(iteration)
+            elif kind == "TEXT_BLOCK_END":
+                self._record_public_text(
+                    agent,
+                    public_texts,
+                    public_recorded,
+                    reply_index=reply_index,
+                    bucket=_round_bucket(self._iteration_of(agent)),
+                    text=str(getattr(chunk, "text", "") or ""),
+                )
+            elif kind == "TOOL_CALL_START":
+                call_id = str(getattr(chunk, "tool_call_id", "") or "")
+                iteration = self._iteration_of(agent)
+                pending[call_id] = {
+                    "name": str(getattr(chunk, "tool_call_name", "") or ""),
+                    "args": "",
+                    "startedAt": time.perf_counter(),
+                    # 归属在**开始时固定**：结束时沿用它，不再重新读
+                    # 「当前轮」猜 —— 并行调用时那个值可能是别的调用的。
+                    "iteration": iteration,
+                }
+                # 工具侧事件（提交 / 试做 / 候选）自己不知道第几轮 ——
+                # 把**真实**轮次写进追踪上下文，它们靠它归轮。
+                edit_trace_service.set_current_iteration(iteration)
+                # 「调用开始了」也记一条：这一轮能在工具返回**之前**
+                # 就出现在界面上（不等最后一刻才给结果）。
+                edit_trace_service.record(
+                    edit_trace_service.STAGE_TOOL_CALL,
+                    name=str(getattr(chunk, "tool_call_name", "") or ""),
+                    toolCallId=call_id,
+                    iteration=iteration,
+                    replyIndex=reply_index,
+                    params={},
+                    result={},
+                    status="ok",
+                    # 开始阶段还没有业务结论：如实标「未取得」。
+                    businessOk=None,
+                )
+            elif kind == "TOOL_CALL_DELTA":
+                call_id = str(getattr(chunk, "tool_call_id", "") or "")
+                entry = pending.setdefault(
+                    call_id,
+                    {"name": "", "args": "", "startedAt": time.perf_counter()},
+                )
+                entry["args"] += str(getattr(chunk, "delta", "") or "")
+            elif kind == "TOOL_RESULT_TEXT_DELTA":
+                # 工具的**真实返回文本**：后台结果的第一来源。
+                call_id = str(getattr(chunk, "tool_call_id", "") or "")
+                delta = str(getattr(chunk, "delta", "") or "")
+                if delta:
+                    tool_payloads.setdefault(call_id, []).append(delta)
+            elif kind == "TOOL_RESULT_END":
+                call_id = str(getattr(chunk, "tool_call_id", "") or "")
+                entry = pending.pop(
+                    call_id,
+                    {"name": "", "args": "", "startedAt": None},
+                )
+                state = str(getattr(chunk, "state", "") or "")
+                failed = state == "error"
+                tool_calls += 1
+                if failed:
+                    tool_errors += 1
+                params, params_parsed = _parse_tool_args(entry.get("args") or "")
+                started = entry.get("startedAt")
+                duration = (
+                    int((time.perf_counter() - started) * 1000)
+                    if isinstance(started, float)
+                    else 0
+                )
+                # 轮次沿用**开始时固定**的那个 —— 不在这里重新读
+                # 「当前轮」：并行调用时它可能已经被别的调用带偏。
+                iteration = entry.get("iteration")
+                if not isinstance(iteration, int):
+                    iteration = self._iteration_of(agent)
+                # 业务结果：只认工具**真实返回**的载荷。
+                payload = _parse_tool_payload(
+                    "".join(tool_payloads.pop(call_id, []))
+                )
+                (
+                    business_ok,
+                    business_message,
+                    business_reason,
+                    business_issues,
+                    business_detail,
+                    phase,
+                    draft_changed,
+                ) = _business_from_payload(entry.get("name"), payload)
+                edit_trace_service.record(
+                    edit_trace_service.STAGE_TOOL_CALL,
+                    name=entry.get("name") or "",
+                    toolCallId=call_id,
+                    iteration=iteration,
+                    replyIndex=reply_index,
+                    params=params,
+                    result={
+                        "state": state,
+                        "paramsParsed": params_parsed,
+                        # 工具的真实返回：后台结果的来源。
+                        "business": payload,
+                    },
+                    status="error" if failed else "ok",
+                    # 工具**执行**报错（框架报的工具结果状态）就是
+                    # ``tool_error``；提交参数不合法 / 试做失败是**工具自己**
+                    # 报的类别，优先级更高，不会被这里盖掉。
+                    errorCategory=(
+                        edit_trace_service.ERR_TOOL_ERROR if failed else ""
+                    ),
+                    durationMs=duration,
+                    businessOk=business_ok,
+                    businessMessage=business_message,
+                    businessReason=business_reason,
+                    businessIssues=business_issues,
+                    businessDetail=business_detail,
+                    phase=phase,
+                    draftChanged=draft_changed,
+                    # 提交形状指纹：判「又提交了同一份没改好的东西」。
+                    submitShape=_submit_shape(entry.get("name") or "", params),
+                )
+            elif kind == "REPLY_END":
+                finished_reason = str(getattr(chunk, "finished_reason", "") or "")
+                error = getattr(chunk, "error", None)
+                if error is not None:
+                    error_type = str(getattr(error, "type", "") or "")
+
+        # 收尾：把没赶上 TEXT_BLOCK_END 的公开文本也记下来。
+        self._record_public_text(
+            agent,
+            public_texts,
+            public_recorded,
+            reply_index=reply_index,
+        )
+
+        if final_msg is None:
+            log_warning(
+                logger,
+                "AgentScope 流式回复没有产出最终消息 replyIndex=%d",
+                reply_index,
+            )
+        return final_msg, {
+            "finishedReason": finished_reason,
+            "errorType": error_type,
+            "toolCalls": tool_calls,
+            "toolErrors": tool_errors,
+        }
+
+    @staticmethod
+    def _record_public_text(
+        agent,
+        public_texts: dict[str, list[str]],
+        public_recorded: set[str],
+        *,
+        reply_index: int,
+        bucket: str | None = None,
+        text: str = "",
+    ) -> None:
+        """把这一轮模型的**公开**文本记进追踪（思考摘要的唯一来源）。
+
+        隐藏的 ``THINKING_BLOCK_*`` **不订阅、不读取、不转发** ——
+        这里只处理 ``TEXT_BLOCK_*``。
+        """
+        targets = [bucket] if bucket is not None else list(public_texts.keys())
+        for key in targets:
+            if not key or key in public_recorded:
+                continue
+            content = text or "".join(public_texts.get(key) or [])
+            if not str(content or "").strip():
+                continue
+            iteration = (
+                int(key) if key.isdigit() else AgentScopeReportAgent._iteration_of(agent)
+            )
+            public_recorded.add(key)
+            edit_trace_service.record(
+                edit_trace_service.STAGE_AGENT_REPLY,
+                name=edit_trace_service.EVENT_PUBLIC_TEXT,
+                iteration=iteration,
+                replyIndex=reply_index,
+                params={"text": content},
+                result={"chars": len(content)},
+            )
+            # 记完就把这一段清掉：避免同一段文本被重复记。
+            public_texts.pop(key, None)
+
+    @staticmethod
+    def _iteration_of(agent) -> int | None:
+        """**当前正在跑的这一轮**是第几轮（1 起）。
+
+        框架在**一轮结束后**才把 ``cur_iter`` 加一，所以事件到达那一刻
+        ``cur_iter`` 是「已完成的轮数」；当前轮 = ``cur_iter + 1``。
+        取不到就返回 ``None``（「未取得」），不伪造。
+        """
+        value = AgentScopeReportAgent._real_iterations(agent)
+        if value is None:
+            return None
+        return value + 1
+
+    @staticmethod
+    def _real_iterations(agent) -> int | None:
+        """本轮**真实**的 ReAct 迭代数。
+
+        来自框架状态（``agent.state.cur_iter``）—— 不是 HTTP 请求次数，
+        也不是猜的。取不到就返回 ``None``（「未取得」），不伪造。
+        """
+        try:
+            value = getattr(getattr(agent, "state", None), "cur_iter", None)
+            if isinstance(value, int) and value >= 0:
+                return value
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    @staticmethod
+    def _finished_reason(reply_msg) -> str:
+        """框架给出的停止原因（``completed`` / ``exceed_max_iters`` / …）。"""
+        try:
+            reason = getattr(reply_msg, "finished_reason", None)
+            if reason is None:
+                return ""
+            return str(getattr(reason, "value", reason))
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _stop_reason_of(finished_reason: str, *, submitted: bool = False) -> str:
+        """把框架停止原因翻译成我们自己的停止原因文案。
+
+        ``completed`` **不等于**「没有提交」：到底提交没提交，看**真实的
+        提交事实**（追踪里有没有真的提交成功），不靠猜。
+        """
+        if finished_reason == "exceed_max_iters":
+            return "预算耗尽：达到迭代上限仍未提交终结工具"
+        if finished_reason == "completed":
+            return (
+                "循环正常结束：已提交终结工具"
+                if submitted
+                else "循环结束但没有提交终结工具"
+            )
+        if finished_reason == "error":
+            return "本轮以错误结束"
+        if finished_reason == "interrupted":
+            return "本轮被中断"
+        return ""
+
+    @staticmethod
+    def _classify_no_submission(
+        *,
+        finished_reason: str,
+        iterations: int | None,
+        budget: int,
+        tool_category: str = "",
+    ) -> str:
+        """编辑态「没有有效提交」时的**失败分类**。
+
+        预算耗尽 / 参数非法 / 试做失败 / 工具报错 / 未提交 —— **不混用**。
+
+        ``tool_category`` 是工具侧已经报出来的**具体**原因（试做失败、
+        参数不合法、工具报错、查不到目标）。有它就以它为准：那是模型
+        这一轮真正卡住的地方，比「预算用完了」更能指引下一步。
+        预算耗尽与模型侧原因仍然记在 ``stopReason`` 里，不丢。
+        """
+        if tool_category:
+            return tool_category
+        if finished_reason == "exceed_max_iters":
+            return edit_trace_service.ERR_BUDGET_EXHAUSTED
+        if finished_reason == "error":
+            return edit_trace_service.ERR_MODEL_ERROR
+        if finished_reason == "interrupted":
+            return edit_trace_service.ERR_NOT_SUBMITTED
+        # 没到上限就结束 —— 可能没提交，也可能输出不合法。
+        # 「参数不合法」由提交工具自己报（submit_edit_plan 返回 error），
+        # 走到这里说明**根本没调用**提交工具 → 归为「未提交」。
+        if iterations is not None and budget > 0 and iterations >= budget:
+            return edit_trace_service.ERR_BUDGET_EXHAUSTED
+        return edit_trace_service.ERR_NOT_SUBMITTED
 
     @staticmethod
     def _build_tool_context(request: AgentRequest) -> ToolContext:
@@ -594,6 +1366,10 @@ class AgentScopeReportAgent:
                 if snapshots.lastReportRun
                 else None
             ),
+            # 用户**这一轮**的原话：提交工具用它兜底写入修改事项的
+            # ``originalRequest``。模型不一定传这个参数，但服务端本来
+            # 就知道用户说了什么 —— 不能让归档记录丢掉最关键的那句话。
+            extra={"userMessage": str(request.message or "")},
         )
 
     @staticmethod
@@ -1499,6 +2275,137 @@ class AgentScopeReportAgent:
             ],
             uiActions=["confirm_framework", "reject_framework"],
         )
+
+
+def _parse_tool_args(raw: str) -> tuple[dict[str, Any], bool]:
+    """工具调用参数（增量 JSON 片段）→ 参数字典。
+
+    解析不出来就**说解析不出来**（空字典 + ``False``）：不把半截 JSON
+    当成参数写进追踪，也不伪造参数。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {}, False
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return {}, False
+    if isinstance(parsed, dict):
+        return parsed, True
+    return {}, False
+
+
+def _parse_tool_payload(text: str) -> dict[str, Any] | None:
+    """工具的**真实返回**（文本）→ 载荷字典。
+
+    这是「后台结果」的第一来源：工具自己返回的业务载荷。
+    解析不出来就返回 ``None`` —— 那就是「后台结果未取得」，
+    **不能**拿框架的 ``state`` 顶替。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        # 有些工具返回的是「一段说明 + 一段 JSON」：只取 JSON 那段。
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(raw[start : end + 1])
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _business_from_payload(
+    tool_name: str,
+    payload: dict[str, Any] | None,
+) -> tuple[bool | None, str, str, list[dict[str, Any]], dict[str, Any], str, bool | None]:
+    """从工具的**真实返回**里取业务事实。
+
+    返回 ``(businessOk, businessMessage, businessReason, businessIssues,
+    businessDetail, phase, draftChanged)``。
+
+    * ``businessOk`` 为 ``None`` = **未取得**（绝不拿框架 ``state`` 顶替）；
+    * ``phase`` 说明这一轮走到了哪一步（计划 / 试做 / 候选）；
+    * ``draftChanged`` 说明**正式**草稿有没有被改 —— 提交类工具只产出
+      计划与候选，**不改正式草稿**（试做跑在副本上）。
+    """
+    if not isinstance(payload, dict):
+        return None, "", "", [], {}, "", None
+
+    business_ok: bool | None = None
+    if "accepted" in payload:
+        business_ok = bool(payload.get("accepted"))
+    elif "ok" in payload:
+        business_ok = bool(payload.get("ok"))
+
+    message = ""
+    if payload.get("error"):
+        message = str(payload.get("error"))
+    elif payload.get("summary"):
+        message = str(payload.get("summary"))
+
+    reason = str(payload.get("reason") or "")
+    issues = [
+        issue
+        for issue in (payload.get("errors") or [])
+        if isinstance(issue, dict)
+    ]
+    detail: dict[str, Any] = {}
+    if payload.get("resolvedOperations") is not None:
+        detail["resolvedOperations"] = payload.get("resolvedOperations")
+    if payload.get("checked") is not None:
+        detail["checked"] = payload.get("checked")
+    if payload.get("tool"):
+        detail["tool"] = str(payload.get("tool"))
+
+    phase = ""
+    draft_changed: bool | None = None
+    if str(tool_name or "").startswith("submit_"):
+        phase = edit_trace_service.PHASE_PLAN
+        if payload.get("checked") is True:
+            # 过了试做 → 形成了待确认候选。
+            phase = edit_trace_service.PHASE_CANDIDATE
+        elif issues:
+            # 试做没过（带具体错误清单）→ 停在试做这一步。
+            phase = edit_trace_service.PHASE_TRIAL
+        # 提交类工具只写计划/候选，**不碰正式草稿**。
+        draft_changed = False
+    return business_ok, message, reason, issues, detail, phase, draft_changed
+
+
+def _submit_shape(tool_name: str, params: dict[str, Any]) -> str:
+    """提交形状的指纹：用来判「又提交了同一份没改好的东西」。
+
+    只看**形状**（能力、目标、参数）—— 值改了就说明改好了，不算重复。
+    """
+    if not str(tool_name or "").startswith("submit_"):
+        return ""
+    shape = {
+        "intent": params.get("intent"),
+        "operations": params.get("operations"),
+        "operation": params.get("operation"),
+        "target": params.get("target"),
+    }
+    shape = {
+        key: value for key, value in shape.items() if value not in (None, "", [], {})
+    }
+    if not shape:
+        return ""
+    try:
+        canonical = json.dumps(shape, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        canonical = str(shape)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def _round_bucket(iteration: int | None) -> str:
+    """轮次的分组键（取不到就是 ``"unknown"``，不假装是哪一轮）。"""
+    return str(iteration) if isinstance(iteration, int) else "unknown"
 
 
 def _extract_text(msg) -> str:

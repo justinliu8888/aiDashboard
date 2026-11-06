@@ -1,4 +1,4 @@
-/* 反馈收件箱页面样式（20261104）。沿用工作台的白卡片观感。 */
+/* 管理员入口页面样式（20261105-admin1）。沿用工作台的白卡片观感。 */
 
 .fb-item {
   display: block;
@@ -214,4 +214,78 @@
 
 .fb-btn-danger:hover:not(:disabled) {
   background: #be123c;
+}
+
+/* ---------- 区域切换（用户反馈 / 编辑经验） ---------- */
+
+.fb-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.75rem;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.6;
+  cursor: pointer;
+  transition: color .15s ease, background-color .15s ease, border-color .15s ease;
+}
+
+.fb-tab:hover {
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.fb-tab:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+.fb-tab.is-active {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+/* ---------- 编辑经验区域 ---------- */
+
+/* 经验卡片里既有文字又有按钮，整块不可点（避免和按钮抢点击）。 */
+.fb-item.fb-item-static {
+  cursor: default;
+}
+
+.fb-item.fb-item-static:hover {
+  border-color: #e2e8f0;
+  background: #fff;
+}
+
+/* 表单小标签 */
+.fb-field-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: #475569;
+}
+
+/* 脱敏后的 JSON 展示（操作清单 / 结果摘要） */
+.fb-json {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  color: #334155;
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+
+/* 弱化文字（补充要求、适用条件等） */
+.fb-muted {
+  color: #94a3b8;
 }

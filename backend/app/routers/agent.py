@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.schemas.agent import AgentRequest, AgentResponse, AgentState
+from app.services import edit_trace_service
 from app.services import report_diagnostics_service as diagnostics
 from app.services.agent_service import agent_service
 from app.services.draft_workspace import DraftLocked, draft_workspace
@@ -343,15 +344,24 @@ def _persist_turn(
             # + 清追问计数）。消费放在**同一笔事务里**：落库失败 → 整笔回滚
             # → 计划原样还在，用户还能重试这一轮（契约 0002 §6/§7）。
             session_service.commit_staged_plan_consumption(session_key)
+            # 待审核经验记录（20211105）：**同一笔事务里**写入。
+            # 与「更新草稿 + 消费候选」一起成败 —— 不会出现「接受失败却留下
+            # 成功经验」，也不会出现「草稿改了却没记」。
+            _commit_edit_archive(session_key)
             # 这一轮要写的**下一菜单**（选择锁）：同一笔事务里落库。
             # 必须排在计划消费**之后**：消费会清掉旧锁，下一菜单再写上去
             # （「先清旧卡、再挂新卡」）。两者任一失败 → 整笔回滚。
             session_service.commit_staged_pending_choice(session_key)
+        # 事务提交成功 → 接受成功的那件事**结束**了 → 清掉修改事项。
+        # （事务失败时上面就抛出去了，事项原样留着，用户还能重试。）
+        if "template_edit_applied" in (response.uiActions or []):
+            _clear_finished_edit_item(session_key)
     except PendingPlanConsumedError:
         # 计划已经被别人消费掉：这一轮基于的是**失效候选** → 整笔回滚。
         # **不恢复**候选：恢复会让同一份修改再落一遍。
         session_service.discard_staged_plan_consumption(session_key)
         session_service.discard_staged_pending_choice(session_key)
+        session_service.discard_staged_edit_archive(session_key)
         raise
     except _TurnFenced:
         # 停止确认之后的迟到结果：**什么都不写**（会话、工作区、菜单都不动）。
@@ -362,14 +372,75 @@ def _persist_turn(
         # 那份待确认计划吃掉，用户要能重试（契约 0002 §7）。
         session_service.discard_staged_plan_consumption(session_key)
         session_service.discard_staged_pending_choice(session_key)
+        # **已停止 / 已取消的任务不得迟到晋升**（契约 0003 §3.5）：
+        # 暂存的待审核记录作废，绝不写进经验库。
+        session_service.discard_staged_edit_archive(session_key)
         _restore_pending_candidates(session_key, pre_turn_state)
         raise
     except Exception:
         # 落库失败：把待处理候选放回去，用户还能重试这一轮。
         session_service.discard_staged_plan_consumption(session_key)
         session_service.discard_staged_pending_choice(session_key)
+        session_service.discard_staged_edit_archive(session_key)
         _restore_pending_candidates(session_key, pre_turn_state)
         raise
+
+
+def _commit_edit_archive(session_key: str) -> None:
+    """在**最终提交事务里**写一条待审核经验记录。**在事务中调用。**
+
+    没有暂存（普通轮次）→ 什么都不做。
+    有暂存 → 写进经验库；**失败要抛出去**，让整笔事务回滚：
+    经验库写失败却提交了事务，用户会拿到「草稿改了但记录没留」，
+    而经验库正是管理员后续审核的依据 —— 半份状态比整笔失败更糟。
+
+    幂等：同一 ``planId`` 重复归档返回同一条记录，不会重复。
+    """
+    payload = session_service.commit_staged_edit_archive(session_key)
+    if not payload:
+        return
+    from app.services.edit_experience_service import record_pending_edit
+
+    record_id = record_pending_edit(
+        session_id=str(payload.get("session_id") or ""),
+        draft_id=str(payload.get("draft_id") or ""),
+        plan_id=str(payload.get("plan_id") or ""),
+        item_id=str(payload.get("item_id") or ""),
+        original_request=str(payload.get("original_request") or ""),
+        supplement=str(payload.get("supplement") or ""),
+        operations=payload.get("operations") or [],
+        result=payload.get("result") or {},
+        capability_version=str(payload.get("capability_version") or ""),
+    )
+    logger.info(
+        "[agent.chat] 已归档待审核经验记录 sessionId=%s recordId=%s",
+        session_key,
+        record_id,
+    )
+
+
+def _clear_finished_edit_item(session_key: str) -> None:
+    """接受成功 → 这件事结束了 → 清掉当前修改事项。
+
+    **为什么**：修改事项是「同一件事」的现场。事情结束后它留着，
+    下一次新修改会**复用**已结束的那份清单。
+
+    **在事务之外调用**：清事项是「这一轮之后」的清理，不是本轮成败的一部分 ——
+    事务失败时这一轮根本没生效，事项本来就该留着（用户还能重试）。
+    只清 ``editItem``，不删聊天、不删撤销历史、不删草稿。
+    """
+    try:
+        from app.services.edit_item_service import clear_edit_item
+
+        clear_edit_item(session_key)
+        # 这件事的**用户原话**也忘掉：下一件事不继承上一件的原话。
+        session_service.forget_edit_request_text(session_key)
+    except Exception as exc:  # noqa: BLE001 — 清理失败不该让这一轮失败
+        logger.warning(
+            "[agent.chat] 清理已结束的修改事项失败 sessionId=%s errorType=%s",
+            session_key,
+            type(exc).__name__,
+        )
 
 
 def _task_id_of(request: AgentRequest) -> str | None:
@@ -647,6 +718,83 @@ def _draft_workspace_payload(state: Any, *, definition: Any = None) -> dict[str,
     }
 
 
+def _record_turn_persisted(
+    request: AgentRequest, response: AgentResponse, session_key: str
+) -> None:
+    """事务**成功之后**才记「正式生效」与真实版本。
+
+    为什么放在这里：只有在**既有持久化事务真的提交了**之后，
+    才能说「正式草稿改了」。工具把提交槽写成功**不等于**草稿改了。
+
+    事务内不写任何额外业务数据 —— 记录只发生在提交之后。
+    """
+    try:
+        from app.services import edit_trace_service
+
+        workspace = getattr(response.domainObjects, "draftWorkspace", None)
+        workspace = workspace if isinstance(workspace, dict) else {}
+        revision = workspace.get("revision")
+        saved_revision = workspace.get("savedRevision")
+        edit_trace_service.record(
+            edit_trace_service.STAGE_APPLY,
+            name="turn_persisted",
+            params={
+                "draftId": str(workspace.get("draftId") or ""),
+                "revision": revision,
+                "savedRevision": saved_revision,
+            },
+            result={
+                "committed": True,
+                "revision": revision,
+                "savedRevision": saved_revision,
+            },
+            phase=edit_trace_service.PHASE_APPLIED,
+            applied=True,
+            draftChanged=True,
+            checks={
+                # 业务结论来自**执行层**：这里只声明持久化成功。
+                "business": edit_trace_service.CHECK_UNKNOWN,
+                "persistence": edit_trace_service.PERSIST_COMMITTED,
+                # 本轮**没有**效果核对行为 —— 不推断符合或不符合。
+                "effect": edit_trace_service.EFFECT_NOT_RUN,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — 记录失败不能令已成功的事务返回业务失败
+        logger.warning(
+            "[agent.chat] 记录生效事实失败 sessionId=%s errorType=%s",
+            session_key,
+            type(exc).__name__,
+        )
+
+
+def _record_turn_persist_failed(session_key: str, reason: str) -> None:
+    """事务失败：记录**真实**失败与已知的回滚事实。
+
+    不说「已生效」，也不说「部分生效」—— 只说没提交成。
+    """
+    try:
+        from app.services import edit_trace_service
+
+        edit_trace_service.record(
+            edit_trace_service.STAGE_APPLY,
+            name="turn_persist_failed",
+            params={"reason": str(reason or "")},
+            result={"committed": False, "reason": str(reason or "")},
+            status="error",
+            applied=False,
+            draftChanged=False,
+            checks={
+                "business": edit_trace_service.CHECK_UNKNOWN,
+                "persistence": edit_trace_service.PERSIST_FAILED,
+                "effect": edit_trace_service.EFFECT_NOT_RUN,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[agent.chat] 记录落库失败事实失败 sessionId=%s", session_key
+        )
+
+
 @router.post("/chat", response_model=AgentResponse)
 async def chat(request: AgentRequest) -> AgentResponse:
     started = perf_counter()
@@ -672,6 +820,15 @@ async def chat(request: AgentRequest) -> AgentResponse:
     draft_id = session_service.load_draft_id(session_key)
     lock_owner, task_id = _acquire_turn_lock(session_key, request, draft_id)
     _begin_turn_task(draft_id, task_id, lock_owner, session_key, request)
+    # ---- 请求作用域的追踪 ----
+    #
+    # 在**请求入口**开，覆盖三条路径：普通编辑、**同一事项补充**、
+    # **接受**。作用域在 ``finally`` 里恢复 —— 不能串到下一个请求。
+    _trace, _trace_token = edit_trace_service.begin_trace_scope(
+        session_id=session_key,
+        draft_id=draft_id or "",
+        message_id=str(request.messageId or ""),
+    )
     # 本轮开始前的候选现场：落库失败时要放回去（可重试）。
     pre_turn_state = _capture_edit_state(session_key)
     # 上一轮没落成的暂存作废：暂存没被消费 = 计划还在，用户还能再点一次接受。
@@ -709,6 +866,7 @@ async def chat(request: AgentRequest) -> AgentResponse:
             # 栅栏：这一轮已经不能落库（被停掉 / 被撤销 / 锁在别人手里）。
             log_timeline_step("persist_fenced")
             _abort_turn_task(task_id, reason="fenced")
+            _record_turn_persist_failed(session_key, "fenced")
             raise HTTPException(status_code=409, detail=str(exc)) from None
         except Exception as exc:  # noqa: BLE001
             # 落库失败：**不返回成功 final**（这一轮没保存成功）。
@@ -719,12 +877,17 @@ async def chat(request: AgentRequest) -> AgentResponse:
                 exc,
             )
             _abort_turn_task(task_id, reason="persist_failed")
+            _record_turn_persist_failed(session_key, "persist_failed")
             raise HTTPException(
                 status_code=500, detail="这一轮没有保存成功，请重试。"
             ) from None
+        # 事务真的提交了 → 现在才可以说「正式生效」，并带上真实版本。
+        _record_turn_persisted(request, response, session_key)
         return response
     finally:
         _release_turn_lock(draft_id, lock_owner, task_id)
+        # 请求结束：恢复追踪作用域（不能串到下一个请求）。
+        edit_trace_service.end_trace_scope(_trace_token)
 
 
 @router.post("/chat/stream")
@@ -742,7 +905,13 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
         queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
 
         async def emit(event: str, data: dict[str, Any]) -> None:
-            data = {**data, "elapsedMs": round((perf_counter() - started) * 1000)}
+            # 每条 SSE 事件都带上本轮的 ``messageId``：客户端据此判断
+            # 「这条事件是不是本请求的」，迟到的事件不会串到别的请求上。
+            data = {
+                **data,
+                "messageId": request.messageId,
+                "elapsedMs": round((perf_counter() - started) * 1000),
+            }
             try:
                 await queue.put((event, data))
             except Exception as exc:  # noqa: BLE001
@@ -756,6 +925,15 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
 
         async def run_chat() -> None:
             start_timeline(request.conversationId)
+            # ---- 请求作用域的追踪 ----
+            #
+            # 在**请求入口**开，覆盖三条路径：普通编辑、**同一事项补充**、
+            # **接受**。作用域在 ``finally`` 里恢复 —— 不能串到下一个请求。
+            _trace, _trace_token = edit_trace_service.begin_trace_scope(
+                session_id=session_key,
+                draft_id=draft_id or "",
+                message_id=str(request.messageId or ""),
+            )
             # 请求级上下文：这一轮里的模型调用靠它关联会话与消息。
             diagnostics.begin_request_context(
                 conversation_id=request.conversationId,
@@ -803,6 +981,8 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
                 # 落库放在发 final 之前：final 一到客户端就可能刷新会话列表，
                 # 顺序反了会看到还没入库的旧数据。
                 _persist_turn(request, response, pre_turn_state=pre_turn_state)
+                # 事务真的提交了 → 现在才可以说「正式生效」，并带上真实版本。
+                _record_turn_persisted(request, response, session_key)
                 await emit(
                     "final",
                     response.model_dump(mode="json"),
@@ -836,6 +1016,7 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
                     task_id,
                 )
                 _abort_turn_task(task_id, reason="fenced")
+                _record_turn_persist_failed(session_key, "fenced")
                 await emit(
                     "error",
                     {"message": str(exc), "code": "TURN_FENCED"},
@@ -848,6 +1029,7 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
                     exc,
                 )
                 _abort_turn_task(task_id, reason="persist_failed")
+                _record_turn_persist_failed(session_key, "persist_failed")
                 # 用户可见的错误消息里不带异常原文：只说「出了什么事、怎么办」。
                 await emit(
                     "error",
@@ -866,6 +1048,8 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
                     (perf_counter() - started) * 1000,
                 )
                 _release_turn_lock(draft_id, lock_owner, task_id)
+                # 请求结束：恢复追踪作用域（不能串到下一个请求）。
+                edit_trace_service.end_trace_scope(_trace_token)
                 await queue.put(None)
 
         task = asyncio.create_task(run_chat())

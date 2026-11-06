@@ -44,6 +44,21 @@ def _env_int(*names: str, default: int) -> int:
     return int(_env(*names, default=str(default)))
 
 
+def _env_int_or(*names: str, default: int) -> int:
+    """读整数；值不合法时**回退到默认值**，不抛异常。
+
+    用于「可被运行期改写」的那几项：这类配置在实例构造时读，
+    一个写错的环境变量不该把整个进程带崩。
+    """
+    raw = _env(*names)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def _env_float(*names: str, default: float) -> float:
     return float(_env(*names, default=str(default)))
 
@@ -139,17 +154,45 @@ class Settings:
 
     # ReAct 预算：AgentScope 默认 max_iters=50，报表场景用不了那么多步
     react_max_iters: int = int(os.getenv("REACT_MAX_ITERS", "6"))
-    react_max_iters_edit: int = int(os.getenv("REACT_MAX_ITERS_EDIT", "4"))
-    #: 能力格式（动态操作清单 + 整批试做 + 同一轮修正）的预算。
+    #: **编辑预算的唯一来源**（新旧编辑共用，契约 0003 §4）。
     #:
-    #: 这条路要够：读草稿 → 查维度 → 提交（试做失败）→ 改正后再提交。
-    #: 仍然**有上限**：用完仍未通过就安全结束，原草稿不变。
-    react_max_iters_edit_capability: int = int(
-        os.getenv("REACT_MAX_ITERS_EDIT_CAPABILITY", "8")
+    #: 默认 **8** 圈：新的报表编辑要求与同一事项的后续调整用同一个上限，
+    #: **不再**因为「没有 editItem / 没有旧候选」退回 4 圈。
+    #:
+    #: 旧名 ``REACT_MAX_ITERS_EDIT_CAPABILITY`` 只作**兼容回退**
+    #: （新名没设时才读它）；真正生效的始终只有这一个值。
+    react_max_iters_edit: int = int(
+        os.getenv("REACT_MAX_ITERS_EDIT")
+        or os.getenv("REACT_MAX_ITERS_EDIT_CAPABILITY")
+        or "8"
     )
     react_max_iters_fix: int = int(os.getenv("REACT_MAX_ITERS_FIX", "5"))
     react_structured_output_grace_iters: int = int(
         os.getenv("REACT_STRUCTURED_OUTPUT_GRACE_ITERS", "2")
+    )
+
+    # ---------- 编辑执行追踪（20261105，契约 0003 §2）----------
+    #
+    # 逐圈事件落在**受限本机目录**（与 diagnostics 同风格）：
+    # 不在前端公开目录、不进 API 响应、不进仓库。
+    edit_trace_enabled: bool = os.getenv(
+        "AI_EDIT_TRACE_ENABLED", "true"
+    ).lower() not in {"0", "false", "no", "off"}
+    edit_trace_dir: Path = Path(
+        os.getenv(
+            "AI_EDIT_TRACE_DIR",
+            str(Path.home() / "Library/Logs/haewu-ai-report/edit-trace"),
+        )
+    ).expanduser()
+    #: 追踪目录总容量上限（字节）、单条事件文本上限（字符）、保留期限（天）。
+    edit_trace_max_bytes: int = int(
+        os.getenv("AI_EDIT_TRACE_MAX_BYTES", str(10 * 1024 * 1024))
+    )
+    edit_trace_max_event_chars: int = int(
+        os.getenv("AI_EDIT_TRACE_MAX_EVENT_CHARS", "2000")
+    )
+    edit_trace_retention_days: int = int(
+        os.getenv("AI_EDIT_TRACE_RETENTION_DAYS", "7")
     )
 
     # Observation 裁剪：单次工具返回的条目上限，防止上下文爆炸
@@ -210,6 +253,49 @@ class Settings:
     #
     # 这一层是「当前到底在用哪家、哪个模型、怎么调」的唯一答案。
     # 调用方只读这里的解析结果，不自己拼 provider。
+
+    def __init__(self) -> None:
+        """在**实例构造时**重读几个必须随进程/测试环境变化的配置。
+
+        为什么只有这几个：类属性在 import 时求值，`get_settings.cache_clear()`
+        之后拿到的仍是 import 时的值 —— 改环境变量不生效。
+        编辑预算与追踪配置是本次运行要能调的，所以这里在实例化时读一次 env，
+        覆盖类属性上的默认值。
+        """
+        self.react_max_iters_edit = _env_int_or(
+            "REACT_MAX_ITERS_EDIT",
+            # 旧名：兼容回退（新名没设时才读它）。
+            "REACT_MAX_ITERS_EDIT_CAPABILITY",
+            default=8,
+        )
+        self.edit_trace_enabled = os.getenv(
+            "AI_EDIT_TRACE_ENABLED", "true"
+        ).lower() not in {"0", "false", "no", "off"}
+        self.edit_trace_dir = Path(
+            os.getenv(
+                "AI_EDIT_TRACE_DIR",
+                str(Path.home() / "Library/Logs/haewu-ai-report/edit-trace"),
+            )
+        ).expanduser()
+        self.edit_trace_max_bytes = _env_int_or(
+            "AI_EDIT_TRACE_MAX_BYTES", default=10 * 1024 * 1024
+        )
+        self.edit_trace_max_event_chars = _env_int_or(
+            "AI_EDIT_TRACE_MAX_EVENT_CHARS", default=2000
+        )
+        self.edit_trace_retention_days = _env_int_or(
+            "AI_EDIT_TRACE_RETENTION_DAYS", default=7
+        )
+
+    @property
+    def react_max_iters_edit_capability(self) -> int:
+        """**已废弃**：旧的「能力格式单独预算」开关。
+
+        现在新旧编辑共用一个预算（``react_max_iters_edit``），
+        保留这个属性只是为了让旧调用方不至于直接报错 —— 它**不再**是
+        第二个可调开关，读到的就是同一个值。
+        """
+        return self.react_max_iters_edit
 
     @property
     def provider_name(self) -> str:

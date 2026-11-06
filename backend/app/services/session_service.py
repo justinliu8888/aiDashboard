@@ -373,6 +373,77 @@ class SessionService:
         # 真正落库在最终提交事务里做（契约 0002 §6/§7）。
         # 同样是**只在内存里**：暂存没被提交 = 菜单没变 = 用户还能重试。
         self._staged_pending_choice: dict[str, dict[str, Any] | None] = {}
+        # **待审核经验记录的延迟写入暂存**（20261105）：接受成功时要归档一条
+        # 执行记录（契约 0003 §3.5）。归档必须与「更新草稿 + 消费候选」在
+        # **同一笔事务**里成功 —— 否则会出现「接受失败却留下成功经验」。
+        # 所以这里只暂存，��正写入在最终提交事务里做。**只在内存里**。
+        self._staged_edit_archive: dict[str, dict[str, Any]] = {}
+        # **本事项的用户原话**（20261105）：编辑那一轮把用户说的第一句话
+        # 记在这里，接受那一轮读它来归档。
+        #
+        # 为什么不在接受轮现取：``collectedInfo["pendingEditRequest"]`` 在
+        # 候选落库后就被清掉了，而接受是**另一次请求** —— 那时已经取不到。
+        # 模型传的 ``originalRequest`` 也不能当权威：模型不一定传这个参数。
+        # **只在内存里**：丢了最多让归档记录少一句原话，不影响用户数据。
+        self._edit_request_text: dict[str, str] = {}
+
+    # ---------- 本事项的用户原话（20261105）----------
+
+    def remember_edit_request_text(self, session_id: str, text: str) -> None:
+        """记住这件事的用户原话。**已有值时不覆盖** ——
+        补充同一件事时不得改写原要求（契约 0003 §3.6）。"""
+        value = str(text or "").strip()
+        if not session_id or not value:
+            return
+        with self._staging_lock:
+            self._edit_request_text.setdefault(session_id, value)
+
+    def edit_request_text(self, session_id: str) -> str:
+        """取这件事的用户原话（没有则空串）。"""
+        if not session_id:
+            return ""
+        with self._staging_lock:
+            return self._edit_request_text.get(session_id, "")
+
+    def forget_edit_request_text(self, session_id: str) -> None:
+        """这件事结束了 → 忘掉它的原话（下一件事不继承）。"""
+        if not session_id:
+            return
+        with self._staging_lock:
+            self._edit_request_text.pop(session_id, None)
+
+    # ---------- 待审核经验记录暂存（20261105）----------
+
+    def stage_edit_archive(self, session_id: str, payload: dict[str, Any]) -> None:
+        """暂存「这一轮成功后要归档的执行记录」。
+
+        **为什么暂存而不是直接写**：归档必须与草稿更新、候选消费在
+        **同一笔事务**里成败。直接写的话，事务回滚后经验记录已经落库 ——
+        用户看到的是「接受失败，却留下一条成功经验」（契约 0003 §3.5）。
+        """
+        with self._staging_lock:
+            self._staged_edit_archive[session_id] = dict(payload)
+
+    def staged_edit_archive(self, session_id: str) -> dict[str, Any] | None:
+        """当前暂存的执行记录（没有则 None）。只读，不消费。"""
+        with self._staging_lock:
+            payload = self._staged_edit_archive.get(session_id)
+            return dict(payload) if payload is not None else None
+
+    def commit_staged_edit_archive(self, session_id: str) -> dict[str, Any] | None:
+        """在**最终提交事务里**取走暂存的执行记录。**在事务中调用。**
+
+        返回取走的载荷（没有则 None）。调用方负责在事务里写经验库 ——
+        写失败要让异常抛出去，整笔事务回滚（不能出现「草稿改了、
+        经验没记」的半份状态，也不能出现相反的半份状态）。
+        """
+        with self._staging_lock:
+            return self._staged_edit_archive.pop(session_id, None)
+
+    def discard_staged_edit_archive(self, session_id: str) -> None:
+        """丢弃暂存：这一轮没落成（被栅栏拒绝 / 落库失败），暂存作废。"""
+        with self._staging_lock:
+            self._staged_edit_archive.pop(session_id, None)
 
     @property
     def repository(self) -> SessionRepository:

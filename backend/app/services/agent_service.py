@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -56,6 +57,7 @@ from app.schemas.report_policy import ReportPolicyDraft
 from app.storage.report_design_repository import DESIGN_PHASE_DRAFT_READY
 from app.schemas.session import MAX_CLARIFICATION_ROUNDS, PendingEditPlan
 from app.services import routing_rules
+from app.services import edit_trace_service
 from app.services.catalog_mock_service import get_catalog
 from app.services.internal_id_sanitizer import (
     metric_display_label,
@@ -907,6 +909,88 @@ class AgentService:
     async def chat(
         self, request: AgentRequest, emit: EmitEvent | None = None
     ) -> AgentResponse:
+        """本轮对话入口。
+
+        **追踪订阅在这里建立** —— 覆盖**所有**分支：
+
+        * 普通编辑轮；
+        * **同一修改事项的补充 / 纠正**（这条路径早于业务 Agent 的
+          包装调用，原来绕过了订阅，逐轮摘要推不出去）；
+        * 接受路径（不走模型，只走既有事务）。
+
+        订阅者是**请求作用域**的（ContextVar）：并行请求各自一份，
+        不会串线。逐轮摘要与最终摘要**同一份数据**
+        （同一个 ``build_round_summaries``），不存在第二个来源。
+        """
+        trace_tasks: list[asyncio.Task] = []
+
+        def _on_trace_round(payload: dict[str, Any]) -> None:
+            """把「ReAct 第 N 轮」转成 SSE 事件（不打断主流程）。"""
+            if emit is None:
+                return
+            round_summary = payload.get("round")
+            if not isinstance(round_summary, dict):
+                return
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            trace_tasks.append(
+                loop.create_task(_emit(emit, "trace_round", dict(round_summary)))
+            )
+
+        unsubscribe_trace = edit_trace_service.subscribe(_on_trace_round)
+        try:
+            # 本次用户要求的**脱敏**摘要与来源：排障时第一眼要知道
+            # 「这一轮到底是被要求做什么」。只记长度受控的摘要，
+            # 不落盘原话全文。
+            edit_trace_service.record(
+                edit_trace_service.STAGE_AGENT_REPLY,
+                name="request_source",
+                replyIndex=0,
+                params={
+                    "state": request.state.value,
+                    "messageId": str(request.messageId or ""),
+                    "conversationId": str(request.conversationId or ""),
+                    "queryMode": bool(getattr(request, "queryMode", False)),
+                },
+                result={
+                    "requestSummary": edit_trace_service.redact(
+                        str(request.message or ""), limit=200
+                    ),
+                    "requestChars": len(request.message or ""),
+                },
+            )
+            response = await self._chat_inner(request, emit=emit)
+        finally:
+            # 本轮结束：退订，并把还没发出去的逐轮事件**发完** ——
+            # 不让「最后几轮」比 final 先到或干脆丢掉。
+            unsubscribe_trace()
+            if trace_tasks:
+                await asyncio.gather(*trace_tasks, return_exceptions=True)
+        # 失败 notice 也**保留本次 Trace**：排查时不能因为这一轮
+        # 没成功就看不到它到底做了什么。
+        return self._attach_trace_debug(response)
+
+    @staticmethod
+    def _attach_trace_debug(response: AgentResponse) -> AgentResponse:
+        """给响应挂上本轮追踪标识与摘要（**成功轮与失败轮都挂**）。"""
+        summary = edit_trace_service.trace_summary()
+        trace_id = str(summary.get("traceId") or "")
+        if not trace_id:
+            return response
+        debug = dict(response.debug or {})
+        debug.setdefault("traceId", trace_id)
+        debug.setdefault("traceSummary", summary)
+        response.debug = debug
+        return response
+
+    async def _chat_inner(
+        self,
+        request: AgentRequest,
+        emit: EmitEvent | None = None,
+    ) -> AgentResponse:
+        """本轮对话的**实际实现**（订阅与收尾在 :meth:`chat` 里）。"""
         total_started = perf_counter()
         log_timeline_step("service_start")
         await _emit(
@@ -1719,6 +1803,10 @@ class AgentService:
             handle is not None,
             request.state.value,
         )
+        # ---- 逐轮人话摘要 → SSE ----
+        #
+        # 订阅与收尾在 :meth:`chat` 里（覆盖**所有**分支，含同一修改事项
+        # 的补充路径）。这里只负责**调用**业务 Agent。
         if handle is not None:
             response = await handle(request)
         else:
@@ -2219,6 +2307,13 @@ class AgentService:
             # 这里**不**清澄清计数（契约表 §7.2、规格第 19 条）：
             # 候选计划落库不是新任务，随后的**局部调整**不重置额度。
             # 换一件事（额度键变了）才由 record_clarification 自然重开。
+            #
+            # 顺手记住这件事的**用户原话**：接受是另一次请求，那时
+            # ``collectedInfo`` 已经被清掉，原话取不回来了。
+            session_service.remember_edit_request_text(
+                session_key,
+                str(request.collectedInfo.get("pendingEditRequest") or request.message or ""),
+            )
             request.collectedInfo.pop("pendingEditRequest", None)
             request.collectedInfo.pop("pendingEditTimeAnchor", None)
             request.collectedInfo.pop("editItemContinuation", None)
@@ -2437,10 +2532,28 @@ class AgentService:
 
         不重新让模型规划：执行的就是用户看到并确认的那份清单。
         整批成功才生效；任一步失败 → 整批不生效，原草稿原样。
+
+        **接受是独立请求**：这里记的是「接受阶段」与「副本执行」的事实，
+        **不是**新的 ReAct 轮次（不带轮次号、不伪装成模型又跑了一遍）。
         """
-        from app.services.edit_item_service import load_preview_context
+        from app.services.edit_item_service import load_edit_item, load_preview_context
         from app.services.edit_trial_service import run_trial, summarize_facts
         from app.services.template_edit_engine import EditResult
+
+        # 关联原候选 / 事项（能取得时）：真实存在才记。
+        item = load_edit_item()
+        if isinstance(item, dict):
+            edit_trace_service.set_ids(
+                item_id=str(item.get("itemId") or ""),
+                plan_id=str(item.get("candidatePlanId") or ""),
+            )
+        edit_trace_service.record(
+            edit_trace_service.STAGE_ACCEPTANCE,
+            name="accept_started",
+            params={"operationCount": len(plan.operations or [])},
+            result={"accepted": True},
+            phase=edit_trace_service.PHASE_ACCEPTED,
+        )
 
         operations = [
             {
@@ -2459,6 +2572,27 @@ class AgentService:
             preview_context=load_preview_context(definition),
         )
         if not trial.ok:
+            edit_trace_service.record(
+                edit_trace_service.STAGE_ACCEPTANCE,
+                name="accept_trial",
+                params={"operationCount": len(operations)},
+                result={"ok": False, "errorCount": len(trial.errors or [])},
+                status="error",
+                businessOk=False,
+                businessMessage=trial.error_message,
+                businessReason=str((trial.errors or [{}])[0].get("reason") or ""),
+                businessIssues=list(trial.errors or []),
+                phase=edit_trace_service.PHASE_TRIAL,
+                # 副本失败 → 正式草稿**确实**没变（副本直接丢掉）。
+                draftChanged=False,
+                checks={
+                    "business": edit_trace_service.CHECK_FAIL,
+                    # 事务根本没走到：接受阶段只做副本执行。
+                    "persistence": edit_trace_service.PERSIST_NOT_RUN,
+                    # 本轮**没有**效果核对行为。
+                    "effect": edit_trace_service.EFFECT_NOT_RUN,
+                },
+            )
             return EditResult(
                 plan=plan,
                 draftBeforeEdit=definition,
@@ -2474,6 +2608,22 @@ class AgentService:
                 },
             )
         facts = trial.facts
+        edit_trace_service.record(
+            edit_trace_service.STAGE_ACCEPTANCE,
+            name="accept_trial",
+            params={"operationCount": len(operations)},
+            result={"ok": True, "resolved": len(trial.resolved_operations or [])},
+            businessOk=True,
+            businessMessage=facts.get("summary") or "",
+            phase=edit_trace_service.PHASE_TRIAL,
+            # 副本执行成功，**正式草稿还没变**（事务还没提交）。
+            draftChanged=False,
+            checks={
+                "business": edit_trace_service.CHECK_PASS,
+                "persistence": edit_trace_service.PERSIST_NOT_RUN,
+                "effect": edit_trace_service.EFFECT_NOT_RUN,
+            },
+        )
         return EditResult(
             plan=plan,
             draftBeforeEdit=definition,
@@ -2565,6 +2715,11 @@ class AgentService:
             if request.message == EDIT_CANCEL:
                 # 取消 = 这件事结束了，下一件事按额度键规则重新开。
                 session_service.reset_clarification(session_key)
+                # **终态记录与活动现场分开**（契约 0003 §5）：
+                # 这件事已经结束 → 清掉当前修改事项，后续新事项**不复用**
+                # 已结束的那份清单（否则下一次提交会接着旧清单走）。
+                # 只清事项本身，**不删聊天、不删撤销历史**。
+                self._clear_finished_edit_item(session_key)
                 response = self._edit_notice(
                     request, "已撤回这次待确认修改，草稿没有变化。"
                 )
@@ -2761,9 +2916,113 @@ class AgentService:
         # 成功路径：只**暂存**消费计划，真正消费在最终提交事务里做。
         # 那一笔事务失败 → 整笔回滚 → 暂存作废 → 计划原样还在，可重试。
         session_service.stage_pending_plan_consumption(session_key, pending.planId)
+        # 待审核经验记录（20211105 契约 §3.5）：**同样只暂存**，真正写入在
+        # 最终提交事务里 —— 与「更新草稿 + 消费候选」一起成败。
+        # 接受失败 / 事务回滚 → 不产生记录（不能出现「接受失败却留下成功经验」）。
+        self._stage_edit_archive(
+            request, session_key, plan=plan, result=result, pending=pending
+        )
         return self._remember_choice(
             self._build_template_edit_response(request, result, plan=plan_for_preview)
         )
+
+    @staticmethod
+    def _clear_finished_edit_item(session_key: str) -> None:
+        """这件事结束了 → 清掉当前修改事项。
+
+        **为什么**：修改事项是「同一件事」的现场。事情结束后它留着，
+        下一次新修改会**复用**已结束的那份清单（提交工具看到 item 存在
+        就接着它走），造成旧事项混用。
+
+        **清什么**：只清 ``editItem`` 这一个键 —— **不删聊天、不删撤销历史、
+        不删草稿**。候选补充仍保存同一事项的有效内容（补充路径不调用这里）。
+        """
+        try:
+            from app.services.edit_item_service import clear_edit_item
+
+            clear_edit_item(session_key)
+            # 这件事的**用户原话**也一并忘掉：下一件事不继承上一件的原话。
+            session_service.forget_edit_request_text(session_key)
+        except Exception as exc:  # noqa: BLE001 — 清理失败不该挡住取消
+            logger.warning(
+                "[agent.chat] 清理已结束的修改事项失败 sessionId=%s errorType=%s",
+                session_key,
+                type(exc).__name__,
+            )
+
+    def _stage_edit_archive(
+        self, request: AgentRequest, session_key: str, *,
+        plan: Any, result: Any, pending: Any,
+    ) -> None:
+        """暂存一条待审核执行记录（脱敏在服务端做，这里只备料）。
+
+        **准入**：只有走到这里（接受 + 正式执行成功）才会暂存。
+        失败路径（校验没过、执行异常）根本到不了这里。
+        同一 ``planId`` 重复提交 → 服务端幂等，不会产生重复记录。
+        """
+        try:
+            from app.services.edit_item_service import load_edit_item
+
+            item = load_edit_item(session_key) or {}
+            # 原要求取**修改事项里记住的那句**（提交工具在编辑那一轮
+            # 写入的），没有就取**本事项记住的用户原话**。
+            #
+            # 两者都拿不到才留空 —— 不能拿本轮 ``request.message`` 顶：
+            # 这一轮是「接受修改」，拿它当原要求会把记录写歪。
+            original_request = str(item.get("originalRequest") or "") or str(
+                session_service.edit_request_text(session_key) or ""
+            )
+            supplement = str(item.get("supplement") or "")
+            operations = [
+                step.model_dump(mode="json")
+                for step in getattr(plan, "operations", []) or []
+                if str(getattr(step, "op", "") or "").strip()
+            ]
+            if not operations:
+                # 旧格式计划（intent + operation）：也能归档，但清单形态不同。
+                operations = [{
+                    "intent": str(getattr(plan, "intent", "") or ""),
+                    "operation": {
+                        k: v
+                        for k, v in (getattr(plan, "operation", None).model_dump(
+                            mode="json", exclude_none=True
+                        ).items() if getattr(plan, "operation", None) else [])
+                    },
+                }]
+            facts = dict((result.debug or {}).get("editFacts") or {})
+            session_service.stage_edit_archive(session_key, {
+                "session_id": session_key,
+                "draft_id": str(session_service.load_draft_id(session_key) or ""),
+                "plan_id": str(pending.planId),
+                "item_id": str(item.get("itemId") or ""),
+                "original_request": original_request,
+                "supplement": supplement,
+                "operations": operations,
+                "result": {
+                    "summary": str(facts.get("summary") or ""),
+                    "changeSetCount": len(
+                        getattr(getattr(result, "changeSet", None), "changed", []) or []
+                    ),
+                    "applied": True,
+                },
+                "capability_version": self._catalog_version(),
+            })
+        except Exception as exc:  # noqa: BLE001 — 备料失败不该挡住接受
+            logger.warning(
+                "[agent.chat] 暂存待审核经验记录失败 sessionId=%s errorType=%s",
+                session_key,
+                type(exc).__name__,
+            )
+
+    @staticmethod
+    def _catalog_version() -> str:
+        """当前能力目录版本（写进记录，便于将来核对方法是否还适用）。"""
+        try:
+            from app.services.capability_catalog_service import catalog_version
+
+            return catalog_version()
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _try_answer_readonly_query(
         self, request: AgentRequest, definition: ReportDefinitionDraft

@@ -40,7 +40,13 @@ def _request(
 # ---------- 预算 ----------
 
 def test_react_budget_shrinks_on_edit_and_fix_states():
-    """编辑和修复场景步数要更少，不能和生成场景用同一个预算。"""
+    """编辑和修复场景的预算要与生成场景**不同**，各自独立配置。
+
+    20261105 变更（契约 0003 §4）：编辑预算默认从 4 提到 **8**，
+    新旧编辑共用同一个值。这里断言的是「预算来源独立」，
+    不再断言「编辑比生成少」—— 那条约束在新默认值下不成立，
+    且需求明确要求「查询或其他业务节点的预算不因本次修改自动提高」。
+    """
     agent = AgentScopeReportAgent.__new__(AgentScopeReportAgent)
     agent._settings = get_settings()
 
@@ -51,7 +57,8 @@ def test_react_budget_shrinks_on_edit_and_fix_states():
     assert generate.max_iters == get_settings().react_max_iters
     assert edit.max_iters == get_settings().react_max_iters_edit
     assert fix.max_iters == get_settings().react_max_iters_fix
-    assert edit.max_iters < generate.max_iters
+    # 编辑与生成走**不同**的预算来源。
+    assert edit.max_iters != generate.max_iters
     assert fix.max_iters < generate.max_iters
 
 
@@ -59,7 +66,9 @@ def test_react_budget_is_far_below_agentscope_default():
     """AgentScope 默认 50 步，报表场景用不了那么多。"""
     settings = get_settings()
     assert settings.react_max_iters <= 10
-    assert settings.react_max_iters_edit <= 6
+    # 编辑预算 20261105 起默认 8（契约 0003 §4：统一预算，不再按
+    # 有无 editItem 分叉）。上限仍然远低于 AgentScope 默认的 50。
+    assert settings.react_max_iters_edit <= 8
 
 
 # ---------- 输入补全 ----------
@@ -296,7 +305,11 @@ def test_model_failure_is_not_user_clarification():
     )
     assert response.error.code == "EDIT_VERIFICATION_UNAVAILABLE"
     assert response.questions == []
+    # 20261105：``editOutcome`` 保持既有值 ``technical_failure``（前端按
+    # ``error.code`` 渲染失败，不改既有协议值）；精确原因改由
+    # ``debug.errorCategory`` 承载。
     assert response.debug["editOutcome"] == "technical_failure"
+    assert response.debug["errorCategory"] == "unknown"
     assert "补充具体区块" not in response.reply
 
 
