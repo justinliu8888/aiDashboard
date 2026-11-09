@@ -4,7 +4,7 @@
 
 - **目录版本**（contractFingerprint 派生）：`72d0cc0c0c8adcc7`
 - **契约指纹**：`72d0cc0c0c8adcc71374496f9491b273b3364e5529346c7a16b231a40dc33a4a`
-- **生成时间**：2026-11-09T03:46:37+00:00
+- **生成时间**：2026-11-09T03:51:46+00:00
 - **条目总数**：74（Agent Tool 20 / 清单能力与展示操作、规则快路 37 / 旧编辑意图 17）
 
 ## 入口类型说明
@@ -5825,7 +5825,7 @@
 {
   "version": "72d0cc0c0c8adcc7",
   "contractFingerprint": "72d0cc0c0c8adcc71374496f9491b273b3364e5529346c7a16b231a40dc33a4a",
-  "generatedAt": "2026-11-09T03:46:37+00:00",
+  "generatedAt": "2026-11-09T03:51:46+00:00",
   "entries": [
     {
       "id": "search_catalog",
