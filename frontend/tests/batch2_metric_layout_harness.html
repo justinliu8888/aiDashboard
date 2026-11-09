@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>第二批指标卡布局核对（单卡 / 比较行 / 长名称 / 指标组）</title>
+<script src="../pages/vendor/tailwindcss.js?v=20261103-vendor1"></script>
+<link rel="stylesheet" href="../pages/workbench_text_metric.css?v=20261106-batch2" />
+<style>
+  body { font-family: system-ui, -apple-system, "PingFang SC", sans-serif; background: #f1f5f9; }
+  /* 报表面板的**真实**容器宽度由 ?panel= 指定（CSS px）——
+     用来模拟窄面板（360～500 CSS px）。 */
+  #panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; }
+  .harness-region { border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px; margin-bottom: 12px; }
+  .harness-title { font-size: 13px; font-weight: 600; color: #0f172a; margin-bottom: 8px; }
+</style>
+</head>
+<body class="p-5">
+  <h1 class="text-lg font-semibold text-slate-800 mb-1">第二批指标卡布局核对</h1>
+  <p class="text-xs text-slate-500 mb-4">
+    载荷是隔离的（不连后台）：验证<b>前端模块怎么消费</b> —— 名称是否完整、比较行是否有边距、
+    单卡是否占满宽度、长名称怎么换行、指标组两列 16px。
+  </p>
+  <div id="panel"></div>
+
+<script src="../pages/vendor/iconify-icon.min.js?v=20261103-vendor1"></script>
+<script src="../pages/workbench_text_metric.js?v=20261106-batch2"></script>
+<script>
+  window.session = { resolvedTheme: null };
+  const PAYLOAD = {
+    previewContext: { definitionId: "probe", definitionVersion: "1", timezone: "Asia/Shanghai" },
+    regions: [
+      {
+        regionId: "region_card_short", name: "运行设备数", role: "SUMMARY", componentType: "METRIC_CARD",
+        dataSource: "simulated", capabilityPending: false,
+        payload: {
+          label: "运行设备数", value: 9, unit: "台", precision: 0,
+          metrics: [{
+            metricKey: "runningDeviceCount", id: "m_total", label: "运行设备数", kind: "integer",
+            unit: "台", value: 9, precision: 0, fieldRef: "runningDeviceCount",
+            format: { kind: "NUMBER", unitLabel: "台" }, displayValue: "9 台",
+            comparisonFieldRef: "deviceCount", comparisonUnit: "台", comparisonValue: 10,
+            comparisonAvailable: true, comparisonDisplayValue: "10 台",
+          }],
+          sourceMode: "simulated", format: {},
+        },
+      },
+      {
+        regionId: "region_card_long", name: "昨日总耗电量（含昨日逐小时累计）", role: "SUMMARY", componentType: "METRIC_CARD",
+        dataSource: "simulated", capabilityPending: false,
+        payload: {
+          label: "昨日总耗电量（含昨日逐小时累计）", value: 4900.8, unit: "kWh", precision: 1,
+          metrics: [{
+            metricKey: "totalEnergyKwh", id: "m_long", label: "昨日总耗电量（含昨日逐小时累计）", kind: "decimal",
+            unit: "kWh", value: 4900.8, precision: 1, fieldRef: "totalEnergyKwh",
+            format: { kind: "NUMBER", precision: 1, unitLabel: "kWh" }, displayValue: "4,900.8 kWh",
+            comparisonFieldRef: null, comparisonValue: null, comparisonAvailable: false,
+          }],
+          sourceMode: "simulated", format: {},
+        },
+      },
+      {
+        regionId: "region_group", name: "总告警数", role: "SUMMARY", componentType: "METRIC_GROUP",
+        dataSource: "simulated", capabilityPending: false,
+        payload: {
+          label: "总告警数", unit: "条",
+          metrics: [
+            { metricKey: "totalAlarmCount", id: "m_1", label: "总告警数", kind: "integer", unit: "条", value: 5, precision: 0, fieldRef: "totalAlarmCount", format: { kind: "NUMBER", unitLabel: "条" }, displayValue: "5 条" },
+            { metricKey: "seriousAlarmCount", id: "m_2", label: "严重告警数", kind: "integer", unit: "条", value: 1, precision: 0, fieldRef: "seriousAlarmCount", format: { kind: "NUMBER", unitLabel: "条" }, displayValue: "1 条" },
+            { metricKey: "processingAlarmCount", id: "m_3", label: "处理中告警数", kind: "integer", unit: "条", value: 3, precision: 0, fieldRef: "processingAlarmCount", format: { kind: "NUMBER", unitLabel: "条" }, displayValue: "3 条" },
+          ],
+          arrangement: { mode: "GRID", columns: 2, direction: "HORIZONTAL", gap: { value: 16, unit: "PX" } },
+          sourceMode: "simulated", format: {},
+        },
+      },
+    ],
+  };
+
+  const params = new URLSearchParams(window.location.search);
+  const panel = document.getElementById("panel");
+  if (params.get("panel")) panel.style.width = `${Number(params.get("panel"))}px`;
+  const only = params.get("only");
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  for (const region of PAYLOAD.regions || []) {
+    if (only && region.regionId !== only) continue;
+    const wrap = document.createElement("div");
+    wrap.className = "harness-region";
+    wrap.dataset.regionId = region.regionId;
+    wrap.innerHTML = `<div class="harness-title">${esc(region.name)} <span class="text-[10px] font-normal text-slate-400">${esc(region.componentType)}</span></div><div class="region-body"></div>`;
+    panel.appendChild(wrap);
+    const container = wrap.querySelector(".region-body");
+    const ctx = { unit: (region.payload || {}).unit || "", defRegion: null, totalsByUnit: {}, payload: PAYLOAD };
+    if (region.componentType === "METRIC_CARD") window.WorkbenchTextMetric.renderMetricCard(container, region, ctx);
+    else if (region.componentType === "METRIC_GROUP") window.WorkbenchTextMetric.renderMetricGroup(container, region, ctx);
+  }
+</script>
+</body>
+</html>

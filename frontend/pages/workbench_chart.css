@@ -1,0 +1,71 @@
+/* ============================================================================
+ * workbench_chart.css —— 图表渲染模块（批次二 · 图表组件包）的专属样式。
+ *
+ * 用途：给 <script src="./workbench_chart.js"> 配套的结构样式。
+ * 接入方式（由协调者在 workbench.html 里加两行）：
+ *   <link rel="stylesheet" href="./workbench_chart.css?v=20261106-chart1">
+ *   <script src="./workbench_chart.js?v=20261106-chart1"></script>
+ *
+ * 约束：
+ *   - 纯 CSS，无构建步骤依赖（不引 preprocessor、不引 tailwind 配置）；
+ *   - 类名一律加 wch- 前缀，**不覆盖**宿主既有的 .region-body 等类，
+ *     也不碰主工作台的布局类；
+ *   - 图表画布本身由 ECharts 负责绘制，这里只管**结构**：
+ *     画布高度、图下说明行、空态与兜底点列。
+ * ==========================================================================*/
+
+/* ---------------------------------------------------------------- 画布 */
+
+/* ECharts 落图的容器：高度固定，与既有图表路径一致。 */
+.wch-canvas {
+  box-sizing: border-box;
+  width: 100%;
+  height: 260px;
+  min-width: 0;
+}
+
+/* ---------------------------------------------------------------- 说明行 */
+
+/* 图下的说明行：单位 + 数据点个数 + 模拟标记。 */
+.wch-note {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #94a3b8;
+}
+
+/* ---------------------------------------------------------------- 空态 */
+
+.wch-empty {
+  box-sizing: border-box;
+  padding: 12px 16px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  font-size: 12px;
+  color: #64748b;
+}
+
+/* ---------------------------------------------------------------- 兜底 */
+
+/* ECharts 与 SVG 渲染器都不可用时的兜底：把点列出来，数据不丢。 */
+.wch-fallback {
+  box-sizing: border-box;
+  padding: 8px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.wch-fallback-unit {
+  margin-bottom: 4px;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.wch-fallback-row {
+  font-size: 12px;
+  line-height: 1.6;
+  color: #334155;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}

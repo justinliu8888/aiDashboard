@@ -370,6 +370,7 @@ def _restore_session_menu(
     if isinstance(definition, dict):
         payload["domainObjects"] = {"reportDefinitionDraft": definition}
     try:
+        session_service.save_state(session_id, "USER_EDITING_TEMPLATE")
         session_service.repository.append_message(
             session_id=session_id,
             role="assistant",
@@ -543,6 +544,28 @@ def open_draft(draft_id: str, body: DraftOpenRequest) -> dict[str, Any]:
                     # 对话的那条会话，状态与菜单是它自己的，不许用草稿
                     # 快照覆盖（契约 0002 §6.3）。
                     _sync_session_scene(session_id, state)
+                else:
+                    # 兼容旧撤销现场：菜单已恢复到编辑态，会话却仍留在保存后的
+                    # ANALYZING。只修复属于本草稿的权威编辑菜单，不覆盖活动任务。
+                    record = session_service.repository.get_session(session_id)
+                    pending = record.pendingChoice if record else None
+                    question = (pending or {}).get("question") or {}
+                    if (
+                        record and record.state == "ANALYZING"
+                        and not record.pendingEditPlan
+                        and (pending or {}).get("state") == "USER_EDITING_TEMPLATE"
+                        and question.get("id") == "template_edit_confirm"
+                        and question.get("stepDraftId") == draft_id
+                        and not draft_workspace.lock_owner(draft_id)
+                    ):
+                        task = state.activeTask or {}
+                        if task.get("state") == "RUNNING":
+                            draft_workspace.fail_task(
+                                task["taskId"], reason="reopen_orphaned_turn_without_lock"
+                            )
+                            state = draft_workspace.load_draft(draft_id)
+                        if not state.activeTask:
+                            session_service.save_state(session_id, "USER_EDITING_TEMPLATE")
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[drafts] 切换草稿对象失败 draftId=%s code=%s errorType=%s",

@@ -92,26 +92,37 @@ def test_generated_draft_requires_confirmation_dropdown(client, base_context):
         "reportDefinition": generated["domainObjects"]["reportDefinitionDraft"],
         "reportPolicy": generated["domainObjects"]["reportPolicyDraft"],
     }
-    for message in ("把趋势图改成最近 7 天", "__advance__"):
-        rejected = client.post("/api/agent/chat", json={
-            **body, "state": "WAITING_USER_CONFIRM",
-            "message": message, "snapshots": snapshots,
-        }).json()
-        assert rejected["state"] == "WAITING_USER_CONFIRM"
-        assert rejected["uiActions"] == ["selection_required"]
-        assert rejected["questions"][0]["id"] == question["id"]
-
+    # 先走合法动作：选「修改」→ 拿到**受限修改输入**这一步（可以打字，
+    # 但只允许这一种动作 —— 这就是第二批的入口形态）。
     editing = client.post("/api/agent/chat", json={
         **body, "state": "WAITING_USER_CONFIRM",
         "message": "修改", "snapshots": snapshots,
     }).json()
     assert editing["state"] == "USER_EDITING_TEMPLATE"
-    assert editing["questions"][0]["selectionOnly"] is False
+    edit_request = [q for q in editing["questions"] if q.get("stepKind") == "edit_request"]
+    assert edit_request, editing["questions"]
+    assert edit_request[0]["selectionOnly"] is False
+    assert edit_request[0]["allowsOther"] is True
+
     edited = client.post("/api/agent/chat", json={
         **body, "state": "USER_EDITING_TEMPLATE",
         "message": "把趋势图改成最近 7 天", "snapshots": snapshots,
     }).json()
     assert edited["uiActions"] != ["selection_required"]
+
+    # 再走自由输入：不能越过待确认菜单 —— 这一轮最多给出一份**待确认的候选**，
+    # 草稿与版本一个字节都不动，服务端仍然挂着待决项。
+    for message in ("把趋势图改成最近 7 天", "__advance__"):
+        rejected = client.post("/api/agent/chat", json={
+            **body, "state": "WAITING_USER_CONFIRM",
+            "message": message, "snapshots": snapshots,
+        }).json()
+        assert rejected["domainObjects"].get("changeSet") is None
+        rejected_draft = rejected["domainObjects"].get("reportDefinitionDraft") or {}
+        generated_meta = generated["domainObjects"]["reportDefinitionDraft"]["metadata"]
+        assert (rejected_draft.get("metadata") or {}).get("revision", 0) == \
+            generated_meta.get("revision", 0)
+        assert client.get(f"/api/sessions/{body['conversationId']}").json()["pendingChoice"] is not None
 
 
 def test_agentscope_generation_uses_locked_confirmation_contract(
@@ -145,8 +156,10 @@ def test_agentscope_generation_uses_locked_confirmation_contract(
     monkeypatch.setattr(agent_service, "_agent", agent)
     monkeypatch.setattr(context_engine, "route", continue_current)
 
+    # 第二批新契约：「同意」走 save_definition_draft 工具请求，
+    # 会话状态停在 ANALYZING（后续推进由前端驱动）。
     for choice, expected_state in (
-        ("同意", "SAVE_DEFINITION_DRAFT"),
+        ("同意", "ANALYZING"),
         ("修改", "USER_EDITING_TEMPLATE"),
         ("重新开始", "ANALYZING"),
     ):
@@ -170,22 +183,33 @@ def test_agentscope_generation_uses_locked_confirmation_contract(
             "reportDefinition": generated["domainObjects"]["reportDefinitionDraft"],
             "reportPolicy": generated["domainObjects"]["reportPolicyDraft"],
         }
-        rejected = client.post("/api/agent/chat", json={
-            **body, "state": "WAITING_USER_CONFIRM",
-            "message": "直接修改标题", "snapshots": snapshots,
-        }).json()
-        assert rejected["uiActions"] == ["selection_required"]
-        assert rejected["questions"][0]["id"] == "template_edit_confirm"
-
         selected = client.post("/api/agent/chat", json={
             **body, "state": "WAITING_USER_CONFIRM",
             "message": choice, "snapshots": snapshots,
         }).json()
         assert selected["state"] == expected_state
 
+        # 自由输入不能越过待确认菜单：草稿与版本没动，
+        # 服务端仍然挂着待决项 —— 要么是草稿级菜单（同意 / 修改 / 重新开始），
+        # 要么是被收敛成的**受限修改输入**这一步（仍然只允许一种合法动作）。
+        # 这是第二批的设计：菜单上的「其他」输入框就是合法入口，
+        # 所以这里守的是「**没有未经接受的写入**」。
+        bypass = client.post("/api/agent/chat", json={
+            **body, "state": "WAITING_USER_CONFIRM",
+            "message": "直接修改标题", "snapshots": snapshots,
+        }).json()
+        assert bypass["domainObjects"].get("changeSet") is None
+        bypass_draft = bypass["domainObjects"].get("reportDefinitionDraft") or {}
+        assert (bypass_draft.get("metadata") or {}).get("revision", 0) == 0
+        pending = client.get(f"/api/sessions/{body['conversationId']}").json()["pendingChoice"]
+        assert pending is not None
+        assert pending["question"]["id"] in {"template_edit_confirm", "template_edit_request"}
+
 
 def test_confirm_dropdown_save_and_restart(client, base_context):
-    for choice, expected_state in (("同意", "SAVE_DEFINITION_DRAFT"), ("重新开始", "ANALYZING")):
+    # 第二批新契约：「同意」走 ``save_definition_draft`` 工具请求（保存本身
+    # 仍然是「另一次接受」），会话状态停在 ANALYZING（后续推进由前端驱动）。
+    for choice, expected_state in (("同意", "ANALYZING"), ("重新开始", "ANALYZING")):
         body = {"conversationId": f"conv_confirm_{choice}", "context": base_context}
         generated = client.post("/api/agent/chat", json={
             **body, "state": "ANALYZING",
@@ -339,7 +363,11 @@ def test_template_preview_restart_clears_pending_choice(client, base_context):
         **body, "state": "NEEDS_CLARIFICATION", "message": "重新开始",
     }).json()
     assert restarted["state"] == "ANALYZING"
-    assert not restarted["questions"]
+    # 权威状态是**服务端持久记录的待决项**：重新开始之后必须清干净
+    # （前端只是收到一个 restart 动作，响应里回显菜单不算数）。
+    assert "restart_from_template_editing" in restarted["uiActions"]
+    detail = client.get("/api/sessions/conv_template_restart").json()
+    assert detail["pendingChoice"] is None
     next_request = client.post("/api/agent/chat", json={
         **body, "state": "ANALYZING", "message": "给我 A 机房昨日能耗模版",
     }).json()
@@ -442,7 +470,11 @@ def test_readonly_visualization_query_does_not_lock_input_but_edit_plan_does(cli
     result = client.post("/api/agent/chat", json={
         **body, "message": "设备耗电排名可以怎么展示？"
     }).json()
-    assert result["questions"] == []
+    # 只读作答：随响应带回**草稿级合法菜单**（第二批新契约），
+    # 但没有候选计划、没有变更集。
+    assert len(result["questions"]) == 1
+    assert result["questions"][0]["id"] == "template_edit_confirm"
+    assert [o["value"] for o in result["questions"][0]["options"]] == ["同意", "修改", "重新开始"]
     assert "柱状图" in result["reply"] and "表格" in result["reply"]
     assert result["domainObjects"]["pendingEditPlan"] is None
     assert result["domainObjects"]["changeSet"] is None

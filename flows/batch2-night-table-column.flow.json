@@ -1,0 +1,106 @@
+{
+  "outDir": "../.selfcheck/flow-batch2-night-table-column",
+  "waitMs": 1500,
+  "timeout": 15000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "第二批夜间：07 §7.1 表格增列与列位置（补充复核）",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "screenshot": "c00-新建对话"
+        },
+        {
+          "eval": "(() => {\n  const sels = [\n    '[data-question-other=\"template_edit_confirm\"] .question-other-input',\n    '[data-question-text=\"template_edit_request\"] .question-text-input'\n  ];\n  let n = 0;\n  for (const sel of sels) {\n    for (const el of document.querySelectorAll(sel)) {\n      if (el.value) {\n        el.value = '';\n        el.dispatchEvent(new Event('input', { bubbles: true }));\n        n += 1;\n      }\n    }\n  }\n  return n >= 0;\n})()"
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成 A 机房昨日能耗日报，报表里要有这五个板块，标题就用我写的名字：第一个板块标题「日报说明」，是说明文字；第二个板块标题「昨日总耗电」，是指标卡；第三个板块标题「设备耗电明细」，是明细表，列出设备名称和耗电量；第四个板块标题「设备耗电排名」，是柱状图，横轴设备名称、纵轴耗电量；第五个板块标题「昨日逐小时耗电趋势」，是折线图。"
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "waitFor": ".plan-action-select",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.plan-action-select'); const opt = Array.from(s.options).find(o => o.textContent.trim() === '确认方案'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "screenshot": "c01-草稿已生成"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(() => {\n  const sels = [\n    '[data-question-other=\"template_edit_confirm\"] .question-other-input',\n    '[data-question-text=\"template_edit_request\"] .question-text-input'\n  ];\n  let n = 0;\n  for (const sel of sels) {\n    for (const el of document.querySelectorAll(sel)) {\n      if (el.value) {\n        el.value = '';\n        el.dispatchEvent(new Event('input', { bubbles: true }));\n        n += 1;\n      }\n    }\n  }\n  return n >= 0;\n})()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "在「设备耗电明细」表里增加一列「设备总数」，放在「设备名称」后面，绑定这个区域已有的设备总数字段；其他列保持不变。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "c02-表格增列-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "eval": "(() => {\n  const rows = (() => {\n  const regions = Array.from(document.querySelectorAll('#preview-root [data-region-id]'));\n  const box = regions.find((r) => {\n    const n = r.querySelector('.region-name');\n    return n && (n.innerText || '').includes('设备耗电明细');\n  });\n  if (!box) return null;\n  const rows = Array.from(box.querySelectorAll('.wtb-thead tr'));\n  return rows.map((tr) => Array.from(tr.querySelectorAll('th')).map((th) => (th.innerText || '').trim()));\n})();\n  if (!rows) return false;\n  const flat = rows.flat();\n  return flat.includes('设备总数');\n})()"
+        },
+        {
+          "eval": "(() => {\n  const rows = (() => {\n  const regions = Array.from(document.querySelectorAll('#preview-root [data-region-id]'));\n  const box = regions.find((r) => {\n    const n = r.querySelector('.region-name');\n    return n && (n.innerText || '').includes('设备耗电明细');\n  });\n  if (!box) return null;\n  const rows = Array.from(box.querySelectorAll('.wtb-thead tr'));\n  return rows.map((tr) => Array.from(tr.querySelectorAll('th')).map((th) => (th.innerText || '').trim()));\n})();\n  if (!rows) return false;\n  for (const row of rows) {\n    const i = row.indexOf('设备名称');\n    const j = row.indexOf('设备总数');\n    if (i >= 0 && j === i + 1) return true;\n  }\n  return false;\n})()"
+        },
+        {
+          "screenshot": "c03-表格增列-接受后"
+        }
+      ]
+    }
+  ]
+}

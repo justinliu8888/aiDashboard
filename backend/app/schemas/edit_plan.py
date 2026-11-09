@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class EditIntent(str, Enum):
@@ -308,6 +308,37 @@ class EditOperationTarget(BaseModel):
     @classmethod
     def _text(cls, value: Any) -> str:
         return str(value or "").strip()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _alias_keys(cls, value: Any) -> Any:
+        """目标键的**等价写法**在这里就归一。
+
+        模型常把目标写成 ``{"target": "region_x"}`` / ``{"id": "region_x"}`` /
+        ``{"region": "region_x"}``。这些键**不在契约里**，pydantic 默认会
+        静默丢掉 —— 到了能力层就只剩一个空目标，模型再也不知道自己写错在哪。
+        这里把等价键收进 ``regionId`` / ``ref``，**不新增**契约里的键。
+        """
+        if not isinstance(value, dict):
+            return value
+        out = dict(value)
+        region_id = str(out.get("regionId") or "").strip()
+        ref = str(out.get("ref") or "").strip()
+        for key in ("target", "region", "id", "region_id", "regionId"):
+            text = str(out.get(key) or "").strip()
+            if text and not region_id:
+                region_id = text
+                break
+        for key in ("ref", "targetRef", "target_ref"):
+            text = str(out.get(key) or "").strip()
+            if text and not ref:
+                ref = text
+                break
+        if region_id:
+            out["regionId"] = region_id
+        if ref:
+            out["ref"] = ref
+        return out
 
 
 class EditOperationSpec(BaseModel):

@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.display_binding_service import (
+    icon_catalog,
+    simulated_field_catalog,
+)
 from app.services.edit_capabilities.chart_data import (
     CATEGORICAL_PAYLOAD_CONTRACT,
     dimension_catalog,
@@ -23,6 +27,9 @@ DESCRIPTION = (
     "每个维度有哪些分类、各是多少模拟数值。"
     "新增分类统计图表（饼图 / 柱状图）时先用它确认维度名，"
     "再把 dimension 填进新增图表的参数里。"
+    "同时列出当前可绑定的**模拟单值字段**（指标卡 / 指标组 / 文本占位符用）"
+    "与**注册图标**（指标图标用）—— 先查清单再填 fieldRef / iconRef，"
+    "不要凭名字编字段或图标。"
     "这些数值都是**模拟**的，不接真实告警源。"
 )
 PARAMETERS = {
@@ -39,5 +46,11 @@ def run() -> dict[str, Any]:
         "status": "FOUND",
         "dimensions": dimension_catalog(),
         "payloadContract": CATEGORICAL_PAYLOAD_CONTRACT,
-        "note": "数值均为模拟数据，会在图上标注；不接真实告警源。",
+        "simulatedFields": simulated_field_catalog(),
+        "registeredIcons": icon_catalog(),
+        "note": (
+            "数值均为模拟数据，会在图上标注；不接真实告警源。"
+            "simulatedFields 是当前可绑定的单值字段（fieldRef 的合法取值）；"
+            "registeredIcons 是可用的注册图标（iconRef 的合法取值）。"
+        ),
     }

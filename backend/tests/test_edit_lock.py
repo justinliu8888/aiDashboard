@@ -421,11 +421,19 @@ def test_direct_api_call_cannot_bypass_the_locked_menu(design_ready):
         client, "把标题改成新标题", message_id="msg_bypass"
     ).json()
 
-    assert response["uiActions"] == ["selection_required"]
+    # 第二批新契约：自由输入被收敛成「受限补录入口」，不会直接执行修改。
+    assert response["uiActions"] == ["template_editing", "ask_template_edit_detail"]
     assert response["domainObjects"]["pendingEditPlan"] is None
     assert response["domainObjects"].get("changeSet") is None
     # 待确认菜单还在：没有被这一句自由输入顶掉。
-    assert session_service.load_pending_choice(DESIGN_SESSION_ID) is not None
+    stored = session_service.load_pending_choice(DESIGN_SESSION_ID)
+    assert stored is not None
+    assert stored["state"] == "WAITING_USER_CONFIRM"
+    assert stored["question"]["id"] == "template_edit_confirm"
+    assert [o["value"] for o in stored["question"]["options"]] == ["同意", "修改", "重新开始"]
+    # 自由输入只被收敛成作用域内的澄清入口，不产生任何已提交的计划。
+    assert response["questions"][0]["id"] == "template_edit_action"
+    assert response["questions"][0]["selectionOnly"] is False
 
 
 # --------------------------------------------------------------------------

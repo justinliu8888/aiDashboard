@@ -1,0 +1,57 @@
+{
+  "outDir": "../.selfcheck/flow-f02-01-dropdown",
+  "serveCmd": "cd ../backend && AI_SESSION_DB_PATH=/tmp/f02_flow_sessions_v2.db /opt/anaconda3/bin/python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8165",
+  "port": 8165,
+  "waitMs": 1500,
+  "timeout": 120000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "F02-01 Dropdown 定向回归：方案卡菜单-草稿确认菜单-点击推进-只读不写入",
+      "url": "http://127.0.0.1:8165/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        { "click": "#btn-new-session" },
+        { "wait": 600 },
+
+        { "type": "#chat-input", "text": "生成 A 机房昨日能耗日报，包含总耗电、设备耗电排名和昨日逐小时耗电趋势" },
+        { "press": "Enter" },
+        { "waitFor": ".plan-action-select", "timeout": 120000 },
+
+        { "eval": "Array.from(document.querySelectorAll('.plan-action-select')).filter(s => !s.disabled).length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('.plan-action-select')).filter(s => !s.disabled).map(s => Array.from(s.options).map(o => o.textContent.trim()).join(',')).join('|') === '请选择方案操作,确认方案,其他修改'" },
+        { "eval": "document.querySelector('[data-plan-card=\"current\"]') !== null" },
+        { "eval": "document.querySelector('[data-plan-summary]') !== null" },
+        { "screenshot": "f02-01-01-方案卡有可点 Dropdown" },
+
+        {
+          "eval": "(() => { const s = document.querySelector('.plan-action-select'); const opt = Array.from(s.options).find(o => o.textContent.trim() === '确认方案'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        { "waitFor": ".question-select", "timeout": 120000 },
+        { "wait": 1200 },
+
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => s.getAttribute('data-wp-history') !== '1').length === 1" },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => s.getAttribute('data-wp-history') !== '1').map(s => Array.from(s.options).map(o => o.textContent.trim()).join(',')).join('|') === '请选择,同意,修改,重新开始'" },
+        { "eval": "document.getElementById('preview-root').innerText.includes('总耗电')" },
+        { "eval": "(() => { window.__f02Regions = Array.from(document.querySelectorAll('#preview-root [data-region-id]')).map(el => el.dataset.regionId).sort().join(','); return window.__f02Regions.length > 0; })()" },
+        { "eval": "document.querySelectorAll('.question-select').length - document.querySelectorAll('.question-select[data-wp-history=\"1\"]').length === 1" },
+        { "eval": "document.getElementById('chat-input').disabled === true" },
+        { "screenshot": "f02-01-02-草稿确认菜单存在且可点" },
+
+        {
+          "eval": "(() => { const s = Array.from(document.querySelectorAll('.question-select')).filter(x => x.getAttribute('data-wp-history') !== '1' && !x.disabled).pop(); const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        { "waitText": "草稿已保存", "timeout": 120000 },
+        { "wait": 1000 },
+        { "eval": "Array.from(document.querySelectorAll('.question-select')).filter(s => s.getAttribute('data-wp-history') !== '1' && !s.disabled).length === 0" },
+        { "eval": "document.getElementById('chat-input').disabled === false" },
+        { "eval": "document.querySelector('dialog[open]') !== null" },
+        { "eval": "(() => { const i = document.querySelector('dialog[open] input[name=\"draftName\"]'); if (!i) return false; i.value = '第二批 F02 回归草稿'; return true; })()" },
+        { "click": "dialog[open] button[value=\"save\"]" },
+        { "wait": 1500 },
+        { "eval": "document.querySelector('dialog[open]') === null" },
+        { "screenshot": "f02-01-03-点同意后草稿落库并弹出存草稿对话框" }
+      ]
+    }
+  ]
+}

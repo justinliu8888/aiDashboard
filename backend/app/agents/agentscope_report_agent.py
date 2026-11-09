@@ -209,6 +209,30 @@ def _neutralize_applied_style_claims(reply: str) -> str:
     return "".join(fixed)
 
 
+def _trial_failure_detail() -> str:
+    """试做失败的**具体**内容（哪一步、哪条约束、为什么）。
+
+    没有失败时返回空串。失败原文取自本轮追踪里**最后一次**试做失败 ——
+    这是真实发生过的事，不是推断。没有原文就什么都不加（不编原因）。
+    """
+    try:
+        failure = edit_trace_service.last_trial_failure()
+    except Exception:  # noqa: BLE001 — 诊断信息不该让整轮失败
+        return ""
+    if not failure:
+        return ""
+    detail = str(failure.get("message") or "").strip()
+    if not detail:
+        constraint = str(failure.get("constraint") or "").strip()
+        reason = str(failure.get("reason") or "").strip()
+        detail = constraint or reason
+    if not detail:
+        return ""
+    op = str(failure.get("op") or "").strip()
+    prefix = f"具体原因（{op}）：" if op else "具体原因："
+    return f"{prefix}{detail}"
+
+
 class AgentScopeReportAgent:
     """AgentScope ReAct Agent + 真实模型（provider 由配置决定），覆盖样例 1。"""
 
@@ -655,12 +679,14 @@ class AgentScopeReportAgent:
         elif category == edit_trace_service.ERR_PARAMS_INVALID:
             message = (
                 "本次编辑没有完成：提交的修改参数不合法，没有形成可执行的修改计划。"
-                "草稿和待确认操作都没有变化。请把要求说得再具体一点。"
+                + _trial_failure_detail()
+                + "草稿和待确认操作都没有变化。请把要求说得再具体一点。"
             )
         elif category == edit_trace_service.ERR_TRIAL_FAILED:
             message = (
                 "本次编辑没有完成：修改计划在预执行校验时没有通过，原草稿保持不变。"
-                "可以调整要求后重试。"
+                + _trial_failure_detail()
+                + "可以调整要求后重试。"
             )
         elif category == edit_trace_service.ERR_ACCEPT_FAILED:
             message = (

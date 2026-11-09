@@ -85,8 +85,8 @@ const sessionApi = {
     const suffix = query.toString() ? "?" + query.toString() : "";
     return this.request("/api/sessions" + suffix);
   },
-  detail(sessionId) {
-    return this.request("/api/sessions/" + sessionId);
+  detail(sessionId, options = {}) {
+    return this.request("/api/sessions/" + sessionId, options);
   },
   remove(sessionId) {
     return this.request("/api/sessions/" + sessionId, { method: "DELETE" });
@@ -2803,6 +2803,43 @@ function renderedStepCard(stepId, questionKey = null) {
   return null;
 }
 
+/**
+ * 屏幕上现在有没有**当前待答那一步**的可操作入口。
+ *
+ * 用来判「锁着但没有可点的入口」这种死路：锁是服务端给的，入口是屏幕上的
+ * 东西，两者必须同时在 —— 只有锁没有入口，用户就既不能打字也点不了任何东西。
+ *
+ * 判据（按可靠性排序）：
+ *
+ * 1. **同一步的卡已经画在屏上**（``data-step-id`` 相同）→ 有。受限修改输入
+ *    那一步的合法入口是卡里的**专用输入**，本来就没有下拉框；这张卡在就算有。
+ * 2. **当前那张下拉框在屏上而且可点** → 有。历史回放出来的旧卡是灰的
+ *    （``disabled``），不算数 —— 它不是当前待答那一张。
+ * 3. **文字型待决的专用输入在屏上** → 有（合法入口是卡里那个输入框）。
+ *
+ * 为什么**不能**用「屏上有没有 ``[data-step-id]``」当判据：很多合法菜单
+ * **没有步骤身份**（``stepId`` 为空）—— 例如设计流生成草稿后给的
+ * ``template_edit_confirm``（同意 / 修改 / 重新开始）。用那种判据会把
+ * 「菜单明明在屏上」误判成「屏上没菜单」，于是兜底逻辑**又画一张一样的
+ * 菜单**：页面上出现两张「请选择下一步操作」，用户不知道该点哪张
+ * （交互回归实测到的现象）。这比「没有菜单」更糟。
+ */
+function hasRenderedActionableEntry(choice) {
+  if (!choice) return false;
+  const stepId = String(choice.stepId || "");
+  if (stepId) {
+    const cards = Array.from(document.querySelectorAll("[data-step-id]"));
+    if (cards.some((card) => card.getAttribute("data-step-id") === stepId)) return true;
+  }
+  const id = String(choice.id || "");
+  if (!id) return false;
+  const selects = Array.from(document.querySelectorAll(".question-select"));
+  if (selects.some((select) => select.dataset.questionId === id && !select.disabled)) return true;
+  const textBoxes = Array.from(document.querySelectorAll("[data-question-text]"));
+  if (textBoxes.some((box) => box.dataset.questionText === id)) return true;
+  return false;
+}
+
 function appendAiQuestions(questions, { lock = true } = {}) {
   let list = (questions || []).filter(Boolean);
   // Older responses attach a separate edit input to the clarification menu.
@@ -3532,7 +3569,11 @@ async function postAgentStream(body, debugCard, signal) {
     body: JSON.stringify(body),
     signal,
   });
-  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok || !res.body) {
+    const error = new Error(`HTTP ${res.status}`);
+    error.status = res.status;
+    throw error;
+  }
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
@@ -3744,11 +3785,23 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
     finishDebugTrace(debugCard, "done");
   } catch (err) {
     if (epoch !== requestEpoch || err.name === "AbortError") return;
+    addDebugEvent(debugCard, "transport_failed", {
+      stage: "transport_failed", status: err.status || null,
+      message: err.message, messageId: body.messageId,
+    });
     finishDebugTrace(debugCard, "failed");
     // 传输失败：**客户端观察**，不冒充服务端已停止或业务失败。
     // 失败这一条也给一个反馈入口（独立接口签发目标）。
     const failureMark = typeof aiBubbleCount === "function" ? aiBubbleCount() : 0;
-    appendAiText("请求失败：" + err.message);
+    appendAiText([502, 503, 504, 520, 522, 524].includes(err.status)
+      ? "连接暂时中断，尚不能确认这次操作是否生效。正在核对后台；请保留当前草稿。"
+      : "请求失败：" + err.message + "。请从当前菜单重新选择或重试。");
+    // 断流时后台可能已提交，先恢复权威现场；请求失败不消费当前菜单。
+    if (typeof syncChoiceLockFromServer === "function") await syncChoiceLockFromServer();
+    if (epoch !== requestEpoch) return;
+    document.querySelectorAll(".question-select").forEach((select) => {
+      if (select.dataset.questionId === lockedChoice?.id) select.value = "";
+    });
     if (typeof registerFeedbackClientEvent !== "function") return;
     registerFeedbackClientEvent("client_failure", {
       clientAttemptId: body.messageId || newMessageId(),
@@ -4094,6 +4147,21 @@ async function sendMessage(text, { fromChoice = false, designAction = null, from
   // syncChoiceLockFromServer —— 跳过即可（**不是**功能降级：
   // 真实页面里它与主脚本同文件，一定在）。
   if (restrictedTurn && !lockedChoice && typeof syncChoiceLockFromServer === "function") {
+    await syncChoiceLockFromServer();
+    syncInputControls();
+  }
+  // 统一出口的**前端兜底**（反馈 F02-01）：输入锁着，但屏幕上**没有**当前
+  // 待答那一步的可点入口 —— 用户看到的是「有回复、没有 Dropdown、输入又锁着」
+  // 的死路。
+  //
+  // 这里不自己编一张卡：向服务端要它当前的权威菜单并画出来；服务端说
+  // 「这一步不在了」才放锁（``syncChoiceLockFromServer`` 已经这么处理）。
+  //
+  // 判据是「屏上有没有**当前这一步**的入口」（``hasRenderedActionableEntry``），
+  // **不是**「屏上有没有带步骤身份的卡」：合法菜单常常没有步骤身份，
+  // 用后一种判据会在菜单明明在屏上的时候又补画一张 —— 页面出现两张
+  // 「请选择下一步操作」，用户不知道该点哪张。
+  if (lockedChoice && !hasRenderedActionableEntry(lockedChoice) && typeof syncChoiceLockFromServer === "function") {
     await syncChoiceLockFromServer();
     syncInputControls();
   }
@@ -5885,14 +5953,24 @@ function applyRevokedSteps(stepIds) {
  */
 async function syncChoiceLockFromServer() {
   const sessionId = session.sessionId;
+  const epoch = requestEpoch;
   if (!sessionId) return;
   let detail = null;
+  const recovery = new AbortController();
+  const timer = setTimeout(() => recovery.abort(), 4000);
   try {
-    detail = await sessionApi.detail(sessionId);
+    detail = await sessionApi.detail(sessionId, { signal: recovery.signal });
   } catch (err) {
-    // 问不到就不动锁：宁可锁着（后端仍可能锁着），也不擅自放开。
+    // 隧道故障时详情接口也可能挂起；恢复检查有上限，不能一直锁住发送。
+    if (epoch === requestEpoch && session.sessionId === sessionId) {
+      appendAiText("暂时无法核对后台，已保留原草稿和当前选项。连接恢复后可重新选择；请勿重复接受同一修改。");
+    }
     return;
+  } finally {
+    clearTimeout(timer);
   }
+  if (epoch !== requestEpoch || session.sessionId !== sessionId) return;
+  if (detail.state) setState(detail.state);
   const pending = detail?.pendingChoice?.question || null;
   if (!pending) {
     // 服务端说这一步不在了 → 放锁。
@@ -6259,11 +6337,35 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
   const unit = ctx.unit ?? readPayloadUnit(region, p, ctx.defRegion);
 
   if (type === "TEXT") {
+    // 第二批：文本组件专属渲染（受控 Markdown、占位符绑定、目录层级）。
+    // 新模块没加载时走既有纯文本渲染 —— 兜底，不是功能降级。
+    const textApi = typeof window !== "undefined" ? window.WorkbenchTextMetric : null;
+    if (textApi && typeof textApi.renderText === "function") {
+      textApi.renderText(container, region, ctx);
+      return;
+    }
     container.innerHTML = `<div class="text-xl font-semibold text-slate-800">${esc(p.rendered || p.template || "")}</div>`;
     return;
   }
 
+  if (type === "METRIC_GROUP") {
+    // 第二批：多指标组 —— 一个区域里的指标项列表（不是容器，不生成子卡片）。
+    const groupApi = typeof window !== "undefined" ? window.WorkbenchTextMetric : null;
+    if (groupApi && typeof groupApi.renderMetricGroup === "function") {
+      groupApi.renderMetricGroup(container, region, ctx);
+      return;
+    }
+    container.innerHTML = `<pre class="mono text-[11px] text-slate-500 bg-slate-50 rounded p-2 overflow-x-auto">${esc(JSON.stringify(p, null, 2).slice(0, 400))}</pre>`;
+    return;
+  }
+
   if (type === "METRIC_CARD") {
+    // 第二批：指标卡专属渲染（指标级格式、比较值、注册图标）。
+    const metricApi = typeof window !== "undefined" ? window.WorkbenchTextMetric : null;
+    if (metricApi && typeof metricApi.renderMetricCard === "function") {
+      metricApi.renderMetricCard(container, region, ctx);
+      return;
+    }
     // 权威格式：服务端写进定义里的那一份 region.format（契约 0002 §3.5 / BUG-010）。
     // 服务端已经按它算好了 displayValue；这里优先用服务端的，
     // 拿不到（例如用户 JSON 模式）才按同一份格式本地渲染。
@@ -6292,10 +6394,18 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
         : serverDisplay !== null
           ? esc(serverDisplay)
           : `${esc(formatMetricValue(m.value, m.precision))}<span class="text-[11px] font-normal text-slate-400 ml-1">${esc(m.unit || "")}</span>`;
+      // **空值不能被渲染入口提前吞掉**：服务端按格式算好的 ``nullText``
+      // （如「—」）就是这一格该显示的东西。占位模式仍然只显示名称。
+      const isPlaceholder = p.placeholderOnly === true || m.placeholderOnly === true;
+      const emptyText = isPlaceholder
+        ? ""
+        : (serverDisplay !== null
+          ? esc(serverDisplay)
+          : esc((m.format && m.format.nullText != null) ? m.format.nullText : "—"));
       return `
           <div class="rounded-lg border border-slate-200 bg-white px-3 py-2" data-region-metric="${esc(m.metricKey || m.label || "")}">
             <div class="text-[11px] text-slate-500">${esc(m.label || m.metricKey || "指标")}</div>
-            <div class="text-base font-semibold text-slate-900 mt-0.5 min-h-6">${hasValue ? display : ""}</div>
+            <div class="text-base font-semibold text-slate-900 mt-0.5 min-h-6">${hasValue ? display : emptyText}</div>
           </div>`;
     }).join("");
     container.innerHTML = `
@@ -6304,6 +6414,12 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
   }
 
   if (type === "TABLE") {
+    // 第二批：表格专属渲染（多层表头、列宽样式、冻结、分页、行分组、汇总）。
+    const tableApi = typeof window !== "undefined" ? window.WorkbenchTable : null;
+    if (tableApi && typeof tableApi.renderTable === "function") {
+      tableApi.renderTable(container, region, ctx);
+      return;
+    }
     const columns = Array.isArray(p.columns) ? p.columns : [];
     const rows = Array.isArray(p.rows) ? p.rows : [];
     // 逐格显示串：服务端按权威格式算好的（{fieldRef: 显示串} 每行一份）。
@@ -6379,6 +6495,12 @@ function renderRegionPayloadBody(container, region, payload, ctx = {}) {
   }
 
   if (type === "CHART") {
+    // 第二批：图表专属渲染（图型区分、编码、轴、图例、配色、提示、参考线）。
+    const chartApi = typeof window !== "undefined" ? window.WorkbenchChart : null;
+    if (chartApi && typeof chartApi.renderChart === "function") {
+      chartApi.renderChart(container, region, ctx);
+      return;
+    }
     renderChartPayload(container, region, p, unit);
     return;
   }
@@ -6698,6 +6820,11 @@ function destroyCharts() {
   for (const c of _chartInstances.splice(0)) {
     try { c.dispose(); } catch (e) {}
   }
+  // 第二批：图表组件模块自己建的实例由它自己销毁（同一份清理口径）。
+  const chartApi = typeof window !== "undefined" ? window.WorkbenchChart : null;
+  if (chartApi && typeof chartApi.destroy === "function") {
+    try { chartApi.destroy(); } catch (e) {}
+  }
 }
 
 // 独立的预览面板渲染器（renderFinalReport / renderFinalRegion）已下线：
@@ -6809,8 +6936,11 @@ async function deleteSession(sessionId) {
 function pendingMenuCardShown(question) {
   const id = String(question?.id || "").trim();
   if (!id) return false;
+  const stepId = String(question?.stepId || "").trim();
   return Array.from(document.querySelectorAll(".question-select")).some(
-    (el) => el.getAttribute("data-question-id") === id
+    (el) => el.getAttribute("data-question-id") === id && (
+      !stepId || el.closest("[data-step-id]")?.getAttribute("data-step-id") === stepId
+    )
   );
 }
 
@@ -7504,6 +7634,18 @@ function resizeWorkbenchCharts() {
       }
       chart.resize();
     } catch (e) { /* 单个图失败不影响其它 */ }
+  }
+  // 第二批：图表组件模块的实例同样要跟着尺寸变化重排。
+  const chartApi = typeof window !== "undefined" ? window.WorkbenchChart : null;
+  if (chartApi && Array.isArray(chartApi.instances)) {
+    for (const chart of chartApi.instances) {
+      try {
+        if (!chart || typeof chart.resize !== "function") continue;
+        const dom = typeof chart.getDom === "function" ? chart.getDom() : null;
+        if (dom && (dom.offsetParent === null || !dom.clientWidth || !dom.clientHeight)) continue;
+        chart.resize();
+      } catch (e) { /* 单个图失败不影响其它 */ }
+    }
   }
 }
 

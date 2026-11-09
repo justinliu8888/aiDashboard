@@ -15,6 +15,7 @@ IS_READ_ONLY / APPLICABLE_STATES / run()；
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from contextvars import ContextVar
@@ -269,10 +270,26 @@ def _make_function_tool(tool, FunctionTool, permission):
     description = tool.DESCRIPTION
     parameters = tool.PARAMETERS
     max_error_chars = get_settings().observation_error_max_chars
+    #: 工具**签名**里认的键。模型多给一个键不该让整轮废掉：
+    #: 现场实证 —— 模型照着 JSON Schema 填了 ``baseCombination``，
+    #: 而 ``run()`` 的签名里没有它 → ``TypeError`` → 整轮修改全废
+    #: （草稿一个字没改，用户只看到「没能提交成待确认候选」）。
+    #: 多出来的键**丢掉**（不是收下）：契约里没有的键没有语义。
+    try:
+        accepted = set(inspect.signature(runner).parameters)
+    except (TypeError, ValueError):  # pragma: no cover — 极端情况按原样传
+        accepted = set()
 
     async def _invoke(**kwargs: Any):
         """工具执行入口；返回 dict / str，交由 FunctionTool 转成 ToolChunk。"""
         try:
+            if accepted:
+                dropped = sorted(set(kwargs) - accepted)
+                if dropped:
+                    kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+                    logger.info(
+                        "[tool] 丢掉签名之外的键 name=%s dropped=%s", name, dropped,
+                    )
             result = runner(**kwargs)
             if tool.CATEGORY == ToolCategory.FACT:
                 # 事实工具的调用要看得见：只读问答的可信度取决于

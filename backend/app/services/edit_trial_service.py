@@ -181,6 +181,9 @@ def _trace_step(
         if error:
             result["reason"] = str(error.get("reason") or "")
             result["constraint"] = str(error.get("constraint") or "")
+            # 失败**原文**也留着：用户要看到「哪一步、哪条约束、为什么」，
+            # 只有 reason / constraint 的机器码对用户没有意义。
+            result["message"] = str(error.get("message") or "")
         if not_executed:
             # **未执行**要说得出口：不是成功，也不是「没有变化」。
             result["notExecuted"] = True

@@ -2,10 +2,10 @@
 
 > **本文件是自动生成物，请勿手改。**由 `backend/app/services/capability_catalog_service.py` 从**真实注册项**生成：已注册 Tool、清单能力、旧编辑意图、展示操作白名单、规则快路。参数契约直接取注册项自己的 JSON Schema，不手抄、不另维护参数表。
 
-- **目录版本**（contractFingerprint 派生）：`9d3a93dc46c648dc`
-- **契约指纹**：`9d3a93dc46c648dc1574e420971faed31d22cd50874ff6568b55263e2e574c13`
-- **生成时间**：2026-11-06T00:40:36+00:00
-- **条目总数**：61（Agent Tool 20 / 清单能力与展示操作、规则快路 24 / 旧编辑意图 17）
+- **目录版本**（contractFingerprint 派生）：`72d0cc0c0c8adcc7`
+- **契约指纹**：`72d0cc0c0c8adcc71374496f9491b273b3364e5529346c7a16b231a40dc33a4a`
+- **生成时间**：2026-11-09T03:46:37+00:00
+- **条目总数**：74（Agent Tool 20 / 清单能力与展示操作、规则快路 37 / 旧编辑意图 17）
 
 ## 入口类型说明
 
@@ -370,7 +370,7 @@
 - **入口类型**：`agent_tool` —— Agent Tool —— 模型可直接调用
 - **分组**：工具 / 事实查询（只读）
 - **状态**：`available`
-- **用途**：列出当前可用的**模拟分类维度**（如告警等级、告警区域、告警类型），每个维度有哪些分类、各是多少模拟数值。新增分类统计图表（饼图 / 柱状图）时先用它确认维度名，再把 dimension 填进新增图表的参数里。这些数值都是**模拟**的，不接真实告警源。
+- **用途**：列出当前可用的**模拟分类维度**（如告警等级、告警区域、告警类型），每个维度有哪些分类、各是多少模拟数值。新增分类统计图表（饼图 / 柱状图）时先用它确认维度名，再把 dimension 填进新增图表的参数里。同时列出当前可绑定的**模拟单值字段**（指标卡 / 指标组 / 文本占位符用）与**注册图标**（指标图标用）—— 先查清单再填 fieldRef / iconRef，不要凭名字编字段或图标。这些数值都是**模拟**的，不接真实告警源。
 - **参数**：与上文「get_current_draft」的参数契约完全相同（完整内容见文件末尾机器可读元数据的 `entries` 字段）
 - **必填参数**：（无）
 - **目标 / 引用要求**：无参数。
@@ -2135,6 +2135,7 @@
         "CONTAINER",
         "DATA_QUALITY",
         "METRIC_CARD",
+        "METRIC_GROUP",
         "TABLE",
         "TEXT"
       ],
@@ -2146,8 +2147,10 @@
       "enum": [
         "AREA",
         "BAR",
+        "DONUT",
         "LINE",
-        "PIE"
+        "PIE",
+        "STACKED_BAR"
       ],
       "default": ""
     },
@@ -2229,8 +2232,8 @@
   - 不需要目标（自己新建区块 / 整批作用于草稿）
   - 新增的区块可用 params.ref 起稳定引用名，后续步骤用 target.ref 指它
   - title 至少 1 个字符
-  - componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、TABLE、TEXT
-  - chartKind 取值域：AREA、BAR、LINE、PIE
+  - componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、METRIC_GROUP、TABLE、TEXT
+  - chartKind 取值域：AREA、BAR、DONUT、LINE、PIE、STACKED_BAR
   - dimension 取值域：alertLevel、alertRegion、alertType
   - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
   - 包装要求：{"op": "ADD_SECTION", "params": {"title": "<title>"}}
@@ -2300,6 +2303,7 @@
         "CONTAINER",
         "DATA_QUALITY",
         "METRIC_CARD",
+        "METRIC_GROUP",
         "TABLE",
         "TEXT"
       ],
@@ -2311,8 +2315,10 @@
       "enum": [
         "AREA",
         "BAR",
+        "DONUT",
         "LINE",
-        "PIE"
+        "PIE",
+        "STACKED_BAR"
       ],
       "default": ""
     }
@@ -2336,8 +2342,8 @@
   - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
 - **运行限制**：
   - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
-  - componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、TABLE、TEXT
-  - chartKind 取值域：AREA、BAR、LINE、PIE
+  - componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、METRIC_GROUP、TABLE、TEXT
+  - chartKind 取值域：AREA、BAR、DONUT、LINE、PIE、STACKED_BAR
   - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
   - 包装要求：{"op": "SET_DISPLAY", "target": {"regionId": "<regionId>"}, "params": {}}
   - 最小结构示例（只给格式）：{"op": "SET_DISPLAY", "target": {"regionId": "<regionId>"}, "params": {}}
@@ -2425,7 +2431,7 @@
 - **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
 - **分组**：清单能力 / 设置样式
 - **状态**：`available`
-- **用途**：一批受约束的展示操作（分组 / 排版 / 样式 / 格式 / 页面）。**这是一个包装能力**：展示操作名不是顶层能力，只能放在它的 params.operations 里，每一项形如 {"op": "<展示操作名>", "params": {...}}；operations 是**非空列表**。允许的 op、每个 op 的必填 / 可选键与取值域见能力总目录的「展示操作白名单」一节（由展示服务的白名单自动生成）。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里 SET_PRESENTATION 这一项的 params.operations 里（每一项形如 {"op": "<展示操作名>", "params": {...}}）。**包装要求**：{"op": "SET_PRESENTATION", "params": {"operations": [{"op": "CREATE_GROUP", "params": {"groupId": "<groupId>", "memberRegionIds": ["<memberRegionIds>"]}}]}}。
+- **用途**：一批受约束的展示操作（分组 / 排版 / 样式 / 格式 / 页面）。**这是一个包装能力**：展示操作名不是顶层能力，只能放在它的 params.operations 里，每一项形如 {"op": "<展示操作名>", "params": {...}}；operations 是**非空列表**。允许的 op、每个 op 的必填 / 可选键与取值域见能力总目录的「展示操作白名单」一节（由展示服务的白名单自动生成）。**区域级格式（SET_FORMAT）写的是整块卡片的格式**：指标卡 / 指标组里某个指标项的数字显示格式请用 SET_METRIC_ITEM（指标级）—— 区域级格式会连带改掉这张卡上别的指标的单位。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里 SET_PRESENTATION 这一项的 params.operations 里（每一项形如 {"op": "<展示操作名>", "params": {...}}）。**包装要求**：{"op": "SET_PRESENTATION", "params": {"operations": [{"op": "CREATE_GROUP", "params": {"groupId": "<groupId>", "memberRegionIds": ["<memberRegionIds>"]}}]}}。
 - **参数**（JSON Schema，取自真实契约）：
 
 ```json
@@ -2497,6 +2503,960 @@
   - dispatch：`app/tools/submit_edit_plan_tool.py::run`
   - validation：`app/services/edit_capabilities/base.py::validate_params`
   - execution：`app/services/edit_capabilities/blocks.py::_set_presentation`
+
+### SET_DATA_BINDING
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置这个区域**展示**用的绑定：outputRef（换绑已登记的输出）、fieldAliases（展示字段名 → 实际结果字段名）、presentationFilters（只过滤展示记录）、sort / topN（展示排序与前 N 项）。这些**只改展示**：源输出、全量总计和其他区域的输入不变；未登记的引用会被拒绝，不会自动新增跨区域数据依赖。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_DATA_BINDING", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_DATA_BINDING 的参数对象。",
+  "properties": {
+    "outputRef": {
+      "type": "string",
+      "description": "改绑的输出引用（output:<name>）",
+      "default": ""
+    },
+    "fieldAliases": {
+      "type": "object",
+      "description": "展示字段名 → 实际结果字段名，例如 {\"时间点\":\"timestamp\"}。右侧必须是已声明字段；也兼容可唯一识别的反向映射。",
+      "additionalProperties": false
+    },
+    "clearFieldAliases": {
+      "type": "boolean",
+      "default": false
+    },
+    "presentationFilters": {
+      "type": "array",
+      "description": "只过滤展示记录。条件形如 {\"type\":\"CONDITION\",\"left\":{\"type\":\"FIELD\",\"fieldRef\":\"energyKwh\"},\"operator\":\"GT\",\"operands\":[{\"type\":\"LITERAL\",\"value\":400}]}；组用 type=GROUP、logic=AND/OR/NOT、conditions=[条件]。也接收 fieldRef/operator/value 简写，统一转成上述结构。",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "CONDITION",
+              "GROUP"
+            ]
+          },
+          "left": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "FIELD"
+                ]
+              },
+              "fieldRef": {
+                "type": "string",
+                "description": "已声明的实际字段名"
+              }
+            },
+            "additionalProperties": false
+          },
+          "operator": {
+            "type": "string",
+            "enum": [
+              "EQ",
+              "NE",
+              "GT",
+              "GE",
+              "LT",
+              "LE",
+              "IN",
+              "NOT_IN",
+              "BETWEEN",
+              "CONTAINS",
+              "STARTS_WITH",
+              "IS_NULL",
+              "IS_NOT_NULL"
+            ]
+          },
+          "operands": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "LITERAL"
+                  ]
+                },
+                "value": {
+                  "type": "string",
+                  "description": "字面量值；数字阈值用数字"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "logic": {
+            "type": "string",
+            "enum": [
+              "AND",
+              "OR",
+              "NOT"
+            ]
+          },
+          "conditions": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "clearPresentationFilters": {
+      "type": "boolean",
+      "default": false
+    },
+    "sort": {
+      "type": "array",
+      "description": "展示排序字段（fieldRef / direction / nulls）",
+      "items": {
+        "type": "object"
+      }
+    },
+    "clearSort": {
+      "type": "boolean",
+      "default": false
+    },
+    "topN": {
+      "type": "integer",
+      "description": "展示前 N 项；只是展示裁剪，不限制取数"
+    },
+    "clearTopN": {
+      "type": "boolean",
+      "default": false
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（带 step / op / target / constraint / reason）
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_DATA_BINDING", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_DATA_BINDING", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/binding_component.py::_set_data_binding`
+
+### SET_CHART_KIND
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：改一个图表区块的图表类型：LINE / AREA / BAR / STACKED_BAR / PIE / DONUT。**只改图型**，分类、系列与数值一律不动；类型逐字保留（STACKED_BAR 不折成 BAR，DONUT 不折成 PIE）。饼图 / 环形图复用当前分类绑定，或当前输出已声明的分类字段与数值字段；已有分组聚合输出、SUM/COUNT 的离散时间桶也可直接切换，保持原标签和逐点数值。无需先调用 SET_CATEGORY_DATA；不得为了切换图型另填分类或数值。未聚合的连续时间序列与多系列不能直接转换。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_CHART_KIND", "target": {"regionId": "<regionId>"}, "params": {"chartKind": "AREA"}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_CHART_KIND 的参数对象。",
+  "properties": {
+    "chartKind": {
+      "type": "string",
+      "description": "图表类型（LINE / AREA / BAR / STACKED_BAR / PIE / DONUT）",
+      "enum": [
+        "AREA",
+        "BAR",
+        "DONUT",
+        "LINE",
+        "PIE",
+        "STACKED_BAR"
+      ],
+      "minLength": 1
+    }
+  },
+  "required": [
+    "chartKind"
+  ]
+}
+```
+
+- **必填参数**：chartKind
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unsupported_chart_kind
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=incompatible_data_shape
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - chartKind 取值域：AREA、BAR、DONUT、LINE、PIE、STACKED_BAR
+  - chartKind 至少 1 个字符
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_CHART_KIND", "target": {"regionId": "<regionId>"}, "params": {"chartKind": "AREA"}}
+  - 最小结构示例（只给格式）：{"op": "SET_CHART_KIND", "target": {"regionId": "<regionId>"}, "params": {"chartKind": "AREA"}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/chart_component.py::_set_chart_kind`
+
+### SET_CHART_ENCODINGS
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置图表的视觉通道绑定（给的是**完整清单**）：每一项形如 {"channel": "X", "fieldRef": "<字段名>", "format": {...}}；channel 取 X / Y / SERIES / COLOR / LABEL，每个通道最多一项。字段必须已登记或属于当前模拟字段目录；饼图 / 环形图没有横纵轴，只接受 COLOR 与 LABEL。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_CHART_ENCODINGS", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_CHART_ENCODINGS 的参数对象。",
+  "properties": {
+    "encodings": {
+      "type": "array",
+      "description": "完整的通道绑定清单：每一项形如 {\"channel\": \"X\", \"fieldRef\": \"<字段名>\", \"format\": {...}}；channel 取 X / Y / SERIES / COLOR / LABEL，每个通道最多一项。",
+      "items": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "type": "string",
+            "description": "视觉通道（X / Y / SERIES / COLOR / LABEL）",
+            "enum": [
+              "X",
+              "Y",
+              "SERIES",
+              "COLOR",
+              "LABEL"
+            ]
+          },
+          "fieldRef": {
+            "type": "string",
+            "description": "数据字段名（必须已登记或属于模拟字段目录）"
+          },
+          "format": {
+            "type": "object",
+            "description": "该通道的显示格式（可选）",
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_encoding
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=missing_channel
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unsupported_channel
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=duplicate_channel
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=channel_not_applicable
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_CHART_ENCODINGS", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_CHART_ENCODINGS", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/chart_component.py::_set_chart_encodings`
+
+### SET_CHART_AXES
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置图表坐标轴：axes 的键是 'x' 或 'y'，值形如 {"title": "...", "minimum": 0, "maximum": 100, "format": {...}, "scale": "LINEAR"}；给哪个轴就改哪个轴，没给的轴保持原样（clearAxes=true 先清空全部）。scale 取 LINEAR / LOG / TIME / CATEGORY；下限不能高于上限。饼图 / 环形图没有坐标轴，设不了。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_CHART_AXES", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_CHART_AXES 的参数对象。",
+  "properties": {
+    "axes": {
+      "type": "object",
+      "description": "要设置的坐标轴：键是 'x' 或 'y'，值形如 {\"title\": \"...\", \"minimum\": 0, \"maximum\": 100, \"format\": {...}, \"scale\": \"LINEAR\"}；给哪个轴就改哪个轴，没给的轴保持原样。",
+      "additionalProperties": false
+    },
+    "clearAxes": {
+      "type": "boolean",
+      "description": "是否先清空全部坐标轴（true = 清空后再应用 axes 里的内容）",
+      "default": false
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=axes_not_supported
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_axis
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_CHART_AXES", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_CHART_AXES", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/chart_component.py::_set_chart_axes`
+
+### SET_CHART_LEGEND
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置图例开关与稳定系列配色：legend 是布尔值（不填 = 不改，协议里图例只有开关，没有位置与方向）；seriesColors 是「稳定系列键 → 颜色」的映射（颜色写十六进制、rgb()/hsl()、颜色关键字或主题 token 名，不接受外链）；系列键必须是这个图表真实存在的系列（clearSeriesColors=true 先清空）。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_CHART_LEGEND", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_CHART_LEGEND 的参数对象。",
+  "properties": {
+    "legend": {
+      "type": "boolean",
+      "description": "是否显示图例（不填 = 不改；协议里图例只有开关，没有位置 / 方向）"
+    },
+    "seriesColors": {
+      "type": "object",
+      "description": "稳定系列键 → 颜色（十六进制 / rgb() / 颜色关键字或主题 token 名）",
+      "additionalProperties": false
+    },
+    "clearSeriesColors": {
+      "type": "boolean",
+      "description": "是否先清空已有配色（true = 清空后再应用 seriesColors）",
+      "default": false
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_series
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_series_color
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_CHART_LEGEND", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_CHART_LEGEND", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/chart_component.py::_set_chart_legend`
+
+### SET_CHART_TOOLTIP
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置提示框里**额外**显示的字段：tooltipFields 给的是完整清单（字段必须已登记或属于当前模拟字段目录；clearTooltipFields=true 清空）。基础提示（分类名与数值）永远保留，不会被关掉。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_CHART_TOOLTIP", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_CHART_TOOLTIP 的参数对象。",
+  "properties": {
+    "tooltipFields": {
+      "type": "array",
+      "description": "提示里要额外显示的字段名（非空时按此完整清单替换）",
+      "items": {
+        "type": "string"
+      }
+    },
+    "clearTooltipFields": {
+      "type": "boolean",
+      "description": "是否清空提示字段（true = 清空；基础提示不受影响）",
+      "default": false
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_CHART_TOOLTIP", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_CHART_TOOLTIP", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/chart_component.py::_set_chart_tooltip`
+
+### SET_CHART_REFERENCE_LINES
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置参考线：referenceLines 是「名称 → 表达式」，形如 {"type": "LITERAL", "value": 100}（本批只支持常量数值表达式，数值按图表数值轴的单位理解）；参考线挂在有单一数值轴的图型上，饼图 / 环形图没有轴，设不了；名称不能重复（clearReferenceLines=true 先清空）。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_CHART_REFERENCE_LINES", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_CHART_REFERENCE_LINES 的参数对象。",
+  "properties": {
+    "referenceLines": {
+      "type": "object",
+      "description": "参考线：名称 → 表达式，形如 {\"type\": \"LITERAL\", \"value\": 100}；数值按图表数值轴的单位理解。",
+      "additionalProperties": false
+    },
+    "clearReferenceLines": {
+      "type": "boolean",
+      "description": "是否先清空已有参考线（true = 清空后再应用 referenceLines）",
+      "default": false
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=reference_axis_ambiguous
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_reference_line
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=duplicate_reference_line
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_CHART_REFERENCE_LINES", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_CHART_REFERENCE_LINES", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/chart_component.py::_set_chart_reference_lines`
+
+### SET_TABLE_COLUMNS
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置表格的**列清单**（完整清单：给了就是全部，顺序即显示顺序）。每一项形如 {"id": "col_1", "label": "机房名称", "fieldRef": "roomName", "format": {"kind": "TEXT"}, "width": {"value": 120, "unit": "PX"}, "style": {"textAlign": "LEFT"}, "headerPath": ["能耗", "总量"]}；给了 id 就是改这一列（id 必须已存在），不给 id 就是新增一列。标题（label）与取值字段（fieldRef）**互相独立**；清单里没有的列**不再显示**，但源字段、输出与指标一个都不删。**只改其中几列时，清单里其余列的相对顺序要照抄当前表格的顺序**（先按 get_current_region 给的顺序列出，再改你要改的那几项）—— **不要按 id 重排**：清单顺序就是显示顺序，按 id 排会把用户刚放好的列挪走。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_TABLE_COLUMNS", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_TABLE_COLUMNS 的参数对象。",
+  "properties": {
+    "columns": {
+      "type": "array",
+      "description": "完整的列清单（顺序即显示顺序）：每一项形如 {\"id\": \"col_1\", \"label\": \"机房名称\", \"fieldRef\": \"roomName\", \"format\": {\"kind\": \"TEXT\"}, \"width\": {\"value\": 120, \"unit\": \"PX\"}, \"style\": {\"textAlign\": \"LEFT\"}, \"headerPath\": [\"能耗\", \"总量\"]}；给了 id 就是改这一列（id 必须已存在），不给 id 就是新增一列。清单里没有的列**不再显示**（源字段、输出与指标一个都不删）。",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "列的稳定 id（改已有列时给，新增列不给）",
+            "default": ""
+          },
+          "label": {
+            "type": "string",
+            "description": "列标题（与取值字段互相独立）",
+            "default": ""
+          },
+          "fieldRef": {
+            "type": "string",
+            "description": "取值字段名（必须已登记）",
+            "default": ""
+          },
+          "format": {
+            "type": "object",
+            "description": "这一列的显示格式（可选；不给则沿用原格式）",
+            "additionalProperties": false
+          },
+          "width": {
+            "type": "object",
+            "description": "列宽 {\"value\": 120, \"unit\": \"PX\"}（可选）",
+            "additionalProperties": false
+          },
+          "style": {
+            "type": "object",
+            "description": "这一列的样式（可选；只认受控的外观键）",
+            "additionalProperties": false
+          },
+          "headerPath": {
+            "type": "array",
+            "description": "多层表头路径（可选；每一层一段表头文字；[] 表示清空）",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=no_changes
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=empty_column_list
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_column_id
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=missing_column_label
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=missing_column_field_ref
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_TABLE_COLUMNS", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_TABLE_COLUMNS", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/table_component.py::_set_table_columns`
+
+### SET_TABLE_DISPLAY
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置表格的**展示方式**：groupRowsBy（按字段分组显示行 —— 只是排版，**不产生小计或聚合**；清空用 clearGroupRowsBy）、rowNumber（是否显示序号）、pageSize（网页展示每页行数 —— 只是展示分页，**不限制取数与导出**；清空用 clearPageSize）、frozenColumnCount（冻结前几列；清空用 clearFrozenColumnCount）。没给的项保持原样。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_TABLE_DISPLAY", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_TABLE_DISPLAY 的参数对象。",
+  "properties": {
+    "groupRowsBy": {
+      "type": "array",
+      "description": "按哪些字段分组显示行（只是展示分组，**不产生小计或聚合**）；清空用 clearGroupRowsBy",
+      "items": {
+        "type": "string"
+      }
+    },
+    "clearGroupRowsBy": {
+      "type": "boolean",
+      "description": "是否清空行分组字段",
+      "default": false
+    },
+    "rowNumber": {
+      "type": "boolean",
+      "description": "是否显示序号列（不填 = 不改）"
+    },
+    "pageSize": {
+      "type": "integer",
+      "description": "网页展示每页行数（只是**展示**分页，不限制取数与导出）"
+    },
+    "clearPageSize": {
+      "type": "boolean",
+      "description": "是否清掉每页行数（恢复成不分页）",
+      "default": false
+    },
+    "frozenColumnCount": {
+      "type": "integer",
+      "description": "冻结前几列（不填 = 不改）"
+    },
+    "clearFrozenColumnCount": {
+      "type": "boolean",
+      "description": "是否清掉冻结列设置",
+      "default": false
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=no_changes
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_page_size
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_frozen_column_count
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_TABLE_DISPLAY", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_TABLE_DISPLAY", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/table_component.py::_set_table_display`
+
+### SET_TABLE_SUMMARIES
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置表格的**汇总引用**（完整清单：给了就是全部；清空用 clearSummaries）。每一项形如 {"label": "告警总数", "outputRef": "output:alarms", "fieldRef": "totalAlarmCount", "basis": "FULL_RESULT"}；outputRef 必须是这个区域**已登记**的计算输出（不会凭空生成汇总），basis 只能是 FULL_RESULT（全量口径）或 VISIBLE_ROWS（可见行口径）。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_TABLE_SUMMARIES", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_TABLE_SUMMARIES 的参数对象。",
+  "properties": {
+    "summaries": {
+      "type": "array",
+      "description": "完整的汇总清单：每一项形如 {\"label\": \"告警总数\", \"outputRef\": \"output:alarms\", \"fieldRef\": \"totalAlarmCount\", \"basis\": \"FULL_RESULT\"}；outputRef 必须是这个区域**已登记**的计算输出，basis 只能是 FULL_RESULT（全量口径）或 VISIBLE_ROWS（可见行口径）。",
+      "items": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "汇总标签",
+            "minLength": 1
+          },
+          "outputRef": {
+            "type": "string",
+            "description": "已登记的计算输出（output:<name>）",
+            "default": ""
+          },
+          "fieldRef": {
+            "type": "string",
+            "description": "汇总字段名",
+            "default": ""
+          },
+          "basis": {
+            "type": "string",
+            "description": "汇总口径（FULL_RESULT 全量口径 / VISIBLE_ROWS 可见行口径）",
+            "default": ""
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "clearSummaries": {
+      "type": "boolean",
+      "description": "是否清空全部汇总引用",
+      "default": false
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=no_changes
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_output_ref
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_TABLE_SUMMARIES", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_TABLE_SUMMARIES", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/table_component.py::_set_table_summaries`
+
+### SET_TEXT_CONTENT
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置文本区块的正文：template（正文文本）、format（PLAIN / MARKDOWN）、headingLevel（目录层级，不是字号）、bindings（占位符 → 表达式，形如 {"type": "FIELD", "fieldRef": "<字段名>"}）。**卡片标题与正文互不相干** —— 这里只改正文。模板里没有绑定的占位符不会报错，但会列在结果里；{{roomName}} 与 {{logicalDate}} 仍按固定替换生效。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_TEXT_CONTENT", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_TEXT_CONTENT 的参数对象。",
+  "properties": {
+    "template": {
+      "type": "string",
+      "description": "正文文本（空 = 不改）；里面的 {{占位符}} 按 bindings 取值",
+      "default": ""
+    },
+    "clearTemplate": {
+      "type": "boolean",
+      "description": "是否清空正文（true = 清空后再应用 template）",
+      "default": false
+    },
+    "format": {
+      "type": "string",
+      "description": "文本格式：PLAIN（纯文本，保留换行）或 MARKDOWN（受控 Markdown）",
+      "default": ""
+    },
+    "headingLevel": {
+      "type": "integer",
+      "description": "目录层级（0 起的整数；不填 = 不改）—— 不是字号"
+    },
+    "clearHeadingLevel": {
+      "type": "boolean",
+      "description": "是否清空目录层级",
+      "default": false
+    },
+    "bindings": {
+      "type": "object",
+      "description": "占位符 → 表达式：键是占位符名，值形如 {\"type\": \"FIELD\", \"fieldRef\": \"<字段名>\"}；给的项按名字合并进去，没给的保持原样。",
+      "additionalProperties": false
+    },
+    "clearBindings": {
+      "type": "boolean",
+      "description": "是否先清空全部占位符绑定（true = 清空后再应用 bindings）",
+      "default": false
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unsupported_text_format
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_heading_level
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_TEXT_CONTENT", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_TEXT_CONTENT", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/text_metric.py::_set_text_content`
+
+### SET_METRIC_ITEM
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置单指标卡：label（指标名称）、fieldRef（数值字段）、outputRef（覆盖区域默认输出，必须是本区域已登记的 output:<name>）、format（指标级显示格式）、comparisonFieldRef（对比字段）、iconRef（注册图标，只认注册清单里的键）。**改名称不碰数值、字段绑定、单位与格式。**对比字段与指标字段的单位必须一致，单位标签不许悄悄改。**指标卡 / 指标组的数字显示格式（精度、千分位、单位标签、空值文本）一律用本能力**：它写在指标项自己的 format 上；区域级的 SET_FORMAT 是整块卡片的格式，不是指标项的格式 —— 用它改指标卡会连带改掉这张卡上别的指标的单位。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_METRIC_ITEM", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_METRIC_ITEM 的参数对象。",
+  "properties": {
+    "label": {
+      "type": "string",
+      "description": "指标名称（空 = 不改）；改名字不碰数值、字段、单位与格式",
+      "default": ""
+    },
+    "fieldRef": {
+      "type": "string",
+      "description": "数值字段名（必须已登记或属于当前模拟字段目录；空 = 不改）",
+      "default": ""
+    },
+    "outputRef": {
+      "type": "string",
+      "description": "覆盖区域默认输出的引用（output:<name>，name 必须是本区域已登记的计算输出）",
+      "default": ""
+    },
+    "clearOutputRef": {
+      "type": "boolean",
+      "description": "是否清空输出覆盖（回到区域默认输出）",
+      "default": false
+    },
+    "format": {
+      "type": "object",
+      "description": "指标的显示格式（空 = 不改）：kind / precision / unitLabel / thousandSeparator / dateTimePattern / nullText / roundingMode",
+      "additionalProperties": false
+    },
+    "clearFormat": {
+      "type": "boolean",
+      "description": "是否清空指标格式",
+      "default": false
+    },
+    "comparisonFieldRef": {
+      "type": "string",
+      "description": "对比字段名（必须已登记；单位要与指标字段一致）",
+      "default": ""
+    },
+    "clearComparisonFieldRef": {
+      "type": "boolean",
+      "description": "是否清空对比字段",
+      "default": false
+    },
+    "iconRef": {
+      "type": "string",
+      "description": "注册图标引用（只认注册清单里的键；不接受图片 URL）",
+      "default": ""
+    },
+    "clearIconRef": {
+      "type": "boolean",
+      "description": "是否清空图标",
+      "default": false
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=incompatible_unit
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_METRIC_ITEM", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_METRIC_ITEM", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/text_metric.py::_set_metric_item`
+
+### SET_METRIC_GROUP
+
+- **入口类型**：`operation` —— 后端执行的操作 —— 不是独立 Tool
+- **分组**：清单能力 / 设置统计与展示
+- **状态**：`available`
+- **用途**：设置多指标组：metrics 是该组的**完整**指标项清单（每项形如 {'id': 'm_1', 'label': '总耗电量', 'fieldRef': 'totalEnergyKwh', 'format': {'kind': 'NUMBER'}}）；带 id 的项按 id 就地更新，不带 id 的是新项，清单里没有的项从展示清单里移除（**不删任何源数据 / 输出 / 列 / 区块**）。**不传 metrics = 只改排版，组里已有的指标项原样保留** —— 只改列数 / 间距这类要求不要顺手把指标项清成 0 项。arrangement 设组内排版（mode / columns / direction / gap）。create=true 可把指标卡（或正文为空的文本区块）改成多指标组。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}。**包装要求**：{"op": "SET_METRIC_GROUP", "target": {"regionId": "<regionId>"}, "params": {}}。
+- **参数**（JSON Schema，取自真实契约）：
+
+```json
+{
+  "type": "object",
+  "description": "SET_METRIC_GROUP 的参数对象。",
+  "properties": {
+    "metrics": {
+      "type": "array",
+      "description": "该指标组的**完整**指标项清单：每一项形如 {\"id\": \"m_1\", \"label\": \"总耗电量\", \"fieldRef\": \"totalEnergyKwh\", \"format\": {\"kind\": \"NUMBER\", \"precision\": 1}}；带 id 的项按 id 就地更新（id 必须已存在），不带 id 的是新项；清单里没有的项从展示清单里移除（**不删任何源数据 / 输出 / 列 / 区块**）。**不传这一项 = 只改组内排版，组里已有的指标项原样保留**（缺省不等于「清空」——清空会把用户没提的指标项悄悄抹掉）。",
+      "items": {
+        "type": "object"
+      }
+    },
+    "arrangement": {
+      "type": "object",
+      "description": "组内排版：{'mode': 'GRID'|'FLOW'|'ABSOLUTE', 'columns': 1..12, 'direction': 'VERTICAL'|'HORIZONTAL', 'gap': {'value': 0..96, 'unit': 'PX'|'PERCENT'}}",
+      "additionalProperties": false
+    },
+    "create": {
+      "type": "boolean",
+      "description": "是否把目标区块改成多指标组（指标卡 → 指标组；正文为空的文本区块 → 指标组）",
+      "default": false
+    }
+  }
+}
+```
+
+- **必填参数**：（无）
+- **目标 / 引用要求**：每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。
+- **返回值**：CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）
+- **适用节点**：WAITING_USER_CONFIRM、USER_EDITING_TEMPLATE
+- **只读**：否
+- **副作用**：只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。
+- **主要错误**：
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=incompatible_component_type
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_metric_item
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_metric_id
+  - 能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=incompatible_unit
+  - 参数不合法 → reason=invalid_params，不执行
+  - 目标引用不认识 → reason=unknown_ref / missing_target / unknown_region
+- **运行限制**：
+  - 每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）
+  - 提交位置：submit_edit_plan 的 operations 里直接给一项 {"op": "<能力名>", "target": {...}, "params": {...}}
+  - 包装要求：{"op": "SET_METRIC_GROUP", "target": {"regionId": "<regionId>"}, "params": {}}
+  - 最小结构示例（只给格式）：{"op": "SET_METRIC_GROUP", "target": {"regionId": "<regionId>"}, "params": {}}
+- **源码定位**：
+  - registration：`app/services/edit_capabilities/base.py::register`
+  - dispatch：`app/tools/submit_edit_plan_tool.py::run`
+  - validation：`app/services/edit_capabilities/base.py::validate_params`
+  - execution：`app/services/edit_capabilities/text_metric.py::_set_metric_group`
 
 ## 三、旧编辑意图（旧格式入口，由 TemplateEditEngine.apply 执行）
 
@@ -4863,9 +5823,9 @@
 <!-- 机器可读元数据（本文件的唯一机器可读来源；上面的正文是给人看的） -->
 ```json
 {
-  "version": "9d3a93dc46c648dc",
-  "contractFingerprint": "9d3a93dc46c648dc1574e420971faed31d22cd50874ff6568b55263e2e574c13",
-  "generatedAt": "2026-11-06T00:40:36+00:00",
+  "version": "72d0cc0c0c8adcc7",
+  "contractFingerprint": "72d0cc0c0c8adcc71374496f9491b273b3364e5529346c7a16b231a40dc33a4a",
+  "generatedAt": "2026-11-09T03:46:37+00:00",
   "entries": [
     {
       "id": "search_catalog",
@@ -5343,7 +6303,7 @@
       "group": "工具 / 事实查询（只读）",
       "entryType": "agent_tool",
       "status": "available",
-      "purpose": "列出当前可用的**模拟分类维度**（如告警等级、告警区域、告警类型），每个维度有哪些分类、各是多少模拟数值。新增分类统计图表（饼图 / 柱状图）时先用它确认维度名，再把 dimension 填进新增图表的参数里。这些数值都是**模拟**的，不接真实告警源。",
+      "purpose": "列出当前可用的**模拟分类维度**（如告警等级、告警区域、告警类型），每个维度有哪些分类、各是多少模拟数值。新增分类统计图表（饼图 / 柱状图）时先用它确认维度名，再把 dimension 填进新增图表的参数里。同时列出当前可绑定的**模拟单值字段**（指标卡 / 指标组 / 文本占位符用）与**注册图标**（指标图标用）—— 先查清单再填 fieldRef / iconRef，不要凭名字编字段或图标。这些数值都是**模拟**的，不接真实告警源。",
       "params": {
         "type": "object",
         "properties": {}
@@ -7147,6 +8107,7 @@
               "CONTAINER",
               "DATA_QUALITY",
               "METRIC_CARD",
+              "METRIC_GROUP",
               "TABLE",
               "TEXT"
             ],
@@ -7158,8 +8119,10 @@
             "enum": [
               "AREA",
               "BAR",
+              "DONUT",
               "LINE",
-              "PIE"
+              "PIE",
+              "STACKED_BAR"
             ],
             "default": ""
           },
@@ -7245,8 +8208,8 @@
         "不需要目标（自己新建区块 / 整批作用于草稿）",
         "新增的区块可用 params.ref 起稳定引用名，后续步骤用 target.ref 指它",
         "title 至少 1 个字符",
-        "componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、TABLE、TEXT",
-        "chartKind 取值域：AREA、BAR、LINE、PIE",
+        "componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、METRIC_GROUP、TABLE、TEXT",
+        "chartKind 取值域：AREA、BAR、DONUT、LINE、PIE、STACKED_BAR",
         "dimension 取值域：alertLevel、alertRegion、alertType",
         "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
         "包装要求：{\"op\": \"ADD_SECTION\", \"params\": {\"title\": \"<title>\"}}",
@@ -7316,6 +8279,7 @@
               "CONTAINER",
               "DATA_QUALITY",
               "METRIC_CARD",
+              "METRIC_GROUP",
               "TABLE",
               "TEXT"
             ],
@@ -7327,8 +8291,10 @@
             "enum": [
               "AREA",
               "BAR",
+              "DONUT",
               "LINE",
-              "PIE"
+              "PIE",
+              "STACKED_BAR"
             ],
             "default": ""
           }
@@ -7354,8 +8320,8 @@
       ],
       "limits": [
         "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
-        "componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、TABLE、TEXT",
-        "chartKind 取值域：AREA、BAR、LINE、PIE",
+        "componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、METRIC_GROUP、TABLE、TEXT",
+        "chartKind 取值域：AREA、BAR、DONUT、LINE、PIE、STACKED_BAR",
         "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
         "包装要求：{\"op\": \"SET_DISPLAY\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
         "最小结构示例（只给格式）：{\"op\": \"SET_DISPLAY\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
@@ -7446,7 +8412,7 @@
       "group": "清单能力 / 设置样式",
       "entryType": "operation",
       "status": "available",
-      "purpose": "一批受约束的展示操作（分组 / 排版 / 样式 / 格式 / 页面）。**这是一个包装能力**：展示操作名不是顶层能力，只能放在它的 params.operations 里，每一项形如 {\"op\": \"<展示操作名>\", \"params\": {...}}；operations 是**非空列表**。允许的 op、每个 op 的必填 / 可选键与取值域见能力总目录的「展示操作白名单」一节（由展示服务的白名单自动生成）。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里 SET_PRESENTATION 这一项的 params.operations 里（每一项形如 {\"op\": \"<展示操作名>\", \"params\": {...}}）。**包装要求**：{\"op\": \"SET_PRESENTATION\", \"params\": {\"operations\": [{\"op\": \"CREATE_GROUP\", \"params\": {\"groupId\": \"<groupId>\", \"memberRegionIds\": [\"<memberRegionIds>\"]}}]}}。",
+      "purpose": "一批受约束的展示操作（分组 / 排版 / 样式 / 格式 / 页面）。**这是一个包装能力**：展示操作名不是顶层能力，只能放在它的 params.operations 里，每一项形如 {\"op\": \"<展示操作名>\", \"params\": {...}}；operations 是**非空列表**。允许的 op、每个 op 的必填 / 可选键与取值域见能力总目录的「展示操作白名单」一节（由展示服务的白名单自动生成）。**区域级格式（SET_FORMAT）写的是整块卡片的格式**：指标卡 / 指标组里某个指标项的数字显示格式请用 SET_METRIC_ITEM（指标级）—— 区域级格式会连带改掉这张卡上别的指标的单位。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里 SET_PRESENTATION 这一项的 params.operations 里（每一项形如 {\"op\": \"<展示操作名>\", \"params\": {...}}）。**包装要求**：{\"op\": \"SET_PRESENTATION\", \"params\": {\"operations\": [{\"op\": \"CREATE_GROUP\", \"params\": {\"groupId\": \"<groupId>\", \"memberRegionIds\": [\"<memberRegionIds>\"]}}]}}。",
       "params": {
         "type": "object",
         "description": "SET_PRESENTATION 的参数对象。",
@@ -7518,6 +8484,975 @@
         "dispatch": "app/tools/submit_edit_plan_tool.py::run",
         "validation": "app/services/edit_capabilities/base.py::validate_params",
         "execution": "app/services/edit_capabilities/blocks.py::_set_presentation"
+      }
+    },
+    {
+      "id": "SET_DATA_BINDING",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置这个区域**展示**用的绑定：outputRef（换绑已登记的输出）、fieldAliases（展示字段名 → 实际结果字段名）、presentationFilters（只过滤展示记录）、sort / topN（展示排序与前 N 项）。这些**只改展示**：源输出、全量总计和其他区域的输入不变；未登记的引用会被拒绝，不会自动新增跨区域数据依赖。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_DATA_BINDING\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_DATA_BINDING 的参数对象。",
+        "properties": {
+          "outputRef": {
+            "type": "string",
+            "description": "改绑的输出引用（output:<name>）",
+            "default": ""
+          },
+          "fieldAliases": {
+            "type": "object",
+            "description": "展示字段名 → 实际结果字段名，例如 {\"时间点\":\"timestamp\"}。右侧必须是已声明字段；也兼容可唯一识别的反向映射。",
+            "additionalProperties": false
+          },
+          "clearFieldAliases": {
+            "type": "boolean",
+            "default": false
+          },
+          "presentationFilters": {
+            "type": "array",
+            "description": "只过滤展示记录。条件形如 {\"type\":\"CONDITION\",\"left\":{\"type\":\"FIELD\",\"fieldRef\":\"energyKwh\"},\"operator\":\"GT\",\"operands\":[{\"type\":\"LITERAL\",\"value\":400}]}；组用 type=GROUP、logic=AND/OR/NOT、conditions=[条件]。也接收 fieldRef/operator/value 简写，统一转成上述结构。",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "CONDITION",
+                    "GROUP"
+                  ]
+                },
+                "left": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "FIELD"
+                      ]
+                    },
+                    "fieldRef": {
+                      "type": "string",
+                      "description": "已声明的实际字段名"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "operator": {
+                  "type": "string",
+                  "enum": [
+                    "EQ",
+                    "NE",
+                    "GT",
+                    "GE",
+                    "LT",
+                    "LE",
+                    "IN",
+                    "NOT_IN",
+                    "BETWEEN",
+                    "CONTAINS",
+                    "STARTS_WITH",
+                    "IS_NULL",
+                    "IS_NOT_NULL"
+                  ]
+                },
+                "operands": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "type": "string",
+                        "enum": [
+                          "LITERAL"
+                        ]
+                      },
+                      "value": {
+                        "type": "string",
+                        "description": "字面量值；数字阈值用数字"
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "logic": {
+                  "type": "string",
+                  "enum": [
+                    "AND",
+                    "OR",
+                    "NOT"
+                  ]
+                },
+                "conditions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "clearPresentationFilters": {
+            "type": "boolean",
+            "default": false
+          },
+          "sort": {
+            "type": "array",
+            "description": "展示排序字段（fieldRef / direction / nulls）",
+            "items": {
+              "type": "object"
+            }
+          },
+          "clearSort": {
+            "type": "boolean",
+            "default": false
+          },
+          "topN": {
+            "type": "integer",
+            "description": "展示前 N 项；只是展示裁剪，不限制取数"
+          },
+          "clearTopN": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（带 step / op / target / constraint / reason）",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_DATA_BINDING\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_DATA_BINDING\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/binding_component.py::_set_data_binding"
+      }
+    },
+    {
+      "id": "SET_CHART_KIND",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "改一个图表区块的图表类型：LINE / AREA / BAR / STACKED_BAR / PIE / DONUT。**只改图型**，分类、系列与数值一律不动；类型逐字保留（STACKED_BAR 不折成 BAR，DONUT 不折成 PIE）。饼图 / 环形图复用当前分类绑定，或当前输出已声明的分类字段与数值字段；已有分组聚合输出、SUM/COUNT 的离散时间桶也可直接切换，保持原标签和逐点数值。无需先调用 SET_CATEGORY_DATA；不得为了切换图型另填分类或数值。未聚合的连续时间序列与多系列不能直接转换。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_CHART_KIND\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {\"chartKind\": \"AREA\"}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_CHART_KIND 的参数对象。",
+        "properties": {
+          "chartKind": {
+            "type": "string",
+            "description": "图表类型（LINE / AREA / BAR / STACKED_BAR / PIE / DONUT）",
+            "enum": [
+              "AREA",
+              "BAR",
+              "DONUT",
+              "LINE",
+              "PIE",
+              "STACKED_BAR"
+            ],
+            "minLength": 1
+          }
+        },
+        "required": [
+          "chartKind"
+        ]
+      },
+      "required": [
+        "chartKind"
+      ],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unsupported_chart_kind",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=incompatible_data_shape",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "chartKind 取值域：AREA、BAR、DONUT、LINE、PIE、STACKED_BAR",
+        "chartKind 至少 1 个字符",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_CHART_KIND\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {\"chartKind\": \"AREA\"}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_CHART_KIND\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {\"chartKind\": \"AREA\"}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/chart_component.py::_set_chart_kind"
+      }
+    },
+    {
+      "id": "SET_CHART_ENCODINGS",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置图表的视觉通道绑定（给的是**完整清单**）：每一项形如 {\"channel\": \"X\", \"fieldRef\": \"<字段名>\", \"format\": {...}}；channel 取 X / Y / SERIES / COLOR / LABEL，每个通道最多一项。字段必须已登记或属于当前模拟字段目录；饼图 / 环形图没有横纵轴，只接受 COLOR 与 LABEL。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_CHART_ENCODINGS\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_CHART_ENCODINGS 的参数对象。",
+        "properties": {
+          "encodings": {
+            "type": "array",
+            "description": "完整的通道绑定清单：每一项形如 {\"channel\": \"X\", \"fieldRef\": \"<字段名>\", \"format\": {...}}；channel 取 X / Y / SERIES / COLOR / LABEL，每个通道最多一项。",
+            "items": {
+              "type": "object",
+              "properties": {
+                "channel": {
+                  "type": "string",
+                  "description": "视觉通道（X / Y / SERIES / COLOR / LABEL）",
+                  "enum": [
+                    "X",
+                    "Y",
+                    "SERIES",
+                    "COLOR",
+                    "LABEL"
+                  ]
+                },
+                "fieldRef": {
+                  "type": "string",
+                  "description": "数据字段名（必须已登记或属于模拟字段目录）"
+                },
+                "format": {
+                  "type": "object",
+                  "description": "该通道的显示格式（可选）",
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_encoding",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=missing_channel",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unsupported_channel",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=duplicate_channel",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=channel_not_applicable",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_CHART_ENCODINGS\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_CHART_ENCODINGS\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/chart_component.py::_set_chart_encodings"
+      }
+    },
+    {
+      "id": "SET_CHART_AXES",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置图表坐标轴：axes 的键是 'x' 或 'y'，值形如 {\"title\": \"...\", \"minimum\": 0, \"maximum\": 100, \"format\": {...}, \"scale\": \"LINEAR\"}；给哪个轴就改哪个轴，没给的轴保持原样（clearAxes=true 先清空全部）。scale 取 LINEAR / LOG / TIME / CATEGORY；下限不能高于上限。饼图 / 环形图没有坐标轴，设不了。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_CHART_AXES\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_CHART_AXES 的参数对象。",
+        "properties": {
+          "axes": {
+            "type": "object",
+            "description": "要设置的坐标轴：键是 'x' 或 'y'，值形如 {\"title\": \"...\", \"minimum\": 0, \"maximum\": 100, \"format\": {...}, \"scale\": \"LINEAR\"}；给哪个轴就改哪个轴，没给的轴保持原样。",
+            "additionalProperties": false
+          },
+          "clearAxes": {
+            "type": "boolean",
+            "description": "是否先清空全部坐标轴（true = 清空后再应用 axes 里的内容）",
+            "default": false
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=axes_not_supported",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_axis",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_CHART_AXES\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_CHART_AXES\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/chart_component.py::_set_chart_axes"
+      }
+    },
+    {
+      "id": "SET_CHART_LEGEND",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置图例开关与稳定系列配色：legend 是布尔值（不填 = 不改，协议里图例只有开关，没有位置与方向）；seriesColors 是「稳定系列键 → 颜色」的映射（颜色写十六进制、rgb()/hsl()、颜色关键字或主题 token 名，不接受外链）；系列键必须是这个图表真实存在的系列（clearSeriesColors=true 先清空）。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_CHART_LEGEND\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_CHART_LEGEND 的参数对象。",
+        "properties": {
+          "legend": {
+            "type": "boolean",
+            "description": "是否显示图例（不填 = 不改；协议里图例只有开关，没有位置 / 方向）"
+          },
+          "seriesColors": {
+            "type": "object",
+            "description": "稳定系列键 → 颜色（十六进制 / rgb() / 颜色关键字或主题 token 名）",
+            "additionalProperties": false
+          },
+          "clearSeriesColors": {
+            "type": "boolean",
+            "description": "是否先清空已有配色（true = 清空后再应用 seriesColors）",
+            "default": false
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_series",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_series_color",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_CHART_LEGEND\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_CHART_LEGEND\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/chart_component.py::_set_chart_legend"
+      }
+    },
+    {
+      "id": "SET_CHART_TOOLTIP",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置提示框里**额外**显示的字段：tooltipFields 给的是完整清单（字段必须已登记或属于当前模拟字段目录；clearTooltipFields=true 清空）。基础提示（分类名与数值）永远保留，不会被关掉。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_CHART_TOOLTIP\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_CHART_TOOLTIP 的参数对象。",
+        "properties": {
+          "tooltipFields": {
+            "type": "array",
+            "description": "提示里要额外显示的字段名（非空时按此完整清单替换）",
+            "items": {
+              "type": "string"
+            }
+          },
+          "clearTooltipFields": {
+            "type": "boolean",
+            "description": "是否清空提示字段（true = 清空；基础提示不受影响）",
+            "default": false
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_CHART_TOOLTIP\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_CHART_TOOLTIP\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/chart_component.py::_set_chart_tooltip"
+      }
+    },
+    {
+      "id": "SET_CHART_REFERENCE_LINES",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置参考线：referenceLines 是「名称 → 表达式」，形如 {\"type\": \"LITERAL\", \"value\": 100}（本批只支持常量数值表达式，数值按图表数值轴的单位理解）；参考线挂在有单一数值轴的图型上，饼图 / 环形图没有轴，设不了；名称不能重复（clearReferenceLines=true 先清空）。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_CHART_REFERENCE_LINES\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_CHART_REFERENCE_LINES 的参数对象。",
+        "properties": {
+          "referenceLines": {
+            "type": "object",
+            "description": "参考线：名称 → 表达式，形如 {\"type\": \"LITERAL\", \"value\": 100}；数值按图表数值轴的单位理解。",
+            "additionalProperties": false
+          },
+          "clearReferenceLines": {
+            "type": "boolean",
+            "description": "是否先清空已有参考线（true = 清空后再应用 referenceLines）",
+            "default": false
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=reference_axis_ambiguous",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_reference_line",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=duplicate_reference_line",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_CHART_REFERENCE_LINES\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_CHART_REFERENCE_LINES\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/chart_component.py::_set_chart_reference_lines"
+      }
+    },
+    {
+      "id": "SET_TABLE_COLUMNS",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置表格的**列清单**（完整清单：给了就是全部，顺序即显示顺序）。每一项形如 {\"id\": \"col_1\", \"label\": \"机房名称\", \"fieldRef\": \"roomName\", \"format\": {\"kind\": \"TEXT\"}, \"width\": {\"value\": 120, \"unit\": \"PX\"}, \"style\": {\"textAlign\": \"LEFT\"}, \"headerPath\": [\"能耗\", \"总量\"]}；给了 id 就是改这一列（id 必须已存在），不给 id 就是新增一列。标题（label）与取值字段（fieldRef）**互相独立**；清单里没有的列**不再显示**，但源字段、输出与指标一个都不删。**只改其中几列时，清单里其余列的相对顺序要照抄当前表格的顺序**（先按 get_current_region 给的顺序列出，再改你要改的那几项）—— **不要按 id 重排**：清单顺序就是显示顺序，按 id 排会把用户刚放好的列挪走。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_TABLE_COLUMNS\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_TABLE_COLUMNS 的参数对象。",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "description": "完整的列清单（顺序即显示顺序）：每一项形如 {\"id\": \"col_1\", \"label\": \"机房名称\", \"fieldRef\": \"roomName\", \"format\": {\"kind\": \"TEXT\"}, \"width\": {\"value\": 120, \"unit\": \"PX\"}, \"style\": {\"textAlign\": \"LEFT\"}, \"headerPath\": [\"能耗\", \"总量\"]}；给了 id 就是改这一列（id 必须已存在），不给 id 就是新增一列。清单里没有的列**不再显示**（源字段、输出与指标一个都不删）。",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "列的稳定 id（改已有列时给，新增列不给）",
+                  "default": ""
+                },
+                "label": {
+                  "type": "string",
+                  "description": "列标题（与取值字段互相独立）",
+                  "default": ""
+                },
+                "fieldRef": {
+                  "type": "string",
+                  "description": "取值字段名（必须已登记）",
+                  "default": ""
+                },
+                "format": {
+                  "type": "object",
+                  "description": "这一列的显示格式（可选；不给则沿用原格式）",
+                  "additionalProperties": false
+                },
+                "width": {
+                  "type": "object",
+                  "description": "列宽 {\"value\": 120, \"unit\": \"PX\"}（可选）",
+                  "additionalProperties": false
+                },
+                "style": {
+                  "type": "object",
+                  "description": "这一列的样式（可选；只认受控的外观键）",
+                  "additionalProperties": false
+                },
+                "headerPath": {
+                  "type": "array",
+                  "description": "多层表头路径（可选；每一层一段表头文字；[] 表示清空）",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=no_changes",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=empty_column_list",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_column_id",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=missing_column_label",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=missing_column_field_ref",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_TABLE_COLUMNS\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_TABLE_COLUMNS\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/table_component.py::_set_table_columns"
+      }
+    },
+    {
+      "id": "SET_TABLE_DISPLAY",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置表格的**展示方式**：groupRowsBy（按字段分组显示行 —— 只是排版，**不产生小计或聚合**；清空用 clearGroupRowsBy）、rowNumber（是否显示序号）、pageSize（网页展示每页行数 —— 只是展示分页，**不限制取数与导出**；清空用 clearPageSize）、frozenColumnCount（冻结前几列；清空用 clearFrozenColumnCount）。没给的项保持原样。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_TABLE_DISPLAY\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_TABLE_DISPLAY 的参数对象。",
+        "properties": {
+          "groupRowsBy": {
+            "type": "array",
+            "description": "按哪些字段分组显示行（只是展示分组，**不产生小计或聚合**）；清空用 clearGroupRowsBy",
+            "items": {
+              "type": "string"
+            }
+          },
+          "clearGroupRowsBy": {
+            "type": "boolean",
+            "description": "是否清空行分组字段",
+            "default": false
+          },
+          "rowNumber": {
+            "type": "boolean",
+            "description": "是否显示序号列（不填 = 不改）"
+          },
+          "pageSize": {
+            "type": "integer",
+            "description": "网页展示每页行数（只是**展示**分页，不限制取数与导出）"
+          },
+          "clearPageSize": {
+            "type": "boolean",
+            "description": "是否清掉每页行数（恢复成不分页）",
+            "default": false
+          },
+          "frozenColumnCount": {
+            "type": "integer",
+            "description": "冻结前几列（不填 = 不改）"
+          },
+          "clearFrozenColumnCount": {
+            "type": "boolean",
+            "description": "是否清掉冻结列设置",
+            "default": false
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=no_changes",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_page_size",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_frozen_column_count",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_TABLE_DISPLAY\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_TABLE_DISPLAY\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/table_component.py::_set_table_display"
+      }
+    },
+    {
+      "id": "SET_TABLE_SUMMARIES",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置表格的**汇总引用**（完整清单：给了就是全部；清空用 clearSummaries）。每一项形如 {\"label\": \"告警总数\", \"outputRef\": \"output:alarms\", \"fieldRef\": \"totalAlarmCount\", \"basis\": \"FULL_RESULT\"}；outputRef 必须是这个区域**已登记**的计算输出（不会凭空生成汇总），basis 只能是 FULL_RESULT（全量口径）或 VISIBLE_ROWS（可见行口径）。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_TABLE_SUMMARIES\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_TABLE_SUMMARIES 的参数对象。",
+        "properties": {
+          "summaries": {
+            "type": "array",
+            "description": "完整的汇总清单：每一项形如 {\"label\": \"告警总数\", \"outputRef\": \"output:alarms\", \"fieldRef\": \"totalAlarmCount\", \"basis\": \"FULL_RESULT\"}；outputRef 必须是这个区域**已登记**的计算输出，basis 只能是 FULL_RESULT（全量口径）或 VISIBLE_ROWS（可见行口径）。",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "description": "汇总标签",
+                  "minLength": 1
+                },
+                "outputRef": {
+                  "type": "string",
+                  "description": "已登记的计算输出（output:<name>）",
+                  "default": ""
+                },
+                "fieldRef": {
+                  "type": "string",
+                  "description": "汇总字段名",
+                  "default": ""
+                },
+                "basis": {
+                  "type": "string",
+                  "description": "汇总口径（FULL_RESULT 全量口径 / VISIBLE_ROWS 可见行口径）",
+                  "default": ""
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "clearSummaries": {
+            "type": "boolean",
+            "description": "是否清空全部汇总引用",
+            "default": false
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_region",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=no_changes",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_output_ref",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_TABLE_SUMMARIES\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_TABLE_SUMMARIES\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/table_component.py::_set_table_summaries"
+      }
+    },
+    {
+      "id": "SET_TEXT_CONTENT",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置文本区块的正文：template（正文文本）、format（PLAIN / MARKDOWN）、headingLevel（目录层级，不是字号）、bindings（占位符 → 表达式，形如 {\"type\": \"FIELD\", \"fieldRef\": \"<字段名>\"}）。**卡片标题与正文互不相干** —— 这里只改正文。模板里没有绑定的占位符不会报错，但会列在结果里；{{roomName}} 与 {{logicalDate}} 仍按固定替换生效。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_TEXT_CONTENT\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_TEXT_CONTENT 的参数对象。",
+        "properties": {
+          "template": {
+            "type": "string",
+            "description": "正文文本（空 = 不改）；里面的 {{占位符}} 按 bindings 取值",
+            "default": ""
+          },
+          "clearTemplate": {
+            "type": "boolean",
+            "description": "是否清空正文（true = 清空后再应用 template）",
+            "default": false
+          },
+          "format": {
+            "type": "string",
+            "description": "文本格式：PLAIN（纯文本，保留换行）或 MARKDOWN（受控 Markdown）",
+            "default": ""
+          },
+          "headingLevel": {
+            "type": "integer",
+            "description": "目录层级（0 起的整数；不填 = 不改）—— 不是字号"
+          },
+          "clearHeadingLevel": {
+            "type": "boolean",
+            "description": "是否清空目录层级",
+            "default": false
+          },
+          "bindings": {
+            "type": "object",
+            "description": "占位符 → 表达式：键是占位符名，值形如 {\"type\": \"FIELD\", \"fieldRef\": \"<字段名>\"}；给的项按名字合并进去，没给的保持原样。",
+            "additionalProperties": false
+          },
+          "clearBindings": {
+            "type": "boolean",
+            "description": "是否先清空全部占位符绑定（true = 清空后再应用 bindings）",
+            "default": false
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unsupported_text_format",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_heading_level",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_TEXT_CONTENT\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_TEXT_CONTENT\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/text_metric.py::_set_text_content"
+      }
+    },
+    {
+      "id": "SET_METRIC_ITEM",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置单指标卡：label（指标名称）、fieldRef（数值字段）、outputRef（覆盖区域默认输出，必须是本区域已登记的 output:<name>）、format（指标级显示格式）、comparisonFieldRef（对比字段）、iconRef（注册图标，只认注册清单里的键）。**改名称不碰数值、字段绑定、单位与格式。**对比字段与指标字段的单位必须一致，单位标签不许悄悄改。**指标卡 / 指标组的数字显示格式（精度、千分位、单位标签、空值文本）一律用本能力**：它写在指标项自己的 format 上；区域级的 SET_FORMAT 是整块卡片的格式，不是指标项的格式 —— 用它改指标卡会连带改掉这张卡上别的指标的单位。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_METRIC_ITEM\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_METRIC_ITEM 的参数对象。",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "指标名称（空 = 不改）；改名字不碰数值、字段、单位与格式",
+            "default": ""
+          },
+          "fieldRef": {
+            "type": "string",
+            "description": "数值字段名（必须已登记或属于当前模拟字段目录；空 = 不改）",
+            "default": ""
+          },
+          "outputRef": {
+            "type": "string",
+            "description": "覆盖区域默认输出的引用（output:<name>，name 必须是本区域已登记的计算输出）",
+            "default": ""
+          },
+          "clearOutputRef": {
+            "type": "boolean",
+            "description": "是否清空输出覆盖（回到区域默认输出）",
+            "default": false
+          },
+          "format": {
+            "type": "object",
+            "description": "指标的显示格式（空 = 不改）：kind / precision / unitLabel / thousandSeparator / dateTimePattern / nullText / roundingMode",
+            "additionalProperties": false
+          },
+          "clearFormat": {
+            "type": "boolean",
+            "description": "是否清空指标格式",
+            "default": false
+          },
+          "comparisonFieldRef": {
+            "type": "string",
+            "description": "对比字段名（必须已登记；单位要与指标字段一致）",
+            "default": ""
+          },
+          "clearComparisonFieldRef": {
+            "type": "boolean",
+            "description": "是否清空对比字段",
+            "default": false
+          },
+          "iconRef": {
+            "type": "string",
+            "description": "注册图标引用（只认注册清单里的键；不接受图片 URL）",
+            "default": ""
+          },
+          "clearIconRef": {
+            "type": "boolean",
+            "description": "是否清空图标",
+            "default": false
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=incompatible_unit",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_METRIC_ITEM\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_METRIC_ITEM\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/text_metric.py::_set_metric_item"
+      }
+    },
+    {
+      "id": "SET_METRIC_GROUP",
+      "group": "清单能力 / 设置统计与展示",
+      "entryType": "operation",
+      "status": "available",
+      "purpose": "设置多指标组：metrics 是该组的**完整**指标项清单（每项形如 {'id': 'm_1', 'label': '总耗电量', 'fieldRef': 'totalEnergyKwh', 'format': {'kind': 'NUMBER'}}）；带 id 的项按 id 就地更新，不带 id 的是新项，清单里没有的项从展示清单里移除（**不删任何源数据 / 输出 / 列 / 区块**）。**不传 metrics = 只改排版，组里已有的指标项原样保留** —— 只改列数 / 间距这类要求不要顺手把指标项清成 0 项。arrangement 设组内排版（mode / columns / direction / gap）。create=true 可把指标卡（或正文为空的文本区块）改成多指标组。 （**操作清单里的能力，不是独立 Tool**：模型在 submit_edit_plan 的 operations 里给出 op + target + params，由后端在草稿副本上执行。）**提交位置**：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}。**包装要求**：{\"op\": \"SET_METRIC_GROUP\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}。",
+      "params": {
+        "type": "object",
+        "description": "SET_METRIC_GROUP 的参数对象。",
+        "properties": {
+          "metrics": {
+            "type": "array",
+            "description": "该指标组的**完整**指标项清单：每一项形如 {\"id\": \"m_1\", \"label\": \"总耗电量\", \"fieldRef\": \"totalEnergyKwh\", \"format\": {\"kind\": \"NUMBER\", \"precision\": 1}}；带 id 的项按 id 就地更新（id 必须已存在），不带 id 的是新项；清单里没有的项从展示清单里移除（**不删任何源数据 / 输出 / 列 / 区块**）。**不传这一项 = 只改组内排版，组里已有的指标项原样保留**（缺省不等于「清空」——清空会把用户没提的指标项悄悄抹掉）。",
+            "items": {
+              "type": "object"
+            }
+          },
+          "arrangement": {
+            "type": "object",
+            "description": "组内排版：{'mode': 'GRID'|'FLOW'|'ABSOLUTE', 'columns': 1..12, 'direction': 'VERTICAL'|'HORIZONTAL', 'gap': {'value': 0..96, 'unit': 'PX'|'PERCENT'}}",
+            "additionalProperties": false
+          },
+          "create": {
+            "type": "boolean",
+            "description": "是否把目标区块改成多指标组（指标卡 → 指标组；正文为空的文本区块 → 指标组）",
+            "default": false
+          }
+        }
+      },
+      "required": [],
+      "targetSpec": "每一步各自带 target：target.regionId 指向草稿里已有区块，target.ref 指向本次新增区块（ADD_SECTION 的 params.ref 起名）。",
+      "resultSpec": "CapabilityOutcome：ok / message / detail（含 regionId、title、chartKind）；试做失败时返回具体错误（哪一步、哪个目标、哪条约束、为什么，外加字段路径、收到的类型、要求的类型、该填在哪、最小示例）",
+      "states": [
+        "WAITING_USER_CONFIRM",
+        "USER_EDITING_TEMPLATE"
+      ],
+      "readOnly": false,
+      "sideEffects": "只改**服务端草稿的隔离副本**；试做通过并由用户接受后，才在正式事务里写入草稿（版本 +1）。",
+      "errors": [
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=incompatible_component_type",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=invalid_metric_item",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=unknown_metric_id",
+        "能力失败抛 CapabilityError（step / op / target / constraint / reason），reason=incompatible_unit",
+        "参数不合法 → reason=invalid_params，不执行",
+        "目标引用不认识 → reason=unknown_ref / missing_target / unknown_region"
+      ],
+      "limits": [
+        "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）",
+        "提交位置：submit_edit_plan 的 operations 里直接给一项 {\"op\": \"<能力名>\", \"target\": {...}, \"params\": {...}}",
+        "包装要求：{\"op\": \"SET_METRIC_GROUP\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}",
+        "最小结构示例（只给格式）：{\"op\": \"SET_METRIC_GROUP\", \"target\": {\"regionId\": \"<regionId>\"}, \"params\": {}}"
+      ],
+      "code": {
+        "registration": "app/services/edit_capabilities/base.py::register",
+        "dispatch": "app/tools/submit_edit_plan_tool.py::run",
+        "validation": "app/services/edit_capabilities/base.py::validate_params",
+        "execution": "app/services/edit_capabilities/text_metric.py::_set_metric_group"
       }
     },
     {
@@ -17503,7 +19438,7 @@
   ],
   "counts": {
     "agent_tool": 20,
-    "operation": 24,
+    "operation": 37,
     "legacy_intent": 17
   },
   "contract": {
@@ -17553,6 +19488,7 @@
               "CONTAINER",
               "DATA_QUALITY",
               "METRIC_CARD",
+              "METRIC_GROUP",
               "TABLE",
               "TEXT"
             ]
@@ -17565,8 +19501,10 @@
             "enum": [
               "AREA",
               "BAR",
+              "DONUT",
               "LINE",
-              "PIE"
+              "PIE",
+              "STACKED_BAR"
             ]
           },
           {
@@ -17632,8 +19570,8 @@
         "references": [],
         "limits": [
           "title 至少 1 个字符",
-          "componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、TABLE、TEXT",
-          "chartKind 取值域：AREA、BAR、LINE、PIE",
+          "componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、METRIC_GROUP、TABLE、TEXT",
+          "chartKind 取值域：AREA、BAR、DONUT、LINE、PIE、STACKED_BAR",
           "dimension 取值域：alertLevel、alertRegion、alertType",
           "不需要目标（自己新建区块 / 整批作用于草稿）",
           "新增的区块可用 params.ref 起稳定引用名，后续步骤用 target.ref 指它"
@@ -17694,6 +19632,7 @@
               "CONTAINER",
               "DATA_QUALITY",
               "METRIC_CARD",
+              "METRIC_GROUP",
               "TABLE",
               "TEXT"
             ]
@@ -17706,15 +19645,17 @@
             "enum": [
               "AREA",
               "BAR",
+              "DONUT",
               "LINE",
-              "PIE"
+              "PIE",
+              "STACKED_BAR"
             ]
           }
         ],
         "references": [],
         "limits": [
-          "componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、TABLE、TEXT",
-          "chartKind 取值域：AREA、BAR、LINE、PIE",
+          "componentType 取值域：ANALYSIS、CHART、CONTAINER、DATA_QUALITY、METRIC_CARD、METRIC_GROUP、TABLE、TEXT",
+          "chartKind 取值域：AREA、BAR、DONUT、LINE、PIE、STACKED_BAR",
           "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
         ],
         "available": true,
@@ -17854,6 +19795,891 @@
         "limits": [
           "operations 至少 1 项",
           "不需要目标（自己新建区块 / 整批作用于草稿）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_DATA_BINDING",
+        "title": "设置展示绑定",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_DATA_BINDING",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "outputRef",
+          "fieldAliases",
+          "clearFieldAliases",
+          "presentationFilters",
+          "clearPresentationFilters",
+          "sort",
+          "clearSort",
+          "topN",
+          "clearTopN"
+        ],
+        "fields": [
+          {
+            "name": "outputRef",
+            "type": "string",
+            "required": false,
+            "description": "改绑的输出引用（output:<name>）"
+          },
+          {
+            "name": "fieldAliases",
+            "type": "object",
+            "required": false,
+            "description": "展示字段名 → 实际结果字段名，例如 {\"时间点\":\"timestamp\"}。右侧必须是已声明字段；也兼容可唯一识别的反向映射。",
+            "freeForm": true
+          },
+          {
+            "name": "clearFieldAliases",
+            "type": "boolean",
+            "required": false
+          },
+          {
+            "name": "presentationFilters",
+            "type": "array",
+            "required": false,
+            "description": "只过滤展示记录。条件形如 {\"type\":\"CONDITION\",\"left\":{\"type\":\"FIELD\",\"fieldRef\":\"energyKwh\"},\"operator\":\"GT\",\"operands\":[{\"type\":\"LITERAL\",\"value\":400}]}；组用 type=GROUP、logic=AND/OR/NOT、conditions=[条件]。也接收 fieldRef/operator/value 简写，统一转成上述结构。",
+            "items": [
+              {
+                "name": "type",
+                "type": "string",
+                "required": false,
+                "enum": [
+                  "CONDITION",
+                  "GROUP"
+                ]
+              },
+              {
+                "name": "left",
+                "type": "object",
+                "required": false,
+                "properties": [
+                  {
+                    "name": "type",
+                    "type": "string",
+                    "required": true,
+                    "enum": [
+                      "FIELD"
+                    ]
+                  },
+                  {
+                    "name": "fieldRef",
+                    "type": "string",
+                    "required": true,
+                    "description": "已声明的实际字段名"
+                  }
+                ]
+              },
+              {
+                "name": "operator",
+                "type": "string",
+                "required": false,
+                "enum": [
+                  "EQ",
+                  "NE",
+                  "GT",
+                  "GE",
+                  "LT",
+                  "LE",
+                  "IN",
+                  "NOT_IN",
+                  "BETWEEN",
+                  "CONTAINS",
+                  "STARTS_WITH",
+                  "IS_NULL",
+                  "IS_NOT_NULL"
+                ]
+              },
+              {
+                "name": "operands",
+                "type": "array",
+                "required": false,
+                "items": [
+                  {
+                    "name": "type",
+                    "type": "string",
+                    "required": true,
+                    "enum": [
+                      "LITERAL"
+                    ]
+                  },
+                  {
+                    "name": "value",
+                    "type": "string",
+                    "required": true,
+                    "description": "字面量值；数字阈值用数字"
+                  }
+                ]
+              },
+              {
+                "name": "logic",
+                "type": "string",
+                "required": false,
+                "enum": [
+                  "AND",
+                  "OR",
+                  "NOT"
+                ]
+              },
+              {
+                "name": "conditions",
+                "type": "array",
+                "required": false,
+                "itemsType": "object"
+              }
+            ]
+          },
+          {
+            "name": "clearPresentationFilters",
+            "type": "boolean",
+            "required": false
+          },
+          {
+            "name": "sort",
+            "type": "array",
+            "required": false,
+            "description": "展示排序字段（fieldRef / direction / nulls）",
+            "itemsType": "object"
+          },
+          {
+            "name": "clearSort",
+            "type": "boolean",
+            "required": false
+          },
+          {
+            "name": "topN",
+            "type": "integer",
+            "required": false,
+            "description": "展示前 N 项；只是展示裁剪，不限制取数"
+          },
+          {
+            "name": "clearTopN",
+            "type": "boolean",
+            "required": false
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_CHART_KIND",
+        "title": "设置图表类型",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_CHART_KIND",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {
+            "chartKind": "AREA"
+          }
+        },
+        "required": [
+          "chartKind"
+        ],
+        "optional": [],
+        "fields": [
+          {
+            "name": "chartKind",
+            "type": "string",
+            "required": true,
+            "description": "图表类型（LINE / AREA / BAR / STACKED_BAR / PIE / DONUT）",
+            "enum": [
+              "AREA",
+              "BAR",
+              "DONUT",
+              "LINE",
+              "PIE",
+              "STACKED_BAR"
+            ],
+            "minLength": 1
+          }
+        ],
+        "references": [],
+        "limits": [
+          "chartKind 取值域：AREA、BAR、DONUT、LINE、PIE、STACKED_BAR",
+          "chartKind 至少 1 个字符",
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_CHART_ENCODINGS",
+        "title": "设置图表通道绑定",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_CHART_ENCODINGS",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "encodings"
+        ],
+        "fields": [
+          {
+            "name": "encodings",
+            "type": "array",
+            "required": false,
+            "description": "完整的通道绑定清单：每一项形如 {\"channel\": \"X\", \"fieldRef\": \"<字段名>\", \"format\": {...}}；channel 取 X / Y / SERIES / COLOR / LABEL，每个通道最多一项。",
+            "items": [
+              {
+                "name": "channel",
+                "type": "string",
+                "required": false,
+                "description": "视觉通道（X / Y / SERIES / COLOR / LABEL）",
+                "enum": [
+                  "X",
+                  "Y",
+                  "SERIES",
+                  "COLOR",
+                  "LABEL"
+                ]
+              },
+              {
+                "name": "fieldRef",
+                "type": "string",
+                "required": false,
+                "description": "数据字段名（必须已登记或属于模拟字段目录）"
+              },
+              {
+                "name": "format",
+                "type": "object",
+                "required": false,
+                "description": "该通道的显示格式（可选）",
+                "freeForm": true
+              }
+            ]
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_CHART_AXES",
+        "title": "设置图表坐标轴",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_CHART_AXES",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "axes",
+          "clearAxes"
+        ],
+        "fields": [
+          {
+            "name": "axes",
+            "type": "object",
+            "required": false,
+            "description": "要设置的坐标轴：键是 'x' 或 'y'，值形如 {\"title\": \"...\", \"minimum\": 0, \"maximum\": 100, \"format\": {...}, \"scale\": \"LINEAR\"}；给哪个轴就改哪个轴，没给的轴保持原样。",
+            "freeForm": true
+          },
+          {
+            "name": "clearAxes",
+            "type": "boolean",
+            "required": false,
+            "description": "是否先清空全部坐标轴（true = 清空后再应用 axes 里的内容）"
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_CHART_LEGEND",
+        "title": "设置图例与系列配色",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_CHART_LEGEND",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "legend",
+          "seriesColors",
+          "clearSeriesColors"
+        ],
+        "fields": [
+          {
+            "name": "legend",
+            "type": "boolean",
+            "required": false,
+            "description": "是否显示图例（不填 = 不改；协议里图例只有开关，没有位置 / 方向）"
+          },
+          {
+            "name": "seriesColors",
+            "type": "object",
+            "required": false,
+            "description": "稳定系列键 → 颜色（十六进制 / rgb() / 颜色关键字或主题 token 名）",
+            "freeForm": true
+          },
+          {
+            "name": "clearSeriesColors",
+            "type": "boolean",
+            "required": false,
+            "description": "是否先清空已有配色（true = 清空后再应用 seriesColors）"
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_CHART_TOOLTIP",
+        "title": "设置图表提示字段",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_CHART_TOOLTIP",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "tooltipFields",
+          "clearTooltipFields"
+        ],
+        "fields": [
+          {
+            "name": "tooltipFields",
+            "type": "array",
+            "required": false,
+            "description": "提示里要额外显示的字段名（非空时按此完整清单替换）",
+            "itemsType": "string"
+          },
+          {
+            "name": "clearTooltipFields",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清空提示字段（true = 清空；基础提示不受影响）"
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_CHART_REFERENCE_LINES",
+        "title": "设置图表参考线",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_CHART_REFERENCE_LINES",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "referenceLines",
+          "clearReferenceLines"
+        ],
+        "fields": [
+          {
+            "name": "referenceLines",
+            "type": "object",
+            "required": false,
+            "description": "参考线：名称 → 表达式，形如 {\"type\": \"LITERAL\", \"value\": 100}；数值按图表数值轴的单位理解。",
+            "freeForm": true
+          },
+          {
+            "name": "clearReferenceLines",
+            "type": "boolean",
+            "required": false,
+            "description": "是否先清空已有参考线（true = 清空后再应用 referenceLines）"
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_TABLE_COLUMNS",
+        "title": "设置表格列",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_TABLE_COLUMNS",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "columns"
+        ],
+        "fields": [
+          {
+            "name": "columns",
+            "type": "array",
+            "required": false,
+            "description": "完整的列清单（顺序即显示顺序）：每一项形如 {\"id\": \"col_1\", \"label\": \"机房名称\", \"fieldRef\": \"roomName\", \"format\": {\"kind\": \"TEXT\"}, \"width\": {\"value\": 120, \"unit\": \"PX\"}, \"style\": {\"textAlign\": \"LEFT\"}, \"headerPath\": [\"能耗\", \"总量\"]}；给了 id 就是改这一列（id 必须已存在），不给 id 就是新增一列。清单里没有的列**不再显示**（源字段、输出与指标一个都不删）。",
+            "items": [
+              {
+                "name": "id",
+                "type": "string",
+                "required": false,
+                "description": "列的稳定 id（改已有列时给，新增列不给）"
+              },
+              {
+                "name": "label",
+                "type": "string",
+                "required": false,
+                "description": "列标题（与取值字段互相独立）"
+              },
+              {
+                "name": "fieldRef",
+                "type": "string",
+                "required": false,
+                "description": "取值字段名（必须已登记）"
+              },
+              {
+                "name": "format",
+                "type": "object",
+                "required": false,
+                "description": "这一列的显示格式（可选；不给则沿用原格式）",
+                "freeForm": true
+              },
+              {
+                "name": "width",
+                "type": "object",
+                "required": false,
+                "description": "列宽 {\"value\": 120, \"unit\": \"PX\"}（可选）",
+                "freeForm": true
+              },
+              {
+                "name": "style",
+                "type": "object",
+                "required": false,
+                "description": "这一列的样式（可选；只认受控的外观键）",
+                "freeForm": true
+              },
+              {
+                "name": "headerPath",
+                "type": "array",
+                "required": false,
+                "description": "多层表头路径（可选；每一层一段表头文字；[] 表示清空）"
+              }
+            ]
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_TABLE_DISPLAY",
+        "title": "设置表格展示方式",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_TABLE_DISPLAY",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "groupRowsBy",
+          "clearGroupRowsBy",
+          "rowNumber",
+          "pageSize",
+          "clearPageSize",
+          "frozenColumnCount",
+          "clearFrozenColumnCount"
+        ],
+        "fields": [
+          {
+            "name": "groupRowsBy",
+            "type": "array",
+            "required": false,
+            "description": "按哪些字段分组显示行（只是展示分组，**不产生小计或聚合**）；清空用 clearGroupRowsBy",
+            "itemsType": "string"
+          },
+          {
+            "name": "clearGroupRowsBy",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清空行分组字段"
+          },
+          {
+            "name": "rowNumber",
+            "type": "boolean",
+            "required": false,
+            "description": "是否显示序号列（不填 = 不改）"
+          },
+          {
+            "name": "pageSize",
+            "type": "integer",
+            "required": false,
+            "description": "网页展示每页行数（只是**展示**分页，不限制取数与导出）"
+          },
+          {
+            "name": "clearPageSize",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清掉每页行数（恢复成不分页）"
+          },
+          {
+            "name": "frozenColumnCount",
+            "type": "integer",
+            "required": false,
+            "description": "冻结前几列（不填 = 不改）"
+          },
+          {
+            "name": "clearFrozenColumnCount",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清掉冻结列设置"
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_TABLE_SUMMARIES",
+        "title": "设置表格汇总",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_TABLE_SUMMARIES",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "summaries",
+          "clearSummaries"
+        ],
+        "fields": [
+          {
+            "name": "summaries",
+            "type": "array",
+            "required": false,
+            "description": "完整的汇总清单：每一项形如 {\"label\": \"告警总数\", \"outputRef\": \"output:alarms\", \"fieldRef\": \"totalAlarmCount\", \"basis\": \"FULL_RESULT\"}；outputRef 必须是这个区域**已登记**的计算输出，basis 只能是 FULL_RESULT（全量口径）或 VISIBLE_ROWS（可见行口径）。",
+            "items": [
+              {
+                "name": "label",
+                "type": "string",
+                "required": true,
+                "description": "汇总标签",
+                "minLength": 1
+              },
+              {
+                "name": "outputRef",
+                "type": "string",
+                "required": false,
+                "description": "已登记的计算输出（output:<name>）"
+              },
+              {
+                "name": "fieldRef",
+                "type": "string",
+                "required": false,
+                "description": "汇总字段名"
+              },
+              {
+                "name": "basis",
+                "type": "string",
+                "required": false,
+                "description": "汇总口径（FULL_RESULT 全量口径 / VISIBLE_ROWS 可见行口径）"
+              }
+            ]
+          },
+          {
+            "name": "clearSummaries",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清空全部汇总引用"
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_TEXT_CONTENT",
+        "title": "设置文本正文",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_TEXT_CONTENT",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "template",
+          "clearTemplate",
+          "format",
+          "headingLevel",
+          "clearHeadingLevel",
+          "bindings",
+          "clearBindings"
+        ],
+        "fields": [
+          {
+            "name": "template",
+            "type": "string",
+            "required": false,
+            "description": "正文文本（空 = 不改）；里面的 {{占位符}} 按 bindings 取值"
+          },
+          {
+            "name": "clearTemplate",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清空正文（true = 清空后再应用 template）"
+          },
+          {
+            "name": "format",
+            "type": "string",
+            "required": false,
+            "description": "文本格式：PLAIN（纯文本，保留换行）或 MARKDOWN（受控 Markdown）"
+          },
+          {
+            "name": "headingLevel",
+            "type": "integer",
+            "required": false,
+            "description": "目录层级（0 起的整数；不填 = 不改）—— 不是字号"
+          },
+          {
+            "name": "clearHeadingLevel",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清空目录层级"
+          },
+          {
+            "name": "bindings",
+            "type": "object",
+            "required": false,
+            "description": "占位符 → 表达式：键是占位符名，值形如 {\"type\": \"FIELD\", \"fieldRef\": \"<字段名>\"}；给的项按名字合并进去，没给的保持原样。",
+            "freeForm": true
+          },
+          {
+            "name": "clearBindings",
+            "type": "boolean",
+            "required": false,
+            "description": "是否先清空全部占位符绑定（true = 清空后再应用 bindings）"
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_METRIC_ITEM",
+        "title": "设置指标卡",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_METRIC_ITEM",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "label",
+          "fieldRef",
+          "outputRef",
+          "clearOutputRef",
+          "format",
+          "clearFormat",
+          "comparisonFieldRef",
+          "clearComparisonFieldRef",
+          "iconRef",
+          "clearIconRef"
+        ],
+        "fields": [
+          {
+            "name": "label",
+            "type": "string",
+            "required": false,
+            "description": "指标名称（空 = 不改）；改名字不碰数值、字段、单位与格式"
+          },
+          {
+            "name": "fieldRef",
+            "type": "string",
+            "required": false,
+            "description": "数值字段名（必须已登记或属于当前模拟字段目录；空 = 不改）"
+          },
+          {
+            "name": "outputRef",
+            "type": "string",
+            "required": false,
+            "description": "覆盖区域默认输出的引用（output:<name>，name 必须是本区域已登记的计算输出）"
+          },
+          {
+            "name": "clearOutputRef",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清空输出覆盖（回到区域默认输出）"
+          },
+          {
+            "name": "format",
+            "type": "object",
+            "required": false,
+            "description": "指标的显示格式（空 = 不改）：kind / precision / unitLabel / thousandSeparator / dateTimePattern / nullText / roundingMode",
+            "freeForm": true
+          },
+          {
+            "name": "clearFormat",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清空指标格式"
+          },
+          {
+            "name": "comparisonFieldRef",
+            "type": "string",
+            "required": false,
+            "description": "对比字段名（必须已登记；单位要与指标字段一致）"
+          },
+          {
+            "name": "clearComparisonFieldRef",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清空对比字段"
+          },
+          {
+            "name": "iconRef",
+            "type": "string",
+            "required": false,
+            "description": "注册图标引用（只认注册清单里的键；不接受图片 URL）"
+          },
+          {
+            "name": "clearIconRef",
+            "type": "boolean",
+            "required": false,
+            "description": "是否清空图标"
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
+        ],
+        "available": true,
+        "source": "app/services/edit_capabilities/base.py::register"
+      },
+      {
+        "op": "SET_METRIC_GROUP",
+        "title": "设置多指标组",
+        "submission": "top_level",
+        "packageOp": "",
+        "packageField": "",
+        "envelope": {
+          "op": "SET_METRIC_GROUP",
+          "target": {
+            "regionId": "<regionId>"
+          },
+          "params": {}
+        },
+        "required": [],
+        "optional": [
+          "metrics",
+          "arrangement",
+          "create"
+        ],
+        "fields": [
+          {
+            "name": "metrics",
+            "type": "array",
+            "required": false,
+            "description": "该指标组的**完整**指标项清单：每一项形如 {\"id\": \"m_1\", \"label\": \"总耗电量\", \"fieldRef\": \"totalEnergyKwh\", \"format\": {\"kind\": \"NUMBER\", \"precision\": 1}}；带 id 的项按 id 就地更新（id 必须已存在），不带 id 的是新项；清单里没有的项从展示清单里移除（**不删任何源数据 / 输出 / 列 / 区块**）。**不传这一项 = 只改组内排版，组里已有的指标项原样保留**（缺省不等于「清空」——清空会把用户没提的指标项悄悄抹掉）。"
+          },
+          {
+            "name": "arrangement",
+            "type": "object",
+            "required": false,
+            "description": "组内排版：{'mode': 'GRID'|'FLOW'|'ABSOLUTE', 'columns': 1..12, 'direction': 'VERTICAL'|'HORIZONTAL', 'gap': {'value': 0..96, 'unit': 'PX'|'PERCENT'}}",
+            "freeForm": true
+          },
+          {
+            "name": "create",
+            "type": "boolean",
+            "required": false,
+            "description": "是否把目标区块改成多指标组（指标卡 → 指标组；正文为空的文本区块 → 指标组）"
+          }
+        ],
+        "references": [],
+        "limits": [
+          "每一步都要有明确目标：target.regionId（草稿里已有区块）或 target.ref（本次新增区块的引用名）"
         ],
         "available": true,
         "source": "app/services/edit_capabilities/base.py::register"

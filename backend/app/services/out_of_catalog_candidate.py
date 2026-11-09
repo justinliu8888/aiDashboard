@@ -89,16 +89,67 @@ _QUOTE_PAIRS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _strip_quotes(text: str) -> str:
+#: 引号里那段内容**后面**还跟着的成分词（只在引号段里剥）。
+_SPAN_TAIL_NOISE: tuple[str, ...] = (
+    "这个指标", "该指标", "这个板块", "该板块",
+    "这个卡片", "该卡片", "这个", "该",
+)
+
+
+def _remove_quote_marks(text: str) -> str:
+    """只去掉引号本身，**内容留着**。
+
+    旧实现在这里把引号里的内容一起删掉 —— 用户圈出来的指标名
+    （「季度累计能耗」）就这么消失了，抽出来的意图成了「显示这个」
+    这种碎片（现场实证：``draft_97f84ed4dfb5`` rev2 把指标名写成
+    「显示这个」、``fieldRef`` 写成空）。
+
+    引号是**用户圈名字的记号**，不是删除记号。
+    """
     for left, right in _QUOTE_PAIRS:
         if left == right:
             text = text.replace(left, "")
             continue
-        if left in text and right in text:
-            head, _, tail = text.partition(left)
-            _, _, rest = tail.partition(right)
-            text = f"{head}{rest}".strip()
+        text = text.replace(left, "").replace(right, "")
     return text
+
+
+def _quoted_spans(text: str) -> list[str]:
+    """引号里用户自己圈出来的内容（按出现顺序）。
+
+    「」『』《》“” 与成对的半角引号都认；引号不闭合时不算一段。
+    """
+    found: list[tuple[int, str]] = []
+    for left, right in _QUOTE_PAIRS:
+        if left == right:
+            continue
+        cursor = 0
+        while True:
+            start = text.find(left, cursor)
+            if start < 0:
+                break
+            end = text.find(right, start + len(left))
+            if end < 0:
+                break
+            span = text[start + len(left):end].strip()
+            if span:
+                found.append((start, span))
+            cursor = end + len(right)
+    for mark in ('"', "'"):
+        cursor = 0
+        while True:
+            start = text.find(mark, cursor)
+            if start < 0:
+                break
+            end = text.find(mark, start + 1)
+            if end < 0:
+                break
+            span = text[start + 1:end].strip()
+            if span:
+                found.append((start, span))
+            cursor = end + 1
+    found.sort(key=lambda item: item[0])
+    return [span for _, span in found]
 
 
 def _strip_trailing_noise(text: str) -> str:
@@ -125,10 +176,43 @@ def split_metric_intent(
     再交给规则层）：「增加一个电脑耗电率 耗电量」→ 意图「电脑耗电率」、
     回答「耗电量」。
 
+    **用户圈出来的名字优先**：引号里那一段（「季度累计能耗」）就是用户
+    说的那个指标名 —— 先按它抽；抽不出来再按整句抽（引号只当字符看）。
+
     抽不出意图时返回 ``("", "")`` —— 抽不出就不猜，宁可让上层照既有
     口径追问。
     """
-    value = _strip_quotes(str(text or "").strip())
+    raw = str(text or "").strip()
+    for span in _quoted_spans(raw):
+        intent, answer = _intent_from_text(
+            _strip_span_tail(span), strip_add_prefix=strip_add_prefix,
+        )
+        if intent:
+            return intent, answer
+    # 引号里没抽出来 → 整句照旧抽（引号**只去符号**，内容留着）。
+    return _intent_from_text(
+        _remove_quote_marks(raw), strip_add_prefix=strip_add_prefix,
+    )
+
+
+def _strip_span_tail(text: str) -> str:
+    """引号段末尾的成分词（「季度累计能耗这个指标」→ 「季度累计能耗」）。"""
+    value = str(text or "").strip()
+    changed = True
+    while changed:
+        changed = False
+        for noise in _SPAN_TAIL_NOISE:
+            if value.endswith(noise) and len(value) > len(noise):
+                value = value[: -len(noise)].strip()
+                changed = True
+    return value
+
+
+def _intent_from_text(
+    text: str, *, strip_add_prefix: bool = True,
+) -> tuple[str, str]:
+    """从**一段**文字里抽指标意图与澄清回答（引号已处理干净）。"""
+    value = str(text or "").strip()
     value = value.strip(" 　：:，,。.；;！!？?、")
     if strip_add_prefix:
         # 句首的客套话先剥掉（「帮我加个冰箱明细」也是新增请求）。

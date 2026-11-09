@@ -1,0 +1,234 @@
+{
+  "outDir": "../.selfcheck/flow-batch2-night-metric-group",
+  "waitMs": 1500,
+  "timeout": 15000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "第二批夜间：T06 多指标组（新增卡片 → 转组 → 增删排序改名 → 组内排列）",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "screenshot": "g00-新建对话"
+        },
+        {
+          "eval": "(() => { const sels = [\"[data-question-other=\\\"template_edit_confirm\\\"] .question-other-input\",\"[data-question-text=\\\"template_edit_request\\\"] .question-text-input\"]; let n = 0; for (const sel of sels) { for (const el of document.querySelectorAll(sel)) { if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); n += 1; } } } return n >= 0; })()"
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成 A 机房昨日能耗日报，报表里要有这五个板块，标题就用我写的名字：第一个板块标题「日报说明」，是说明文字；第二个板块标题「昨日总耗电」，是指标卡；第三个板块标题「设备耗电明细」，是明细表，列出设备名称和耗电量；第四个板块标题「设备耗电排名」，是柱状图，横轴设备名称、纵轴耗电量；第五个板块标题「昨日逐小时耗电趋势」，是折线图。"
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "waitFor": ".plan-action-select",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.plan-action-select'); const opt = Array.from(s.options).find(o => o.textContent.trim() === '确认方案'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "screenshot": "g01-草稿已生成"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 180000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel"
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "单独增加一个「总告警数」指标卡，显示当前已有结果中的告警总数，单位用条。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "g02-新增指标卡候选"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('总告警数')"
+        },
+        {
+          "screenshot": "g03-总告警数已新增"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 180000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel"
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「总告警数」这个区块改成一个多指标组，组里有「总告警数」「严重告警数」「处理中告警数」三个指标项，数值分别绑定告警总数、严重告警数和处理中告警数。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "g04-多指标组候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "eval": "(() => { const box = document.querySelector('#preview-root [data-region-id=\"region_总告警数\"]'); if (!box) return false; const labels = Array.from(box.querySelectorAll('.wtm-metric-label')).map(x => x.textContent.trim()); return labels.includes('严重告警数') && labels.includes('处理中告警数') && labels.includes('总告警数'); })()"
+        },
+        {
+          "screenshot": "g05-三指标组已生效"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 180000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel"
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "从「总告警数」指标组里移除「处理中告警数」，把剩下两项的顺序调换一下，并把「总告警数」这一项的名称改成「告警总数」。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "g06-指标项增删排序候选"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "eval": "(() => { const box = document.querySelector('#preview-root [data-region-id=\"region_总告警数\"]'); if (!box) return false; const labels = Array.from(box.querySelectorAll('.wtm-metric-label')).map(x => x.textContent.trim()); return labels.length === 2 && labels.includes('告警总数') && labels.includes('严重告警数') && !labels.includes('处理中告警数'); })()"
+        },
+        {
+          "screenshot": "g07-指标项增删排序改名已生效"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 180000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel"
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「总告警数」指标组改成横向排列、两列，间距 16 像素。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "g08-组内排列候选"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "eval": "(() => { const box = document.querySelector('#preview-root [data-region-id=\"region_总告警数\"]'); if (!box) return false; const g = box.querySelector('.wtm-group'); if (!g) return false; const style = g.getAttribute('style') || ''; if (!style.includes('repeat(2')) return false; const cards = g.querySelectorAll('.wtm-metric').length; if (cards < 2) return false; const gap = getComputedStyle(g).gap; return true; })()"
+        },
+        {
+          "screenshot": "g09-组内排列已生效"
+        }
+      ]
+    }
+  ]
+}

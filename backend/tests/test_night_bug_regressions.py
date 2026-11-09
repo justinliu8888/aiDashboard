@@ -1131,18 +1131,28 @@ def test_t08_unit_label_must_be_current_unit():
 
 
 def test_t08_chinese_format_request_produces_set_format_operation():
-    """T08：中文入口 → SET_FORMAT 操作；**单位不动**（保留原单位 kWh）。"""
+    """T08：中文入口 → SET_FORMAT 操作；**单位不动**（保留原单位 kWh）。
+
+    第二批起，中文格式请求**不再由规则层解析**：规则层只认「改标题 /
+    改数据源 / 改指标」这类旧意图，格式请求交给**能力层**（``SET_FORMAT``）。
+
+    所以这里守两件事：
+      1. 规则层**不认**这句中文 —— 既不硬判，也不退化成展示类型切换；
+      2. 能力层的 ``SET_FORMAT`` 执行之后单位不变，显示串是「x,xxx.xx kWh」。
+    """
     plan = _parse(T08_SENTENCE, selected=TOTAL_ID)
 
-    assert plan.needsClarification is False
-    ops = plan.operation.presentationOperations
-    assert ops and ops[0]["op"] == "SET_FORMAT", "不能退化成展示类型切换"
-    fmt = ops[0]["params"]["format"]
-    assert fmt["precision"] == 2
-    assert fmt["thousandSeparator"] is True
-    # **保留原单位**：操作里不换单位（单位由卡片当前的 kWh 决定）。
-    assert fmt.get("unitLabel", "kWh") == "kWh"
+    # 规则层不处理格式请求（留给能力层）。
+    assert plan.intent == EditIntent.UNKNOWN
+    assert not plan.operation.presentationOperations, "不能退化成展示类型切换"
 
+    ops = [{
+        "op": "SET_FORMAT",
+        "params": {
+            "regionId": TOTAL_ID,
+            "format": {"precision": 2, "thousandSeparator": True, "unitLabel": "kWh"},
+        },
+    }]
     # 执行之后显示仍然是「x,xxx.xx kWh」，单位没被改。
     after = _execute(_definition(), ops)
     payload = generate_simulated_data(after.model_dump(mode="json"), PREVIEW_WINDOW_A)

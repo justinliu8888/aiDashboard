@@ -137,8 +137,10 @@ def test_uncertain_edit_reaches_business_agent_and_preserves_debug(
     assert response["debug"]["editOutcome"] == "candidate"
     assert response["questions"][0]["id"] == "pending_edit_plan_confirm"
     assert response["questions"][0]["selectionOnly"] is True
+    # 第二批的候选卡选项：接受 / 撤回上一步 / 继续修改
+    # （说明书 §1「改错了：在同一张卡的 Dropdown 里选「撤回上一步」」）。
     assert [item["value"] for item in response["questions"][0]["options"]] == [
-        "接受修改", "继续调整", "取消",
+        "接受修改", "撤回上一步", "继续修改",
     ]
     assert response["uiActions"] == ["pending_edit_plan"]
     # 候选计划只等确认，草稿此刻不变。
@@ -251,8 +253,10 @@ def test_day_grain_api_returns_updated_title(post_chat, definition):
 
     assert accepted["state"] == "USER_EDITING_TEMPLATE"
     assert accepted["uiActions"] == ["template_edit_applied"]
-    # 批准之后**不再**挂第二张确认卡（同一轮就执行完了）。
-    assert accepted["questions"] == []
+    # 批准之后**不再**挂第二张确认卡（同一轮就执行完了）；
+    # 只留下草稿级合法菜单（同意 / 修改 / 重新开始）。
+    assert [q["id"] for q in accepted["questions"]] == ["template_edit_confirm"]
+    assert accepted["questions"][0]["selectionOnly"] is True
     assert next(
         item for item in accepted["domainObjects"]["reportDefinitionDraft"]["regions"]
         if item["id"] == "region_hourly_trend"
@@ -453,8 +457,8 @@ def test_agent_api_applies_edit_and_returns_current_draft(post_chat, definition)
     assert applied["state"] == "USER_EDITING_TEMPLATE"
     assert applied["domainObjects"]["changeSet"] is not None
     assert applied["domainObjects"]["reportDefinitionDraft"]["metadata"]["revision"] == 1
-    # 批准之后不再挂二次确认卡。
-    assert applied["questions"] == []
+    # 批准之后不再挂二次确认卡，只剩草稿级合法菜单。
+    assert [q["id"] for q in applied["questions"]] == ["template_edit_confirm"]
     assert "confirm_template_edit" not in applied["uiActions"]
 
 
@@ -490,7 +494,9 @@ def test_agent_api_can_confirm_edited_draft(post_chat, definition):
     )
     data = response.json()
 
-    assert data["state"] == "SAVE_DEFINITION_DRAFT"
+    # 第二批新契约：保存走 ``save_definition_draft`` 工具请求，
+    # 会话状态停在 ANALYZING（后续推进由前端驱动）。
+    assert data["state"] == "ANALYZING"
     assert data["toolRequests"][0]["type"] == "SAVE_DEFINITION_DRAFT"
 
 

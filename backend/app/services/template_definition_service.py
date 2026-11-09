@@ -157,6 +157,39 @@ def _empty_shell(
     return {"role": shape["role"], "component": component}
 
 
+def _align_metric_card_label(
+    converted: dict[str, Any], preview_spec: Mapping[str, Any]
+) -> None:
+    """指标卡的 ``component.metric.label`` 对齐到**指标的名字**。
+
+    板块标题是 ``region.name``；``component.metric.label`` 是**指标名称**
+    （协议 ``MetricItem.label``）。两者混成同一个字符串时，卡片上会把标题
+    当成指标名显示两遍（标题一遍、指标名一遍）。
+
+    指标的名字以 ``previewSpec.metrics[0].label`` 为准 —— 那是**用户对指标
+    的原话**（``_build_preview_spec`` 写的）。没有指标身份时（占位空壳）
+    **保持原样**，不拿标题冒充指标名。
+    """
+    component = converted.get("component")
+    if not isinstance(component, dict) or component.get("type") != "METRIC_CARD":
+        return
+    metric = component.get("metric")
+    if not isinstance(metric, dict):
+        return
+    if not str(metric.get("fieldRef") or "").strip() and not str(
+        metric.get("id") or ""
+    ).strip():
+        # 占位空壳：这一块还没有指标身份，别动标题。
+        return
+    metrics = preview_spec.get("metrics")
+    if not isinstance(metrics, list):
+        return
+    first = next((item for item in metrics if isinstance(item, Mapping)), None)
+    label = str((first or {}).get("label") or "").strip()
+    if label:
+        metric["label"] = label
+
+
 def _declared_columns(
     region: TemplateRegion, section: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
@@ -1004,7 +1037,12 @@ def build_template_definition(
                     ],
                 }
             elif kind == "metric_card":
-                converted["component"]["metric"]["label"] = title
+                # 指标卡的 ``component.metric.label`` 是**指标名称**
+                # （协议 MetricItem.label），不是板块标题 —— 标题是
+                # ``region.name``。两者混成同一个字符串时，卡片上会把标题
+                # 当成指标名显示两遍。这里只留占位，等 ``previewSpec`` 建好
+                # 之后按指标身份对齐（见 ``_align_metric_card_label``）。
+                pass
         elif region.dataStatus == "placeholder" or (
             region.dataStatus == "bound" and not executable_binding
         ):
@@ -1060,6 +1098,8 @@ def build_template_definition(
             source_mode=mode.mode,
             region_id=str(region.id or ""),
         )
+        # 指标卡的指标名称按**指标身份**对齐（板块标题 ≠ 指标名称）。
+        _align_metric_card_label(converted, preview_spec)
         converted.update({
             "id": region.id, "name": title,
             "layout": {"placement": _plan_placement(kind, index=index)},

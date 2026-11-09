@@ -1,0 +1,109 @@
+{
+  "outDir": "../.selfcheck/flow-batch2-night-text-binding",
+  "waitMs": 1500,
+  "timeout": 15000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "第二批夜间：07 §4.4 正文动态绑定 + 标题层级（补充复核）",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "screenshot": "t00-新建对话"
+        },
+        {
+          "eval": "(() => {\n  const sels = [\n    '[data-question-other=\"template_edit_confirm\"] .question-other-input',\n    '[data-question-text=\"template_edit_request\"] .question-text-input'\n  ];\n  let n = 0;\n  for (const sel of sels) {\n    for (const el of document.querySelectorAll(sel)) {\n      if (el.value) {\n        el.value = '';\n        el.dispatchEvent(new Event('input', { bubbles: true }));\n        n += 1;\n      }\n    }\n  }\n  return n >= 0;\n})()"
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成 A 机房昨日能耗日报，报表里要有这五个板块，标题就用我写的名字：第一个板块标题「日报说明」，是说明文字；第二个板块标题「昨日总耗电」，是指标卡；第三个板块标题「设备耗电明细」，是明细表，列出设备名称和耗电量；第四个板块标题「设备耗电排名」，是柱状图，横轴设备名称、纵轴耗电量；第五个板块标题「昨日逐小时耗电趋势」，是折线图。"
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "waitFor": ".plan-action-select",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.plan-action-select'); const opt = Array.from(s.options).find(o => o.textContent.trim() === '确认方案'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "screenshot": "t01-草稿已生成"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(() => {\n  const sels = [\n    '[data-question-other=\"template_edit_confirm\"] .question-other-input',\n    '[data-question-text=\"template_edit_request\"] .question-text-input'\n  ];\n  let n = 0;\n  for (const sel of sels) {\n    for (const el of document.querySelectorAll(sel)) {\n      if (el.value) {\n        el.value = '';\n        el.dispatchEvent(new Event('input', { bubbles: true }));\n        n += 1;\n      }\n    }\n  }\n  return n >= 0;\n})()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「日报说明」的正文改成引用当前已有结果中的「告警总数」：正文模板写成「当前告警共 {{告警总数}} 条」，其中 {{告警总数}} 是绑定值，要真实取数不能写死；同时把这段的标题层级设为 2。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "t02-动态绑定+标题层级-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "eval": "(() => {\n  const root = document.getElementById('preview-root');\n  if (!root) return false;\n  const text = root.innerText || '';\n  if (!text.includes('当前告警共')) return false;\n  if (text.includes('{{告警总数}}')) return false;\n  return /当前告警共\\s*[0-9][0-9,.]*\\s*条/.test(text);\n})()"
+        },
+        {
+          "eval": "(() => {\n  const root = document.getElementById('preview-root');\n  if (!root) return false;\n  const el = root.querySelector('.wtm-text[data-wtm-heading-level]');\n  if (!el) return false;\n  return String(el.getAttribute('data-wtm-heading-level')) === '2';\n})()"
+        },
+        {
+          "eval": "(() => {\n  const root = document.getElementById('preview-root');\n  if (!root) return false;\n  const el = root.querySelector('.wtm-text');\n  if (!el) return false;\n  const t = el.innerText || '';\n  return t.includes('当前告警共') && !t.includes('{{');\n})()"
+        },
+        {
+          "screenshot": "t03-动态绑定+标题层级-接受后"
+        }
+      ]
+    }
+  ]
+}

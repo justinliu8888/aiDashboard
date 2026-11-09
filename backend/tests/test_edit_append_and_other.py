@@ -538,7 +538,10 @@ def test_saving_does_not_take_over_the_draft_revision(post_chat, definition):
             "reportDefinition": draft2,
         },
     ).json()
-    assert saved["state"] == "SAVE_DEFINITION_DRAFT"
+    # 第二批新契约：保存走 save_definition_draft 工具请求，
+    # 会话状态停在 ANALYZING（后续推进由前端驱动）。
+    assert saved["state"] == "ANALYZING"
+    assert "save_definition_draft" in saved["uiActions"]
     saved_draft = saved["domainObjects"]["reportDefinitionDraft"]
     # 版本号没被保存次数占用：保存次数另记一个字段。
     assert saved_draft["metadata"]["revision"] == 2
@@ -621,11 +624,16 @@ def test_accepting_a_corrected_plan_that_fails_validation_gives_a_new_card(
 
     questions = corrected["questions"]
     assert questions, "追问要给一张卡，不能只回一句话"
-    # 新卡不是原来那张「确认修改」卡。
+    # 新卡不是原来那张「确认修改」卡：接受失败后给回**草稿级合法菜单**
+    # （同意 / 修改 / 重新开始）—— 用户有明确、合法的下一步。
     assert questions[0]["id"] != "pending_edit_plan_confirm"
-    assert questions[0]["id"] == "template_edit_action"
-    # 旧卡作废：选择锁清掉，计划也消费掉了。
-    assert session_service.load_pending_choice("conv_test") is None
+    assert questions[0]["id"] == "template_edit_confirm"
+    assert [o["value"] for o in questions[0]["options"]] == ["同意", "修改", "重新开始"]
+    # 旧卡作废：原来的「确认修改」计划消费掉了，待决项换成**新的合法菜单**
+    # （不是没有待决项 —— 用户必须有明确的下一步）。
     assert session_service.load_pending_plan("conv_test") is None
+    pending = session_service.load_pending_choice("conv_test")
+    assert pending is not None
+    assert pending["question"]["id"] == "template_edit_confirm"
     # 草稿没有被动过。
     assert corrected["domainObjects"]["reportDefinitionDraft"]["metadata"]["revision"] == 0

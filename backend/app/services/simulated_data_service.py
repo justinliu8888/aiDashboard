@@ -56,6 +56,7 @@ from app.services.data_source_mode import (
     source_mode_of_definition,
     source_mode_of_region,
 )
+from app.services.display_binding_service import simulated_field
 from app.services.edit_time_resolver import DEFAULT_TIMEZONE
 from app.services.mock_data_service import (
     ROOM_A_DEVICES,
@@ -805,6 +806,24 @@ def _display_cell(
     return format_display_value(value, effective)
 
 
+def _item_format(region_format: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    """区域格式落到**某一个指标项**上时用的那份格式。
+
+    区域格式里的 ``unitLabel`` 是**这张卡**的单位，不该顺手改掉
+    **别的指标项**的单位：指标卡上除主指标外还有别的指标（卡片追加过
+    指标时清单里有好几项），把主指标的单位（台）写到 kWh 那一项头上，
+    显示出来就是「3,033 台」这种不像话的数字。
+
+    所以：**这一项自己声明了单位**时，区域格式的单位标签让位给这一项的
+    单位；其余显示约定（精度、千分位）照旧由区域格式说了算。
+    """
+    item_unit = str(item.get("unit") or "").strip()
+    label = str(region_format.get("unitLabel") or "").strip()
+    if not item_unit or not label or label == item_unit:
+        return region_format
+    return {key: value for key, value in region_format.items() if key != "unitLabel"}
+
+
 def _attach_authoritative_format(
     payload: dict[str, Any], region: dict[str, Any]
 ) -> dict[str, Any]:
@@ -844,7 +863,9 @@ def _attach_authoritative_format(
             for item in metrics:
                 if isinstance(item, dict) and "value" in item:
                     item["displayValue"] = format_display_value(
-                        item.get("value"), fmt, unit=str(item.get("unit") or "")
+                        item.get("value"),
+                        _item_format(fmt, item),
+                        unit=str(item.get("unit") or ""),
                     )
     rows = payload.get("rows")
     if isinstance(rows, list):
@@ -978,6 +999,93 @@ def _resolve_kind(region: dict[str, Any], spec: dict[str, Any]) -> str:
     return KIND_GENERIC
 
 
+def _region_primary_metric_ref(region: dict[str, Any]) -> str:
+    """区域**主指标**绑的目录指标引用（数据管道里的 METRIC 节点）。
+
+    目录内指标的清单项 ``metricKey`` 就是这个引用 —— 靠它就能认出
+    「清单里的哪一项是主指标」，不靠位置。
+    """
+    nodes = ((region.get("data") or {}).get("pipeline") or {}).get("nodes") or []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("type") or "").upper() == "METRIC":
+            return str(node.get("metricRef") or "")
+    return ""
+
+
+def _primary_metric_entry(
+    region: dict[str, Any], spec: dict[str, Any], kind: str,
+) -> dict[str, Any] | None:
+    """老式指标卡的**主指标**（``component.metric``）在指标清单里的那一条。
+
+    卡片被**追加过指标**之后，``previewSpec.metrics[]`` 里只有追加的那些，
+    主指标不在清单里 —— 载荷就会把追加的那一项当成主指标来渲染，
+    单位 / 字段 / 数值全被主指标顶掉（反馈 F02-04：新增的「总告警数」
+    显示成 ``5.0 kWh``）。
+
+    所以这里把主指标**按它自己的身份**补成清单的第一条。
+
+    * **只有真绑了字段的单指标卡才有主指标**（``component.metric.fieldRef``）：
+      多指标卡里 ``component.metric.label`` 是**卡片标题**、不是某一项指标，
+      按它补会补出一条重复项；
+    * 「能力待接通」**必须带原因**：原因说不出来就不标（契约：标了就要说得清
+      为什么）。
+    """
+    metric = (region.get("component") or {}).get("metric") or {}
+    if not isinstance(metric, dict) or not metric:
+        return None
+    field_ref = str(metric.get("fieldRef") or "")
+    if not field_ref:
+        # 没绑字段：认不出主指标是哪一项 —— 不补（宁可少补，也不能造重复项）。
+        return None
+    label = str(metric.get("label") or "")
+    metric_id = str(metric.get("id") or "")
+    pending_reason = str(spec.get("pendingReason") or "")
+    return {
+        "metricKey": kind,
+        "label": label or str(region.get("name") or "指标"),
+        "kind": kind,
+        "unit": str(
+            spec.get("unit") or (metric.get("format") or {}).get("unitLabel") or ""
+        ),
+        "capabilityPending": bool(spec.get("capabilityPending")) and bool(pending_reason),
+        "pendingReason": pending_reason or None,
+        # **身份**：主指标是谁，靠这几个字段说清 —— 载荷层按它认主指标，
+        # 不按「清单里的第一项」猜。
+        "id": metric_id,
+        "fieldRef": field_ref,
+        "metricRef": _region_primary_metric_ref(region),
+    }
+
+
+def _entry_is_primary(entry: dict[str, Any], primary: dict[str, Any]) -> bool:
+    """清单里的这一项是不是就是**主指标**那一条（按身份，不按位置）。"""
+    if not isinstance(entry, dict) or not isinstance(primary, dict):
+        return False
+    primary_field = str(primary.get("fieldRef") or "")
+    primary_id = str(primary.get("id") or "")
+    primary_label = str(primary.get("label") or "")
+    primary_key = str(primary.get("metricKey") or "")
+    primary_ref = str(primary.get("metricRef") or "")
+    if primary_field and (
+        str(entry.get("fieldRef") or "") == primary_field
+        or str(entry.get("metricKey") or "") == primary_field
+    ):
+        return True
+    if primary_id and str(entry.get("id") or "") == primary_id:
+        return True
+    if primary_label and str(entry.get("label") or "") == primary_label:
+        return True
+    # 目录内指标：清单项的 ``metricKey`` 就是目录指标引用。
+    if primary_ref and str(entry.get("metricKey") or "") == primary_ref:
+        return True
+    # 老式形状：主指标在清单里的 ``metricKey`` 就是区域量身份。
+    if primary_key and str(entry.get("metricKey") or "") == primary_key:
+        return True
+    return False
+
+
 def _resolve_metrics(
     region: dict[str, Any],
     spec: dict[str, Any],
@@ -994,6 +1102,9 @@ def _resolve_metrics(
     **合并**（与列同一套口径）：
 
     - ``previewSpec.metrics[]`` 是**底**；
+    - 卡片的老式**主指标**（``component.metric``）**也要在清单里** ——
+      卡片被追加过指标时清单里只有追加的那些，不补回去的话主指标会被
+      挤掉，追加的那一项反而继承主指标的单位 / 字段（反馈 F02-04）；
     - 列里声明了、清单里**还没有**的**目录外指标**追加进来 ——
       目录外指标也要出现在 ``metrics[]`` 里，不能只活在列上；
     - 占位模式（``displayMode = "placeholder_only"``）的指标标上
@@ -1019,20 +1130,43 @@ def _resolve_metrics(
             if key in item:
                 resolved[key] = item[key]
         metrics.append(resolved)
+    primary_entry = _primary_metric_entry(region, spec, kind)
     if not metrics:
-        metric = (region.get("component") or {}).get("metric") or {}
         metrics = [
             {
                 "metricKey": kind,
-                "label": str(metric.get("label") or region.get("name") or "指标"),
+                "label": str((region.get("component") or {}).get("metric", {}).get("label")
+                             or region.get("name") or "指标"),
                 "kind": kind,
                 "unit": str(
-                    spec.get("unit") or (metric.get("format") or {}).get("unitLabel") or ""
+                    spec.get("unit")
+                    or ((region.get("component") or {}).get("metric", {}).get("format") or {}).get("unitLabel")
+                    or ""
                 ),
                 "capabilityPending": bool(spec.get("capabilityPending")),
                 "pendingReason": spec.get("pendingReason"),
             }
         ]
+    elif primary_entry is not None:
+        matched = [item for item in metrics if _entry_is_primary(item, primary_entry)]
+        if matched:
+            # 清单里那一条**就是**主指标 → 名字与单位按**定义**说了算。
+            #
+            # ``previewSpec.metrics[]`` 是**目录快照**：卡片改过名字之后
+            # （改名 / 换绑），快照里的标签就过期了。前端渲染的是这份清单
+            # （``metrics[]`` 优先于载荷顶层的 ``label``），不刷新的话
+            # **卡片上还是旧名字** —— 现场实证：定义里
+            # ``component.metric.label`` 已经是「耗电格式验证」，页面上的
+            # 指标卡却仍显示「总耗电」。
+            for item in matched:
+                if primary_entry.get("label"):
+                    item["label"] = primary_entry["label"]
+                if primary_entry.get("unit"):
+                    item["unit"] = primary_entry["unit"]
+        else:
+            # 主指标不在清单里（卡片被追加过指标）→ **按身份补回去**，
+            # 放第一条：主指标仍是卡片的主量。
+            metrics = [primary_entry] + metrics
     region_columns = columns if columns is not None else _columns_of(region, spec)
     metrics.extend(_column_metrics(region_columns, metrics))
     for item in metrics:
@@ -1457,20 +1591,25 @@ def _is_placeholder_only(column: dict[str, Any]) -> bool:
 
 
 def _merged_columns(region: dict[str, Any], spec: dict[str, Any]) -> list[dict[str, Any]]:
-    """区域的列：``previewSpec.columns`` 与 ``component.columns`` **合并**。
+    """区域的列：``component.columns`` 与 ``previewSpec.columns`` **合并**。
+
+    **第二批起，``component.columns`` 是展示列的定义之源**（协议
+    ``TableComponent.columns``）：它决定**列集合与顺序**。
+    ``previewSpec.columns`` 退回到**语义描述的来源** —— 它带着
+    ``semanticKind`` / ``valueType`` / ``deterministicScope``，但**不再**
+    决定哪些列出现、按什么顺序出现。
 
     合并规则（两边都有时以谁为准是**定死的**）：
 
-    - 以 ``previewSpec.columns`` 为**底** —— 它带着**语义描述**
-      （``semanticKind`` / ``valueType`` / ``deterministicScope``）；
-    - ``component.columns`` 里 ``fieldRef`` **还没被覆盖**的列**追加**在后面
-      —— 目录外新增的列只写在组件列上时也不会丢（新增是追加，不是替换）；
-    - 同一个 ``fieldRef`` 两边都有：**身份信息**（``label`` / ``format`` /
-      ``displayMode`` / ``bindingKind``）以 ``component.columns`` 为准，
-      **语义描述**沿用 ``previewSpec`` 的。
+    - ``component.columns`` 非空 → **以它为准**（列集合 + 顺序）；
+      ``previewSpec`` 里 ``fieldRef`` 对得上的列**只补语义描述**，
+      对不上的（历史遗留的旧列）**不再进入展示**。
+    - ``component.columns`` 为空（老定义）→ 退回旧口径：以
+      ``previewSpec.columns`` 为底，组件列追加在后面 —— 与改造前一致。
 
     旧行为是「有 previewSpec.columns 就整份丢掉组件列」—— 目录外新增的列
-    会连同它的展示值一起消失。
+    会连同它的展示值一起消失；**第二批修复的正是这个覆盖风险**：旧
+    ``previewSpec`` 的列与顺序不能盖住新定义。
     """
     preview_raw = [
         item for item in (spec.get("columns") or []) if isinstance(item, dict)
@@ -1480,42 +1619,71 @@ def _merged_columns(region: dict[str, Any], spec: dict[str, Any]) -> list[dict[s
         for item in ((region.get("component") or {}).get("columns") or [])
         if isinstance(item, dict)
     ]
-    merged: list[dict[str, Any]] = []
-    position_by_ref: dict[str, int] = {}
+    if not component_raw:
+        # 老定义：没有组件列 —— 退回旧口径（previewSpec 为底，组件列追加）。
+        merged: list[dict[str, Any]] = []
+        position_by_ref: dict[str, int] = {}
+        for item in preview_raw:
+            field_ref = str(item.get("fieldRef") or "").strip()
+            if not field_ref:
+                continue
+            merged.append(dict(item))
+            position_by_ref.setdefault(field_ref, len(merged) - 1)
+        for item in component_raw:
+            field_ref = str(item.get("fieldRef") or "").strip()
+            if not field_ref:
+                continue
+            position = position_by_ref.get(field_ref)
+            if position is None:
+                merged.append(dict(item))
+                position_by_ref[field_ref] = len(merged) - 1
+                continue
+            target = merged[position]
+            for key in ("id", "label", "displayMode", "bindingKind"):
+                value = item.get(key)
+                if value is None:
+                    continue
+                if key == "label" and not str(value).strip():
+                    continue
+                target[key] = value
+            component_format = item.get("format")
+            if isinstance(component_format, dict) and component_format:
+                base_format = target.get("format")
+                target["format"] = (
+                    {**base_format, **component_format}
+                    if isinstance(base_format, dict)
+                    else dict(component_format)
+                )
+        return merged
+
+    # 新定义：组件列说了算（列集合 + 顺序）。
+    semantic_by_ref: dict[str, dict[str, Any]] = {}
     for item in preview_raw:
         field_ref = str(item.get("fieldRef") or "").strip()
-        if not field_ref:
-            continue
-        merged.append(dict(item))
-        position_by_ref.setdefault(field_ref, len(merged) - 1)
+        if field_ref and field_ref not in semantic_by_ref:
+            semantic_by_ref[field_ref] = item
+    merged = []
     for item in component_raw:
         field_ref = str(item.get("fieldRef") or "").strip()
         if not field_ref:
             continue
-        position = position_by_ref.get(field_ref)
-        if position is None:
-            merged.append(dict(item))
-            position_by_ref[field_ref] = len(merged) - 1
-            continue
-        # 同一个 fieldRef：身份信息以组件列为准，语义描述沿用 previewSpec。
-        target = merged[position]
-        for key in ("id", "label", "displayMode", "bindingKind"):
-            value = item.get(key)
-            if value is None:
-                continue
-            if key == "label" and not str(value).strip():
-                continue
-            target[key] = value
-        # 展示格式**逐键合并**：组件列的单位 / 精度说了算，
-        # previewSpec 里其余的键（``kind`` / ``precision``）不丢。
-        component_format = item.get("format")
-        if isinstance(component_format, dict) and component_format:
-            base_format = target.get("format")
-            target["format"] = (
-                {**base_format, **component_format}
-                if isinstance(base_format, dict)
-                else dict(component_format)
-            )
+        column = dict(item)
+        source = semantic_by_ref.get(field_ref)
+        if source:
+            # 语义描述跟着 previewSpec 走（组件列没写的那几个键）。
+            for key, value in source.items():
+                if key in ("id", "label", "format", "displayMode", "bindingKind"):
+                    continue
+                column.setdefault(key, value)
+            component_format = item.get("format")
+            base_format = source.get("format")
+            if isinstance(base_format, dict) and base_format:
+                column["format"] = (
+                    {**base_format, **component_format}
+                    if isinstance(component_format, dict) and component_format
+                    else dict(base_format)
+                )
+        merged.append(column)
     return merged
 
 
@@ -2126,6 +2294,240 @@ def _analysis_payload(
     }
 
 
+def _metric_group_payload(
+    region: dict[str, Any],
+    spec: dict[str, Any],
+    *,
+    field_values: dict[str, Any],
+    comparison_values: dict[str, Any],
+    base: _Base,
+    ctx: _Context,
+) -> dict[str, Any]:
+    """多指标组的基础载荷：一个区域里的**指标项列表**。
+
+    指标组的每一项绑定一个**已声明的单值字段**（模拟字段目录），值来自
+    本区域的受控模拟供给 —— **不凭空造数**、不自动聚合、不生成子卡片。
+    """
+    component = region.get("component") or {}
+    items = component.get("metrics")
+    items = [item for item in (items or []) if isinstance(item, dict)]
+    metrics: list[dict[str, Any]] = []
+    for item in items:
+        field_ref = str(item.get("fieldRef") or "")
+        value = field_values.get(field_ref)
+        declared = simulated_field(field_ref)
+        metrics.append(
+            {
+                "metricKey": field_ref or str(item.get("id") or ""),
+                "id": str(item.get("id") or ""),
+                "label": str(item.get("label") or field_ref or "指标"),
+                "kind": str((declared or {}).get("dataType") or "GENERIC").lower(),
+                "unit": str((declared or {}).get("unit") or ""),
+                "value": value,
+                "precision": int((item.get("format") or {}).get("precision") or 0),
+                "capabilityPending": False,
+                "pendingReason": None,
+            }
+        )
+    primary = metrics[0] if metrics else {}
+    value = primary.get("value")
+    return {
+        "label": str(component.get("title") or region.get("name") or "指标组"),
+        "value": value,
+        "unit": str(primary.get("unit") or ""),
+        "precision": int(primary.get("precision") or 0),
+        "yoyPercent": None,
+        "comparisonAvailable": any(
+            item.get("fieldRef") in comparison_values for item in items
+        ),
+        "windowLabel": base.window_label,
+        "dataSource": "simulated",
+        "metrics": metrics,
+        "arrangement": component.get("arrangement") or {},
+    }
+
+
+def _apply_metric_field_binding(
+    region: dict[str, Any],
+    payload: dict[str, Any],
+    field_values: dict[str, Any],
+) -> None:
+    """指标卡绑定到**具体字段**时，数值真的跟着字段走（M01）。
+
+    没绑字段（或字段取不到值）→ **保留原有口径**，不换数、不造数。
+
+    **写在哪一项上按身份来，不按位置来**：卡片被追加过指标之后，清单里的
+    第一项是**追加的那一项**（反馈 F02-04）。按位置写会把主指标的数值 /
+    字段 / 单位盖到追加项上 —— 新增的「总告警数」就显示成 ``5.0 kWh``。
+    """
+    metric = (region.get("component") or {}).get("metric") or {}
+    field_ref = str(metric.get("fieldRef") or "")
+    if not field_ref:
+        return
+    if field_ref not in field_values:
+        return
+    value = field_values.get(field_ref)
+    declared = simulated_field(field_ref)
+    payload["value"] = value
+    payload["unit"] = str((declared or {}).get("unit") or payload.get("unit") or "")
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, list) or not metrics:
+        return
+    index = _index_of_primary_metric(metrics, metric, field_ref)
+    if index is None:
+        # 清单里没有主指标这一项 → **不往别的项上写**。
+        # 宁可主数值停在载荷顶层，也不把主指标的身份盖到别的指标上。
+        return
+    item = metrics[index]
+    if not isinstance(item, dict):
+        return
+    item["value"] = value
+    item["metricKey"] = field_ref
+    item["unit"] = payload["unit"]
+
+
+def _index_of_primary_metric(
+    metrics: list[dict[str, Any]], metric: dict[str, Any], field_ref: str,
+) -> int | None:
+    """指标清单里**主指标**那一条的下标（认不出就是 ``None``）。
+
+    判据是**身份**：字段引用 / 指标 id / 标签任一对上就是它。
+    「清单里只有一项」时也认（老式指标卡：清单里就主指标一项）。
+    """
+    primary_id = str(metric.get("id") or "")
+    primary_label = str(metric.get("label") or "")
+    for index, item in enumerate(metrics):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("fieldRef") or "") == field_ref:
+            return index
+        if str(item.get("metricKey") or "") == field_ref:
+            return index
+        if primary_id and str(item.get("id") or "") == primary_id:
+            return index
+        if primary_label and str(item.get("label") or "") == primary_label:
+            return index
+    if len(metrics) == 1:
+        # 只有一项：它就是主指标（老式指标卡的历史形状）。
+        return 0
+    return None
+
+
+def _chart_series_keys(region: dict[str, Any], spec: dict[str, Any]) -> list[str]:
+    """图表的**稳定系列标识**（图例配色按它认系列）。
+
+    来源：组件指标项的 id / 指标键 / 字段键、``previewSpec`` 的指标键、
+    分类绑定的分类标签、以及声明的编码字段。**按定义取**，不按顺序猜。
+    """
+    component = region.get("component") or {}
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        keys.append(text)
+
+    for item in component.get("metrics") or []:
+        if isinstance(item, dict):
+            _add(item.get("id"))
+            _add(item.get("metricKey"))
+            _add(item.get("fieldRef"))
+    metric = component.get("metric")
+    if isinstance(metric, dict):
+        _add(metric.get("id"))
+        _add(metric.get("metricKey"))
+        _add(metric.get("fieldRef"))
+    for item in spec.get("metrics") or []:
+        if isinstance(item, dict):
+            _add(item.get("metricKey"))
+    categorical = _categorical_binding(region)
+    if categorical:
+        for item in categorical.get("categories") or []:
+            if isinstance(item, dict):
+                _add(item.get("label"))
+    for encoding in component.get("encodings") or []:
+        if isinstance(encoding, dict):
+            _add(encoding.get("fieldRef"))
+    return keys
+
+
+def _decorate_component_payload(
+    region: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    field_values: dict[str, Any],
+    comparison_values: dict[str, Any],
+    full_rows: list[dict[str, Any]],
+    visible_rows: list[dict[str, Any]],
+    summary_values: dict[str, Any],
+    base: _Base,
+    ctx: _Context,
+    seed_scope: str,
+    room_name: str = "",
+) -> dict[str, Any]:
+    """第二批的**组件专属载荷接线**（C0 侧）。
+
+    这里只做**编排**：造数仍然是本模块的事（口径统一、确定性不变），
+    各组件包负责「定义 → 组件载荷」的**纯转换**（协议字段落到载荷键）。
+
+    * 文本      → ``text_metric_payload_service.build_text_payload``
+    * 指标卡/指标组 → ``text_metric_payload_service.decorate_metric_payload``
+    * 表格      → ``table_payload_service.decorate_table_payload``
+    * 图表      → ``chart_payload_service.decorate_chart_payload``
+
+    组件包**不取生产数据、不存库、不调模型** —— 这里也不给它们写权限。
+    """
+    component = region.get("component") or {}
+    ctype = str(component.get("type") or "")
+    spec = _preview_spec(region)
+    ctx_payload = {
+        "fieldValues": dict(field_values),
+        "comparisonValues": dict(comparison_values),
+        "roomName": room_name,
+        "logicalDate": str(ctx.start.astimezone(ctx.tz).date().isoformat()),
+        "fullRows": list(full_rows),
+        "visibleRows": list(visible_rows),
+        "summaryValues": dict(summary_values),
+        "seriesKeys": _chart_series_keys(region, spec),
+        "base": base,
+        "seedScope": seed_scope,
+    }
+    if ctype == "TEXT":
+        from app.services import text_metric_payload_service
+
+        return text_metric_payload_service.build_text_payload(region, ctx=ctx_payload)
+    if ctype in ("METRIC_CARD", "METRIC_GROUP"):
+        from app.services import text_metric_payload_service
+
+        _apply_metric_field_binding(region, payload, field_values)
+        decorated = text_metric_payload_service.decorate_metric_payload(
+            region, payload, ctx=ctx_payload
+        )
+        # 区域格式在**字段绑定之后**再算一遍显示串。
+        #
+        # 绑定把主指标的值换成了它真正绑的字段（9 台），显示串必须跟着
+        # 换 —— 不然卡片上会出现「数值 9、显示 3,199 台」这种自相矛盾
+        # 的载荷（实测：给指标卡设一次区域级格式就出现）。
+        _attach_authoritative_format(decorated, region)
+        return decorated
+    if ctype == "TABLE":
+        from app.services import table_payload_service
+
+        return table_payload_service.decorate_table_payload(
+            region, payload, ctx=ctx_payload
+        )
+    if ctype == "CHART":
+        from app.services import chart_payload_service
+
+        return chart_payload_service.decorate_chart_payload(
+            region, payload, ctx=ctx_payload
+        )
+    return payload
+
+
 def _text_payload(
     region: dict[str, Any], ctx: _Context, room_name: str
 ) -> dict[str, Any]:
@@ -2136,6 +2538,166 @@ def _text_payload(
         "{{logicalDate}}", ctx.start.astimezone(ctx.tz).date().isoformat()
     )
     return {"rendered": rendered, "template": template, "dataSource": "simulated"}
+
+
+# --------------------------------------------------------------------------
+# 模拟字段目录的**受控单值**供给（第二批）
+# --------------------------------------------------------------------------
+#
+# 第二批要绑的是「**已有输出里的字段**」。当前是模拟数据阶段，没有生产
+# 计算引擎，因此这里按模拟字段目录
+# （``display_binding_service.SIMULATED_FIELD_CATALOG``）给出**受控、
+# 确定性**的单值：
+#
+# * 来源清楚：每个字段都来自本区域已有的模拟基础数据（能耗、设备、告警），
+#   不是随手编的数字；
+# * 确定性：按**区域种子**推导，同一份定义两次生成结果相同；
+# * **不写进纯定义**、不迁移历史数据。
+
+def _simulated_field_values(
+    base: _Base,
+    ctx: _Context,
+    region: dict[str, Any],
+    seed_scope: str,
+    room_name: str,
+) -> dict[str, Any]:
+    """按模拟字段目录给出本区域的**单值**字典。"""
+    device_count = len(base.devices)
+    alarm_total = ALARM_ROW_COUNT
+    serious = int(
+        hash_float(f"serious/{seed_scope}", 1, max(1, alarm_total - 1))
+    )
+    processing = max(0, alarm_total - serious - 1)
+    running = int(
+        hash_float(f"running/{seed_scope}", max(1, device_count - 1), device_count)
+    )
+    pue = round(hash_float(f"pue/{seed_scope}", 1.2, 1.8 - 1e-6), 2)
+    logical_date = ctx.start.astimezone(ctx.tz).date().isoformat()
+    return {
+        "totalAlarmCount": alarm_total,
+        "seriousAlarmCount": serious,
+        "processingAlarmCount": processing,
+        "deviceCount": device_count,
+        "runningDeviceCount": running,
+        "totalEnergyKwh": round(float(base.total_kwh), 1),
+        "totalCost": round(
+            float(base.total_kwh) * SIMULATED_ELECTRICITY_PRICE_PER_KWH, 2
+        ),
+        "averagePue": pue,
+        "roomName": room_name,
+        "logicalDate": logical_date,
+    }
+
+
+def _comparison_field_values(
+    field_values: dict[str, Any],
+    seed_scope: str,
+) -> dict[str, Any]:
+    """比较字段的**对照值**（模拟的上一期口径）。
+
+    口径写在 ``detail`` 里：同一个量的对照值按**量族**给（同一份报表里
+    同一个量的对照一致），不是随机数。
+    """
+    out: dict[str, Any] = {}
+    total_energy = field_values.get("totalEnergyKwh")
+    if isinstance(total_energy, (int, float)):
+        out["totalEnergyKwh"] = round(float(total_energy) * 0.92, 1)
+    total_cost = field_values.get("totalCost")
+    if isinstance(total_cost, (int, float)):
+        out["totalCost"] = round(float(total_cost) * 0.92, 2)
+    alarms = field_values.get("totalAlarmCount")
+    if isinstance(alarms, (int, float)):
+        out["totalAlarmCount"] = int(alarms)
+        out["seriousAlarmCount"] = field_values.get("seriousAlarmCount")
+        out["processingAlarmCount"] = field_values.get("processingAlarmCount")
+    devices = field_values.get("deviceCount")
+    if isinstance(devices, (int, float)):
+        out["deviceCount"] = int(devices)
+        out["runningDeviceCount"] = field_values.get("runningDeviceCount")
+    pue = field_values.get("averagePue")
+    if isinstance(pue, (int, float)):
+        out["averagePue"] = round(float(pue) * 0.98, 2)
+    return out
+
+
+# --------------------------------------------------------------------------
+# 展示裁剪（第二批 B03 / B04）
+# --------------------------------------------------------------------------
+
+def _display_pipeline_rows(
+    region: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    allow_sort_and_topn: bool = True,
+) -> list[dict[str, Any]]:
+    """本区域的**展示记录**（别名 → 过滤 → 排序 → 前 N 项）。
+
+    只作用这个区域的展示：源输出、全量总计、其他区域的输入**不动**。
+
+    ``allow_sort_and_topn=False`` 时**只做别名与过滤** —— 时间序列的横轴
+    顺序是数据的含义，排序与前 N 项会把它破坏掉（那不是展示裁剪，是改口径）。
+    """
+    from app.services.display_binding_service import apply_presentation_pipeline
+
+    binding = region.get("binding") or {}
+    if not isinstance(binding, dict):
+        binding = {}
+    return apply_presentation_pipeline(
+        rows,
+        field_aliases=binding.get("fieldAliases"),
+        presentation_filters=binding.get("presentationFilters"),
+        sort=binding.get("sort") if allow_sort_and_topn else None,
+        top_n=binding.get("topN") if allow_sort_and_topn else None,
+    )
+
+
+def _summary_values(
+    region: dict[str, Any],
+    *,
+    full_rows: list[dict[str, Any]],
+    visible_rows: list[dict[str, Any]],
+    field_values: dict[str, Any],
+) -> dict[str, Any]:
+    """汇总取值：**后台**算出来的受控模拟值（不在浏览器累加）。
+
+    * ``FULL_RESULT``   → 全量结果口径（裁剪**之前**的记录）；
+    * ``VISIBLE_ROWS``  → 可见行口径（裁剪**之后**的记录）。
+
+    取不到合法口径时**不返回值**（载荷层据此显示「没有对应输出」，
+    **不沿用旧数字、不临时求和**）。
+    """
+    from app.services.display_binding_service import resolve_summary_output
+
+    summaries = (region.get("component") or {}).get("summaries")
+    if not isinstance(summaries, list) or not summaries:
+        return {}
+    values: dict[str, Any] = {}
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        check = resolve_summary_output(region, summary)
+        if not check.get("ok"):
+            continue
+        output_ref = str(check.get("outputRef") or "")
+        field_ref = str(check.get("fieldRef") or "")
+        basis = str(check.get("basis") or "")
+        rows = full_rows if basis == "FULL_RESULT" else visible_rows
+        numeric = [
+            row.get(field_ref)
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get(field_ref), (int, float))
+        ]
+        if numeric:
+            values[f"{output_ref}|{field_ref}|{basis}"] = round(
+                float(sum(numeric)), 2
+            )
+            continue
+        # 记录里没有该字段的数值时，只在**全量口径**下退回模拟字段目录的单值。
+        if basis == "FULL_RESULT" and field_ref in field_values:
+            value = field_values.get(field_ref)
+            if isinstance(value, (int, float)):
+                values[f"{output_ref}|{field_ref}|{basis}"] = value
+    return values
 
 
 # ---------------------------------------------------------------- 公开入口
@@ -2270,6 +2832,13 @@ def generate_simulated_data(
                 base=base, buckets=region_buckets, powers=region_powers,
                 ctx=ctx, seed_scope=seed_scope,
             )
+        elif ctype == "METRIC_GROUP":
+            payload = _metric_group_payload(
+                region, spec,
+                field_values=field_values,
+                comparison_values=comparison_values,
+                base=base, ctx=ctx,
+            )
         elif ctype == "TABLE":
             payload = _table_payload(
                 region, spec, kind, base=base, buckets=region_buckets, ctx=ctx,
@@ -2299,5 +2868,45 @@ def generate_simulated_data(
         payload[SOURCE_MODE_KEY] = _source_mode_of_region(region, definition_mode).mode
         # 该区域的**权威格式**随载荷带出去（显示格式走权威格式）。
         _attach_authoritative_format(payload, region)
+        # -- 第二批：受控模拟单值 + 展示裁剪 + 汇总取值 -------------------
+        field_values = _simulated_field_values(
+            base, ctx, region, seed_scope, room_name
+        )
+        comparison_values = _comparison_field_values(field_values, seed_scope)
+        full_rows: list[dict[str, Any]] = []
+        visible_rows: list[dict[str, Any]] = []
+        if ctype == "TABLE":
+            full_rows = [
+                row for row in (payload.get("rows") or []) if isinstance(row, dict)
+            ]
+            visible_rows = _display_pipeline_rows(region, full_rows)
+        elif ctype == "CHART":
+            full_rows = [
+                row for row in (payload.get("points") or []) if isinstance(row, dict)
+            ]
+            # 时间序列的横轴顺序是数据的含义 —— 排序与前 N 项不作用在它上面。
+            is_trend = str(region.get("role") or "").upper() == "TREND"
+            visible_rows = _display_pipeline_rows(
+                region, full_rows, allow_sort_and_topn=not is_trend
+            )
+        summary_values = _summary_values(
+            region,
+            full_rows=full_rows,
+            visible_rows=visible_rows,
+            field_values=field_values,
+        )
+        # -- 第二批：组件专属的载荷接线（文本 / 指标 / 表格 / 图表） --------
+        payload = _decorate_component_payload(
+            region, payload,
+            field_values=field_values,
+            comparison_values=comparison_values,
+            full_rows=full_rows,
+            visible_rows=visible_rows,
+            summary_values=summary_values,
+            base=base,
+            ctx=ctx,
+            seed_scope=seed_scope,
+            room_name=room_name,
+        )
         result[region_id] = payload
     return result

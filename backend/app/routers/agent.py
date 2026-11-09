@@ -235,6 +235,15 @@ def _restore_pending_candidates(
         logger.warning("[agent.chat] 恢复选择锁失败 sessionId=%s", session_key)
 
 
+
+def _recover_failed_execution(session_key: str, captured: dict[str, Any]) -> None:
+    """执行没有产生响应：丢弃暂存，恢复原候选与可回答的菜单。"""
+    session_service.discard_staged_plan_consumption(session_key)
+    session_service.discard_staged_pending_choice(session_key)
+    session_service.discard_staged_edit_archive(session_key)
+    _restore_pending_candidates(session_key, captured)
+
+
 def _abort_turn_task(task_id: str | None, *, reason: str) -> None:
     """这一轮没落成：任务收尾。
 
@@ -475,6 +484,10 @@ def _release_turn_lock(
                     task_id,
                 )
                 return
+            if task is not None and str(getattr(task, "state", "")) == "RUNNING":
+                # 异常路径未走到提交收尾：先使任务失去提交资格再放锁，
+                # 避免重开时仍被遗留的 RUNNING 记录锁住。
+                draft_workspace.fail_task(task_id, reason="turn_ended_before_completion")
         draft_workspace.release(draft_id, lock_owner)
     except Exception as exc:  # noqa: BLE001 — 放锁失败不阻断本轮对话
         logger.warning(
@@ -482,6 +495,37 @@ def _release_turn_lock(
             draft_id,
             type(exc).__name__,
         )
+
+
+def _report_identity(definition: Any) -> tuple[str, str]:
+    """一份定义属于**哪一份报表**（模板 + 方案）。
+
+    「同一份报表的修改」与「另一份报表」的区别就在这里：改一块、
+    改名、换排版 —— 模板与方案不变；重新生成一份新报表 —— 方案就变了。
+    """
+    metadata = (definition or {}).get("metadata") or {}
+    binding = metadata.get("templateBinding") or {}
+    return (
+        str(binding.get("templateId") or ""),
+        str(binding.get("planId") or ""),
+    )
+
+
+def _is_another_report(left: Any, right: Any) -> bool:
+    """这两份定义是不是**两份不同的报表**。
+
+    判据用「模板 + 方案」这一对身份键 —— 不是「内容有没有变」：
+    内容变了不等于换了报表（改名、改数值都是同一份报表）。
+
+    身份键读不出来（老会话 / 用户 JSON 模式没有模板绑定）时**不算**
+    另一份报表：宁可当成同一份报表继续提交修改，也不另起对象 ——
+    另起对象的代价是**撤销链断掉**。
+    """
+    left_identity = _report_identity(left)
+    right_identity = _report_identity(right)
+    if not any(left_identity) or not any(right_identity):
+        return False
+    return left_identity != right_identity
 
 
 def _same_definition(left: Any, right: Any) -> bool:
@@ -640,6 +684,20 @@ def _commit_draft_workspace(
     snapshot = session_service.load_snapshot(session_key)
     definition = snapshot.get("definition")
     if not isinstance(definition, dict) or not definition.get("regions"):
+        # 会话快照读到的��**这一轮落库前**的定义：确认报表这一轮的定义
+        # 刚由设计存储提交，快照里还读不到 —— 直接拿快照会得到空定义，
+        # 基线就建不出来。
+        #
+        # 基线建不出来的后果不是「晚一点建」而已：基线滑到后面某一轮才建
+        # 时，用户在这中间接受的修改已经被烤进基线里，**撤销链是空的**
+        # （现场实证：改一处 → 同意保存 → 撤销 → 「没有可撤销的修改了」，
+        # 409 ``DraftUndoUnavailable``）。
+        #
+        # 这一轮**刚产出**的定义在响应里 —— 用它，基线就在该在的那一轮建。
+        produced = getattr(response.domainObjects, "reportDefinitionDraft", None)
+        if produced is not None:
+            definition = produced.model_dump(mode="json")
+    if not isinstance(definition, dict) or not definition.get("regions"):
         _complete_turn_task(task_id, None)
         return None
     draft_id = session_service.load_draft_id(session_key)
@@ -653,10 +711,21 @@ def _commit_draft_workspace(
         if _same_definition(current.definition, definition):
             # 内容没变 → 不产生新的修改单位（一个接受 = 一个修改单位）。
             state = current
-        elif separate_draft_on_change:
+        elif separate_draft_on_change and _is_another_report(
+            current.definition, definition,
+        ):
             # 确认的是**另一份报表** → 另起一个草稿对象。
             _, state = _create_baseline_draft(session_key, definition, workspace_snapshot)
         else:
+            # 同一份报表：这一轮的内容变化**记成一次修改单位**，
+            # 草稿对象接着用。
+            #
+            # 现场实证（session ``sess_b7e12ed61653`` / draft
+            # ``draft_a9ccd4d415c7``）：点「同意」保存时定义与草稿对象
+            # 里的那份**不一样**（元信息被回填过），于是被当成「另一份
+            # 报表」→ **另起了一个草稿对象**，会话切到新对象上 —— 旧对象
+            # 里那 1 条撤销单位就此失联：保存后再点「撤销」→ 409
+            # ``DraftUndoUnavailable``（「没有可撤销的修改了」）。
             state = draft_workspace.commit_edit(
                 draft_id,
                 definition=definition,
@@ -839,6 +908,8 @@ async def chat(request: AgentRequest) -> AgentResponse:
         try:
             response = await agent_service.chat(request)
         except Exception as exc:  # noqa: BLE001
+            _recover_failed_execution(session_key, pre_turn_state)
+            _abort_turn_task(task_id, reason="execution_failed")
             log_timeline_step("router_failed")
             _log_failure(
                 f"[agent.chat] step=router_failed conversationId={request.conversationId} "
@@ -964,8 +1035,10 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
             session_service.discard_staged_plan_consumption(session_key)
             # 上一轮没落成的**菜单**暂存同样作废（见非流式入口的同名调用）。
             session_service.discard_staged_pending_choice(session_key)
+            execution_returned = False
             try:
                 response = await agent_service.chat(request, emit=emit)
+                execution_returned = True
                 log_timeline_step("router_return")
                 log_info(
                     logger,
@@ -1022,6 +1095,8 @@ async def chat_stream(request: AgentRequest) -> StreamingResponse:
                     {"message": str(exc), "code": "TURN_FENCED"},
                 )
             except Exception as exc:  # noqa: BLE001
+                if not execution_returned:
+                    _recover_failed_execution(session_key, pre_turn_state)
                 log_timeline_step("router_failed")
                 _log_failure(
                     f"[agent.chat.stream] step=router_failed conversationId={request.conversationId} "

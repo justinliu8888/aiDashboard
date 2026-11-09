@@ -33,8 +33,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import (
     ROUND_CEILING,
+    ROUND_DOWN,
     ROUND_FLOOR,
     ROUND_HALF_DOWN,
+    ROUND_HALF_EVEN,
     ROUND_HALF_UP,
     Decimal,
 )
@@ -824,11 +826,16 @@ def region_authoritative_format(region: Any) -> dict[str, Any]:
 
 
 #: 舍入方式 → ``decimal`` 的舍入常量。
+#:
+#: 项目既有的一套（第一批）之外，**协议 ``FormatSpec.roundingMode``** 的
+#: ``HALF_EVEN`` / ``DOWN`` 也认 —— 两套取值域并���，不改既有行为。
 _ROUNDING_MODES = {
     "HALF_UP": ROUND_HALF_UP,
     "HALF_DOWN": ROUND_HALF_DOWN,
     "FLOOR": ROUND_FLOOR,
     "CEIL": ROUND_CEILING,
+    "HALF_EVEN": ROUND_HALF_EVEN,
+    "DOWN": ROUND_DOWN,
 }
 
 #: 没给 ``dateTimePattern`` 时的默认日期样式。
@@ -844,6 +851,22 @@ _DATE_FORMAT_KINDS = ("DATE", "DATETIME")
 
 def _is_numeric_value(value: Any) -> bool:
     return isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
+
+
+def _percent_ratio(value: Any) -> Any:
+    """百分比的无量纲比率 → 百分数（只用于**显示**，底层值不动）。
+
+    认不出来就原样返回 —— 不猜、不补 100。
+    """
+    try:
+        number = Decimal(str(value)) * 100
+    except Exception:  # noqa: BLE001 — 不是数字就交给原来的格式化分支
+        return value
+    try:
+        # 去掉 ``20.0`` 这种多出来的尾零（精度由格式自己再定）。
+        return number.normalize()
+    except Exception:  # noqa: BLE001
+        return number
 
 
 def _format_number(value: Any, fmt: dict[str, Any]) -> str:
@@ -905,6 +928,8 @@ def format_display_value(
     """按**权威格式**把一个值渲染成显示串（底层值一个字节都不动）。
 
     - 数值：按 ``precision`` / ``thousandSeparator`` / ``roundingMode`` 显示；
+    - **百分比**：按**无量纲比率**显示（``0.2`` → ``20%``）——
+      协议 ``FormatSpec.kind = PERCENT`` 的语义就是比率，不是百分数；
     - 日期：按 ``dateTimePattern`` 显示（``kind`` 是 ``DATE`` / ``DATETIME``）；
     - 单位标签：格式里声明了 ``unitLabel`` 就用它（**可以空串** = 不带单位），
       没声明就用传入的 ``unit``。
@@ -922,7 +947,11 @@ def format_display_value(
     elif kind in _DATE_FORMAT_KINDS:
         text = _format_datetime(value, spec, kind)
     elif kind in _NUMERIC_FORMAT_KINDS:
-        text = _format_number(value, spec)
+        if kind == "PERCENT":
+            # 百分比 = 无量纲比率 × 100。底层值不动，只改显示。
+            text = _format_number(_percent_ratio(value), spec)
+        else:
+            text = _format_number(value, spec)
         numeric = _is_numeric_value(value)
     elif isinstance(value, bool):
         text = str(value)
@@ -936,8 +965,11 @@ def format_display_value(
     if numeric:
         label = spec["unitLabel"] if "unitLabel" in spec else str(unit or "")
         label = str(label or "").strip()
+        if not label and kind == "PERCENT" and "unitLabel" not in spec:
+            # 百分比默认带 ``%``；**显式**给了 ``unitLabel``（含空串）就听它的。
+            label = "%"
         if label:
-            text = f"{text} {label}"
+            text = f"{text} {label}" if label != "%" else f"{text}%"
     return text
 
 

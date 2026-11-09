@@ -28,6 +28,10 @@ from app.services.edit_capabilities.base import (  # noqa: F401
     validate_params,
 )
 from app.services.edit_capabilities import blocks as _blocks  # noqa: F401
+from app.services.edit_capabilities import binding_component as _binding_component  # noqa: F401
+from app.services.edit_capabilities import chart_component as _chart_component  # noqa: F401
+from app.services.edit_capabilities import table_component as _table_component  # noqa: F401
+from app.services.edit_capabilities import text_metric as _text_metric  # noqa: F401
 from app.services.edit_capabilities.chart_data import (  # noqa: F401
     CATEGORICAL_PAYLOAD_CONTRACT,
     SIMULATED_DIMENSIONS,

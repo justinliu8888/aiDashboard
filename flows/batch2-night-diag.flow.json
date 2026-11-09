@@ -1,0 +1,133 @@
+{
+  "outDir": "../.selfcheck/flow-batch2-night-diag",
+  "waitMs": 1500,
+  "timeout": 180000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "诊断：受限卡兜底路径",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成 A 机房昨日能耗日报，报表里要有这五个板块，标题就用我写的名字：第一个板块标题「日报说明」，是说明文字；第二个板块标题「昨日总耗电」，是指标卡；第三个板块标题「设备耗电明细」，是明细表，列出设备名称和耗电量；第四个板块标题「设备耗电排名」，是柱状图，横轴设备名称、纵轴耗电量；第五个板块标题「昨日逐小时耗电趋势」，是折线图。"
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "waitFor": ".plan-action-select",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.plan-action-select'); const opt = Array.from(s.options).find(o => o.textContent.trim() === '确认方案'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === \"\\u4fee\\u6539\"); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": "[data-question-other=\"template_edit_confirm\"] .question-other-input:not([disabled])",
+          "timeout": 15000
+        },
+        {
+          "type": "[data-question-other=\"template_edit_confirm\"] .question-other-input:not([disabled])",
+          "text": "把「昨日总耗电」指标卡的名称改成「昨日总耗电量」，数值绑定保持不变。"
+        },
+        {
+          "click": "[data-question-other=\"template_edit_confirm\"] .question-other-submit:not([disabled])"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "diag-01-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === \"\\u63a5\\u53d7\\u4fee\\u6539\"); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "screenshot": "diag-02-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === \"\\u4fee\\u6539\"); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": "[data-question-other=\"template_edit_confirm\"] .question-other-input:not([disabled])",
+          "timeout": 15000
+        },
+        {
+          "type": "[data-question-other=\"template_edit_confirm\"] .question-other-input:not([disabled])",
+          "text": "把「昨日总耗电量」指标卡改为显示当前区域已有结果中的「运行设备数」，单位用台。"
+        },
+        {
+          "click": "[data-question-other=\"template_edit_confirm\"] .question-other-submit:not([disabled])"
+        },
+        {
+          "wait": 6000
+        },
+        {
+          "screenshot": "diag-03-第二段提交后"
+        },
+        {
+          "eval": "({locked: (typeof lockedChoice!=='undefined'&&lockedChoice)?lockedChoice.id:null, restrictedInputs: Array.from(document.querySelectorAll('[data-question-text=\"template_edit_request\"] .question-text-input')).map(i=>i.disabled), inlineInputs: Array.from(document.querySelectorAll('[data-question-other=\"template_edit_confirm\"] .question-other-input')).map(i=>({d:i.disabled,v:i.value}))})"
+        },
+        {
+          "waitFor": "[data-question-text=\"template_edit_request\"] .question-text-input:not([disabled])",
+          "timeout": 30000
+        },
+        {
+          "type": "[data-question-text=\"template_edit_request\"] .question-text-input:not([disabled])",
+          "text": "把「昨日总耗电量」指标卡改为显示当前区域已有结果中的「运行设备数」，单位用台。"
+        },
+        {
+          "click": "[data-question-text-submit=\"template_edit_request\"]:not([disabled])"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "diag-04-受限卡路径产出候选"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === \"\\u63a5\\u53d7\\u4fee\\u6539\"); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "eval": "Array.from(document.querySelectorAll('#preview-root .region-name')).map(x=>x.textContent.trim()).join('|')"
+        },
+        {
+          "screenshot": "diag-05-最终"
+        }
+      ]
+    }
+  ]
+}

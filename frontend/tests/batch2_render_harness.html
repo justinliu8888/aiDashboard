@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>第二批渲染核对（文本 / 指标组 / 表格 / 图表）</title>
+<script src="../pages/vendor/tailwindcss.js?v=20261103-vendor1"></script>
+<link rel="stylesheet" href="../pages/workbench_text_metric.css?v=20261106-batch2" />
+<link rel="stylesheet" href="../pages/workbench_table.css?v=20261106-batch2" />
+<link rel="stylesheet" href="../pages/workbench_chart.css?v=20261106-batch2" />
+<style>
+  body { font-family: system-ui, -apple-system, "PingFang SC", sans-serif; background: #f1f5f9; }
+  .harness-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; }
+  .harness-title { font-size: 13px; font-weight: 600; color: #0f172a; margin-bottom: 8px; }
+  .harness-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  .harness-region { border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px; }
+</style>
+</head>
+<body class="p-5">
+  <h1 class="text-lg font-semibold text-slate-800 mb-1">第二批渲染核对</h1>
+  <p class="text-xs text-slate-500 mb-4">载荷由后台 <code>build_report_preview_payload</code> 生成（同一份定义、同一批第二批能力），这里只验证三个前端模块的消费。</p>
+  <div class="harness-grid" id="root"></div>
+
+<script src="../pages/vendor/echarts.min.js?v=20261103-vendor1"></script>
+<script src="../pages/vendor/iconify-icon.min.js?v=20261103-vendor1"></script>
+<script src="../pages/workbench_text_metric.js?v=20261106-batch2"></script>
+<script src="../pages/workbench_table.js?v=20261106-batch2"></script>
+<script src="../pages/workbench_chart.js?v=20261106-batch2"></script>
+<script>
+  window.session = { resolvedTheme: null };
+  const PAYLOAD = {"previewContext": {"definitionId": "probe", "definitionVersion": "1", "timezone": "Asia/Shanghai", "anchorTime": "2026-11-06T00:00:00+08:00", "windowStart": "2026-11-03T00:00:00+08:00", "windowEnd": "2026-11-06T00:00:00+08:00", "grainUnit": "DAY", "generatorVersion": "probe"}, "regions": [{"regionId": "region_text", "name": "交接说明", "role": "ANALYSIS", "componentType": "TEXT", "dataSource": "simulated", "capabilityPending": false, "payload": {"rendered": "机房 A 机房 在 2026-11-03 的交接说明：\n\n- 查看告警\n- 检查设备\n- 记录异常", "template": "机房 {{roomName}} 在 {{logicalDate}} 的交接说明：\n\n- 查看告警\n- 检查设备\n- 记录异常", "format": "MARKDOWN", "headingLevel": 2, "bindings": [{"name": "totalAlarmCount", "fieldRef": "totalAlarmCount", "value": 5, "resolved": true, "note": ""}], "unboundPlaceholders": [], "notes": [], "dataSource": "simulated"}}, {"regionId": "region_metric", "name": "总告警数", "role": "SUMMARY", "componentType": "METRIC_GROUP", "dataSource": "simulated", "capabilityPending": false, "payload": {"label": "总告警数", "value": 5, "unit": "条", "precision": 0, "yoyPercent": null, "comparisonAvailable": true, "windowLabel": "2026-11-03 ~ 2026-11-05（3 天）", "dataSource": "simulated", "metrics": [{"metricKey": "totalAlarmCount", "id": "m_1", "label": "总告警数", "kind": "integer", "unit": "条", "value": 5, "precision": 0, "capabilityPending": false, "pendingReason": null, "fieldRef": "totalAlarmCount", "format": {"kind": "NUMBER", "precision": 0, "unitLabel": "条"}, "displayValue": "5 条", "comparisonFieldRef": "seriousAlarmCount", "comparisonUnit": "条", "comparisonValue": 1, "comparisonAvailable": true, "comparisonDisplayValue": "1 条", "iconRef": "alert", "icon": "mdi:alert-outline"}, {"metricKey": "seriousAlarmCount", "id": "m_2", "label": "严重告警数", "kind": "integer", "unit": "条", "value": 3, "precision": 0, "capabilityPending": false, "pendingReason": null, "fieldRef": "seriousAlarmCount", "format": {"kind": "NUMBER", "precision": 0, "unitLabel": "条"}, "displayValue": "3 条", "comparisonFieldRef": null, "comparisonValue": null, "comparisonDisplayValue": null, "comparisonUnit": ""}, {"metricKey": "deviceCount", "id": "m_3", "label": "设备总数", "kind": "integer", "unit": "台", "value": 10, "precision": 0, "capabilityPending": false, "pendingReason": null, "fieldRef": "deviceCount", "format": {"kind": "NUMBER", "precision": 0, "unitLabel": "台"}, "displayValue": "10 台", "comparisonFieldRef": null, "comparisonValue": null, "comparisonDisplayValue": null, "comparisonUnit": "", "iconRef": "device", "icon": "mdi:server-outline"}], "arrangement": {"mode": "GRID", "columns": 3, "direction": "HORIZONTAL", "gap": {"value": 16, "unit": "PX"}}, "sourceMode": "simulated", "format": {}}}, {"regionId": "region_table", "name": "设备状态表", "role": "DETAIL", "componentType": "TABLE", "dataSource": "simulated", "capabilityPending": false, "payload": {"columns": [{"id": "col_energy", "label": "总耗电量", "fieldRef": "energyKwh", "semanticKind": "energy", "valueType": "energy", "deterministicScope": {"scope": "region", "seedKey": ""}, "format": {"kind": "NUMBER", "precision": 2, "unitLabel": "kWh"}, "width": {"value": 180, "unit": "PX"}, "headerPath": ["能耗"]}, {"id": "col_name", "label": "设备", "fieldRef": "deviceName", "semanticKind": "generic", "valueType": "device_name", "deterministicScope": {"scope": "region", "seedKey": ""}, "format": {"kind": "TEXT"}, "headerPath": ["对象"]}], "rowNumber": true, "rows": [{"energyKwh": 1979.2, "deviceName": "A-2 机架"}, {"energyKwh": 1829.0, "deviceName": "A-1 机架"}, {"energyKwh": 1716.3, "deviceName": "UPS-01 不间断"}, {"energyKwh": 1713.5, "deviceName": "CRAC-01 空调"}, {"energyKwh": 1700.4, "deviceName": "A-4 机架"}, {"energyKwh": 1582.0, "deviceName": "A-5 机架"}, {"energyKwh": 1552.6, "deviceName": "PDU-02 配电"}, {"energyKwh": 1430.5, "deviceName": "CRAC-02 空调"}, {"energyKwh": 1419.4, "deviceName": "A-3 机架"}, {"energyKwh": 1328.9, "deviceName": "PDU-01 配电"}], "dataSource": "simulated", "sourceMode": "simulated", "format": {}, "displayRows": [{"energyKwh": "1979.20 kWh", "deviceName": "A-2 机架"}, {"energyKwh": "1829.00 kWh", "deviceName": "A-1 机架"}, {"energyKwh": "1716.30 kWh", "deviceName": "UPS-01 不间断"}, {"energyKwh": "1713.50 kWh", "deviceName": "CRAC-01 空调"}, {"energyKwh": "1700.40 kWh", "deviceName": "A-4 机架"}, {"energyKwh": "1582.00 kWh", "deviceName": "A-5 机架"}], "visibleRows": [{"energyKwh": 1979.2, "deviceName": "A-2 机架"}, {"energyKwh": 1829.0, "deviceName": "A-1 机架"}, {"energyKwh": 1716.3, "deviceName": "UPS-01 不间断"}, {"energyKwh": 1713.5, "deviceName": "CRAC-01 空调"}, {"energyKwh": 1700.4, "deviceName": "A-4 机架"}, {"energyKwh": 1582.0, "deviceName": "A-5 机架"}], "groupRowsBy": [], "pageSize": 5, "frozenColumnCount": 1, "summaries": [], "notes": []}}, {"regionId": "region_chart", "name": "告警等级分布", "role": "DETAIL", "componentType": "CHART", "dataSource": "simulated", "capabilityPending": false, "payload": {"chartKind": "DONUT", "grain": "DAY", "xField": "alarmLevel", "yField": "count", "unit": "条", "xLabels": ["严重", "一般", "提示"], "yValues": [2, 5, 3], "points": [{"alarmLevel": "严重", "count": 2}, {"alarmLevel": "一般", "count": 5}, {"alarmLevel": "提示", "count": 3}], "dataSource": "simulated", "simulated": true, "categoryLabel": "", "statistic": "", "sourceMode": "simulated", "format": {}, "encodings": [{"channel": "X", "fieldRef": "alarmLevel"}, {"channel": "Y", "fieldRef": "count"}], "axes": {}, "legend": true, "seriesColors": {"严重": "#d97706"}, "tooltipFields": [], "referenceLines": {}, "seriesKeys": ["严重", "一般", "提示", "alarmLevel", "count"], "fieldValues": {"totalAlarmCount": 5, "seriousAlarmCount": 1, "processingAlarmCount": 3, "deviceCount": 10, "runningDeviceCount": 9, "totalEnergyKwh": 16251.8, "totalCost": 11376.26, "averagePue": 1.24, "roomName": "A 机房", "logicalDate": "2026-11-03"}}}, {"regionId": "region_trend", "name": "耗电趋势", "role": "TREND", "componentType": "CHART", "dataSource": "simulated", "capabilityPending": false, "payload": {"chartKind": "LINE", "grain": "DAY", "xField": "timestamp", "yField": "energyKwh", "unit": "kWh", "xLabels": ["11-03", "11-04", "11-05"], "yValues": [5499.6, 5302.3, 5449.9], "points": [{"timestamp": "2026-11-03T00:00:00+08:00", "energyKwh": 5499.6}, {"timestamp": "2026-11-04T00:00:00+08:00", "energyKwh": 5302.3}, {"timestamp": "2026-11-05T00:00:00+08:00", "energyKwh": 5449.9}], "dataSource": "simulated", "sourceMode": "simulated", "format": {}, "encodings": [{"channel": "X", "fieldRef": "timestamp"}, {"channel": "Y", "fieldRef": "energyKwh"}], "axes": {"y": {"title": "耗电量（kWh）", "minimum": 0, "scale": "LINEAR"}}, "legend": true, "seriesColors": {}, "tooltipFields": ["energyKwh"], "referenceLines": {"关注阈值": {"type": "LITERAL", "value": 700}}, "seriesKeys": ["timestamp", "energyKwh"], "fieldValues": {"totalAlarmCount": 5, "seriousAlarmCount": 2, "processingAlarmCount": 2, "deviceCount": 10, "runningDeviceCount": 9, "totalEnergyKwh": 16251.8, "totalCost": 11376.26, "averagePue": 1.78, "roomName": "A 机房", "logicalDate": "2026-11-03"}, "encodingXNote": "声明的横轴字段当前没有可用取值，仍按原有口径显示", "encodingDriven": false, "encodingNote": "声明的纵轴字段当前没有可用取值，仍按原有口径显示"}}]};
+
+  const root = document.getElementById("root");
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  const only = new URLSearchParams(window.location.search).get("only");
+  for (const region of PAYLOAD.regions || []) {
+    if (only && region.regionId !== only) continue;
+    const wrap = document.createElement("div");
+    wrap.className = "harness-region";
+    wrap.innerHTML = `<div class="harness-title">${esc(region.name || region.regionId)} <span class="text-[10px] font-normal text-slate-400">${esc(region.componentType)}</span></div><div class="region-body"></div>`;
+    root.appendChild(wrap);
+    const container = wrap.querySelector(".region-body");
+    const ctx = { unit: (region.payload || {}).unit || "", defRegion: null, totalsByUnit: {}, payload: PAYLOAD };
+    if (region.componentType === "TEXT") {
+      window.WorkbenchTextMetric.renderText(container, region, ctx);
+    } else if (region.componentType === "METRIC_GROUP") {
+      window.WorkbenchTextMetric.renderMetricGroup(container, region, ctx);
+    } else if (region.componentType === "METRIC_CARD") {
+      window.WorkbenchTextMetric.renderMetricCard(container, region, ctx);
+    } else if (region.componentType === "TABLE") {
+      window.WorkbenchTable.renderTable(container, region, ctx);
+    } else if (region.componentType === "CHART") {
+      window.WorkbenchChart.renderChart(container, region, ctx);
+    }
+  }
+  window.addEventListener("resize", () => {
+    for (const chart of window.WorkbenchChart.instances || []) { try { chart.resize(); } catch (e) {} }
+  });
+</script>
+</body>
+</html>

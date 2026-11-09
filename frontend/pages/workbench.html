@@ -615,8 +615,18 @@
      它只管排版，不发请求、不改会话；主工作台把既有叶子渲染注入给它。 -->
 <link rel="stylesheet" href="./workbench_presentation.css?v=20261103-nightb1">
 <script src="./workbench_presentation.js?v=20261103-rework2"></script>
+<!-- 第二批（20261106）：组件专属渲染模块。
+     文本 / 指标卡 / 指标组 / 表格 / 图表各一个模块：只渲染自己那一类叶子，
+     不发请求、不改会话、不持有草稿写权限；主工作台按 componentType 调用。
+     模块没加载时主工作台走既有渲染路径（兜底，不是功能降级）。 -->
+<link rel="stylesheet" href="./workbench_text_metric.css?v=20261106-batch2">
+<script src="./workbench_text_metric.js?v=20261106-batch2"></script>
+<link rel="stylesheet" href="./workbench_table.css?v=20261106-batch2">
+<script src="./workbench_table.js?v=20261106-batch2"></script>
+<link rel="stylesheet" href="./workbench_chart.css?v=20261106-batch2">
+<script src="./workbench_chart.js?v=20261106-batch2"></script>
 <!-- 主工作台：规则模块与方案模块先加载（它们是普通脚本，按文档顺序执行），
      主脚本用 defer：文档解析完执行、在 DOMContentLoaded 之前，不阻塞首帧。 -->
-<script src="./workbench.js?v=20261104-pie-sector1" defer></script>
+<script src="./workbench.js?v=20261109-bounded-recovery" defer></script>
 </body>
 </html>

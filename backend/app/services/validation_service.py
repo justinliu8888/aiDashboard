@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 SUPPORTED_COMPONENT_TYPES = {
     "TEXT",
     "METRIC_CARD",
+    # 多指标组：一个区域里的**指标项列表**（不是容器，不带 children）。
+    "METRIC_GROUP",
     "TABLE",
     "CHART",
     "DATA_QUALITY",
@@ -47,7 +49,16 @@ SUPPORTED_COMPONENT_TYPES = {
     # 容器（分组）：只管排列与阅读顺序，**没有数据**（契约 0002 §1）。
     "CONTAINER",
 }
-SUPPORTED_CHART_KINDS = {"LINE", "AREA", "BAR", "PIE"}
+#: 本批支持的图型（第二批）。STACKED_BAR / DONUT 是**独立图型**，
+#: 不能映射到 BAR / PIE —— 协议与渲染都按真实图型区分。
+SUPPORTED_CHART_KINDS = {
+    "LINE",
+    "AREA",
+    "BAR",
+    "STACKED_BAR",
+    "PIE",
+    "DONUT",
+}
 
 # 派生列类型（与 report_draft_service 的常量保持一致）
 SUPPORTED_DERIVED_KINDS = {

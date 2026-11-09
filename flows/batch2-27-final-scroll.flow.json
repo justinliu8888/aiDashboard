@@ -1,0 +1,40 @@
+{
+  "outDir": "../.selfcheck/flow-27-final-render",
+  "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+  "port": 8000,
+  "waitMs": 2000,
+  "timeout": 120000,
+  "ignore": ["modao.cc"],
+  "flows": [
+    {
+      "name": "第二批最终草稿-只看草稿模式截图",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        { "wait": 1500 },
+        { "click": "#btn-manage-drafts" },
+        { "waitFor": "dialog[open] [data-draft-list]", "timeout": 30000 },
+        { "wait": 600 },
+        { "click": "dialog[open] [data-draft-list] > div:first-child button" },
+        { "wait": 3500 },
+        { "waitFor": "#preview-root [data-region-id]", "timeout": 60000 },
+        { "wait": 1200 },
+        { "click": "#btn-pane-mode" },
+        { "wait": 600 },
+        { "click": "[data-pane-mode-option=\"draft\"]" },
+        { "wait": 1500 },
+        { "screenshot": "27-09-只看草稿-顶部" },
+        {
+          "eval": "(() => { const cands = Array.from(document.querySelectorAll('*')).filter(el => { const s = getComputedStyle(el); return (s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 40; }); window.__scrollers = cands; const target = cands.find(el => el.contains(document.getElementById('preview-root'))) || cands[0]; if (!target) return false; window.__scroller = target; target.scrollTop = target.scrollHeight * 0.45; return true; })()"
+        },
+        { "wait": 1200 },
+        { "screenshot": "27-10-只看草稿-表格" },
+        {
+          "eval": "(() => { if (!window.__scroller) return false; window.__scroller.scrollTop = window.__scroller.scrollHeight * 0.8; return true; })()"
+        },
+        { "wait": 1200 },
+        { "screenshot": "27-11-只看草稿-图表与指标组" }
+      ]
+    }
+  ]
+}

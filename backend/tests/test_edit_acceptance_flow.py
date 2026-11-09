@@ -65,9 +65,19 @@ def test_readonly_question_answers_without_pending_plan(post_chat, definition):
     assert response["domainObjects"]["pendingEditPlan"] is None
     assert response["domainObjects"]["changeSet"] is None
     assert response["domainObjects"]["reportDefinitionDraft"]["metadata"]["revision"] == 0
-    assert response["questions"] == []
     assert "不支持分钟粒度" in response["reply"]
-    assert session_service.load_pending_choice("conv_test") is None
+    # 第二批新契约：只读作答后保留草稿级合法菜单（同意/修改/重新开始），
+    # 但不弹编辑表单，也不产生候选计划或变更。
+    assert len(response["questions"]) == 1
+    assert response["questions"][0]["id"] == "template_edit_confirm"
+    assert response["questions"][0]["selectionOnly"] is True
+    assert [o["value"] for o in response["questions"][0]["options"]] == ["同意", "修改", "重新开始"]
+
+    # 只读提问不推进到编辑流程：持久化的仍是草稿级合法菜单。
+    stored = session_service.load_pending_choice("conv_test")
+    assert stored is not None
+    assert stored["question"]["id"] == "template_edit_confirm"
+    assert [o["value"] for o in stored["question"]["options"]] == ["同意", "修改", "重新开始"]
     assert definition.metadata["revision"] == 0
 
 
@@ -78,7 +88,13 @@ def test_readonly_question_without_target_does_not_turn_into_edit(post_chat, def
         snapshots=_snap(definition),
     ).json()
     assert "请指出" in response["reply"]
-    assert response["questions"] == []
+    # 第二批新契约：只读作答后保留草稿级合法菜单（同意/修改/重新开始），
+    # 但不弹编辑表单，也不产生候选计划或变更。
+    assert len(response["questions"]) == 1
+    assert response["questions"][0]["id"] == "template_edit_confirm"
+    assert response["questions"][0]["selectionOnly"] is True
+    assert [o["value"] for o in response["questions"][0]["options"]] == ["同意", "修改", "重新开始"]
+
     assert response["domainObjects"]["pendingEditPlan"] is None
     assert session_service.load_pending_plan("conv_test") is None
     assert session_service.load_clarification("conv_test") is None
@@ -130,10 +146,20 @@ def test_readonly_visualization_question_only_answers(post_chat, definition):
         snapshots=_snap(definition),
     ).json()
     assert "柱状图" in response["reply"]
-    assert response["questions"] == []
+    # 第二批新契约：只读作答后保留草稿级合法菜单（同意/修改/重新开始），
+    # 但不弹编辑表单，也不产生候选计划或变更。
+    assert len(response["questions"]) == 1
+    assert response["questions"][0]["id"] == "template_edit_confirm"
+    assert response["questions"][0]["selectionOnly"] is True
+    assert [o["value"] for o in response["questions"][0]["options"]] == ["同意", "修改", "重新开始"]
+
     assert response["domainObjects"]["pendingEditPlan"] is None
     assert response["domainObjects"]["changeSet"] is None
-    assert session_service.load_pending_choice("conv_test") is None
+    # 只读提问不推进到编辑流程：持久化的仍是草稿级合法菜单。
+    stored = session_service.load_pending_choice("conv_test")
+    assert stored is not None
+    assert stored["question"]["id"] == "template_edit_confirm"
+    assert [o["value"] for o in stored["question"]["options"]] == ["同意", "修改", "重新开始"]
 
 
 def test_grain_name_does_not_override_followup_choice(post_chat, definition):

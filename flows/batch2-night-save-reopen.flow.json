@@ -1,0 +1,169 @@
+{
+  "outDir": "../.selfcheck/flow-batch2-night-save-reopen",
+  "waitMs": 1500,
+  "timeout": 15000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "第二批夜间：保存草稿、撤销、重新打开（独立短流程）",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "screenshot": "r01-新建对话"
+        },
+        {
+          "eval": "(() => { const sels = [\"[data-question-other=\\\"template_edit_confirm\\\"] .question-other-input\",\"[data-question-text=\\\"template_edit_request\\\"] .question-text-input\"]; let n = 0; for (const sel of sels) { for (const el of document.querySelectorAll(sel)) { if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); n += 1; } } } return n >= 0; })()"
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成 A 机房昨日能耗日报，报表里要有这三个板块，标题就用我写的名字：第一个板块标题「日报说明」，是说明文字；第二个板块标题「昨日总耗电」，是指标卡；第三个板块标题「设备耗电排名」，是柱状图，横轴设备名称、纵轴耗电量。"
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "waitFor": ".plan-action-select",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "r02-方案卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.plan-action-select'); const opt = Array.from(s.options).find(o => o.textContent.trim() === '确认方案'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "r03-草稿已生成"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 180000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel"
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「昨日总耗电」指标卡改名为「昨日总耗电量」。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "r04-改名候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "(() => { const names = Array.from(document.querySelectorAll('#preview-root .region-name')).map(e => e.textContent.trim()); return names.includes('昨日总耗电量'); })()"
+        },
+        {
+          "screenshot": "r05-改名已生效"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitText": "保存草稿",
+          "timeout": 120000
+        },
+        {
+          "wait": 800
+        },
+        {
+          "screenshot": "r06-保存对话框"
+        },
+        {
+          "eval": "(() => { const i = document.querySelector('dialog[open] input[name=\"draftName\"]'); if (!i) return false; i.value = '第二批夜间保存重开验收草稿'; return true; })()"
+        },
+        {
+          "click": "dialog[open] button[value=\"save\"]"
+        },
+        {
+          "wait": 2500
+        },
+        {
+          "eval": "document.querySelector('dialog[open]') === null"
+        },
+        {
+          "screenshot": "r07-已保存"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.wp-history-select'); if (!s) return false; s.value = 'undo'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 2500
+        },
+        {
+          "screenshot": "r08-撤销一次"
+        },
+        {
+          "eval": "(() => { const t = document.getElementById('chat-scroll').innerText || ''; return t.includes('撤销'); })()"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.wp-history-select'); if (!s) return false; s.value = 'undo'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 2500
+        },
+        {
+          "eval": "(() => { const names = Array.from(document.querySelectorAll('#preview-root .region-name')).map(e => e.textContent.trim()); return names.includes('昨日总耗电'); })()"
+        },
+        {
+          "screenshot": "r09-再撤销一次-改名已回退"
+        },
+        {
+          "screenshot": "r09-草稿列表"
+        },
+        {
+          "eval": "(async () => { const deadline = Date.now() + 20000; while (Date.now() < deadline) { const list = document.querySelector('dialog[open] [data-draft-list]'); if (list && (list.innerText || '').includes('第二批夜间保存重开验收草稿')) return true; await new Promise(r => setTimeout(r, 200)); } return false; })()"
+        },
+        {
+          "eval": "(async () => { const deadline = Date.now() + 20000; while (Date.now() < deadline) { const list = document.querySelector('dialog[open] [data-draft-list]'); if (list && (list.innerText || '').includes('第二批夜间保存重开验收草稿')) return true; await new Promise(r => setTimeout(r, 200)); } return false; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "screenshot": "r10-重新打开"
+        },
+        {
+          "eval": "(() => { const names = Array.from(document.querySelectorAll('#preview-root .region-name')).map(e => e.textContent.trim()); if (!names.includes('昨日总耗电') || !names.includes('日报说明') || !names.includes('设备耗电排名')) return false; const t = document.getElementById('preview-root').innerText || ''; return t.includes('5297.2'); })()"
+        }
+      ]
+    }
+  ]
+}

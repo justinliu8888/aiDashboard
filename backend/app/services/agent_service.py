@@ -82,7 +82,7 @@ from app.services.report_design_service import (
     report_design_service,
 )
 from app.services.report_issue_analysis import IssueAnalysis, analyze_region
-from app.services.report_presentation_service import find_region
+from app.services.report_presentation_service import find_region, iter_regions
 # 判定与兜底策略放在 query_answer_service（回答文本策略的家）。
 from app.services.query_answer_service import (
     claims_live_progress,
@@ -786,7 +786,20 @@ class AgentService:
             ),
             reportPolicyDraft=facts.policy or request.snapshots.reportPolicy,
         )
+        model_questions = [q for q in (response.questions or []) if q]
         response.questions = self._preserved_menu(request, pending_guard)
+        if not response.questions:
+            # 查询轮**不丢弃**模型这一轮给出的澄清菜单。
+            #
+            # 原来只有「原来就有的」菜单会被带回：模型刚生成的那张澄清卡
+            # 被整包丢掉，用户看到的是「有回复、没 Dropdown、输入又锁着」
+            # —— 正文里的编号问题不等于可点击的 Dropdown（反馈 F02-01）。
+            #
+            # 模型给的菜单优先于兜底菜单：它知道该问什么、该给哪几个目标。
+            model_menu = self._model_menu(model_questions)
+            if model_menu is not None:
+                response.questions = [model_menu]
+                self._stage_actionable_menu(request, response, model_menu)
         response.debug = {
             **(response.debug or {}),
             "queryMode": True,
@@ -962,6 +975,11 @@ class AgentService:
                 },
             )
             response = await self._chat_inner(request, emit=emit)
+            # **统一出口**（反馈 F02-01）：普通响应与流式响应唯一共同经过的
+            # 出口。每一轮用户可见回复结束，都要有一张当前状态允许、
+            # 实际可执行的 Dropdown —— 不能再出现「有回复、没有 Dropdown、
+            # 输入又锁着」的死路。
+            response = self._ensure_actionable_menu(request, response)
         finally:
             # 本轮结束：退订，并把还没发出去的逐轮事件**发完** ——
             # 不让「最后几轮」比 final 先到或干脆丢掉。
@@ -984,6 +1002,182 @@ class AgentService:
         debug.setdefault("traceSummary", summary)
         response.debug = debug
         return response
+
+    # ---------- 统一出口：每轮结束都有可执行的 Dropdown ----------
+
+    def _ensure_actionable_menu(
+        self, request: AgentRequest, response: AgentResponse
+    ) -> AgentResponse:
+        """**统一出口**：每轮用户可见回复结束，都有一张可执行的 Dropdown。
+
+        为什么落在这一层：``chat()`` 是普通响应（``/api/agent/chat``）与
+        流式响应（``/api/agent/chat/stream``）**唯一**共同经过的出口。
+        在更靠里的分支上补菜单只能覆盖其中一条路；模型漏菜单、只读查询轮、
+        预执行失败轮、流式与普通响应的差异都会从缝里漏出去 —— 用户看到的
+        就是「有回复、没有 Dropdown、输入又锁着」的死路（反馈 F02-01）。
+
+        四条底线：
+
+        1. **已经有可执行菜单** → 原样返回。模型给的澄清菜单比兜底菜单准，
+           不换掉它。
+        2. **有待接受候选** → 候选卡本身就是那张菜单（接受修改 / 继续调整 /
+           取消），不另加一张：两张「请选择」会让用户不知道该点哪张。
+        3. **补出来的菜单必须服务端真的能执行**：选项值命中既有分支，
+           并与本轮消息、草稿**同事务**落库（``stage_pending_choice``）。
+           凭空造一张服务端不接的卡，用户点了会落空 —— 那比没有菜单更糟。
+        4. **明确说「不再阻塞、请自由输入」的轮次不补菜单**（见
+           :meth:`_is_free_text_continuation`）。那几轮本来就该让用户打字，
+           补一张会锁住输入，反而把「别问了，你继续说」变成「先选一个」。
+           这几轮**不锁输入**（不落 pendingChoice），所以它们不是死路。
+        """
+        questions = [q for q in (response.questions or []) if q]
+        if any(self._is_actionable_question(q) for q in questions):
+            return response
+        domain = getattr(response, "domainObjects", None)
+        if getattr(domain, "pendingEditPlan", None):
+            return response
+        if self._is_free_text_continuation(response):
+            return response
+        # 4) **输入锁着、屏上却没有菜单** → 把**当前待决的那张**带回来。
+        #
+        #    它本来就是权威菜单（服务端 ``pending_choice`` 里那一份），带回来
+        #    只是让屏幕与锁重新对上 —— pendingChoice **一个字节都不动**
+        #    （ADR 0002 §6.1：查询回答后原菜单与 pendingChoice 全部不变）。
+        #    这正是反馈 F02-01 的现场：「回复出来后 Dropdown 又没有了；
+        #    自由输入仍被锁定」。
+        session_key = current_session_key() or request.conversationId
+        pending_raw = session_service.load_pending_choice(session_key)
+        if pending_raw:
+            question = _question_from_pending(pending_raw.get("question") or {})
+            if question is not None and self._is_actionable_question(question):
+                response.questions = [question]
+                return response
+        menu = self._next_step_menu(request, response)
+        if menu is None:
+            return response
+        response.questions = [menu]
+        self._stage_actionable_menu(request, response, menu)
+        return response
+
+    @staticmethod
+    def _is_free_text_continuation(response: AgentResponse) -> bool:
+        """这一轮是不是**明说「不再追问，请直接打字」**的轮次。
+
+        有两类：
+
+        - ``template_edit_clarification_limit``：同一件事追问额度用尽，
+          回复里已经列了三条自由输入的替代走法（:data:`DELEGATION_ALTERNATIVES`）；
+        - ``delegated_assumption``：用户说「你自己决定 / 别问了」之后，
+          同样把假设写在明面上、列出自由输入的替代走法。
+
+        这两类轮次契约上就是「**不阻塞**」：``questions`` 故意是空的、
+        不落 pendingChoice → 输入是自由的。补一张 Dropdown 只会把
+        「你继续说」变成「先点一个」，与契约相反（契约表 §7.4 追问额度、
+        §8 不变量 8「宁可少说，不许说假话」）。
+        """
+        actions = set(response.uiActions or [])
+        return bool(
+            actions & {"template_edit_clarification_limit", "delegated_assumption"}
+        )
+
+    @staticmethod
+    def _is_actionable_question(question: AgentQuestion) -> bool:
+        """这张卡是不是**用户现在就能用**的入口。
+
+        三种都算：
+
+        - **有选项** → 可点的 Dropdown；
+        - **带步骤身份** → 受限修改输入那一步（``stepKind="edit_request"``），
+          它在页面上是卡片里的**专用输入**，没有选项，但同样是一个能走通的
+          入口（漏判它会把这一步顶掉 —— 用户就既没有下拉框、也没有输入框）；
+        - **纯文字题**（``expects=TEXT``）→ 「直接填写」那一步。
+        """
+        if question.options:
+            return True
+        if question.stepKind:
+            return True
+        if question.allowsOther:
+            return True
+        return str(question.expects or "").strip().upper() == "TEXT"
+
+    @staticmethod
+    def _model_menu(questions: list[AgentQuestion]) -> AgentQuestion | None:
+        """模型这一轮给出的**可执行**菜单。
+
+        优先带选项的那张（可点的 Dropdown）；没有带选项的，就取受限输入
+        那一步（卡片里的专用输入）。两种都是用户能走通的入口。
+
+        优先带步骤身份的那张 —— 同一轮里的澄清菜单与专用输入卡常共用同一个
+        ``stepId``，它们是**同一步**的两张卡。
+        """
+        usable = [q for q in questions if AgentService._is_actionable_question(q)]
+        if not usable:
+            return None
+        with_options = [q for q in usable if q.options]
+        pool = with_options or usable
+        return next((q for q in pool if q.stepId), pool[0])
+
+    def _next_step_menu(
+        self, request: AgentRequest, response: AgentResponse
+    ) -> AgentQuestion | None:
+        """当前状态**允许**的下一步菜单（没有就诚实不给）。
+
+        只给服务端真的会执行的那一张：
+
+        - 编辑态 / 待确认态 + 有草稿 → 「同意 / 修改 / 重新开始」
+          （三个选项在 :meth:`_try_handle_template_edit` 与待决入口都有既有分支）；
+        - READY → 「继续修改 / 发布 / 导出 PDF」。
+
+        没有草稿、或状态不在这两类里 → **不给**。凭空造的选项点了会落空，
+        那比「这一轮没有菜单」更糟：用户会以为点不动是页面坏了。
+        """
+        if request.snapshots.reportDefinition is None:
+            return None
+        state = response.state
+        if state in (
+            AgentState.USER_EDITING_TEMPLATE,
+            AgentState.WAITING_USER_CONFIRM,
+        ):
+            return self._editing_confirm_questions()[0]
+        if state == AgentState.READY:
+            return self._ready_questions()[0]
+        return None
+
+    @staticmethod
+    def _stage_actionable_menu(
+        request: AgentRequest, response: AgentResponse, menu: AgentQuestion
+    ) -> None:
+        """把兜底菜单落成**权威步骤**（与本轮同事务）。
+
+        不落库的话前端画出来的那张卡点了会落空 —— 服务端并没有这把锁，
+        用户按一次没反应，再按一次还是没反应。落库走
+        ``stage_pending_choice``：真正写库发生在路由层那一笔事务里，
+        与本轮消息、草稿、候选消费一起成败（契约 0002 §6/§7）。
+
+        **不覆盖已有菜单**：已经有权威菜单时本方法不会被调用（见
+        :meth:`_ensure_actionable_menu` 的第 1 条底线）。
+
+        与 ADR 0002 §6.1「查询回答后 pendingChoice 不变」的关系：
+        §6.1 保护的是**不要替用户做决定**（不要顺手接受 / 取消 / 替换已有
+        的待确认项）。这里**不碰**已有的待确认项 —— 有菜单时压根不会走到
+        本方法；只有「本来一张菜单都没有」的轮次才会补一张**下一步**菜单。
+        那张菜单不是决定，是「你现在可以做什么」的入口；选哪一项仍然是
+        用户的事。
+        """
+        if not menu.stepId:
+            menu.stepId = f"step_{uuid.uuid4().hex}"
+        if menu.stepVersion is None:
+            menu.stepVersion = 1
+        if not menu.stepKind:
+            menu.stepKind = STEP_KIND_MENU
+        session_key = current_session_key() or request.conversationId
+        session_service.stage_pending_choice(
+            session_key,
+            {
+                "state": response.state.value,
+                "question": menu.model_dump(mode="json"),
+            },
+        )
 
     async def _chat_inner(
         self,
@@ -2047,13 +2241,60 @@ class AgentService:
         intent: str = "UNKNOWN",
         region_id: str = "",
         delegated: bool = False,
+        question_id: str = "",
     ) -> AgentResponse:
         """要追问的地方，先看用户是不是已经说了「别问了」。"""
         if delegated:
             return self._delegated_response(request, definition)
         return self._edit_clarification_response(
-            request, question, choices=choices, intent=intent, region_id=region_id
+            request, question, choices=choices, intent=intent, region_id=region_id,
+            question_id=question_id,
         )
+
+    @staticmethod
+    def _explicit_region_choice(request: AgentRequest, definition: Any) -> str:
+        """这一轮的消息是不是**从下拉里选出来的稳定区域 ID**。
+
+        「改哪一张卡片」的菜单选项值就是当前草稿的**稳定区域 ID**
+        （契约：选项绑定稳定区域 ID，不能按数组位置或名称猜目标）。
+        前端把选中项的 ``value`` 原样发回来（``sendMessage(select.value)``），
+        所以这里拿到的是一串区域 ID。
+
+        区域 ID 是**最硬的锚点**：它在草稿里唯一、不随可见顺序变、
+        也不受句子里其它卡片名干扰。认出来就直接用它当目标。
+        """
+        message = str(request.message or "").strip()
+        if not message:
+            return ""
+        for region in (definition.regions or []) if definition is not None else []:
+            if not isinstance(region, dict):
+                continue
+            region_id = str(region.get("id") or "")
+            if region_id and region_id == message:
+                return region_id
+        return ""
+
+    @staticmethod
+    def _region_choice_options(reference: Any) -> list[QuestionOption] | None:
+        """「指的是哪一张卡片」的可点选项（**值 = 稳定区域 ID**）。
+
+        正文里的「第 2 个」不是接口参数（反馈 F02-01 / F02-07）：选项必须
+        绑定当前草稿的**稳定区域 ID**，用户点完回传的就是它，服务端按 ID
+        认目标，不再按位置或名称猜。
+
+        没有候选就返回 ``None``（那就不给菜单，改为自由输入的澄清卡）。
+        """
+        choices: list[QuestionOption] = []
+        for option in getattr(reference, "options", None) or []:
+            value = str(getattr(option, "value", "") or "")
+            if not value:
+                continue
+            choices.append(QuestionOption(
+                value=value,
+                label=str(getattr(option, "label", "") or value),
+                description=str(getattr(option, "description", "") or ""),
+            ))
+        return choices or None
 
     @staticmethod
     def _target_is_named_in_message(
@@ -2070,6 +2311,12 @@ class AgentService:
 
         名字是**可靠锚点**：只要动作目标被点名，它就是用户真的指的那张，
         不需要再和另一个被点名的对象比。
+
+        **区分性片段**也算点名：「在说明中引用『总告警数』」里没有出现
+        「交接说明」这四个字，但「说明」是它的片段，而且**当前草稿里没有
+        第二张卡片叫「说明」** —— 那它就是用户指的那张（反馈 F02-03）。
+        片段必须同时满足三条才算数：够长、在句子里出现、**别的卡片没有**
+        （不区分的片段不算点名）。
         """
         if not target_region_id or not text:
             return False
@@ -2086,6 +2333,61 @@ class AgentService:
         for name in names:
             if name and len(str(name).strip()) >= 2 and str(name).strip() in haystack:
                 return True
+        return AgentService._named_by_distinctive_fragment(
+            region, draft, haystack
+        )
+
+    @staticmethod
+    def _named_by_distinctive_fragment(region: dict, draft: Any, text: str) -> bool:
+        """目标的卡片名是不是靠**区分性片段**被点名的。
+
+        片段要同时满足三条：
+
+        1. **够长**：至少 2 个字，且不短于卡片名的一半 —— 「说明」能认出
+           「交接说明」，但「卡」认不出任何一张卡片；
+        2. **在句子里出现**；
+        3. **别的卡片没有**：当前草稿里没有第二张卡片的任何一个名字含这个
+           片段 —— 有的话它就不区分，认出来也是猜。
+
+        判据就地写成表达式：这个函数会被既有单测单独抽进沙箱跑，
+        沙箱里只有它原有的依赖 —— 少一个符号就直接抛错。
+        """
+        component = region.get("component") or {}
+        metric = component.get("metric") or {}
+        own_names = [
+            str(item).strip()
+            for item in (
+                region.get("id"), region.get("name"),
+                component.get("title"), metric.get("label"),
+            )
+            if item and str(item).strip()
+        ]
+        other_names: list[str] = []
+        for other, _ancestors in iter_regions(draft):
+            if not isinstance(other, dict):
+                continue
+            if str(other.get("id") or "") == str(region.get("id") or ""):
+                continue
+            other_component = other.get("component") or {}
+            other_metric = other_component.get("metric") or {}
+            for item in (
+                other.get("id"), other.get("name"),
+                other_component.get("title"), other_metric.get("label"),
+            ):
+                if item and str(item).strip():
+                    other_names.append(str(item).strip())
+        for name in own_names:
+            name_len = len(name)
+            for start in range(name_len):
+                for end in range(name_len, start, -1):
+                    fragment = name[start:end]
+                    if len(fragment) < 2 or len(fragment) * 2 < name_len:
+                        continue
+                    if fragment not in text:
+                        continue
+                    if any(fragment in other for other in other_names):
+                        continue
+                    return True
         return False
 
     @staticmethod
@@ -2217,6 +2519,93 @@ class AgentService:
             return
         response.questions = [*(response.questions or []), step]
 
+    def _target_conflict_response(
+        self,
+        request: AgentRequest,
+        candidate_region_id: str,
+        reference_region_id: str,
+        *,
+        reference_text: str,
+        options: list[Any] | None = None,
+    ) -> AgentResponse:
+        """候选目标与**用户指到的对象**对不上 → 给一张「改哪一张」的 Dropdown。
+
+        反馈 F02-03：原来这里直接抛「可见卡片顺序或目标尚未确认」，
+        用户只拿到一句笼统失败、页面上没有可点的入口，只能干等。
+
+        现在给的是一张**可执行**的下拉：
+
+        • 选项值 = 当前草稿的**稳定区域 ID**（契约：选项绑定稳定区域 ID，
+          不能按旧数组位置或名称猜目标）；
+        • 用户选中后前端把 ``value`` 原样发回来（``sendMessage(select.value)``），
+          服务端按 ID 认目标，不再按句子猜（见 :meth:`_explicit_region_choice`）；
+        • 原始要求留在 ``collectedInfo.pendingEditRequest``：下一轮按**用户
+          选定的目标**重新推这份修改；
+        • **草稿一个字节都没动**，候选也没有落库 —— 失败保护照旧。
+        """
+        labels: dict[str, str] = {}
+        for option in options or []:
+            value = str(getattr(option, "value", "") or "")
+            if value:
+                labels[value] = str(getattr(option, "label", "") or value)
+        ordered: list[str] = []
+        for region_id in (candidate_region_id, reference_region_id):
+            if region_id and region_id not in ordered:
+                ordered.append(region_id)
+        if not ordered:
+            ordered = [candidate_region_id or reference_region_id]
+        choice_options = [
+            QuestionOption(
+                value=region_id,
+                label=labels.get(region_id, region_id),
+                description=region_id,
+            )
+            for region_id in ordered if region_id
+        ]
+        if not choice_options:
+            return self._edit_notice(
+                request, "这句话的目标没能确定，草稿没有变化；请重新说明要改哪一块。"
+            )
+        # 原始要求留到下一轮：用户选完目标，按这个要求重新推修改。
+        if reference_text:
+            request.collectedInfo["pendingEditRequest"] = reference_text
+        names = "、".join(
+            labels.get(region_id, region_id) for region_id in ordered
+        )
+        question = AgentQuestion(
+            id="edit_target_clarification",
+            prompt="你要改的是哪一张卡片？",
+            expects="SINGLE_CHOICE",
+            options=choice_options,
+            selectionOnly=True,
+        )
+        return AgentResponse(
+            conversationId=request.conversationId,
+            state=AgentState.USER_EDITING_TEMPLATE,
+            reply=(
+                f"这句话里有两个可能的目标（{names}），我还没法确定你要改哪一张。"
+                "草稿没有变化，也没有生成待接受的修改计划。"
+                "请从下面的下拉框选一张，选完我按你的原话重新出一份候选。"
+            ),
+            designSessionId=request.context.designSessionId,
+            domainObjects=AgentResponseDomainObjects(
+                reportDefinitionDraft=request.snapshots.reportDefinition,
+                reportPolicyDraft=request.snapshots.reportPolicy,
+            ),
+            questions=[question],
+            uiActions=["ask_template_edit_detail"],
+            debug={
+                "editOutcome": "clarification",
+                "editingIntent": (request.collectedInfo or {}).get("editingIntent")
+                or "UNKNOWN",
+                "editingTargetRegionId": candidate_region_id or None,
+                "targetConflict": {
+                    "candidateRegionId": candidate_region_id or None,
+                    "referenceRegionId": reference_region_id or None,
+                },
+            },
+        )
+
     def _finalize_template_edit(
         self, request: AgentRequest, response: AgentResponse
     ) -> AgentResponse:
@@ -2274,10 +2663,25 @@ class AgentService:
                     # （名字是可靠锚点）；只有"序数 / 指代"这类
                     # **顺序型**参照对不上才拒 —— 那才是"顺序变了、
                     # 目标可能选错"的真实风险。
-                    if not self._target_is_named_in_message(
+                    #
+                    # 候选**没有目标区域**时不是冲突：它要改的是**新建**的那一块
+                    # （能力格式的 ``target.ref``），不碰任何已有卡片 ——
+                    # 「单独增加一个总告警数指标」就是这一类，句子里出现的
+                    # 「总告警数」是**要新建的指标**，不是要改的卡片（反馈 F02-05）。
+                    if candidate.targetRegionId and not self._target_is_named_in_message(
                         candidate.targetRegionId, draft, reference_text
                     ):
-                        raise ValueError("可见卡片顺序或目标尚未确认")
+                        # 目标对不上：**不要**只回一句笼统失败（反馈 F02-03）。
+                        # 给一张「改哪一张」的 Dropdown：选项值 = 当前草稿的
+                        # 稳定区域 ID，用户选完下一轮就按那个 ID 认目标。
+                        # 草稿一个字节都没动，候选也没有落库。
+                        return self._target_conflict_response(
+                            request,
+                            candidate.targetRegionId,
+                            reference.regionId,
+                            reference_text=reference_text,
+                            options=reference.options,
+                        )
             except (KeyError, TypeError, ValueError) as exc:
                 reason = str(exc) if isinstance(exc, ValueError) else "计划字段不完整"
                 notice = self._edit_notice(
@@ -2353,6 +2757,23 @@ class AgentService:
             # 技术失败：这一步**不结束**。把受限输入那张卡带回响应，
             # 用户还能在同一张输入里重试；普通聊天继续锁着。
             self._attach_edit_step(session_key, response)
+            # **失败后必须还有入口**：这一步的步骤身份在提交时被消费掉了，
+            # ``_attach_edit_step`` 拿不到旧卡 —— 响应里就只剩一个锁着的
+            # 灰输入框，用户看不到任何可操作的东西（验收 08-05）。
+            # 这里**重建**一张受限输入卡：草稿没变、没替用户接受任何东西，
+            # 用户可以直接再说一次要改什么。
+            if not any(
+                question.stepKind == STEP_KIND_EDIT_REQUEST
+                for question in (response.questions or [])
+            ):
+                step = self._edit_request_step_question(
+                    self._current_draft_id(session_key)
+                )
+                response.questions = [*(response.questions or []), step]
+                response.uiActions = list(response.uiActions or []) + [
+                    "template_editing",
+                    "ask_template_edit_detail",
+                ]
             return response
         is_clarification = (
             (response.debug or {}).get("editOutcome") == "clarification"
@@ -2405,6 +2826,14 @@ class AgentService:
             )
             response.questions = []
             response.uiActions = ["template_edit_clarification_limit"]
+            # 这一步**结束**了 → 这一步的锁也要跟着结束。
+            #
+            # 额度用尽时「普通聊天可以重新开」（契约表 §7.4）—— 那就得
+            # **真的把锁解开**：旧的追问卡还挂在 ``pending_choice`` 上的话，
+            # 下一条修改请求会被「必须在菜单里选」挡住（实测：追问额度用尽
+            # 之后，后面所有修改请求都被当成「不在菜单里」拒绝，用户完全
+            # 走不下去）。
+            session_service.stage_pending_choice(session_key, None)
             # 这一件事的额度已经用尽：**不要**把「上一轮在追问什么」继续留在
             # collectedInfo 里，否则下一轮的「继续接上一句」会一直贴着
             # 这件已经结束的事，新事项反而被旧事项的上下文缠住。
@@ -2624,12 +3053,23 @@ class AgentService:
                 "effect": edit_trace_service.EFFECT_NOT_RUN,
             },
         )
+        summary = summarize_facts(facts)
+        actually_changed = bool(
+            facts.get("added") or facts.get("removed") or facts.get("modified")
+        )
+        # 「已生效」与「没有改变区块内容」不能同时出现 ——
+        # 没有实际差异时说「已核对，没有实际改动」，草稿保持原样（验收 08-01）。
+        reply = (
+            f"已按你的确认生效。\n{summary}"
+            if actually_changed
+            else f"已按你的确认核对：本次没有实际改动，草稿保持原样。\n{summary}"
+        )
         return EditResult(
             plan=plan,
             draftBeforeEdit=definition,
             draftAfterEdit=trial.definition,
             changeSet=trial.change_set,
-            reply=f"已按你的确认生效。\n{summarize_facts(facts)}",
+            reply=reply,
             editingTargetRegionId=plan.target.regionId or None,
             debug={"editFacts": facts, "reason": "capability_applied"},
         )
@@ -3663,19 +4103,38 @@ class AgentService:
             history_region_id=self._history_region_id(request),
         )
         selected_region_id = request.context.selectedRegionId
-        if reference.status != "NOT_FOUND":
+        # **用户从下拉里明确选出来的目标**（稳定区域 ID）：它比句子里出现的
+        # 任何卡片名都硬 ——「在说明中引用『总告警数』」这句话里有两个卡片名，
+        # 按名字猜会改错卡片。用户已经指明了，就按用户指明的来。
+        explicit_region_id = self._explicit_region_choice(request, definition)
+        if explicit_region_id:
+            selected_region_id = explicit_region_id
+            # 模型也要知道目标：它按 ``ctx.selectedRegionId`` 看当前选中区块。
+            try:
+                request.context.selectedRegionId = explicit_region_id
+            except (AttributeError, ValueError):
+                pass
+        elif reference.status != "NOT_FOUND":
             if reference.status != "RESOLVED":
                 # 指代词没选中对象、序数越界：先问清楚是哪一张。
+                #
+                # **正文里的编号不算数**（反馈 F02-01 / F02-07）：必须给一张
+                # **可点的下拉**，选项值 = 当前草稿的**稳定区域 ID**。
+                # 用户选中后前端把 value 原样发回来，服务端按 ID 认目标。
                 return self._clarification_or_delegated(
                     request, definition,
                     reference.question or "请指出要改的正文卡片名称。",
+                    choices=self._region_choice_options(reference),
                     intent="UNKNOWN", delegated=delegated,
+                    question_id="edit_target_clarification",
                 )
             if not self._reference_is_reliable(reference, request.context):
                 return self._clarification_or_delegated(
                     request, definition,
                     "当前页面卡片顺序无法核对，请指出要改的卡片名称。",
+                    choices=self._region_choice_options(reference),
                     intent="UNKNOWN", delegated=delegated,
+                    question_id="edit_target_clarification",
                 )
             # 用户这一轮明确指了对象（序数 / 名称 / 「刚才那张」）：
             # 以这句话为准，**覆盖**任何还挂在请求里的目标卡片。
@@ -3731,6 +4190,7 @@ class AgentService:
             selected_region_id=selected_region_id,
             scope=scope,
             change_value=change_value,
+            explicit_target_region_id=explicit_region_id or None,
         )
         if (
             plan.intent == EditIntent.CHANGE_DATA_SOURCE
@@ -4098,6 +4558,7 @@ class AgentService:
         choices: list[QuestionOption] | None = None,
         intent: str = "UNKNOWN",
         region_id: str = "",
+        question_id: str = "",
     ) -> AgentResponse:
         return AgentResponse(
             conversationId=request.conversationId,
@@ -4109,7 +4570,9 @@ class AgentService:
                 reportPolicyDraft=request.snapshots.reportPolicy,
             ),
             questions=[AgentQuestion(
-                id="edit_time_clarification" if choices else "edit_reference_clarification",
+                id=question_id or (
+                    "edit_time_clarification" if choices else "edit_reference_clarification"
+                ),
                 prompt=question,
                 expects="SINGLE_CHOICE" if choices else "TEXT",
                 options=choices or [],

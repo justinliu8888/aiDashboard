@@ -15,8 +15,10 @@
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from types import UnionType
+from typing import Any, Callable, Union, get_args, get_origin
 
 from pydantic import BaseModel, ValidationError
 
@@ -132,6 +134,202 @@ class CapabilityError(Exception):
 
 
 # --------------------------------------------------------------------------
+# 入口归一（**无损**）：写法不同，但说的是同一件事
+# --------------------------------------------------------------------------
+
+#: ``target`` 里**区域 id** 的常见别名。
+#:
+#: 模型偶尔把区域 id 写成 ``target`` / ``id`` / ``region``（而不是契约里的
+#: ``regionId``）。这类写法**说的是同一件事** —— 归一掉它，比整轮试做失败
+#: 再让用户重说一句要划算得多。
+_TARGET_REGION_KEYS: tuple[str, ...] = ("regionId", "region", "id", "target")
+
+#: ``target`` 里**本次新增区块引用**的常见别名。
+_TARGET_REF_KEYS: tuple[str, ...] = ("ref", "reference")
+
+
+def target_parts(target: Any) -> tuple[str, str]:
+    """把目标引用归一成 ``(regionId, ref)``。
+
+    认得：``{"regionId": ...}``、``{"ref": ...}``、``{"target": ...}``、
+    ``{"id": ...}``、``{"region": ...}``，以及多包一层的
+    ``{"target": {"regionId": ...}}``。**不认**的是：按标题猜（契约不按标题
+    猜目标，别在这里破例）。
+    """
+    if isinstance(target, dict):
+        region_id = ""
+        ref = ""
+        for key in _TARGET_REGION_KEYS:
+            value = target.get(key)
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                nested_region, nested_ref = target_parts(value)
+                region_id = region_id or nested_region
+                ref = ref or nested_ref
+                continue
+            text = str(value).strip()
+            if text:
+                region_id = region_id or text
+        for key in _TARGET_REF_KEYS:
+            text = str(target.get(key) or "").strip()
+            if text:
+                ref = ref or text
+        return region_id, ref
+    region_id = str(getattr(target, "regionId", "") or "").strip()
+    ref = str(getattr(target, "ref", "") or "").strip()
+    return region_id, ref
+
+
+#: 字符串 → 布尔值的**等价**写法（只认这几个，其余照样报错）。
+_TRUE_WORDS: frozenset[str] = frozenset({"true", "yes", "1", "是", "开", "on"})
+_FALSE_WORDS: frozenset[str] = frozenset({"false", "no", "0", "否", "关", "off"})
+
+
+def as_number(value: Any) -> int | float | None:
+    """**数字的等价写法**收成数字；不是数字就返回 ``None``。
+
+    模型常把数字写成字符串（``"1"`` / ``"220"`` / ``" 16 "``）或写成
+    整数值的浮点（``1.0``）。那是**同一个值**的另一种写法，不是别的值 ——
+    收下它，别因为一个引号把整轮修改判死。
+
+    真不是数字（``"两列"``、``""``、布尔）就返回 ``None``，由调用方按契约
+    明确拒绝。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _is_bool_field(annotation: Any) -> bool:
+    return annotation is bool
+
+
+def _is_list_field(annotation: Any) -> bool:
+    origin = get_origin(annotation)
+    if origin is list:
+        return True
+    return any(get_origin(arg) is list for arg in get_args(annotation))
+
+
+def _is_optional_list_field(annotation: Any) -> bool:
+    """这个列表字段**可以不���**（``list[...] | None``）。
+
+    「可以不���」和「给了就是这份清单」是**两件事**：前者里一个空字符串
+    的意思是「没给」（按缺省处理），后者里空字符串的意思是「空清单」。
+    """
+    origin = get_origin(annotation)
+    # ``X | None``（PEP 604）得到的是 ``types.UnionType``，不是
+    # ``typing.Union`` —— 两种都要认。
+    if origin is not Union and origin is not UnionType:
+        return False
+    args = get_args(annotation)
+    return type(None) in args and any(get_origin(arg) is list for arg in args)
+
+
+def tolerate_params(schema: Any, params: Any) -> Any:
+    """把**常见的等价写法**归一成契约认得的形状。
+
+    只做两件无损的事：
+
+    1. 布尔值写成 ``"true"`` / ``"是"`` / ``1`` → 真值；
+    2. 列表写成 JSON 字符串（``"[{...}]"``）→ 真列表。
+
+    **认不出来的形状照样报错** —— 归一不是放水。归一之后仍然不合契约的，
+    由 pydantic 给出带字段路径、收到类型、要求类型的可执行反馈。
+    """
+    if not isinstance(params, dict) or schema is None:
+        return params
+    fields = getattr(schema, "model_fields", None) or {}
+    if not fields:
+        return params
+    out = dict(params)
+    for name, field_info in fields.items():
+        if name not in out:
+            continue
+        value = out[name]
+        annotation = getattr(field_info, "annotation", None)
+        if _is_bool_field(annotation) and not isinstance(value, bool):
+            text = str(value).strip().lower()
+            if text in _TRUE_WORDS:
+                out[name] = True
+                continue
+            if text in _FALSE_WORDS:
+                out[name] = False
+                continue
+        if isinstance(value, str) and _is_list_field(annotation):
+            text = value.strip()
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    out[name] = parsed
+                continue
+            if not text:
+                # **空数组被写成空字符串**：模型想表达「这份清单是空的」，
+                # 却写成 ``""``。现场实证（主链最后一轮）：模型提交
+                # ``presentationFilters: ""`` → 契约判「必须是列表」→
+                # 整轮试做失败 → 用户只看到一句「修改计划在预执行校验时
+                # 没有通过，原草稿保持不变」。
+                #
+                # 「可以不���」的字段（``list | None``）：空字符串 = **没给**
+                # （按缺省处理，**不是**空清单 —— 缺省清空会把用户没提的
+                # 东西悄悄抹掉）；其余的列表字段：空字符串 = **空清单**。
+                out[name] = (
+                    None if _is_optional_list_field(annotation) else []
+                )
+            continue
+        if isinstance(value, dict) and _is_list_field(annotation):
+            # 列表写成**对象**：模型有时把数组序列化成 ``{"0": {...}, "1": {...}}``
+            # 或直接给单个对象。两种都能**无损**还原成列表 ——
+            # 还原不了就保持原样，交给契约报错（不猜、不放水）。
+            items = _as_item_list(value)
+            if items is not None:
+                out[name] = items
+    return out
+
+
+def _as_item_list(value: dict[str, Any]) -> list[Any] | None:
+    """对象 → 列表：能**无损**还原才还原，还原不了返回 ``None``。"""
+    if not value:
+        return None
+    values = list(value.values())
+    # 形如 {"0": {...}, "1": {...}}：按键排好序就是那份清单。
+    if all(str(key).isdigit() for key in value.keys()):
+        return [value[key] for key in sorted(value.keys(), key=lambda k: int(k))]
+    # 形如 {"items": [...]} / {"metrics": [...]}：**包了一层壳**，壳里就是
+    # 那份清单 —— 现场实证模型就是这么写的（"double-wrapped"），壳本身
+    # 不带信息，拆掉它就是同一个清单。
+    if len(value) == 1:
+        only = values[0]
+        if isinstance(only, list):
+            return list(only)
+    # 形如 {"总告警数": {...}, "严重告警数": {...}}：按名字还原成清单。
+    if all(isinstance(item, dict) for item in values):
+        return values
+    # 单个对象：它就是清单里的一项。
+    if any(key in value for key in ("label", "fieldRef", "id")):
+        return [value]
+    return None
+
+
+# --------------------------------------------------------------------------
 # 执行现场
 # --------------------------------------------------------------------------
 
@@ -165,16 +363,26 @@ class OperationContext:
         正式 regionId 与本次现场的临时 ref 用同一套判定。
         """
         if isinstance(target, dict):
-            region_id = str(target.get("regionId") or "").strip()
-            ref = str(target.get("ref") or "").strip()
+            region_id, ref = target_parts(target)
         else:
             region_id = str(getattr(target, "regionId", "") or "").strip()
             ref = str(getattr(target, "ref", "") or "").strip()
         if ref:
+            # ``ref`` 认得的是**本次修改现场**的引用名。模型常把**区块 id**
+            # 写进 ``ref``（或两个键一起写、键名写错）：这时只要这个值在
+            # 当前草稿里真实存在，就**按区块 id 认** —— 不认的话用户只会看到
+            # 「引用必须属于本次修改现场」，却不知道自己只是写错了键。
+            # 两条都不成立时，仍然按契约明确拒绝。
+            if str(self.refs.get(str(ref).strip()) or "").strip():
+                return self.resolve_reference(ref, field="target.ref", intent="ref")
+            for candidate in (region_id, str(ref).strip()):
+                if candidate and self.find_region(candidate) is not None:
+                    return candidate
             return self.resolve_reference(ref, field="target.ref", intent="ref")
         if not region_id:
             raise CapabilityError(
-                "这一步没有给出目标：请写 target.regionId（已有区块）或 target.ref（本次新增的区块）。",
+                "这一步没有给出目标：请写 target.regionId（已有区块）或 target.ref（本次新增的区块）。"
+                + self._region_hint(),
                 step=self.step,
                 op=self.op,
                 target="",
@@ -182,6 +390,25 @@ class OperationContext:
                 reason="missing_target",
             )
         return self.resolve_reference(region_id, field="target.regionId", intent="region")
+
+    def _region_hint(self) -> str:
+        """当前草稿里**可选的区块**（id + 名称）。
+
+        目标写错时，把可选项直接列出来 —— 模型下一轮就能选对，
+        用户也不必再问一次「改哪一张」。
+        """
+        items: list[str] = []
+        for region in self._live_regions():
+            if not isinstance(region, dict):
+                continue
+            region_id = str(region.get("id") or "").strip()
+            if not region_id:
+                continue
+            name = str(region.get("name") or "").strip()
+            items.append(f"{region_id}（{name}）" if name else region_id)
+        if not items:
+            return ""
+        return "当前草稿里的区块：" + "、".join(items) + "。"
 
     def find_region(self, region_id: str) -> dict[str, Any] | None:
         """按 id 找区块（**递归**：组里的卡片也找得到）。
@@ -413,6 +640,28 @@ class CapabilityOutcome:
 # 能力记录
 # --------------------------------------------------------------------------
 
+def business_facts(
+    *,
+    message: str,
+    detail: dict[str, Any] | None = None,
+    issues: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """能力执行结果里的**业务事实**（追踪层按这五个字段读真实业务结论）。
+
+    ``businessOk`` 是三态：``True`` / ``False`` / ``None``（**未取得**）。
+    这里写的是**执行器真的做了什么** —— 不是「没抛异常」。
+
+    各组件包的能力统一调这一份 —— 不各写一份同义实现。
+    """
+    return {
+        BUSINESS_OK_FIELD: True,
+        BUSINESS_MESSAGE_FIELD: message,
+        BUSINESS_REASON_FIELD: "",
+        BUSINESS_ISSUES_FIELD: [item for item in (issues or []) if isinstance(item, dict)],
+        BUSINESS_DETAIL_FIELD: dict(detail or {}),
+    }
+
+
 @dataclass(frozen=True)
 class EditCapability:
     """一项报表编辑能力。
@@ -475,6 +724,9 @@ def validate_params(
     """
     if capability.params_schema is None:
         return params  # type: ignore[return-value]
+    # **先归一再校验**：等价写法（"true" / JSON 字符串列表）不该换来一次
+    # 整轮试做失败 —— 归一只处理**无损**的写法，其余仍由契约把关。
+    params = tolerate_params(capability.params_schema, params)
     try:
         validated = capability.params_schema.model_validate(params or {})
     except ValidationError as exc:

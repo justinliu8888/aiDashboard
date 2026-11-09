@@ -1,0 +1,1501 @@
+{
+  "outDir": "../.selfcheck/flow-batch2-night-manual-guide",
+  "waitMs": 1500,
+  "timeout": 15000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "第二批夜间：按 07 说明书从头到尾连续走查",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "click": "#btn-new-session"
+        },
+        {
+          "wait": 800
+        },
+        {
+          "screenshot": "g01-新建对话"
+        },
+        {
+          "eval": "(() => { const sels = [\"[data-question-other=\\\"template_edit_confirm\\\"] .question-other-input\",\"[data-question-text=\\\"template_edit_request\\\"] .question-text-input\"]; let n = 0; for (const sel of sels) { for (const el of document.querySelectorAll(sel)) { if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); n += 1; } } } return n >= 0; })()"
+        },
+        {
+          "type": "#chat-input",
+          "text": "生成 A 机房昨日能耗日报，报表里要有这五个板块，标题就用我写的名字：第一个板块标题「日报说明」，是说明文字；第二个板块标题「昨日总耗电」，是指标卡；第三个板块标题「设备耗电明细」，是明细表，列出设备名称和耗电量；第四个板块标题「设备耗电排名」，是柱状图，横轴设备名称、纵轴耗电量；第五个板块标题「昨日逐小时耗电趋势」，是折线图。"
+        },
+        {
+          "press": "Enter"
+        },
+        {
+          "waitFor": ".plan-action-select",
+          "timeout": 180000
+        },
+        {
+          "eval": "document.querySelector('[data-plan-card=\"current\"]') !== null"
+        },
+        {
+          "screenshot": "g02-方案卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.plan-action-select'); const opt = Array.from(s.options).find(o => o.textContent.trim() === '确认方案'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"template_edit_confirm\"]'); if (!s) return false; return Array.from(s.options).map(o => o.textContent.trim()).join(',') === '请选择,同意,修改,重新开始'; })()"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「日报说明」的标题改成「机房运行日报」。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s01-03-文本标题-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"机房运行日报\")"
+        },
+        {
+          "screenshot": "s01-03-文本标题-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「日报说明」的正文内容改成「供值班交接使用」。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s02-04-文本正文-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"供值班交接使用\")"
+        },
+        {
+          "screenshot": "s02-04-文本正文-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「机房运行日报」的正文改成 Markdown 列表，内容是「查看告警、检查设备、记录异常」这三项。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s03-05-正文Markdown列表-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"查看告警\")"
+        },
+        {
+          "screenshot": "s03-05-正文Markdown列表-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「机房运行日报」的正文改成引用当前已有结果中的「告警总数」：正文模板写成「当前告警共 {{告警总数}} 条」，其中 {{告警总数}} 是绑定值，要真实取数不能写死；同时把这段的标题层级设为 2。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s04-06-正文动态绑定+标题层级-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"当前告警共\")"
+        },
+        {
+          "screenshot": "s04-06-正文动态绑定+标题层级-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「昨日总耗电」指标卡的名称改成「昨日总耗电量」，数值绑定保持不变。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s05-07-改指标名称-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"昨日总耗电量\")"
+        },
+        {
+          "screenshot": "s05-07-改指标名称-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「昨日总耗电量」指标卡改为显示当前区域已有结果中的「运行设备数」，单位用台。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s06-09-换成运行设备数-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"运行设备数\")"
+        },
+        {
+          "screenshot": "s06-09-换成运行设备数-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把当前显示「运行设备数」的这张指标卡临时改为显示当前区域已有结果中的「昨日总耗电」，名称改为「耗电格式验证」，单位用 kWh。先保留一位小数，关闭千分位。不要修改结果数据。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s07-10a-临时切到耗电值-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"耗电格式验证\")"
+        },
+        {
+          "screenshot": "s07-10a-临时切到耗电值-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「耗电格式验证」指标卡的数值格式改成整数，并加上千分位，数值绑定和单位标签保持不变。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s08-10b-改整数+千分位-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"耗电格式验证\")"
+        },
+        {
+          "screenshot": "s08-10b-改整数+千分位-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「耗电格式验证」指标卡恢复为显示当前区域已有结果中的「运行设备数」，名称改回「运行设备数」，单位用台，保留整数和千分位格式。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s09-10c-恢复运行设备数-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"运行设备数\")"
+        },
+        {
+          "screenshot": "s09-10c-恢复运行设备数-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "给「运行设备数」指标卡加上已有的比较字段「设备总数」，两个字段单位一致都是台。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s10-11-加比较字段-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "(() => {\n  const regions = Array.from(document.querySelectorAll('#preview-root [data-region-id]'));\n  const box = regions.find((r) => {\n    const n = r.querySelector('.region-name');\n    const l = r.querySelector('.wtm-metric-label');\n    return (n && (n.innerText || '').includes(\"运行设备数\")) ||\n           (l && (l.innerText || '').includes(\"运行设备数\"));\n  });\n  if (!box) return false;\n  const c = box.querySelector('.wtm-metric-compare');\n  if (!c) return false;\n  return (c.innerText || '').includes('对比');\n})()"
+        },
+        {
+          "screenshot": "s10-11-加比较字段-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「运行设备数」指标卡的比较字段取消，并给它设置一个已注册的「设备」图标。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s11-12-取消比较字段+图标-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"运行设备数\")"
+        },
+        {
+          "screenshot": "s11-12-取消比较字段+图标-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "单独增加一个「总告警数」指标卡，显示当前已有结果中的告警总数，单位用条。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s12-13-新增计数指标卡-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"总告警数\")"
+        },
+        {
+          "screenshot": "s12-13-新增计数指标卡-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「总告警数」这个区块改成一个多指标组，组里有「总告警数」「严重告警数」「处理中告警数」三个指标项，数值分别绑定告警总数、严重告警数和处理中告警数。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s13-14-转成多指标组-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"严重告警数\")"
+        },
+        {
+          "screenshot": "s13-14-转成多指标组-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "从「总告警数」指标组里移除「处理中告警数」，把剩下两项的顺序调换一下，并把「总告警数」这一项的名称改成「告警总数」。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s14-15-指标项增删排序改名-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"告警总数\")"
+        },
+        {
+          "screenshot": "s14-15-指标项增删排序改名-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「总告警数」指标组改成横向排列、两列，间距 16 像素。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s15-16-组内排列-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"总告警数\")"
+        },
+        {
+          "screenshot": "s15-16-组内排列-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "在「设备耗电明细」表里增加一列「设备总数」，放在「设备名称」后面，绑定这个区域已有的设备总数字段；其他列保持不变。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s16-17-表格增列-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "(() => {\n  const regions = Array.from(document.querySelectorAll('#preview-root [data-region-id]'));\n  const box = regions.find((r) => {\n    const n = r.querySelector('.region-name');\n    const l = r.querySelector('.wtm-metric-label');\n    return (n && (n.innerText || '').includes(\"运行设备数\")) ||\n           (l && (l.innerText || '').includes(\"运行设备数\"));\n  });\n  if (!box) return false;\n  const c = box.querySelector('.wtm-metric-compare');\n  if (!c) return false;\n  return (c.innerText || '').includes('对比');\n})()"
+        },
+        {
+          "screenshot": "s16-17-表格增列-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电明细」表里「设备名称」这一列的标题改成「时间」，字段绑定改成这个区域已有的时间字段；把「耗电量」这一列的标题改成「昨日耗电量」，字段绑定改成这个区域已有的耗电量字段。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s17-18-列标题与字段绑定-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"昨日耗电量\")"
+        },
+        {
+          "screenshot": "s17-18-列标题与字段绑定-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电明细」表的「时间」这一列列宽设成 220 像素、文字左对齐；「昨日耗电量」这一列数值格式保留两位小数。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s18-19-列宽对齐精度-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电明细\")"
+        },
+        {
+          "screenshot": "s18-19-列宽对齐精度-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电明细」表的多层表头清除，恢复单层表头；并改成按已有的时间字段分组显示行，同时关闭行序号。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s19-20-清多层表头+行分组+关序号-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电明细\")"
+        },
+        {
+          "screenshot": "s19-20-清多层表头+行分组+关序号-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电明细」表设置成每页显示 5 行，并冻结前 1 列。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s20-21-分页+冻结列-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电明细\")"
+        },
+        {
+          "screenshot": "s20-21-分页+冻结列-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电明细」表每页 5 行的设置取消、冻结列也取消；然后在表尾加一行汇总，标签写「耗电量合计」，口径是全量结果，数值取耗电量。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s21-22-取消分页冻结+汇总-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"耗电量合计\")"
+        },
+        {
+          "screenshot": "s21-22-取消分页冻结+汇总-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电明细」表里「昨日耗电量」这一列放到「能耗」这个表头下面，保留原来的列标题。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s22-23-多层表头-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"能耗\")"
+        },
+        {
+          "screenshot": "s22-23-多层表头-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电排名」柱状图改成堆叠柱状图，字段和数值保持不变。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s23-24-柱状改堆叠柱状-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电排名\")"
+        },
+        {
+          "screenshot": "s23-24-柱状改堆叠柱状-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电排名」图的横轴保持用设备名称，纵轴保持用耗电量，纵轴数值格式保留一位小数。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s24-25-编码通道与数值格式-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电排名\")"
+        },
+        {
+          "screenshot": "s24-25-编码通道与数值格式-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电排名」图的横轴标题改成「设备」，纵轴标题改成「昨日耗电量（kWh）」，纵轴下限设成 0。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s25-26-坐标轴标题与下限-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备\")"
+        },
+        {
+          "screenshot": "s25-26-坐标轴标题与下限-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电排名」图的内置图例打开，并把「耗电量」这个系列的配色改成蓝色。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s26-27-图例与系列配色-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电排名\")"
+        },
+        {
+          "screenshot": "s26-27-图例与系列配色-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电排名」图的悬停提示字段设成已有的时间字段和耗电量字段。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s27-28-悬停提示字段-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电排名\")"
+        },
+        {
+          "screenshot": "s27-28-悬停提示字段-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "给「设备耗电排名」图的数值轴加一条参考线，名称叫「关注阈值」，数值 500，单位 kWh。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s28-29-数值轴参考线-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "(() => {\n  const regions = Array.from(document.querySelectorAll('#preview-root [data-region-id]'));\n  const box = regions.find((r) => {\n    const n = r.querySelector('.region-name');\n    const l = r.querySelector('.wtm-metric-label');\n    return (n && (n.innerText || '').includes(\"设备耗电排名\")) ||\n           (l && (l.innerText || '').includes(\"设备耗电排名\"));\n  });\n  if (!box) return false;\n  const holder = box.querySelector('.wch-canvas');\n  if (!holder || !window.echarts || !window.echarts.getInstanceByDom) return false;\n  const inst = window.echarts.getInstanceByDom(holder);\n  if (!inst) return false;\n  const opt = inst.getOption() || {};\n  const series = opt.series || [];\n  for (const s of series) {\n    const ml = s && s.markLine;\n    if (!ml) continue;\n    for (const d of (ml.data || [])) {\n      if (d && (d.name === '关注阈值' || Number(d.yAxis) === 500)) return true;\n    }\n  }\n  return false;\n})()"
+        },
+        {
+          "screenshot": "s28-29-数值轴参考线-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电排名」图的悬停提示字段清除，并清除那条叫「关注阈值」的参考线。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s29-30-清悬停提示+清参考线-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电排名\")"
+        },
+        {
+          "screenshot": "s29-30-清悬停提示+清参考线-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电排名」图改成饼图，分类和数值保持不变。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s30-31-柱状改饼图-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电排名\")"
+        },
+        {
+          "screenshot": "s30-31-柱状改饼图-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电排名」图改成环形图，分类和数值保持不变。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s31-32-饼图改环形图-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电排名\")"
+        },
+        {
+          "screenshot": "s31-32-饼图改环形图-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "做最后一次清理：把「机房运行日报」正文里的动态引用清除、正文恢复成固定文字「供值班交接使用」，并把这段的标题层级取消；同时取消「运行设备数」指标卡的图标。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s32-33-清动态绑定+清标题层级+清图标-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"供值班交接使用\")"
+        },
+        {
+          "screenshot": "s32-33-清动态绑定+清标题层级+清图标-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "eval": "(async () => {\n  const sels = [\n    ['[data-question-text=\"template_edit_request\"] .question-text-input', '[data-question-text-submit=\"template_edit_request\"]'],\n    ['[data-question-other=\"template_edit_confirm\"] .question-other-input', '[data-question-other=\"template_edit_confirm\"] .question-other-submit'],\n  ];\n  const deadline = Date.now() + 20000;\n  while (Date.now() < deadline) {\n    for (const pair of sels) {\n      const el = document.querySelector(pair[0]);\n      if (!el || el.disabled) continue;\n      if (el.offsetParent === null) continue;\n      if (el.value) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }\n      return pair[0];\n    }\n    await new Promise((r) => setTimeout(r, 250));\n  }\n  return '';\n})()",
+          "save": "editInputSel",
+          "timeout": 200000
+        },
+        {
+          "type": "{{editInputSel}}",
+          "text": "把「设备耗电明细」表的展示别名、展示过滤和排序前 N 项都清除，恢复成原来的展示方式。"
+        },
+        {
+          "eval": "(() => {\n  const sel = editInputSel;\n  if (!sel) return '';\n  return sel.indexOf('question-text') >= 0\n    ? '[data-question-text-submit=\"template_edit_request\"]'\n    : '[data-question-other=\"template_edit_confirm\"] .question-other-submit';\n})()",
+          "save": "editSubmitSel"
+        },
+        {
+          "click": "{{editSubmitSel}}"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "screenshot": "s33-34-清别名+清过滤+清排序-候选卡"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"pending_edit_plan_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 180000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes(\"设备耗电明细\")"
+        },
+        {
+          "screenshot": "s33-34-清别名+清过滤+清排序-接受后"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector(\".question-select[data-question-id=\\\"template_edit_confirm\\\"]:not([disabled])\"); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitText": "保存草稿",
+          "timeout": 120000
+        },
+        {
+          "wait": 800
+        },
+        {
+          "screenshot": "g40-保存对话框"
+        },
+        {
+          "eval": "(() => { const i = document.querySelector('dialog[open] input[name=\"draftName\"]'); if (!i) return false; i.value = '第二批夜间验收草稿'; return true; })()"
+        },
+        {
+          "click": "dialog[open] button[value=\"save\"]"
+        },
+        {
+          "wait": 2000
+        },
+        {
+          "eval": "document.querySelector('dialog[open]') === null"
+        },
+        {
+          "screenshot": "g41-已保存"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.wp-history-select'); if (!s) return false; s.value = 'undo'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 2500
+        },
+        {
+          "screenshot": "g42-撤销之后"
+        },
+        {
+          "click": "#btn-manage-drafts"
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "screenshot": "g43-草稿列表"
+        },
+        {
+          "eval": "document.querySelector('dialog[open] [data-draft-list] > div:first-child button') !== null"
+        },
+        {
+          "click": "dialog[open] [data-draft-list] > div:first-child button"
+        },
+        {
+          "wait": 2500
+        },
+        {
+          "screenshot": "g44-重新打开"
+        }
+      ]
+    }
+  ]
+}

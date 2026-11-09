@@ -36,7 +36,9 @@ from app.services.edit_capabilities.chart_data import (
 #: 图表类型的中文说法（给候选卡上的「具体改什么」用）。
 CHART_KIND_LABELS = {
     "PIE": "饼图",
+    "DONUT": "环形图",
     "BAR": "柱状图",
+    "STACKED_BAR": "堆叠柱状图",
     "LINE": "折线图",
     "AREA": "面积图",
 }
@@ -1425,6 +1427,9 @@ register(
             "operations 是**非空列表**。"
             "允许的 op、每个 op 的必填 / 可选键与取值域见能力总目录的"
             "「展示操作白名单」一节（由展示服务的白名单自动生成）。"
+            "**区域级格式（SET_FORMAT）写的是整块卡片的格式**："
+            "指标卡 / 指标组里某个指标项的数字显示格式请用 SET_METRIC_ITEM"
+            "（指标级）—— 区域级格式会连带改掉这张卡上别的指标的单位。"
         ),
         params_schema=SetPresentationParams,
         executor=_set_presentation,

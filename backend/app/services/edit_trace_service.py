@@ -1464,6 +1464,33 @@ _CATEGORY_PRIORITY: tuple[str, ...] = (
 )
 
 
+def last_trial_failure() -> dict[str, Any]:
+    """本轮**最后一次试做失败**的具体内容。
+
+    返回 ``{"op", "reason", "constraint", "message"}``；没有失败时返回空字典。
+
+    为什么单独取它：失败类别（``trial_failed``）只说明「哪一类失败」，
+    **不说明哪一步、哪条约束、为什么** —— 用户拿着这句话没法调整指令
+    （验收 08-05）。这条失败原文就是给用户看的那部分事实。
+    """
+    trace = _TRACE.get()
+    if trace is None:
+        return {}
+    for event in reversed(list(trace.get("events") or [])):
+        if event.get("stage") != STAGE_TRIAL:
+            continue
+        result = event.get("result") or {}
+        if result.get("ok") is not False:
+            continue
+        return {
+            "op": str(event.get("name") or ""),
+            "reason": str(result.get("reason") or ""),
+            "constraint": str(result.get("constraint") or ""),
+            "message": str(result.get("message") or ""),
+        }
+    return {}
+
+
 def latest_error_category() -> str:
     """本轮**已知**的失败类别（只取一个，最具体的那个）。
 

@@ -143,6 +143,15 @@ KNOWN_TABLES: frozenset[str] = frozenset(
         # 同样要进白名单，否则「临时库里没有业务数值表」这条断言会因为
         # 多了几张表而失败。
         "draft_objects",
+        # 反馈与编辑经验（20261104 反馈功能 / 编辑经验表）：存的是**用户写的
+        # 反馈与经验**，不是模拟业务数值 —— 与 draft_objects 同一性质，
+        # 也要进白名单。
+        "feedback_targets",
+        "feedback_visitors",
+        "feedback_items",
+        "feedback_attachments",
+        "edit_experiences",
+        "edit_experience_records",
         "draft_versions",
         "draft_history",
         "draft_tasks",

@@ -245,6 +245,94 @@ def _checks(business: str) -> dict[str, str]:
         return {"business": business, "persistence": "not_run", "effect": "not_run"}
 
 
+#: 这些能力是「在**已有**区块上改」，目标不能空。
+#: ``ADD_SECTION`` 是**新建**区块 —— 目标本来就空，不参与补目标。
+_TARGET_REQUIRED_OPS = frozenset({
+    "SET_METRIC_ITEM",
+    "SET_METRIC_GROUP",
+    "SET_TEXT_CONTENT",
+    "SET_TABLE_COLUMNS",
+    "SET_TABLE_DISPLAY",
+    "SET_TABLE_SUMMARIES",
+    "SET_CHART_KIND",
+    "SET_CHART_ENCODINGS",
+    "SET_CHART_AXES",
+    "SET_CHART_LEGEND",
+    "SET_CHART_TOOLTIP",
+    "SET_CHART_REFERENCE_LINES",
+    "SET_DISPLAY",
+    "SET_CATEGORY_DATA",
+    "SET_PRESENTATION",
+    "SET_DATA_BINDING",
+    "DELETE_SECTION",
+    "DELETE_METRIC",
+    "RENAME_SECTION",
+    "SET_FORMAT",
+    "SET_PAGE",
+    "MOVE_REGION",
+    "DELETE_REGION",
+    "HIDE_REGION",
+    "SHOW_REGION",
+    "SET_PLACEMENT",
+    "SET_STYLE",
+    "SET_METADATA",
+    "UNGROUP",
+    "COPY_REGION",
+    "ADD_METRIC",
+})
+
+
+def _fill_missing_targets(
+    steps: list[dict[str, Any]],
+    *,
+    definition: Any,
+    user_message: str,
+) -> list[dict[str, Any]]:
+    """目标没写对时，按**用户原话里点名的区块**补上（唯一命中才补）。
+
+    模型有时会把目标写成 ``{"target": ""}`` —— 目标键名不对、值也空。
+    这时候试做会报「找不到要改的卡片」，用户只能重说一遍。
+
+    这里用**用户自己的话**补：原话里出现的**区块名**（草稿里真实存在的
+    那些）**唯一命中**时才补 —— 命中多个说明用户指的是好几块，不猜。
+
+    这不是「按标题猜目标」：区块名是用户原话里**点名**的，且唯一命中。
+    """
+    text = str(user_message or "").strip()
+    if not text or definition is None:
+        return steps
+    regions = list(getattr(definition, "regions", None) or [])
+    if not regions:
+        return steps
+    names = {
+        str(region.get("name") or "").strip(): str(region.get("id") or "").strip()
+        for region in regions
+        if isinstance(region, dict)
+    }
+    names = {name: rid for name, rid in names.items() if name and rid}
+    if not names:
+        return steps
+    matched = [
+        (name, rid) for name, rid in names.items() if name and name in text
+    ]
+    if len(matched) != 1:
+        return steps
+    region_id = matched[0][1]
+    out: list[dict[str, Any]] = []
+    for step in steps:
+        op = str(step.get("op") or "").strip()
+        target = dict(step.get("target") or {})
+        if (
+            op in _TARGET_REQUIRED_OPS
+            and not str(target.get("regionId") or "").strip()
+            and not str(target.get("ref") or "").strip()
+        ):
+            target["regionId"] = region_id
+            step = {**step, "target": target}
+        out.append(step)
+    return out
+
+
 def run(
     isTemplateEdit: bool = True,
     intent: str = "UNKNOWN",
@@ -258,6 +346,19 @@ def run(
     options: list[dict[str, Any]] | None = None,
     reply: str = "",
     originalRequest: str = "",
+    # 下面两个字段**在工具的 JSON Schema 里声明了**（``EditPlanPayload``
+    # 继承自 ``EditPlan``）—— 模型照着填是合规的。
+    #
+    # 但它们都是**服务端自己算**的东西：生效组合快照由服务端按当前草稿
+    # 取（规则路径就是 ``_current_combination(definition)``），证据由服务端
+    # 落。按模型说的用会让「生效组合变了」误报（旧组合 / 臆造组合）。
+    #
+    # 现场实证：模型带上 ``baseCombination`` 调用本工具 → ``run()`` 直接抛
+    # ``TypeError: run() got an unexpected keyword argument 'baseCombination'``，
+    # **整轮修改全废**（用户只看到一句「没能把修改提交成待确认候选」，
+    # 草稿一个字没改）。所以这里**收下但不用**。
+    baseCombination: dict[str, Any] | None = None,
+    editFacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     from pydantic import ValidationError
 
@@ -383,6 +484,10 @@ def run(
     # **真实存在的 id 立刻绑定**（``new_item`` / ``load_edit_item`` 给的）：
     # 不提前造候选 id，也不从别的请求借。
     item_id, plan_id = _bind_real_ids(item)
+
+    capability_steps = _fill_missing_targets(
+        capability_steps, definition=definition, user_message=original_text
+    )
 
     trial = run_trial(
         definition=definition,

@@ -1,0 +1,102 @@
+{
+  "outDir": "../.selfcheck/flow-27-final-render",
+  "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+  "port": 8000,
+  "waitMs": 2000,
+  "timeout": 120000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "第二批 27 项最终草稿渲染核对",
+      "url": "http://127.0.0.1:8000/playground/pages/workbench.html",
+      "continueOnError": false,
+      "steps": [
+        {
+          "wait": 1500
+        },
+        {
+          "click": "#btn-manage-drafts"
+        },
+        {
+          "waitFor": "dialog[open] [data-draft-list]",
+          "timeout": 30000
+        },
+        {
+          "wait": 800
+        },
+        {
+          "click": "dialog[open] [data-draft-list] > div:first-child button"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "waitFor": "#preview-root [data-region-id]",
+          "timeout": 60000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('卡片数: 6')"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('9 台')"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('3,206 kWh')"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('告警总数')"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('严重告警数')"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('昨日耗电量')"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('能耗')"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('设备总数')"
+        },
+        {
+          "eval": "document.getElementById('preview-root').innerText.includes('耗电量合计')"
+        },
+        {
+          "screenshot": "27-02-最终草稿-上半屏"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('#preview-root [data-region-id=\"region_3\"]'); if (!t) return false; t.scrollIntoView({block: 'center'}); return true; })()"
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "screenshot": "27-03-最终草稿-表格与多层表头"
+        },
+        {
+          "eval": "(() => { const c = document.querySelector('#preview-root [data-region-id=\"region_4\"]'); if (!c) return false; c.scrollIntoView({block: 'center'}); return true; })()"
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "screenshot": "27-04-最终草稿-图表"
+        },
+        {
+          "eval": "(() => { const m = document.querySelector('#preview-root [data-region-id=\"region_总告警数\"]'); if (!m) return false; m.scrollIntoView({block: 'center'}); return true; })()"
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "screenshot": "27-05-最终草稿-指标组"
+        }
+      ]
+    }
+  ]
+}

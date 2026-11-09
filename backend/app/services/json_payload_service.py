@@ -901,6 +901,14 @@ def build_user_json_payloads(
             )
         elif ctype == "TEXT":
             payload = _text_payload(region=region)
+        elif ctype == "METRIC_GROUP":
+            payload = _metric_group_payload(
+                region=region,
+                rows=processed,
+                source_rows=rows,
+                mapping=mapping,
+                record_count=record_count,
+            )
         else:
             payload = {
                 "dataSource": USER_JSON_DATA_SOURCE,
@@ -908,5 +916,123 @@ def build_user_json_payloads(
                     [f"组件类型 {ctype} 在用户 JSON 模式下没有对应展示，已留空。"]
                 ),
             }
+        # 第二批（B03 / B04）：展示裁剪只作用**本区域的展示记录**，
+        # 源输入、全量记录数与其它区域不受影响。
+        payload = _apply_display_pipeline(region, payload)
         result[region_id] = payload
     return result
+
+
+def _apply_display_pipeline(
+    region: Mapping[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    """展示裁剪：别名 → 过滤 → 排序 → 前 N 项（只作用本区域的展示记录）。"""
+    from app.services.display_binding_service import apply_presentation_pipeline
+
+    binding = region.get("binding") or {}
+    if not isinstance(binding, Mapping):
+        return payload
+    aliases = binding.get("fieldAliases")
+    filters = binding.get("presentationFilters")
+    sort = binding.get("sort")
+    top_n = binding.get("topN")
+    if not any([aliases, filters, sort, top_n is not None]):
+        return payload
+    rows = payload.get("rows")
+    if isinstance(rows, list):
+        visible = apply_presentation_pipeline(
+            [row for row in rows if isinstance(row, Mapping)],
+            field_aliases=aliases,
+            presentation_filters=filters,
+            sort=sort,
+            top_n=top_n,
+        )
+        payload["rows"] = visible
+        payload["visibleRows"] = visible
+        payload["displayedRows"] = len(visible)
+    points = payload.get("points")
+    if isinstance(points, list):
+        visible_points = apply_presentation_pipeline(
+            [point for point in points if isinstance(point, Mapping)],
+            field_aliases=aliases,
+            presentation_filters=filters,
+            sort=sort,
+            top_n=top_n,
+        )
+        payload["points"] = visible_points
+        payload["visiblePoints"] = visible_points
+    return payload
+
+
+def _metric_group_payload(
+    *,
+    region: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    source_rows: Sequence[Mapping[str, Any]],
+    mapping: Mapping[str, str],
+    record_count: int,
+) -> dict[str, Any]:
+    """多指标组载荷：一个区域里的**指标项列表**（不是容器）。
+
+    每个指标项绑定一个**输入字段**（``fieldRef``）；取值走**已有的多行
+    保护**：值不唯一时**不擅自取第一行、不求和**，只显示名称并写明原因。
+    """
+    from app.services.display_binding_service import (
+        DisplayBindingError,
+        collect_field_values,
+    )
+
+    component = region.get("component") or {}
+    items = [
+        item for item in (component.get("metrics") or []) if isinstance(item, Mapping)
+    ]
+    metrics: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for item in items:
+        field_ref = str(item.get("fieldRef") or "")
+        column_id = str(item.get("id") or "")
+        field_key = mapping.get(column_id) or field_ref
+        values = collect_field_values(rows, field_key)
+        distinct = []
+        for value in values:
+            if value not in distinct:
+                distinct.append(value)
+        metric: dict[str, Any] = {
+            "metricKey": field_ref or column_id,
+            "id": column_id,
+            "label": str(item.get("label") or field_ref or "指标"),
+            "kind": "generic",
+            "unit": str((item.get("format") or {}).get("unitLabel") or ""),
+            "precision": int((item.get("format") or {}).get("precision") or 0),
+            "capabilityPending": False,
+            "pendingReason": None,
+        }
+        if len(distinct) == 1:
+            metric["value"] = distinct[0]
+        else:
+            metric["placeholderOnly"] = True
+            if len(distinct) > 1:
+                notes.append(
+                    f"指标「{metric['label']}」对应的字段 {field_key!r} 有 "
+                    f"{len(distinct)} 个不同的值，无法确定取哪一个；已只显示名称，"
+                    "没有取第一行，也没有求和。"
+                )
+            else:
+                notes.append(
+                    f"指标「{metric['label']}」对应的字段 {field_key!r} 在当前数据里取不到值。"
+                )
+        metrics.append(metric)
+    primary = metrics[0] if metrics else {}
+    return {
+        "label": str(component.get("title") or region.get("name") or "指标组"),
+        "value": primary.get("value"),
+        "unit": str(primary.get("unit") or ""),
+        "precision": int(primary.get("precision") or 0),
+        "yoyPercent": None,
+        "comparisonAvailable": False,
+        "dataSource": USER_JSON_DATA_SOURCE,
+        "recordCount": record_count,
+        "metrics": metrics,
+        "arrangement": component.get("arrangement") or {},
+        "notes": _notes(notes),
+    }

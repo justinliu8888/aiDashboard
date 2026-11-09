@@ -103,7 +103,8 @@ def test_catalog_covers_every_edit_intent():
     assert legacy == {intent.value for intent in EditIntent}
 
 
-def test_catalog_covers_the_five_new_capabilities():
+def test_catalog_covers_every_registered_capability():
+    """目录要覆盖**全部**已注册清单能力（第二批新增 13 项）。"""
     entries = catalog.build_catalog()["entries"]
     capability_entries = {
         entry["id"]
@@ -113,13 +114,30 @@ def test_catalog_covers_the_five_new_capabilities():
     assert capability_entries == {
         capability.id for capability in all_capabilities()
     }
-    assert capability_entries == {
+    # 第一批的五项能力不能因为扩容丢掉。
+    assert {
         "ADD_SECTION",
         "DELETE_SECTION",
         "SET_DISPLAY",
         "SET_CATEGORY_DATA",
         "SET_PRESENTATION",
-    }
+    } <= capability_entries
+    # 第二批新增的十三项能力都要在目录里。
+    assert {
+        "SET_DATA_BINDING",
+        "SET_TEXT_CONTENT",
+        "SET_METRIC_ITEM",
+        "SET_METRIC_GROUP",
+        "SET_TABLE_COLUMNS",
+        "SET_TABLE_DISPLAY",
+        "SET_TABLE_SUMMARIES",
+        "SET_CHART_KIND",
+        "SET_CHART_ENCODINGS",
+        "SET_CHART_AXES",
+        "SET_CHART_LEGEND",
+        "SET_CHART_TOOLTIP",
+        "SET_CHART_REFERENCE_LINES",
+    } <= capability_entries
 
 
 def test_catalog_covers_presentation_whitelist_and_dimensions():
@@ -199,17 +217,59 @@ def test_tool_params_match_the_registered_schema():
         assert entry["readOnly"] == bool(tool.IS_READ_ONLY)
 
 
+def _allowed_values(property_schema: dict) -> list | None:
+    """字段的取值域（目录里是 ``enum``，pydantic 里是 ``x-allowedValues``）。"""
+    if "enum" in property_schema:
+        return list(property_schema["enum"])
+    extra = property_schema.get("x-allowedValues")
+    return list(extra) if extra is not None else None
+
+
+def _types_of(property_schema: dict) -> set[str]:
+    """字段的类型集合。
+
+    pydantic 的可选字段写成 ``anyOf: [{type: X}, {type: "null"}]``；
+    目录里的契约写的是**非空类型**（可空靠 ``clear*`` 开关表达），
+    所以比的是**去掉 null 之后的类型集合**。
+    """
+    if isinstance(property_schema.get("type"), str):
+        return {property_schema["type"]}
+    members = property_schema.get("anyOf") or []
+    types: set[str] = set()
+    for member in members:
+        types |= _types_of(member)
+    return types - {"null"}
+
+
 def test_capability_params_match_the_capability_schema():
+    """目录里的参数契约要和能力自己的 schema **语义一致**。
+
+    目录给模型看的是**归一后的扁平 schema**（``enum`` 而不是 ``x-allowedValues``，
+    嵌套模型内联而不是 ``$ref``），所以不比字典相等 —— 比**同一件事**：
+
+    * 字段名集合一致；
+    * 必填字段一致；
+    * 每个字段的类型一致；
+    * 有取值域的字段，取值域一致。
+    """
     entries = catalog.build_catalog()["entries"]
     for capability in all_capabilities():
         entry = _entry(entries, "operation", capability.id)
         assert capability.params_schema is not None
-        assert entry["params"] == capability.params_schema.model_json_schema(), (
-            f"{capability.id} 的参数契约与能力自己的 schema 不一致"
-        )
-        assert entry["required"] == list(
-            capability.params_schema.model_json_schema().get("required") or []
-        )
+        schema = capability.params_schema.model_json_schema()
+        params = entry["params"]
+        assert list(params.get("properties") or {}) == list(
+            schema.get("properties") or {}
+        ), f"{capability.id} 的字段与能力自己的 schema 不一致"
+        assert entry["required"] == list(schema.get("required") or [])
+        for name, property_schema in (schema.get("properties") or {}).items():
+            catalog_property = (params.get("properties") or {})[name]
+            assert _types_of(catalog_property) == _types_of(property_schema), (
+                f"{capability.id}.{name} 的类型与能力自己的 schema 不一致"
+            )
+            assert _allowed_values(catalog_property) == _allowed_values(
+                property_schema
+            ), f"{capability.id}.{name} 的取值域与能力自己的 schema 不一致"
 
 
 def test_presentation_operation_params_come_from_the_real_handlers():
@@ -245,13 +305,23 @@ def test_every_source_ref_resolves():
 
 
 def test_capability_execution_points_at_the_real_executor():
-    """能力经过封装时要指到**真正执行的位置**，不能只指包装文件。"""
+    """能力经过封装时要指到**真正执行的位置**，不能只指包装文件。
+
+    第二批起清单能力分在多个包里（``blocks`` / ``binding_component`` /
+    ``text_metric`` / ``table_component`` / ``chart_component``），
+    执行位置随能力**自己所在的模块**走 —— 这里按真实执行器模块核对，
+    不再写死某一个文件。
+    """
     entries = catalog.build_catalog()["entries"]
     for capability in all_capabilities():
         entry = _entry(entries, "operation", capability.id)
         execution = entry["code"]["execution"]
-        assert "app/services/edit_capabilities/blocks.py::" in execution
-        assert capability.executor.__name__ in execution
+        executor = capability.executor
+        expected_file = catalog._file_of_module(executor.__module__)
+        assert execution == f"{expected_file}::{executor.__name__}", (
+            f"{capability.id} 的执行位置没指到真实执行器：{execution}"
+        )
+        assert expected_file.startswith("app/services/edit_capabilities/")
         assert catalog.verify_source_ref(execution)
 
 

@@ -80,7 +80,15 @@ logger = logging.getLogger(__name__)
 # ---------- 关键词匹配 ----------
 
 DELETE_WORDS = ("删掉", "删除", "去掉", "不要", "移除", "去除", "删了")
-RENAME_WORDS = ("标题改成", "标题改为", "名字改成", "名字改为", "重命名为", "改名为", "叫做")
+RENAME_WORDS = (
+    "标题改成", "标题改为", "名字改成", "名字改为",
+    # 「名称」与「名字」是同一个说法。少了这两个，用户说
+    # 「把指标卡的名称改成 X」就落不到改名意图上 —— 规则层认不出来，
+    # 后面那句里的时间词（卡片名里的「昨日」）反而被当成时间窗，
+    # 一次改名被改成了改时间范围（反馈实测）。
+    "名称改成", "名称改为",
+    "重命名为", "改名为", "叫做",
+)
 REPORT_RENAME_WORDS = (
     "报表名称改成",
     "报表名称改为",
@@ -88,6 +96,25 @@ REPORT_RENAME_WORDS = (
     "报表名改为",
     "报告名称改成",
     "报告名称改为",
+)
+
+#: **被限定过的标题** —— 这些是某个**部件**的标题，不是卡片标题。
+#:
+#: 「横轴标题」「列标题」「表头」前面有限定词，改的是那个部件
+#: （第二批 CH03 的轴标题、TB02 的列表头），不是这张卡片的标题。
+#: 认成卡片改名 = 用户要的部件标题一个字都没落地，卡片标题还被改了。
+SCOPED_TITLE_WORDS = (
+    "横轴标题",
+    "纵轴标题",
+    "轴标题",
+    "列标题",
+    "列表头",
+    "表头",
+    "正文标题",
+    "子标题",
+    "小标题",
+    "章节标题",
+    "系列标题",
 )
 ADD_WORDS = (
     # 长说法在前：先剥掉更长的那个，剥出来的才是指标意图。
@@ -215,6 +242,101 @@ APPEND_WORDS = (
 #: 「替换」语义的说法 —— 只有明确说了这些，追加才让位给替换。
 REPLACE_WORDS = (
     "换成", "替换", "只留", "只保留", "改用", "不要了", "去掉", "移除",
+)
+
+#: 「新增一段文字」的**对象词** —— 这些是文本（协议 TEXT 组件），不是业务指标。
+#:
+#: 「在卡片上面增加标题『X』，再加说明『Y』」说的是文本块。规则快路只会
+#: 「追加指标」这一种表达，硬接管就会凭空造出一个用户没要求的指标和数值
+#: （反馈 F02-02：把标题与说明变成了一个叫「说明」的指标）。
+TEXT_OBJECT_WORDS = (
+    "标题", "说明", "正文", "文案", "文字", "段落", "注解", "备注",
+    "副标题", "小结", "导语", "引言", "注释",
+)
+
+#: 新增文本的说法：新增动词 + 可选数量/量词 + 文本对象词。
+#:
+#: 只认**新增**动词：「把标题改成 X」（改卡片名）与「增加标题 X」（加一段
+#: 文本）是两件事 —— 前者是卡片名，规则层本来就能做，不能被这里挡掉。
+_TEXT_ADD_PATTERN = re.compile(
+    r"(?:增加|添加|新增|补充|加上|写入|插入|加)"
+    r"(?:[一二三四五六七八九十两几0-9]+)?"
+    r"(?:段|个|条|些|点|张|行)?"
+    r"(?:" + "|".join(TEXT_OBJECT_WORDS) + r")"
+)
+
+#: 「先问来源再改」的说法 —— 这类句子里的后半截是**问题**，不是新值。
+#:
+#: 「换成显示已有结果中的，先告诉我来源」：前半句要换指标，后半句是
+#: 「先回答来源」的要求。把整句当成指标名，就会造出一个叫「显示已有结果
+#: 中的，先告诉我来源」的指标（反馈 F02-06）。
+_SOURCE_FIRST_PATTERN = re.compile(
+    r"(?:先|首先|麻烦|请)\s*(?:告诉|说明|给我看|给我)?\s*"
+    r"(?:我|你)?\s*(?:来源|出处|数据来源|字段|口径)"
+)
+
+#: 规则快路**表达不了**的能力词 —— 这些词一出现，整句交给模型支路。
+#:
+#: 规则层能表达的是「改名 / 删卡 / 加卡 / 追加指标 / 改时间窗 / 改粒度 /
+#: 改展示形式」这几类。**第二批的能力属性**（单位、字段绑定、图标、比较
+#: 字段、表头、图例、参考线、别名……）规则层一个都表达不了，它只能把
+#: 整句话当成新值抄进去。
+#:
+#: 实测（第二批 27 项连续实跑）：「把『昨日总耗电量』指标卡改为显示已有
+#: 结果中的『运行设备数』，单位用台」被规则层当成**改名**，整句被抄成
+#: 指标名（label = 「显示当前区域已有结果中的，单位用台」，fieldRef 空）。
+#: 那一行的能力本来就属于模型支路（``SET_METRIC_ITEM``），这里必须让路。
+#:
+#: 刻意**不含**「格式 / 样式 / 排序 / 前 N / 过滤」：这五个词第一批的
+#: 展示规则自己会处理，让路会把第一批的能力也一起交出去。
+CAPABILITY_ONLY_VOCABULARY = (
+    "单位",
+    "绑定",
+    "字段",
+    "图标",
+    "别名",
+    "参考线",
+    "图例",
+    "表头",
+    "冻结",
+    "序号",
+    "悬停",
+    "千分位",
+    "比较字段",
+)
+
+#: **列级 / 表级**的说法（第二批 TB01 / TB02 / TB03 / TB04 / TB06）。
+#:
+#: 这些词只在**表格的列**这个语境里成立（「这一列」「列宽」「每页 5 行」
+#: 「多层表头」），区域级的展示规则（``SET_FORMAT`` / ``SET_STYLE``）
+#: **一条都表达不了**。规则层一旦接走，用户要改的列就被整段丢掉。
+#:
+#: 实测（第二批 27 项连续实跑）：TB01 的整句请求被「两位小数」规则接走，
+#: 只产出一条区域级 ``SET_FORMAT`` —— 列增删、列标题、列宽、对齐、列格式
+#: **一项都没执行**，草稿里那张表还是原样。
+#:
+#: 命中这些词时**整句让路给模型支路**（``SET_TABLE_COLUMNS`` /
+#: ``SET_TABLE_DISPLAY``），由能力目录把列级参数表达出来。
+TABLE_COLUMN_EDIT_VOCABULARY = (
+    "列宽",
+    "这一列",
+    "该列",
+    "此列",
+    "本列",
+    "列标题",
+    "列表头",
+    "列的标题",
+    "增加一列",
+    "新增一列",
+    "加一列",
+    "删除一列",
+    "去掉一列",
+    "列的顺序",
+    "列顺序",
+    "多层表头",
+    "表头",
+    "每页",
+    "分页",
 )
 
 #: 「把 A 换成 B」里的**替换动词**。
@@ -382,7 +504,11 @@ DISPLAY_OPTIONS_BY_SHAPE: dict[str, dict[str, Any]] = {
         "options": [
             {"label": "饼图", "componentType": "CHART", "chartKind": "PIE", "recommended": True,
              "reason": "占比结构优先用饼图"},
-            {"label": "堆叠柱状图", "componentType": "CHART", "chartKind": "BAR", "recommended": False,
+            # 柱状图（BAR）：既能单独看每个分类的大小，也能和堆叠柱状图并列比较。
+            {"label": "柱状图", "componentType": "CHART", "chartKind": "BAR", "recommended": False,
+             "reason": "适合对比各分类的绝对数值"},
+            # 堆叠柱状图（STACKED_BAR）：第二批新增的**独立图型**，不折成 BAR。
+            {"label": "堆叠柱状图", "componentType": "CHART", "chartKind": "STACKED_BAR", "recommended": False,
              "reason": "适合对比多个类别的占比"},
             {"label": "表格", "componentType": "TABLE", "chartKind": "", "recommended": False,
              "reason": "适合查看明细占比"},
@@ -616,6 +742,18 @@ def _region_aliases(region: dict[str, Any]) -> list[str]:
 
 def _definition_revision(definition: ReportDefinitionDraft) -> int:
     return int((definition.metadata or {}).get("revision") or 0)
+
+
+#: 「指标组」是能力层（``SET_METRIC_GROUP``）的概念，规则层**不认**。
+#:
+#: 规则层一旦把它当成「更换指标」，就会产出一个目录外的指标候选
+#: （``out_of_catalog``），用户点「接受修改」时直接失败 —— 验收 08-05。
+_METRIC_GROUP_WORDS = ("指标组", "指标项组", "多指标")
+
+
+def _mentions_metric_group(text: str) -> bool:
+    """这句话是不是在说「指标组」（多指标组 / 组内排列）。"""
+    return any(word in (text or "") for word in _METRIC_GROUP_WORDS)
 
 
 # --------------------------------------------------------------------------
@@ -1769,8 +1907,34 @@ class TemplateEditEngine:
         from app.services.report_presentation_service import is_container
 
         resolved = self._find_region_by_name(definition, named)
+        resolved_type = str(
+            ((resolved or {}).get("component") or {}).get("type") or ""
+        ).strip().upper()
+        if resolved is not None and resolved_type == "METRIC_GROUP":
+            # **指标组**（第二批 MG03）的组内排列是 ``SET_METRIC_GROUP``
+            # 里的 ``arrangement``，跟**容器分组**（第一批）的排列不是
+            # 一回事。这里认成「一张卡片，不是分组」就会把指标组的排列
+            # 请求挡在门外（实测：「把『总告警数』指标组改成横向排列、
+            # 两列、间距 16 像素」被回成「是一张卡片，不是分组」）。
+            #
+            # 让路给模型支路：指标组的排列由能力目录里的
+            # ``SET_METRIC_GROUP.arrangement`` 表达。
+            return None
         if resolved is not None and not is_container(resolved):
             # 点名的是**一张卡片**，不是分组 —— 说清楚，别拿它冒充组。
+            #
+            # 但**只在这句话真的在谈分组时**才这么说。表格请求里也常出现
+            # 「列」和「1 列」（第二批 TB06：「每页显示 5 行，并冻结前 1 列」）
+            # —— 那不是在谈分组，句子里也没有「分组 / 这一组 / 组内」。
+            # 那一轮实测被这条规则接走，回成「『设备耗电明细』是一张卡片，
+            # 不是分组」，**用户要的表格分页与冻结一步都没执行**。
+            #
+            # 判据就是函数文档里写的那句：要么句子里出现「分组」类词，
+            # 要么点名的那个东西**就是一个容器**（上面已经处理）。
+            # 两者都不成立 → 这句话根本不在谈分组 → **让路给模型支路**，
+            # 别用一条不相干的澄清把它吃掉。
+            if not mentions_group:
+                return None
             return {
                 "clarification": {
                     "question": (
@@ -1906,8 +2070,22 @@ class TemplateEditEngine:
         **单位不动**：「保留原单位 kWh」说的就是"别动单位"，所以这里
         **不写** ``unitLabel``（写了反而可能与当前单位冲突）。真正的
         单位换算不在本批能力里，写了会被执行层按"只能保持当前单位"拒绝。
+
+        **指标卡 / 指标组让路给模型支路**：第二批 M02 要的是
+        ``metric.format``（**逐项**格式，写在 ``component.metric.format``），
+        这里写的是**区域级** ``region.format`` —— 两者不是一回事：
+        指标组里每一项的单位 / 格式各不相同，区域级格式表达不了。
+        实测：M02 的请求被这条规则接走，草稿里 ``metric.format`` 没落地
+        —— 27 项矩阵要求的正是 ``metric.format``。
         """
         if target_region is None:
+            return None
+        component_type = str(
+            (target_region.get("component") or {}).get("type") or ""
+        ).strip().upper()
+        if component_type in {"METRIC_CARD", "METRIC_GROUP"}:
+            # 指标卡 / 指标组的数值格式是**逐项**的 → 让路给模型支路
+            # （``SET_METRIC_ITEM.format`` / ``SET_METRIC_GROUP.metrics[]``）。
             return None
         normalized = _normalize_text(text)
         fmt: dict[str, Any] = {}
@@ -1929,6 +2107,17 @@ class TemplateEditEngine:
             },
         }
 
+    @staticmethod
+    def _is_column_level_table_edit(text: str) -> bool:
+        """这句话是不是在改**表格的列**（而不是改整块卡片的展示）。
+
+        判据是**列级说法本身**（:data:`TABLE_COLUMN_EDIT_VOCABULARY`），
+        不猜目标是不是表格：这些词只在列的语境里成立，认不准就把整句
+        交给模型支路，别让表达不了的区域级规则把它吃掉。
+        """
+        normalized = _normalize_text(text or "")
+        return any(word in normalized for word in TABLE_COLUMN_EDIT_VOCABULARY)
+
     # ------------------------------------------------------------------
     # 展示类请求的**统一出口**（契约 §2.1）
     # ------------------------------------------------------------------
@@ -1948,6 +2137,20 @@ class TemplateEditEngine:
         最具体；尺寸、主题、组级排列、移动各自成条；兜底才是既有那批
         展示规则（分组 / 隐藏 / 复制 / 整页紧凑）。
         """
+        # --- 列级表格编辑：整句让路给模型支路 ---
+        #
+        # 「这一列」「列宽」「每页 5 行」「多层表头」这些说法是**列**级、
+        # **表**级的诉求（第二批 TB01 / TB02 / TB03 / TB04 / TB06），
+        # 区域级的展示规则表达不了（``SET_FORMAT`` 只能改整块卡片的
+        # ``region.format``）。实测：TB01 的整句请求被「两位小数」规则
+        # 接走，只产出一条区域级 ``SET_FORMAT``，**列增删、列标题、列宽
+        # 一项都没执行**；TB06 的「冻结前 1 列」被组级排列规则接走。
+        #
+        # 判据是**列级说法本身**（这些词只在表格语境里成立），
+        # 不看目标是不是表格 —— 认不准就交给模型，别用一条表达不了的
+        # 规则把用户的列级要求吃掉。
+        if self._is_column_level_table_edit(text):
+            return None
         # --- 外观（字号 / 对齐 / 圆角）：最具体 ---
         set_style = self._parse_set_style(text, definition, target_region)
         if set_style is not None:
@@ -2833,12 +3036,17 @@ class TemplateEditEngine:
         selected_region_id: str | None,
         scope: ToolScope | None = None,
         change_value: str | None = None,
+        explicit_target_region_id: str | None = None,
     ) -> EditPlan:
         """从用户消息解析出 EditPlan。规则优先，匹配不到交给 UNKNOWN。
 
         ``change_value`` 是**新值片段**：时间窗、粒度、数据源、指标的新值
         只从这里取。调用方可以传自己算好的片段（澄清答案整句就是新值的
         情况）；不传就从消息里按「明确的改动动词」取。片段为空 = 没有新值。
+
+        ``explicit_target_region_id`` 是**用户从下拉里明确选出来的目标**
+        （稳定区域 ID）。它比句子里出现的任何卡片名都硬 —— 先按名字猜再改，
+        猜错了就是改错卡片（反馈 F02-03）。
         """
         plan = EditPlan(isTemplateEdit=True, confidence=0.0)
         # 这份计划所基于的**生效组合快照**（契约表 §2.1 / §4.2）：
@@ -2864,7 +3072,9 @@ class TemplateEditEngine:
 
         # 定位目标 region
         regions = definition.regions or []
-        target_region = self._find_region(regions, text, selected_region_id)
+        target_region = self._find_region(
+            regions, text, selected_region_id, explicit_target_region_id
+        )
         style_reference = self._quoted_style_reference(text)
         if style_reference is not None:
             candidates = self._resolve_quoted_style_target(definition, style_reference["name"])
@@ -2884,6 +3094,26 @@ class TemplateEditEngine:
                 matchedText=_region_label(target_region),
                 confidence=0.9,
             )
+
+        # ===== 0. 指标组（多指标组）→ 交给能力层 =====
+        #
+        # 「多指标组 / 指标组 / 组内排列」是**能力层**的概念
+        # （``SET_METRIC_GROUP``：整组指标项 + 组内排版）。
+        #
+        # 规则层认它 = 「把这张卡的指标换成另一个」：会产出一个**目录外**的
+        # 指标候选，用户点「接受修改」时直接失败（验收 08-05、07 第 14/16 步）。
+        # 「两列 / 间距」还会被展示排版规则抢走，改到区块容器上而不是组内。
+        #
+        # 所以这里**明确不认**：这些句子一律交给能力层（模型）按能力格式处理。
+        if _mentions_metric_group(text):
+            plan.intent = EditIntent.UNKNOWN
+            plan.confidence = 0.0
+            plan.needsClarification = True
+            plan.clarificationQuestion = (
+                "指标组相关修改请说明：这块要有哪些指标项、每项绑定什么、"
+                "组内怎么排列。"
+            )
+            return plan
 
         # ===== 0. 保存 / 更新共享主题 =====
         #
@@ -2982,6 +3212,51 @@ class TemplateEditEngine:
                 metrics=metrics,
                 placeholder_scopes=placeholder_scopes,
             )
+
+        # ===== 2.5 新增文本（标题 / 说明 / 正文）=====
+        #
+        # 「在卡片上面增加标题『X』，再加说明『Y』」说的是**文本块**
+        # （协议 TEXT 组件），不是业务指标。规则快路只会「追加指标」这一种
+        # 表达，硬接管就会凭空造出一个用户没要求的指标和数值（反馈 F02-02：
+        # 标题与说明变成了一个叫「说明」的指标）。
+        #
+        # 这一层**不在规则层表达**：文本块的位置（上方 / 下方）、标题与正文
+        # 的分工、要不要分两块，由模型按能力目录决定（``SET_TEXT_CONTENT`` /
+        # ``ADD_SECTION``）。所以这里把意图退回 UNKNOWN，交给模型支路。
+        #
+        # 顺带解决「快路只执行组合请求的一项、其余静默吞掉」：一句话里同时
+        # 有文本要求和别的要求时，规则层表达不全，整句交给模型。
+        if _TEXT_ADD_PATTERN.search(clean_text):
+            plan.intent = EditIntent.UNKNOWN
+            plan.confidence = 0.0
+            plan.needsClarification = False
+            plan.clarificationQuestion = ""
+            return plan
+
+        # ===== 2.6 能力属性词（单位 / 字段 / 图标 / 表头……）=====
+        #
+        # 这些属性规则快路**一个都表达不了**：它只能把整句话当成新值抄
+        # 进去，于是「把指标卡改为显示已有结果中的运行设备数，单位用台」
+        # 被抄成一个叫「显示当前区域已有结果中的，单位用台」的指标
+        # （第二批 27 项连续实跑实测）。这些属性本来就是模型支路的事
+        # （``SET_METRIC_ITEM`` / ``SET_TABLE_*`` / ``SET_CHART_*`` /
+        # ``SET_DATA_BINDING``），这里整句让路。
+        #
+        # 刻意**不含**「格式 / 样式 / 排序 / 前 N / 过滤」：那五个词
+        # 第一批的展示规则自己会处理。
+        #
+        # 但**列级表格编辑**（列宽 / 这一列 / 每页 N 行 / 多层表头）
+        # 规则层同样表达不了 —— 它表达的是**整块卡片**的展示。
+        # 这一组词也整句让路，落到模型支路的 ``SET_TABLE_COLUMNS`` /
+        # ``SET_TABLE_DISPLAY``。
+        if any(word in clean_text for word in CAPABILITY_ONLY_VOCABULARY) or (
+            self._is_column_level_table_edit(clean_text)
+        ):
+            plan.intent = EditIntent.UNKNOWN
+            plan.confidence = 0.0
+            plan.needsClarification = False
+            plan.clarificationQuestion = ""
+            return plan
 
         # ===== 3. 在已有区块里追加指标 =====
         #
@@ -3173,8 +3448,13 @@ class TemplateEditEngine:
         # 新值只来自**明确的改动动词片段**（规格第 48 条）：卡片名里的
         # 「昨日」「最近 7 天」只用来定位对象，不是要写进去的时间窗。
         # 没有改动动词就没有新值 —— 这里拿到的是空串，不会命中任何时间表达。
+        #
+        # **用户点名要改「标题 / 名称」时不算时间窗**：那句话里的时间词
+        # （「把名称改成昨日总耗电量」里的「昨日」）是**新名字的一部分**，
+        # 不是要把时间窗改成昨天。改名意图在后面（第 8 步），这里要让路。
+        rename_requested = any(word in text for word in RENAME_WORDS)
         time_window, label = self._parse_time_range(new_value)
-        if time_window:
+        if time_window and not rename_requested:
             plan.intent = EditIntent.CHANGE_TIME_RANGE
             plan.confidence = 0.88
             plan.operation = EditOperation(
@@ -3205,7 +3485,7 @@ class TemplateEditEngine:
         # 「能不能按哪些粒度」这类问句没有新值，但仍然是粒度话题：
         # 话题词只认「粒度 / compile」，不拿取值词当话题词 ——
         # 「小时趋势」里的「小时」既不是新值，也不是话题。
-        if grain_unit or any(w in topic_text for w in GRAIN_WORDS):
+        if (grain_unit or any(w in topic_text for w in GRAIN_WORDS)) and not rename_requested:
             plan.intent = EditIntent.CHANGE_COMPILATION_GRAIN
             plan.confidence = 0.85
             if target_region is None:
@@ -3860,8 +4140,26 @@ class TemplateEditEngine:
         regions: list[dict[str, Any]],
         text: str,
         selected_region_id: str | None,
+        explicit_target_region_id: str | None = None,
     ) -> dict[str, Any] | None:
         candidates = TemplateEditEngine._flatten_regions(regions)
+        # **用户明确选出来的目标**（从「改哪一张」的下拉里选中的稳定区域 ID）：
+        # 它比句子里出现的任何卡片名都硬。
+        #
+        # 为什么：「在说明中引用『总告警数』」这句话里同时出现了**两个**卡片名
+        # —— 要改的那张（说明）和被引用的那张（总告警数）。按名字猜会猜成
+        # 后者，改错卡片。用户已经在下拉里指明的那张才作数（反馈 F02-03）。
+        if explicit_target_region_id:
+            chosen = next(
+                (
+                    region
+                    for region in candidates
+                    if str(region.get("id") or "") == str(explicit_target_region_id)
+                ),
+                None,
+            )
+            if chosen is not None:
+                return chosen
         normalized = _normalize_text(text)
         best: tuple[int, dict[str, Any]] | None = None
         for region in candidates:
@@ -4590,6 +4888,14 @@ class TemplateEditEngine:
         candidate = TemplateEditEngine._resolve_out_of_catalog(
             text, strip_add_prefix=strip_add_prefix,
         )
+        if candidate is not None and _SOURCE_FIRST_PATTERN.search(
+            str(candidate.intent or "")
+        ):
+            # 「先告诉我来源」「先说明数据来源」是**问来源**，不是指标名。
+            # 把它当指标就会造出一个叫「显示已有结果中的，先告诉我来源」的
+            # 业务指标（反馈 F02-06）。这里**不认**这个意图：上层会回去问
+            # 「你想换成哪个指标」，或按只读链路先回答来源。
+            return None, None
         metric_ref = match_metric_by_alias(text, set(metrics))
         if not metric_ref or candidate is None:
             # 没提到已登记指标 → 目录外候选；抽不出指标意图 → 照既有口径走。
@@ -4863,13 +5169,20 @@ class TemplateEditEngine:
 
     @staticmethod
     def _extract_rename_title(text: str) -> str | None:
+        # **被限定过的标题**不是卡片标题：「横轴标题改成 X」改的是坐标轴
+        # 标题（第二批 CH03），「列标题改成 X」改的是列表头（TB02）。
+        # 不做这个判断的实测后果：CH03 整句被当成**改卡片标题**，
+        # 「设备耗电排名」这张图差点被改名成「设备」—— 用户要的轴标题
+        # 一个字都没落地。
+        if any(word in (text or "") for word in SCOPED_TITLE_WORDS):
+            return None
         for word in RENAME_WORDS:
             if word in text:
                 after = text.split(word, 1)[1].strip(" ：:，,。.")
                 after = re.sub(
                     r"^(这个|它|该)?(section|区域|面板|卡片)?", "", after
                 ).strip(" ：:，,。.")
-                return after or None
+                return TemplateEditEngine._strip_quotes(after) or None
         return None
 
     @staticmethod
@@ -4890,6 +5203,16 @@ class TemplateEditEngine:
         return extract_change_value(text)
 
     @staticmethod
+    def _strip_quotes(value: str) -> str:
+        """把用户自己加的引号去掉。
+
+        用户写「把标题改成「机房运行日报」」时，**引号是他用来圈出新值的**，
+        不是标题的一部分。引号留在卡片标题里，用户看到的就是
+        「「机房运行日报」」（双层引号），后面再引用它也要多一层。
+        """
+        return str(value or "").strip("「」『』“”\"'‘’ 　：:，,。.")
+
+    @staticmethod
     def _extract_add_title(text: str) -> str | None:
         for word in ADD_WORDS:
             if word in text:
@@ -4897,7 +5220,7 @@ class TemplateEditEngine:
                 after = re.sub(
                     r"(section|区域|面板|卡片|模块|部分)?$", "", after
                 ).strip(" ：:，,。.")
-                return after or None
+                return TemplateEditEngine._strip_quotes(after) or None
         return None
 
     # ===== 应用：各 intent =====
