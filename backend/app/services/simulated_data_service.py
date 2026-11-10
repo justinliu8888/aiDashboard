@@ -56,6 +56,10 @@ from app.services.data_source_mode import (
     source_mode_of_definition,
     source_mode_of_region,
 )
+from app.services.chart_dimension_service import (
+    canonical_field_of,
+    is_device_dimension,
+)
 from app.services.display_binding_service import simulated_field
 from app.services.edit_time_resolver import DEFAULT_TIMEZONE
 from app.services.mock_data_service import (
@@ -1941,6 +1945,11 @@ def _table_payload(
                 )
             rows.append(row)
     elif has_device:
+        # 设备粒度：每台设备一行。**时间列也要有值** —— 一张「设备 + 时间 +
+        # 数值」的明细表里，时间列空着会让用户以为产品坏了。
+        # 设备级是「窗口内每台设备各一条汇总」，时间取窗口里的最后一个桶起点
+        # （报表口径的取数时刻），不是空白。
+        device_bucket = buckets[-1] if buckets else None
         for device in base.devices:
             row = {}
             for column, value_kind, simulated, unit in plans:
@@ -1948,7 +1957,7 @@ def _table_payload(
                     continue
                 seed = f"device/{seed_scope}/{device['deviceId']}/{column['fieldRef']}"
                 row[column["fieldRef"]] = _row_value(
-                    value_kind, seed=seed, device=device, bucket=None,
+                    value_kind, seed=seed, device=device, bucket=device_bucket,
                     hours=window_hours, simulated=simulated, unit=unit,
                 )
             rows.append(row)
@@ -2054,9 +2063,48 @@ def _chart_payload(
     )
     grain = _region_grain(region) or ctx.grain
     multi_day = len({b.start.date() for b in buckets}) > 1
+    # 横轴绑了**设备维度**字段时，这一块按设备出数（不是时间桶）——
+    # 验收 11-01：用户说「横轴保持用设备名称」，这里原先把声明的
+    # ``deviceName`` 强行改回 ``timestamp``，图上还是 0–23 的小时序号，
+    # 「设备名称」反而被当成一条数值系列。
+    x_is_device = is_device_dimension(str(declared_x or ""))
 
     def _y_field_for(metric_kind: str) -> str:
         return _CHART_Y_FIELDS.get(metric_kind, "value")
+
+    declared_y_field = str(declared_y or "").strip()
+
+    def _declared_numeric_values() -> tuple[list[float], str] | None:
+        """声明的纵轴字段是**逐点数值字段**时，按它出数。
+
+        验收 11-01：用户说「纵轴保持用耗电量」，纵轴字段就是 ``energyKwh``。
+        那这一块每个点的耗电量必须是**那个字段自己的值**（设备级就是各台设备
+        的能耗），不能因为区域的指标登记成「通用示意指标」就拿示意值顶上 ——
+        那样图上标着 kWh、数字却是另一套口径。
+        """
+        if declared_y_field == "energyKwh":
+            if x_is_device:
+                return [d["energyKwh"] for d in base.devices], "energyKwh"
+            return [b.energy for b in buckets], "energyKwh"
+        if declared_y_field in ("costYuan", "energyCost"):
+            price = SIMULATED_ELECTRICITY_PRICE_PER_KWH
+            if x_is_device:
+                return (
+                    [round(d["energyKwh"] * price, 2) for d in base.devices],
+                    declared_y_field,
+                )
+            return [round(b.energy * price, 2) for b in buckets], declared_y_field
+        if declared_y_field == "powerKw":
+            if x_is_device:
+                return (
+                    [
+                        round(d["energyKwh"] / max(1.0, window_hours), 2)
+                        for d in base.devices
+                    ],
+                    declared_y_field,
+                )
+            return list(powers), declared_y_field
+        return None
 
     def _series_for(
         metric_kind: str
@@ -2066,7 +2114,19 @@ def _chart_payload(
         x 原值是**带时区的 ISO 时间戳**（趋势）或对象名（对比），
         与既有预览接口的 ``points`` 形状一致；``xLabels`` 才是给人看的标签。
         """
-        if role == "TREND":
+        declared_values = _declared_numeric_values()
+        if declared_values is not None:
+            values, y_field = declared_values
+            if x_is_device:
+                names = [d["deviceName"] for d in base.devices]
+                return names, values, y_field, names
+            return (
+                _axis_labels(buckets, grain, multi_day),
+                values,
+                y_field,
+                [b.start.isoformat() for b in buckets],
+            )
+        if role == "TREND" and not x_is_device:
             if metric_kind == KIND_COST:
                 # 各桶电费之和 == 卡片上的总电费（同一套舍入，不差分毫）。
                 values = _round_to_total(
@@ -2122,6 +2182,19 @@ def _chart_payload(
 
     # 占位模式的指标**不产生数据点**（整列不进 series）。
     visible = [item for item in metrics if not item.get("placeholderOnly")]
+    # 横轴用的**分类字段**不是这一块的量：它已经当横轴用了，不能再当一条
+    # 数值系列（验收 11-01：图例把「设备名称」和「耗电量」并排画成两个
+    # 堆叠数值系列）。
+    if declared_x:
+        kept: list[dict[str, Any]] = []
+        for item in visible:
+            label = str(item.get("label") or "").strip()
+            key = str(item.get("metricKey") or "").strip()
+            canonical = canonical_field_of(label) or canonical_field_of(key)
+            if canonical and canonical == str(declared_x):
+                continue
+            kept.append(item)
+        visible = kept
     primary = (
         visible[0]
         if visible
@@ -2139,8 +2212,6 @@ def _chart_payload(
         # 量身份认不出来时，认定义里声明的纵轴字段。
         y_field = declared_y
     x_field = declared_x or ("timestamp" if role == "TREND" else "deviceName")
-    if x_field == "deviceName" and role == "TREND":
-        x_field = "timestamp"
 
     points = [
         {x_field: x_value, y_field: value}

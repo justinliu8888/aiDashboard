@@ -1,0 +1,158 @@
+{
+  "outDir": "../.selfcheck/flow-batch2-verify",
+  "waitMs": 1500,
+  "timeout": 15000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "P16-P18 页面取证：图表三条修复的可见结果",
+      "url": "http://127.0.0.1:8010/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "eval": "(() => { window.localStorage.setItem('ai-report:last-session-id', 'sess_e0f119df2f51'); return true; })()"
+        },
+        {
+          "eval": "(() => { window.location.reload(); return true; })()",
+          "continueOnError": true
+        },
+        {
+          "wait": 5000
+        },
+        {
+          "waitFor": "#preview-root .region-name",
+          "timeout": 60000
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('[data-region-id=\\\"region_4\\\"]'); const pane = document.getElementById('draft-pane'); if (!el || !pane) return false; const r = el.getBoundingClientRect(); const pr = pane.getBoundingClientRect(); pane.scrollTop += (r.top - pr.top) - 60; return true; })()",
+          "continueOnError": true
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "screenshot": "v01-设备耗电排名图-横轴设备名称-轴标题完整-参考线可见"
+        },
+        {
+          "eval": "(() => { const c = document.querySelector('[data-region-id=\"region_4\"] canvas'); return !!c && c.width > 0 && c.height > 0; })()"
+        },
+        {
+          "eval": "(() => { const t = document.querySelector('[data-region-id=\"region_4\"]').innerText || ''; return t.length > 0; })()"
+        },
+        {
+          "screenshot": "v02-图表区域文字含参考线名称"
+        },
+        {
+          "eval": "(() => { const el = document.querySelector('[data-region-id=\\\"region_3\\\"]'); const pane = document.getElementById('draft-pane'); if (!el || !pane) return false; const r = el.getBoundingClientRect(); const pr = pane.getBoundingClientRect(); pane.scrollTop += (r.top - pr.top) - 60; return true; })()",
+          "continueOnError": true
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "wait": 1000
+        },
+        {
+          "screenshot": "v03-明细表当前状态"
+        },
+        {
+          "eval": "(() => { const rows = document.querySelectorAll('.wtb-tbody tr.wtb-row'); return rows.length === 10; })()"
+        }
+      ]
+    },
+    {
+      "name": "P08-P09 复验：同意保存、撤销一次、重新打开",
+      "url": "http://127.0.0.1:8010/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "wait": 4000
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 60000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '同意'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitText": "保存草稿",
+          "timeout": 120000
+        },
+        {
+          "wait": 1200
+        },
+        {
+          "screenshot": "v04-保存对话框"
+        },
+        {
+          "eval": "(() => { const i = document.querySelector('dialog[open] input[name=\"draftName\"]'); if (!i) return false; i.value = '第二批 Part two 验收草稿（第二轮）'; return true; })()"
+        },
+        {
+          "click": "dialog[open] button[value=\"save\"]"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "eval": "document.querySelector('dialog[open]') === null"
+        },
+        {
+          "screenshot": "v05-已保存"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.wp-history-select'); if (!s) return false; s.value = 'undo'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "wait": 3000
+        },
+        {
+          "screenshot": "v06-撤销一次"
+        },
+        {
+          "eval": "(() => { const t = document.getElementById('chat-scroll').innerText || ''; return t.includes('撤销'); })()"
+        },
+        {
+          "eval": "(() => { const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '打开草稿'); if (!btn) return false; btn.id = 'pt-open-drafts-btn'; return true; })()"
+        },
+        {
+          "click": "#pt-open-drafts-btn"
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "screenshot": "v07-草稿列表"
+        },
+        {
+          "eval": "(() => { const list = document.querySelector('dialog[open] [data-draft-list]'); if (!list) return false; const rows = Array.from(list.querySelectorAll('div')); const row = rows.find(r => (r.textContent || '').includes('第二批 Part two 验收草稿（第二轮）') && r.querySelector('button')); if (!row) return false; row.querySelector('button').id = 'pt-open-target'; return true; })()"
+        },
+        {
+          "click": "#pt-open-target"
+        },
+        {
+          "wait": 4000
+        },
+        {
+          "screenshot": "v08-已重新打开刚保存的草稿"
+        },
+        {
+          "eval": "(() => { const names = Array.from(document.querySelectorAll('#preview-root .region-name')).map(e => e.textContent.trim()); return names.includes('设备耗电明细') && names.includes('机房运行日报') && names.includes('设备耗电排名'); })()"
+        },
+        {
+          "eval": "(() => { const t = document.getElementById('preview-root').innerText || ''; return t.includes('5297.2'); })()"
+        },
+        {
+          "eval": "(() => { const c = document.querySelector('[data-region-id=\"region_4\"] canvas'); return !!c && c.width > 0; })()"
+        }
+      ]
+    }
+  ]
+}

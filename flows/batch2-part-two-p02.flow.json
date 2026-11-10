@@ -1,0 +1,141 @@
+{
+  "outDir": "../.selfcheck/flow-batch2-p02",
+  "waitMs": 1500,
+  "timeout": 15000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "P01 起点草稿加载与前置核对",
+      "url": "http://127.0.0.1:8010/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "eval": "(() => { window.localStorage.setItem('ai-report:last-session-id', 'sess_e0f119df2f51'); return true; })()"
+        },
+        {
+          "eval": "(() => { window.location.reload(); return true; })()",
+          "continueOnError": true
+        },
+        {
+          "wait": 4000
+        },
+        {
+          "waitFor": "#preview-root .region-name",
+          "timeout": 60000
+        },
+        {
+          "screenshot": "p01-01-起点草稿已加载"
+        },
+        {
+          "eval": "(() => { const names = Array.from(document.querySelectorAll('#preview-root .region-name')).map(e => e.textContent.trim()); return names.length >= 5 && names.includes('设备耗电明细') && names.includes('机房运行日报') && names.includes('运行设备数') && names.includes('设备耗电排名'); })()"
+        },
+        {
+          "eval": "(() => { const t = document.getElementById('preview-root').innerText || ''; return t.includes('当前告警共') && t.includes('5297.2'); })()"
+        },
+        {
+          "screenshot": "p01-02-正文绑定与全量合计"
+        },
+        {
+          "eval": "(() => { const heads = Array.from(document.querySelectorAll('.wtb-thead th')).map(e => e.textContent.trim()); return heads.includes('时间') && heads.includes('设备名称') && heads.includes('昨日耗电量'); })()"
+        },
+        {
+          "eval": "(() => { const rows = document.querySelectorAll('.wtb-tbody tr.wtb-row'); return rows.length === 10; })()"
+        },
+        {
+          "eval": "(() => { const vals = Array.from(document.querySelectorAll('.wtb-tbody tr.wtb-row')).map(r => { const tds = r.querySelectorAll('td'); const last = tds[tds.length - 1]; const m = (last.textContent || '').match(/([0-9]+(?:\\.[0-9]+)?)/); return m ? Number(m[1]) : NaN; }); return vals.length === 10 && vals.every(v => !Number.isNaN(v)) && vals.some(v => v > 400) && vals.some(v => v < 400); })()"
+        },
+        {
+          "eval": "(() => { const label = document.querySelector('.wtb-summary__label'); const value = document.querySelector('.wtb-summary__value'); const basis = document.querySelector('.wtb-summary__basis'); return !!label && label.textContent.includes('耗电量合计') && !!value && value.textContent.includes('5297.2') && !!basis && basis.textContent.includes('全量'); })()"
+        },
+        {
+          "screenshot": "p01-03-明细表十行与全量合计"
+        },
+        {
+          "eval": "(() => { const icons = Array.from(document.querySelectorAll('#preview-root .wtm-icon')).map(e => e.getAttribute('icon') || ''); return icons.length >= 1 && icons.every(Boolean); })()"
+        },
+        {
+          "screenshot": "p01-04-图标与图表区域"
+        },
+        {
+          "eval": "(() => { const chats = document.getElementById('chat-scroll'); return !!chats && (chats.innerText || '').includes('请选择下一步操作'); })()"
+        },
+        {
+          "screenshot": "p01-05-下一步菜单"
+        }
+      ]
+    },
+    {
+      "name": "P02 §9 原组合指令→候选→接受",
+      "url": "http://127.0.0.1:8010/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "wait": 3500
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 60000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": "[data-question-text=\"template_edit_request\"] .question-text-input",
+          "timeout": 60000
+        },
+        {
+          "type": "[data-question-text=\"template_edit_request\"] .question-text-input",
+          "text": "给「设备耗电明细」表做三件事：第一，把展示用的字段名做别名映射，「时间」映射成展示名「时间点」，「昨日耗电量」映射成展示名「昨日耗电量（kWh）」，源字段不变；第二，加一个展示过滤，只展示昨日耗电量大于 400 kWh 的记录；第三，按昨日耗电量降序排序并且只展示前 5 项。这三项都只影响展示，不要改变源数据和全量合计。"
+        },
+        {
+          "screenshot": "p02-01-原指令已输入"
+        },
+        {
+          "click": "[data-question-text-submit=\"template_edit_request\"]"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 240000
+        },
+        {
+          "screenshot": "p02-02-候选卡"
+        },
+        {
+          "eval": "(() => { const t = document.getElementById('chat-scroll').innerText || ''; return t.includes('时间点') && t.includes('昨日耗电量（kWh）') && t.includes('400') && t.includes('5'); })()"
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '接受修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 120000
+        },
+        {
+          "wait": 1500
+        },
+        {
+          "screenshot": "p02-03-已接受"
+        },
+        {
+          "eval": "(() => { const heads = Array.from(document.querySelectorAll('.wtb-thead th')).map(e => e.textContent.trim()); return heads.includes('时间点') && heads.includes('昨日耗电量（kWh）') && !heads.includes('时间') && !heads.includes('昨日耗电量'); })()"
+        },
+        {
+          "eval": "(() => { const rows = document.querySelectorAll('.wtb-tbody tr.wtb-row'); return rows.length === 5; })()"
+        },
+        {
+          "eval": "(() => { const vals = Array.from(document.querySelectorAll('.wtb-tbody tr.wtb-row')).map(r => { const tds = r.querySelectorAll('td'); const last = tds[tds.length - 1]; const m = (last.textContent || '').match(/([0-9]+(?:\\.[0-9]+)?)/); return m ? Number(m[1]) : NaN; }); return vals.length === 5 && vals.every(v => v > 400) && vals.every((v, i) => i === 0 || vals[i - 1] >= v); })()"
+        },
+        {
+          "eval": "(() => { const value = document.querySelector('.wtb-summary__value'); const basis = document.querySelector('.wtb-summary__basis'); return !!value && value.textContent.includes('5297.2') && !!basis && basis.textContent.includes('全量'); })()"
+        },
+        {
+          "screenshot": "p02-04-五行降序别名全量合计不变"
+        }
+      ]
+    }
+  ]
+}

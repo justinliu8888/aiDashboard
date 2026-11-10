@@ -10,9 +10,13 @@
 //   * chartKind **逐字**读：PIE / DONUT / BAR / STACKED_BAR / LINE / AREA
 //     **互不折叠**（环形图不是饼图，堆叠柱状图不是柱状图）；
 //   * axes：title / minimum / maximum / format / scale 逐项落到 ECharts；
+//     轴标题的**排版**在画布内部解决（nameLocation / nameGap / grid 边距）——
+//     横轴标题居中放在刻度下面（不再落在轴的末端被裁掉），纵轴标题竖排居中；
 //   * legend：只有开关（协议里没有位置与方向）；seriesColors 按**稳定系列键**上色；
 //   * tooltipFields：加到提示里（基础提示永远保留，取不到值显示占位符）；
-//   * referenceLines：画在数值轴上（没有数值轴的图型不画）。
+//   * referenceLines：画在数值轴上（没有数值轴的图型不画）；
+//     用户没固定上下界时，数值轴的自动范围**同时覆盖数据值和参考线值**（含边距）；
+//     用户固定过的边界**不动** —— 参考线落在外面时在图下写一句提示。
 //
 // ── 两条渲染后端 ──────────────────────────────────────────────────────
 //   - ECharts 可用 → 真图表；
@@ -48,6 +52,30 @@
     PIE: "pie_chart",
     DONUT: "pie_chart",
   };
+
+  // ---------------------------------------------------------------- 排版参数
+  //
+  // 轴标题与画布留白都**在画布内部**解决：不放大外层卡片、不把字号缩到认不出、
+  // 不截断标题 —— 只调 ECharts 的 nameLocation / nameGap 与 grid 边距。
+
+  /** 轴标题的字号（沿用既有的 nameTextStyle 口径）。 */
+  const AXIS_NAME_FONT_SIZE = 10;
+  /** 轴刻度文字的字号（用于估算刻度宽度、给标题让位）。 */
+  const AXIS_LABEL_FONT_SIZE = 11;
+  /** 横轴标题离轴线的距离（居中放在刻度下面）。 */
+  const X_AXIS_NAME_GAP = 30;
+  /** 纵轴标题离轴线的距离区间（按刻度文字宽度算，取它的上下限）。 */
+  const Y_AXIS_NAME_MIN_GAP = 24;
+  const Y_AXIS_NAME_MAX_GAP = 76;
+  /** 画布四边的留白（有轴标题时按标题让位）。 */
+  const GRID_LEFT = 60;
+  const GRID_RIGHT = 20;
+  const GRID_TOP = 24;
+  const GRID_BOTTOM = 36;
+  /** 有横轴标题时，下边距要给「刻度 + 标题」留出位置。 */
+  const GRID_BOTTOM_WITH_X_NAME = 64;
+  /** 纵轴标题（竖排）离画布左缘的净空。 */
+  const Y_AXIS_NAME_LEFT_CLEARANCE = 30;
 
   /** 本模块创建的 ECharts 实例（协调者按它 resize / dispose）。 */
   const instances = [];
@@ -141,6 +169,232 @@
     return PALETTE[index % PALETTE.length];
   }
 
+  // ---------------------------------------------------------------- 数值范围
+
+  /**
+   * 上界取整到「好看的」数（1 / 1.5 / 2 / 2.5 / 3 / 4 / 5 / 6 / 8 / 10 × 10ⁿ）。
+   *
+   * 自己实现，不引第三方库：取比 value 大的最小「好看数」。
+   */
+  function niceCeil(value) {
+    if (!Number.isFinite(value) || value <= 0) return value;
+    const steps = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+    const exp = Math.floor(Math.log10(value));
+    const base = Math.pow(10, exp);
+    const norm = value / base;
+    for (const step of steps) {
+      if (norm <= step + 1e-9) return step * base;
+    }
+    return 10 * base;
+  }
+
+  /** 下界取整到「好看的」数（取比 value 小的最大「好看数」）。 */
+  function niceFloor(value) {
+    if (!Number.isFinite(value) || value <= 0) return value;
+    const steps = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+    const exp = Math.floor(Math.log10(value));
+    const base = Math.pow(10, exp);
+    const norm = value / base;
+    let picked = steps[0];
+    for (const step of steps) {
+      if (norm >= step - 1e-9) picked = step;
+      else break;
+    }
+    return picked * base;
+  }
+
+  /**
+   * 载荷里的数据值范围。
+   *
+   * 堆叠图型（STACKED_BAR）按**同一 x 位置上的堆叠总值**算 —— 不是单系列最大值。
+   */
+  function dataValueRange(payload, kind) {
+    const series = Array.isArray(payload?.series) && payload.series.length
+      ? payload.series
+      : null;
+    const stacked = String(kind || "").toUpperCase() === "STACKED_BAR";
+    let min = null;
+    let max = null;
+    const take = (value) => {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return;
+      if (min === null || num < min) min = num;
+      if (max === null || num > max) max = num;
+    };
+    if (series) {
+      if (stacked) {
+        const lengths = series.map((item) =>
+          Array.isArray(item?.yValues) ? item.yValues.length : 0
+        );
+        const count = lengths.reduce((acc, len) => (len > acc ? len : acc), 0);
+        for (let index = 0; index < count; index += 1) {
+          let sum = 0;
+          let any = false;
+          for (const item of series) {
+            const values = Array.isArray(item?.yValues) ? item.yValues : [];
+            const num = Number(values[index]);
+            if (Number.isFinite(num)) {
+              sum += num;
+              any = true;
+            }
+          }
+          if (any) take(sum);
+        }
+      } else {
+        for (const item of series) {
+          const values = Array.isArray(item?.yValues) ? item.yValues : [];
+          for (const value of values) take(value);
+        }
+      }
+      return { min, max };
+    }
+    const values = Array.isArray(payload?.yValues) ? payload.yValues : [];
+    for (const value of values) take(value);
+    return { min, max };
+  }
+
+  /** 载荷里的有效参考线（数值能当数用的才算）。 */
+  function referenceLineValues(payload) {
+    const lines = isObject(payload?.referenceLines) ? payload.referenceLines : {};
+    const result = [];
+    for (const name of Object.keys(lines)) {
+      const expr = lines[name];
+      const value = Number(isObject(expr) ? expr.value : NaN);
+      if (!Number.isFinite(value)) continue;
+      result.push({ name: String(name), value });
+    }
+    return result;
+  }
+
+  /**
+   * 数值轴的范围计划。
+   *
+   * - 用户**显式**给了 minimum / maximum → 尊重用户的值，**不静默改写**；
+   * - 用户没给的那一边 → 由「数据值 + 全部有效参考线值」算出（含边距、取整到好看的数），
+   *   参考线因此不会跑到可视范围之外；
+   * - 参考线落在用户固定的范围之外 → 记一条提示（图下的说明行里写出来）。
+   */
+  function planValueRange(payload, kind, ySpec) {
+    const spec = isObject(ySpec) ? ySpec : {};
+    const userMin =
+      typeof spec.minimum === "number" && isFinite(spec.minimum)
+        ? spec.minimum
+        : null;
+    const userMax =
+      typeof spec.maximum === "number" && isFinite(spec.maximum)
+        ? spec.maximum
+        : null;
+    const references = referenceLineValues(payload);
+    const data = dataValueRange(payload, kind);
+
+    let min = null;
+    let max = null;
+    if (userMin === null) {
+      let low = data.min;
+      for (const ref of references) {
+        if (low === null || ref.value < low) low = ref.value;
+      }
+      // 只有参考线把下界拽出数据范围时才动它（否则交给 ECharts 自动算）。
+      if (low !== null && (data.min === null || low < data.min)) {
+        min = niceFloor(low * 0.95);
+      }
+    }
+    if (userMax === null) {
+      let high = data.max;
+      for (const ref of references) {
+        if (high === null || ref.value > high) high = ref.value;
+      }
+      if (high !== null && (data.max === null || high > data.max)) {
+        max = niceCeil(high * 1.05);
+      }
+    }
+
+    const effectiveMin = userMin !== null ? userMin : min !== null ? min : data.min;
+    const effectiveMax = userMax !== null ? userMax : max !== null ? max : data.max;
+
+    const warnings = [];
+    for (const ref of references) {
+      if (effectiveMin !== null && ref.value < effectiveMin) {
+        warnings.push({ name: ref.name, value: ref.value, side: "below" });
+      } else if (effectiveMax !== null && ref.value > effectiveMax) {
+        warnings.push({ name: ref.name, value: ref.value, side: "above" });
+      }
+    }
+
+    return {
+      min,
+      max,
+      userMin,
+      userMax,
+      effectiveMin,
+      effectiveMax,
+      references,
+      warnings,
+    };
+  }
+
+  // ---------------------------------------------------------------- 轴标题排版
+
+  /** 估一段文字的像素宽（CJK 约 1 字宽，数字 / 字母约 0.62 字宽）。 */
+  function estimateTextWidth(text, fontSize) {
+    const size = Number(fontSize) || AXIS_LABEL_FONT_SIZE;
+    let width = 0;
+    for (const ch of String(text == null ? "" : text)) {
+      width += /[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]/.test(ch)
+        ? size
+        : size * 0.62;
+    }
+    return width;
+  }
+
+  /** 纵轴刻度里最宽的一格大概多宽（用来给竖排标题让出位置）。 */
+  function estimateValueLabelWidth(payload, kind, ySpec, unit) {
+    const spec = isObject(ySpec) ? ySpec : {};
+    const range = dataValueRange(payload, kind);
+    let width = 0;
+    for (const value of [range.min, range.max]) {
+      if (value === null || !Number.isFinite(value)) continue;
+      const text = formatByFormat(value, spec.format, unit || "");
+      width = Math.max(width, estimateTextWidth(text, AXIS_LABEL_FONT_SIZE));
+    }
+    return width + 8; // 刻度进位后可能多一两位，留一点余量。
+  }
+
+  /**
+   * 轴标题 + 画布留白的排版计划。
+   *
+   * 口径（测试按这个口径断言）：
+   * - 横轴标题：**居中**放在刻度下面（nameLocation="middle"），不再落在轴的末端；
+   * - 纵轴标题：**竖排居中**放在刻度左边（nameLocation="middle" + rotate 90），
+   *   左边距按刻度文字宽度让位，保证不压住刻度；
+   * - 画布留白：grid.bottom 给横轴标题留位置，grid.left 给纵轴标题留位置。
+   */
+  function planAxisLayout(payload, kind, axes, unit) {
+    const specs = isObject(axes) ? axes : {};
+    const xSpec = isObject(specs.x) ? specs.x : {};
+    const ySpec = isObject(specs.y) ? specs.y : {};
+    const xTitle = xSpec.title == null ? "" : String(xSpec.title);
+    const yTitle = ySpec.title == null ? "" : String(ySpec.title);
+    const labelWidth = estimateValueLabelWidth(payload, kind, ySpec, unit);
+    const yNameGap = Math.min(
+      Y_AXIS_NAME_MAX_GAP,
+      Math.max(Y_AXIS_NAME_MIN_GAP, Math.round(labelWidth + 20))
+    );
+    return {
+      xName: xTitle,
+      yName: yTitle,
+      yNameGap,
+      grid: {
+        left: yTitle
+          ? Math.max(GRID_LEFT, yNameGap + Y_AXIS_NAME_LEFT_CLEARANCE)
+          : GRID_LEFT,
+        right: GRID_RIGHT,
+        top: GRID_TOP,
+        bottom: xTitle ? GRID_BOTTOM_WITH_X_NAME : GRID_BOTTOM,
+      },
+    };
+  }
+
   // ---------------------------------------------------------------- 坐标轴
 
   /** 一根轴的 ECharts 设置（按声明逐项落）。 */
@@ -152,13 +406,36 @@
     const title = source.title == null ? "" : String(source.title);
     if (title) {
       out.name = title;
-      out.nameTextStyle = { fontSize: 10, color: opts.nameColor || "#64748b" };
+      out.nameTextStyle = {
+        fontSize: AXIS_NAME_FONT_SIZE,
+        color: opts.nameColor || "#64748b",
+        align: "center",
+      };
+      // 轴标题的**画布内**排版：
+      //   - 横轴：ECharts 默认把轴名落在轴的**末端（最右）** → 被画布右缘裁掉；
+      //     改成**居中**放在刻度下面（nameGap 决定它离刻度多远）；
+      //   - 纵轴：默认横排在轴的顶端 → 长标题会顶出画布左缘；
+      //     改成**竖排居中**放在刻度左边（nameGap 按刻度宽度让位）。
+      if (opts.axisDirection === "x") {
+        out.nameLocation = "middle";
+        out.nameGap = X_AXIS_NAME_GAP;
+      } else if (opts.axisDirection === "y") {
+        out.nameLocation = "middle";
+        out.nameGap = opts.nameGap || Y_AXIS_NAME_MIN_GAP;
+        out.nameRotate = 90;
+      }
     }
     if (typeof source.minimum === "number" && isFinite(source.minimum)) {
       out.min = source.minimum;
+    } else if (Number.isFinite(opts.autoMin)) {
+      // 用户**没有**固定下界 → 用算出来的（盖住参考线）。
+      out.min = opts.autoMin;
     }
     if (typeof source.maximum === "number" && isFinite(source.maximum)) {
       out.max = source.maximum;
+    } else if (Number.isFinite(opts.autoMax)) {
+      // 用户**没有**固定上界 → 用算出来的（盖住参考线）。
+      out.max = opts.autoMax;
     }
     const scale = String(source.scale || "").toUpperCase();
     if (scale === "LINEAR") out.type = "value";
@@ -270,6 +547,8 @@
           formatter: name,
           fontSize: 10,
           color: themeColor || "#64748b",
+          // 名称画在线的**内侧末端**（默认落在轴的外侧 → 被画布右缘裁掉）。
+          position: "insideEndTop",
         },
       });
     }
@@ -374,6 +653,28 @@
     container.appendChild(note);
   }
 
+  /**
+   * 参考线落在用户固定的纵轴范围之外 → 在图下写一句提示。
+   *
+   * 用的是既有的 ``wch-note`` 样式（不另起一套 CSS）。
+   * 提示里说清：参考线**名称**、**数值**、以及它在当前纵轴范围的**外面**。
+   */
+  function appendRangeNote(container, warnings, unit, range) {
+    const list = Array.isArray(warnings) ? warnings : [];
+    if (!list.length) return;
+    const suffix = unit ? " " + unit : "";
+    const bound = (value) => (value === null || value === undefined ? "不限" : String(value));
+    const scope = `当前纵轴范围 ${bound(range?.effectiveMin)} ~ ${bound(range?.effectiveMax)}`;
+    const parts = list.map((item) => {
+      const side = item.side === "above" ? "高于" : "低于";
+      return `参考线「${item.name}」（${item.value}${suffix}）${side}${scope}`;
+    });
+    const note = document.createElement("div");
+    note.className = "wch-note";
+    note.textContent = `注意：${parts.join("；")}，图上看不到这条参考线。`;
+    container.appendChild(note);
+  }
+
   // ---------------------------------------------------------------- 渲染
 
   /**
@@ -446,6 +747,7 @@
           },
           legend: legendOption,
         };
+        let rangePlan = null;
         if (PIE_KINDS[kind]) {
           // 饼图 / 环形图没有坐标轴 —— 不画 xAxis / yAxis。
           option.series = pieSeries(payload, kind, {
@@ -456,20 +758,36 @@
         } else {
           const xSpec = axes.x;
           const ySpec = axes.y;
-          option.grid = { left: 60, right: 20, top: 24, bottom: 36 };
+          // 轴标题的排版 + 画布留白（都在画布内部解决）。
+          const layout = planAxisLayout(payload, kind, axes, unit);
+          // 数值轴的范围：数据 + 参考线（用户固定过的边界不动）。
+          rangePlan = planValueRange(payload, kind, ySpec);
+          option.grid = layout.grid;
           option.xAxis = axisOption(xSpec, "category", {
             unit,
             labelColor: themeColor,
+            axisDirection: "x",
             useServerLabels:
               !!isObject(xSpec) &&
               !!isObject(xSpec.format) &&
               Array.isArray(payload.displayXLabels) &&
               payload.displayXLabels.length > 0,
           });
+          // **类别轴的标签**：ECharts 不给 ``data`` 就画序号（0、1、2…），
+          // 于是「横轴用设备名称」在图上还是一串数字（验收 11-01）。
+          // 载荷已经算好类别名（``displayXLabels`` / ``xLabels``），
+          // 这里原样交给 ECharts —— 图上显示的必须是载荷里的类别。
+          if (option.xAxis && option.xAxis.type === "category" && displayLabels.length) {
+            option.xAxis.data = displayLabels.slice();
+          }
           option.yAxis = axisOption(ySpec, "value", {
             unit,
             labelColor: themeColor,
             nameColor: themeColor || "#64748b",
+            axisDirection: "y",
+            nameGap: layout.yNameGap,
+            autoMin: rangePlan.min,
+            autoMax: rangePlan.max,
           });
           // 单位只是**兜底**：声明过的轴标题（``axes.y.title``）优先 ——
           // 不能拿单位把用户设置的标题盖掉（协议 AxisSpec.title）。
@@ -481,6 +799,9 @@
         }
         chart.setOption(option);
         appendNote(container, payload, unit, displayLabels.length, simulated);
+        if (rangePlan) {
+          appendRangeNote(container, rangePlan.warnings, unit, rangePlan);
+        }
         return;
       } catch (err) {
         console.error("[AI Report] 图表初始化失败", err);

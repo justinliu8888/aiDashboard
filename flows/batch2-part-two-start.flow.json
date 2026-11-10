@@ -1,0 +1,71 @@
+{
+  "outDir": "../.selfcheck/flow-batch2-start",
+  "waitMs": 1500,
+  "timeout": 15000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "P01b 干净起点草稿复验",
+      "url": "http://127.0.0.1:8010/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "eval": "(() => { window.localStorage.setItem('ai-report:last-session-id', 'sess_e3d5fd58d0d4'); return true; })()"
+        },
+        {
+          "eval": "(() => { window.location.reload(); return true; })()",
+          "continueOnError": true
+        },
+        {
+          "wait": 4000
+        },
+        {
+          "waitFor": "#preview-root .region-name",
+          "timeout": 60000
+        },
+        {
+          "screenshot": "p01-01-起点草稿已加载"
+        },
+        {
+          "eval": "(() => { const names = Array.from(document.querySelectorAll('#preview-root .region-name')).map(e => e.textContent.trim()); return names.length >= 5 && names.includes('设备耗电明细') && names.includes('机房运行日报') && names.includes('运行设备数') && names.includes('设备耗电排名'); })()"
+        },
+        {
+          "eval": "(() => { const t = document.getElementById('preview-root').innerText || ''; return t.includes('当前告警共') && t.includes('5297.2'); })()"
+        },
+        {
+          "screenshot": "p01-02-正文绑定与全量合计"
+        },
+        {
+          "eval": "(() => { const heads = Array.from(document.querySelectorAll('.wtb-thead th')).map(e => e.textContent.trim()); return heads.includes('时间') && heads.includes('设备名称') && heads.includes('昨日耗电量'); })()"
+        },
+        {
+          "eval": "(() => { const rows = document.querySelectorAll('.wtb-tbody tr.wtb-row'); return rows.length === 10; })()"
+        },
+        {
+          "eval": "(() => { const vals = Array.from(document.querySelectorAll('.wtb-tbody tr.wtb-row')).map(r => { const tds = r.querySelectorAll('td'); const last = tds[tds.length - 1]; const m = (last.textContent || '').match(/([0-9]+(?:\\.[0-9]+)?)/); return m ? Number(m[1]) : NaN; }); return vals.length === 10 && vals.every(v => !Number.isNaN(v)) && vals.some(v => v > 400) && vals.some(v => v < 400); })()"
+        },
+        {
+          "eval": "(() => { const label = document.querySelector('.wtb-summary__label'); const value = document.querySelector('.wtb-summary__value'); const basis = document.querySelector('.wtb-summary__basis'); return !!label && label.textContent.includes('耗电量合计') && !!value && value.textContent.includes('5297.2') && !!basis && basis.textContent.includes('全量'); })()"
+        },
+        {
+          "screenshot": "p01-03-明细表十行与全量合计"
+        },
+        {
+          "eval": "(() => { const icons = Array.from(document.querySelectorAll('#preview-root .wtm-icon')).map(e => e.getAttribute('icon') || ''); return icons.length >= 1 && icons.every(Boolean); })()"
+        },
+        {
+          "screenshot": "p01-04-图标与图表区域"
+        },
+        {
+          "eval": "(() => { const chats = document.getElementById('chat-scroll'); return !!chats && (chats.innerText || '').includes('请选择下一步操作'); })()"
+        },
+        {
+          "screenshot": "p01-05-下一步菜单"
+        }
+      ]
+    }
+  ]
+}

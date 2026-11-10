@@ -2087,6 +2087,19 @@ class TemplateEditEngine:
             # 指标卡 / 指标组的数值格式是**逐项**的 → 让路给模型支路
             # （``SET_METRIC_ITEM.format`` / ``SET_METRIC_GROUP.metrics[]``）。
             return None
+        if component_type == "CHART":
+            # 图表的数值格式在**通道 / 坐标轴**上（``axes.y.format`` 或编码项
+            # 自带的 ``format``），**不在区域级** ``region.format`` 上。
+            #
+            # 区域级格式对图表不生效，而这条规则会**先命中就返回**，把整句
+            # 里的通道诉求一起吞掉：实测（验收 11-01）用户说「横轴保持用设备
+            # 名称，纵轴保持用耗电量，纵轴数值格式保留一位小数」，候选里只有
+            # 一条 ``SET_FORMAT``（区域级），通道一项都没改，图例仍把「设备
+            # 名称」当数值系列。
+            #
+            # 所以图表的格式诉求**整句让路给能力层**
+            # （``SET_CHART_AXES`` / ``SET_CHART_ENCODINGS``）。
+            return None
         normalized = _normalize_text(text)
         fmt: dict[str, Any] = {}
         match = re.search(r"(\d+|[一二两三四五六七八九十])\s*位?小数", normalized)

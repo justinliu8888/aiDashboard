@@ -23,6 +23,15 @@ from app.data.machine_room_energy import METRIC_DEVICE_ENERGY, METRIC_TOTAL_ENER
 from app.schemas.report_definition import ReportDefinitionDraft
 from app.schemas.report_plan import COMPONENT_TYPE_VALUES, PlanContractError
 from app.schemas.template_design import TemplateDesign, TemplateRegion
+from app.services.chart_dimension_service import (
+    canonical_field_of,
+    dataset_fields,
+    dimension_intent_field,
+    ensure_device_dimension,
+    is_device_dimension,
+    is_dimension_canonical,
+    numeric_intent_fields,
+)
 from app.services.data_source_mode import (
     DEFAULT_SOURCE_MODE,
     SOURCE_MODE_KEY,
@@ -295,6 +304,16 @@ def _build_preview_spec(
     clarification: dict[str, Any] | None = None
     # A catalog binding may cover only one intent; it cannot replace the confirmed plan.
     plan_driven = source_mode == SOURCE_MODE_SIMULATED and bool(intents)
+    if component_type.endswith("_chart"):
+        # 图表的**分类字段**（横轴用的那一个）不是这一块的量 —— 它已经
+        # 当横轴了，不能再登记成指标。登记成指标的后果：造数器照着多指标
+        # 出**两条数值系列**，图例把「设备名称」和「耗电量」并排画成两个
+        # 堆叠数值系列（验收 11-01）。
+        intents = [
+            item
+            for item in intents
+            if not is_dimension_canonical(canonical_field_of(item))
+        ]
     if metric_refs and not plan_driven:
         for metric_ref in metric_refs:
             catalog = get_metric(metric_ref) or {}
@@ -1029,13 +1048,34 @@ def build_template_definition(
                         "type": "TABLE", "columns": deepcopy(_DEFAULT_TABLE_COLUMNS),
                     }
             elif kind.endswith("_chart"):
+                # 图表的横轴：**先认方案里的分类字段**（用户说「横轴设备名称」
+                # 就是横轴设备名称），认不出再按原来的规则兜底。
+                #
+                # 验收 11-01 的实测后果：这里原来只按「是不是设备级指标」决定
+                # 横轴是 ``deviceName`` 还是 ``timestamp``，于是「设备耗电排名」
+                # 被做成按小时的时间趋势（横轴 0–23），而方案里那句「设备名称」
+                # 被当成**指标**登记进指标清单 → 造数器照着多指标出两条数值
+                # 系列，图例把「设备名称」和「耗电量」并排画成两个堆叠数值系列。
+                _chart_fields = dataset_fields(seed, converted)
+                _dimension = dimension_intent_field(intents, _chart_fields)
+                _numeric = numeric_intent_fields(intents, _chart_fields)
+                _x_field = _dimension or ("deviceName" if device else "timestamp")
+                _y_field = _numeric[0] if _numeric else "energyKwh"
                 converted["component"] = {
                     "type": "CHART", "chartKind": kind.split("_")[0].upper(),
                     "encodings": [
-                        {"channel": "X", "fieldRef": "deviceName" if device else "timestamp"},
-                        {"channel": "Y", "fieldRef": "energyKwh"},
+                        {"channel": "X", "fieldRef": _x_field},
+                        {"channel": "Y", "fieldRef": _y_field},
                     ],
                 }
+                if is_device_dimension(_x_field):
+                    # 横轴是设备维度 → 管线按设备分组，输出里声明维度字段。
+                    ensure_device_dimension(
+                        converted,
+                        seed,
+                        dimension_field=_x_field,
+                        value_field=_y_field,
+                    )
             elif kind == "metric_card":
                 # 指标卡的 ``component.metric.label`` 是**指标名称**
                 # （协议 MetricItem.label），不是板块标题 —— 标题是

@@ -29,7 +29,15 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.services.chart_dimension_service import (
+    canonical_field_of,
+    dataset_fields,
+    ensure_device_dimension,
+    field_data_type,
+    is_dimension_field,
+)
 from app.services.display_binding_service import (
+    declared_field_candidates,
     DisplayBindingError,
     require_declared_field,
 )
@@ -643,7 +651,8 @@ def _set_chart_encodings(
     pie_like = kind in PIE_KINDS
     seen: set[str] = set()
     encodings: list[dict[str, Any]] = []
-    for index, raw in enumerate(params.encodings or []):
+    raw_items = [item for item in (params.encodings or []) if isinstance(item, dict)]
+    for index, raw in enumerate(raw_items):
         where = f"第 {index + 1} 项通道绑定"
         if not isinstance(raw, dict):
             raise CapabilityError(
@@ -697,10 +706,12 @@ def _set_chart_encodings(
                 constraint="通道必须与图型相容",
                 reason="channel_not_applicable",
             )
-        field_ref = _require_field(
+        field_ref = _resolve_encoding_field(
+            ctx,
             region,
             raw.get("fieldRef"),
-            what="字段",
+            channel=channel,
+            value_field=_declared_value_field(raw_items),
             op="SET_CHART_ENCODINGS",
             target=region_id,
         )
@@ -717,6 +728,10 @@ def _set_chart_encodings(
         encodings.append(item)
 
     region["component"] = {**component, "encodings": encodings}
+    # 横轴绑了**分类字段**时，它就不是这一块的「指标」了 ——
+    # 留在指标清单里会被当成第二条**数值系列**（验收 11-01：图例把
+    # 「设备名称」和「耗电量」并排画成两个堆叠数值系列）。
+    _drop_dimension_metrics(region, encodings)
     title = _region_title(region, region_id)
     message = (
         f"「{title}」的通道绑定改为 {len(encodings)} 项"
@@ -742,6 +757,167 @@ def _set_chart_encodings(
             ),
         },
     )
+
+
+def _declared_value_field(raw_items: list[dict[str, Any]]) -> str:
+    """这次提交里**纵轴**用的字段（横轴要按维度出数时，汇总的量用它）。"""
+    for raw in raw_items:
+        if str(raw.get("channel") or "").strip().upper() == "Y":
+            return str(raw.get("fieldRef") or "").strip()
+    return ""
+
+
+def _field_is_numeric(
+    ctx: OperationContext, region: dict[str, Any], name: str
+) -> bool:
+    """这个字段是不是**数值**字段（横轴不能放数值）。"""
+    fields = dataset_fields(ctx.definition, region)
+    data_type = field_data_type(fields, name)
+    if not data_type:
+        # 区域输出自己声明的类型也算数。
+        output_fields = _region_output_field_types(region)
+        data_type = output_fields.get(name, "")
+    return data_type in ("DECIMAL", "INTEGER", "NUMBER", "DOUBLE", "FLOAT")
+
+
+def _region_output_field_types(region: dict[str, Any]) -> dict[str, str]:
+    """区域输出声明的字段类型（字段名 → 大写 dataType）。"""
+    data = region.get("data") if isinstance(region, dict) else None
+    data = data if isinstance(data, dict) else {}
+    pipeline = data.get("pipeline") if isinstance(data.get("pipeline"), dict) else {}
+    outputs = pipeline.get("outputs") if isinstance(pipeline.get("outputs"), dict) else {}
+    types: dict[str, str] = {}
+    for spec in outputs.values():
+        expected = (spec or {}).get("expectedFields") if isinstance(spec, dict) else None
+        for field_name, field in (expected or {}).items():
+            types[str(field_name)] = str(
+                (field or {}).get("dataType") or "" if isinstance(field, dict) else ""
+            ).strip().upper()
+    return types
+
+
+def _resolve_encoding_field(
+    ctx: OperationContext,
+    region: dict[str, Any],
+    raw_ref: Any,
+    *,
+    channel: str,
+    value_field: str,
+    op: str,
+    target: str,
+) -> str:
+    """通道字段：已声明的直接用；**分类字段**先把区域改成按维度出数。
+
+    验收 11-01 的实测后果：用户说「横轴用设备名称」，而 ``deviceName``
+    既不在这个区域的输出里、也不在单值模拟字段目录里 → 直接被拒，
+    「横轴保持用设备名称」根本设不上；硬写进去，造数器又按时间桶出数，
+    横轴仍是小时序号。
+
+    这里把**输入数据集里已经登记过的分类字段**接进来：管线按维度分组、
+    输出里声明该字段，然后照常校验。
+    """
+    name = str(raw_ref or "").strip()
+    if not name:
+        return _require_field(region, name, what="字段", op=op, target=target)
+    try:
+        declared = require_declared_field(region, name, what="字段")
+    except DisplayBindingError:
+        declared = ""
+    if declared:
+        # 已声明的字段：横轴必须是**分类 / 时间**字段 —— 数值字段放横轴
+        # 会把「设备名称」画成数值系列（验收 11-01 的图例就是两条数值系列）。
+        if channel == "X" and _field_is_numeric(ctx, region, declared):
+            raise CapabilityError(
+                f"横轴不能放数值字段 {declared!r}：横轴要的是分类字段"
+                "（设备名称 / 设备类型 / 时间…），数值请放纵轴。",
+                op=op,
+                target=target,
+                constraint="横轴必须是分类 / 时间字段",
+                reason="channel_field_mismatch",
+            )
+        return declared
+    fields = dataset_fields(ctx.definition, region)
+    if not is_dimension_field(fields, name):
+        # 不是维度字段 → 照旧按契约明确拒绝（消息里列出可用字段）。
+        return _require_field(region, name, what="字段", op=op, target=target)
+    if channel not in ("X", "COLOR", "LABEL"):
+        raise CapabilityError(
+            f"通道 {channel} 用的是数值字段，不能绑分类字段 {name!r}；"
+            "分类字段只能放在横轴（或饼图的 COLOR / LABEL 通道）。",
+            op=op,
+            target=target,
+            constraint="分类字段只能绑到横轴通道",
+            reason="channel_field_mismatch",
+        )
+    value = value_field or _current_value_field(region)
+    changed = ensure_device_dimension(
+        region,
+        ctx.definition,
+        dimension_field=name,
+        value_field=value,
+    )
+    if not changed and name not in declared_field_candidates(region):
+        raise CapabilityError(
+            f"分类字段 {name!r} 当前用不了：这个区域的数据集里没有可按它分组的"
+            "数值字段，改不了横轴。请改用这个区域已有的字段，或先补充数据来源。",
+            op=op,
+            target=target,
+            constraint="分类字段要有可汇总的数值字段才能用",
+            reason="dimension_not_available",
+        )
+    return _require_field(region, name, what="字段", op=op, target=target)
+
+
+def _current_value_field(region: dict[str, Any]) -> str:
+    """这个区域当前纵轴用的字段（没声明就空串）。"""
+    component = region.get("component") if isinstance(region, dict) else None
+    component = component if isinstance(component, dict) else {}
+    for encoding in component.get("encodings") or []:
+        if not isinstance(encoding, dict):
+            continue
+        if str(encoding.get("channel") or "").strip().upper() == "Y":
+            return str(encoding.get("fieldRef") or "").strip()
+    return ""
+
+
+def _drop_dimension_metrics(region: dict[str, Any], encodings: list[dict[str, Any]]) -> None:
+    """横轴绑了分类字段时，把它从这一块的**指标清单**里去掉。
+
+    分类字段不是这一块的量：留在 ``previewSpec.metrics`` 里，造数器会照着
+    多指标出**两条数值系列**，图例把「设备名称」和「耗电量」并排画成两个
+    堆叠数值系列（验收 11-01 的截图）。
+    """
+    dimension = ""
+    for encoding in encodings:
+        if str(encoding.get("channel") or "").strip().upper() == "X":
+            dimension = str(encoding.get("fieldRef") or "").strip()
+            break
+    if not dimension:
+        return
+    binding = region.get("templateBinding") if isinstance(region, dict) else None
+    binding = binding if isinstance(binding, dict) else {}
+    spec = binding.get("previewSpec") if isinstance(binding.get("previewSpec"), dict) else {}
+    metrics = spec.get("metrics")
+    if not isinstance(metrics, list) or not metrics:
+        return
+    kept = []
+    removed = 0
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            kept.append(metric)
+            continue
+        label = str(metric.get("label") or "").strip()
+        key = str(metric.get("metricKey") or "").strip()
+        canonical = canonical_field_of(label) or canonical_field_of(key)
+        if canonical and canonical == dimension:
+            removed += 1
+            continue
+        kept.append(metric)
+    if not removed:
+        return
+    spec["metrics"] = kept
+    binding["previewSpec"] = spec
+    region["templateBinding"] = binding
 
 
 def _normalize_axis_spec(

@@ -168,6 +168,23 @@ def decorate_chart_payload(
         str(name): dict(spec) for name, spec in axes.items() if isinstance(spec, dict)
     }
 
+    # ---- 纵轴的数值格式：轴上没声明时，取**纵轴通道**声明的格式 ----
+    #
+    # 「纵轴数值格式保留一位小数」这句话，模型可能写进 ``axes.y.format``，
+    # 也可能写进纵轴通道的 ``format``（两者都合法）。前端只认轴上的格式，
+    # 所以这里补一次：轴没声明就用通道的 —— **不改协议**，只是让同一个
+    # 声明在哪都生效（验收 11-01）。
+    _y_encoding_format: dict[str, Any] = {}
+    for _item in encodings:
+        if _item.get("channel") == "Y":
+            _y_encoding_format = _as_dict(_item.get("format"))
+            break
+    if _y_encoding_format:
+        _y_axis = _as_dict(payload["axes"].get("y"))
+        if not _as_dict(_y_axis.get("format")):
+            _y_axis["format"] = dict(_y_encoding_format)
+            payload["axes"]["y"] = _y_axis
+
     legend = component.get("legend")
     payload["legend"] = bool(legend) if isinstance(legend, bool) else True
 
@@ -216,7 +233,14 @@ def decorate_chart_payload(
     y_encoding = by_channel.get("Y")
     if y_encoding:
         y_ref = y_encoding["fieldRef"]
-        if y_ref not in field_values:
+        if y_ref == legacy_y_field and legacy_y_field not in ("", "value"):
+            # 声明的纵轴**就是载荷这一列**（例如 ``energyKwh``）：逐点值
+            # 本来就是按它出的，说它「没有可用取值」是判反了。
+            # （``value`` 是通用示意列的占位名，不算真的字段。）
+            payload["yField"] = y_ref
+            payload["encodingDriven"] = True
+            payload["encodingSource"] = y_ref
+        elif y_ref not in field_values:
             payload["encodingDriven"] = False
             payload["encodingNote"] = ENCODING_Y_NOTE
         elif y_ref == legacy_y_field:

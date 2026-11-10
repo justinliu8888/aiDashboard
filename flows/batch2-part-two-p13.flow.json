@@ -1,0 +1,95 @@
+{
+  "outDir": "../.selfcheck/flow-batch2-p13",
+  "waitMs": 1500,
+  "timeout": 15000,
+  "ignore": [
+    "modao.cc"
+  ],
+  "flows": [
+    {
+      "name": "P13 待接受候选刷新不自动生效",
+      "url": "http://127.0.0.1:8010/playground/pages/workbench.html",
+      "path": "/playground/pages/workbench.html",
+      "continueOnError": true,
+      "steps": [
+        {
+          "eval": "(() => { window.localStorage.setItem('ai-report:last-session-id', 'sess_e0f119df2f51'); return true; })()"
+        },
+        {
+          "eval": "(() => { window.location.reload(); return true; })()",
+          "continueOnError": true
+        },
+        {
+          "wait": 4000
+        },
+        {
+          "waitFor": "#preview-root .region-name",
+          "timeout": 60000
+        },
+        {
+          "eval": "(() => { const t = document.getElementById('preview-root').innerText || ''; return t.includes('5297.2'); })()"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])",
+          "timeout": 60000
+        },
+        {
+          "eval": "(() => { const s = document.querySelector('.question-select[data-question-id=\"template_edit_confirm\"]:not([disabled])'); if (!s || s.disabled) return false; const opt = Array.from(s.options).find(o => o.textContent.trim() === '修改'); if (!opt) return false; s.value = opt.value; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()"
+        },
+        {
+          "waitFor": "[data-question-text=\"template_edit_request\"] .question-text-input",
+          "timeout": 60000
+        },
+        {
+          "type": "[data-question-text=\"template_edit_request\"] .question-text-input",
+          "text": "给「设备耗电明细」表加一个展示过滤，只展示昨日耗电量大于 600 kWh 的记录，并按昨日耗电量降序排序，不要改源数据和全量合计。"
+        },
+        {
+          "click": "[data-question-text-submit=\"template_edit_request\"]"
+        },
+        {
+          "waitFor": ".question-select[data-question-id=\"pending_edit_plan_confirm\"]:not([disabled])",
+          "timeout": 240000
+        },
+        {
+          "screenshot": "p13-01-待接受候选卡"
+        },
+        {
+          "eval": "(() => { const heads = Array.from(document.querySelectorAll('.wtb-thead th')).map(e => e.textContent.trim()); return heads.includes('时间') && heads.includes('昨日耗电量') && !heads.includes('时间点'); })()"
+        },
+        {
+          "eval": "(() => { const rows = document.querySelectorAll('.wtb-tbody tr.wtb-row'); return rows.length === 10; })()"
+        },
+        {
+          "eval": "(() => { window.location.reload(); return true; })()",
+          "continueOnError": true
+        },
+        {
+          "wait": 5000
+        },
+        {
+          "waitFor": "#preview-root .region-name",
+          "timeout": 60000
+        },
+        {
+          "screenshot": "p13-02-刷新后候选未自动生效"
+        },
+        {
+          "eval": "(() => { const heads = Array.from(document.querySelectorAll('.wtb-thead th')).map(e => e.textContent.trim()); return heads.includes('时间') && heads.includes('昨日耗电量') && !heads.includes('时间点'); })()"
+        },
+        {
+          "eval": "(() => { const rows = document.querySelectorAll('.wtb-tbody tr.wtb-row'); return rows.length === 10; })()"
+        },
+        {
+          "eval": "(() => { const value = document.querySelector('.wtb-summary__value'); return !!value && value.textContent.includes('5297.2'); })()"
+        },
+        {
+          "eval": "(() => { const t = document.getElementById('chat-scroll').innerText || ''; return t.includes('待确认'); })()"
+        },
+        {
+          "screenshot": "p13-03-刷新后仍是待确认状态"
+        }
+      ]
+    }
+  ]
+}
